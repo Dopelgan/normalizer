@@ -1,0 +1,49 @@
+# Профиль приёма Data Gateway.
+#
+# Это ЕДИНСТВЕННОЕ, что читает код: core/gateway/profile.py берёт отсюда
+# секцию `data_gateway` и больше ничего. Остальные настройки конвейера
+# живут в .env — см. .env.example и core/config.py. Раньше в этом файле
+# лежала копия всего .env, которую никто не читал: значения в ней тихо
+# расходились с боевыми.
+#
+# Этот файл и есть поставляемый профиль: если по пути GATEWAY_PROFILE_PATH
+# (по умолчанию config/profile.yaml) файла нет, читается образец рядом —
+# то есть он. Чтобы править правила своей установки, скопируйте его в
+# profile.yaml: свой файл старше образца. Нет ни того, ни другого —
+# работают умолчания из GatewayProfile, и об этом пишется строка INFO.
+
+# Отсев непригодных данных. Правила описывают конкретную организацию, а не
+# конвейер, поэтому вынесены из кода. Файла нет — работают умолчания.
+data_gateway:
+  # Каталоги, содержимое которых в базу знаний не принимается вовсе.
+  forbidden_paths: ["/temp/", "/tmp/", "/cache/", "/.trash/", "/recycle"]
+
+  # Личные области. По умолчанию не принимаются, но там встречаются
+  # единственные экземпляры документов — поэтому исход карантин, а не отказ,
+  # и запрет настраиваемый.
+  personal_paths: ["/personal/", "/личное/"]
+  personal_exceptions: []
+  accept_personal_areas: false
+
+  min_size_bytes: 512
+  max_size_bytes: 209715200
+
+  # Категории слоя G-2 и их допустимость.
+  accepted_categories: [business_document, technical_documentation]
+  quarantined_categories: [correspondence, unrecognizable]
+  rejected_categories: [personal, system_file]
+
+  # Категории слоя G-3 (только изображения).
+  # document_scan — скан страницы текста: это документ, а не фотография.
+  accepted_image_categories: [drawing, scheme, document_scan]
+  quarantined_image_categories: [object_photo, screenshot]
+  rejected_image_categories: [personal_photo]
+
+  # Ниже этой уверенности документ уходит на разбор спорных случаев (G-4).
+  min_confidence: 0.6
+  # Классификатор, осмотревший меньшую долю документа, уверенным не считается.
+  min_inspected_fraction: 0.2
+
+  # Передаётся основной модели на слое G-4, чтобы спорный случай разбирался
+  # в контексте деятельности организации.
+  company_profile: ""

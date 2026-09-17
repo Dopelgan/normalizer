@@ -1,0 +1,46 @@
+# Боевой образ: код внутри, ничего не монтируется, процесс не от root.
+# Отличия от Dockerfile.dev: собирается в два этапа (компилятор не едет в
+# готовый образ) и содержит все четыре сервиса — приём, качество, разбор и
+# воркер, — потому что монтировать их с хоста здесь нечем.
+FROM python:3.11-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Только то, что нужно на исполнении: распознавание и рендер PDF.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    tesseract-ocr \
+    tesseract-ocr-rus \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+
+COPY core/ ./core/
+COPY ingest/ ./ingest/
+COPY gateway/ ./gateway/
+COPY quality/ ./quality/
+COPY alembic/ ./alembic/
+COPY config/ ./config/
+COPY alembic.ini init_db.py ./
+
+RUN useradd --create-home --uid 1000 app \
+    && mkdir -p /data/shared \
+    && chown -R app:app /app /data/shared
+USER app
+
+CMD ["uvicorn", "ingest.api:app", "--host", "0.0.0.0", "--port", "8000"]

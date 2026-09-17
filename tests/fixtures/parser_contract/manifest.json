@@ -1,0 +1,21 @@
+{
+  "purpose": "Parser integration/E2E fixtures",
+  "expected": {
+    "valid_text.txt": "accept; text extraction; exact tokens",
+    "valid_markdown.md": "accept; text + table-like content",
+    "valid_table.csv": "accept; tabular parsing",
+    "valid_table.xlsx": "accept; XLSX parsing + formulas",
+    "valid_mixed.docx": "accept; text/document/table structure",
+    "valid_mixed.pdf": "accept; text + table + 2 pages",
+    "valid_image.jpg": "accept; image/OCR",
+    "valid_image.png": "accept; image/OCR",
+    "valid_image.bmp": "accept; image/OCR",
+    "valid_image.tiff": "accept; image/OCR",
+    "valid_drawing.dxf": "accept; level 1 CAD/vector drawing",
+    "unsupported.dwg": "reject; unsupported closed binary format",
+    "corrupt.pdf": "reject or quarantine; technical unreadable",
+    "low_quality.png": "quarantine or degraded OCR; test quality gate",
+    "личное_отпуск.jpg": "quarantine/reject by Data Gateway profile",
+    "no_extension": "discover supported extension via configured lookup or reject if absent"
+  }
+}

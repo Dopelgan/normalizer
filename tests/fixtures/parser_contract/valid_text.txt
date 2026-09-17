@@ -1,0 +1,8 @@
+Parser smoke test
+Document ID: TEST-TXT-001
+Revision: 3
+Status: APPROVED
+Owner: Engineering
+
+This document contains plain text with identifiers rps and expires_at.
+Expected: preserve exact text and metadata-like tokens.

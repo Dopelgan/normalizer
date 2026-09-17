@@ -1,0 +1,17 @@
+{
+  "request_id": "req-fixtures-001",
+  "dialog_id": "dialog-fixtures-001",
+  "s3_fileid": [
+    "valid_mixed.pdf",
+    "valid_mixed.docx",
+    "valid_table.xlsx",
+    "valid_table.csv",
+    "valid_drawing.dxf",
+    "valid_image.png",
+    "личное_отпуск.jpg",
+    "unsupported.dwg",
+    "corrupt.pdf",
+    "low_quality.png"
+  ],
+  "operation": "create"
+}

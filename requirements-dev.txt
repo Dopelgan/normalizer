@@ -1,0 +1,10 @@
+-r requirements.txt
+
+pytest==8.3.4
+pytest-cov==6.0.0
+pytest-mock==3.14.0
+requests-mock==1.12.1
+fakeredis==2.26.1
+httpx==0.28.1
+moto==5.0.20
+locust==2.32.4

@@ -1,0 +1,297 @@
+x-defaults: &defaults
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: 100m
+      max-file: "3"
+
+x-app-env: &app-env
+  env_file:
+    - .env
+
+networks:
+  public_net:
+    driver: bridge
+  internal_net:
+    driver: bridge
+    internal: true    # у контейнеров нет выхода в интернет
+
+volumes:
+  shared_data:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+services:
+  # ============================================
+  # 1. INIT-КОНТЕЙНЕР (ЗАГРУЗЧИК МОДЕЛЕЙ)
+  # ============================================
+  model-downloader:
+    image: python:3.11-slim
+    networks:
+      - public_net
+    volumes:
+      - ./models:/models
+      - ./download.sh:/download.sh
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HF_HUB_HTTP_TIMEOUT=120
+      - HF_XET_HIGH_PERFORMANCE=1
+      - MINERU_MODEL_CACHE=${MINERU_MODEL_CACHE:-/models/pdf-extract-kit}
+      - HF_TOKEN=${HF_TOKEN}
+    entrypoint: ["bash", "/download.sh"]
+
+  # ============================================
+  # 2. БАЗА ДАННЫХ И БРОКЕР
+  # ============================================
+  postgres:
+    <<: *defaults
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-knowledge_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password}
+      POSTGRES_DB: ${POSTGRES_DB:-knowledge}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-knowledge_user} -d ${POSTGRES_DB:-knowledge}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal_net
+
+  redis:
+    <<: *defaults
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal_net
+
+  # ============================================
+  # 3. ML-СЕРВИСЫ (изолированы, читают ./models)
+  # ============================================
+  mineru-api:
+    <<: *defaults
+    build:
+      context: .
+      dockerfile: Dockerfile.mineru
+    image: mineru:${MINERU_VERSION:-3.4.5}
+    expose:
+      - "8000"
+    networks:
+      - internal_net
+    entrypoint: mineru-api
+    # Backend pipeline: Florence используется отдельно, на этапе чертежей,
+    # а не как VLM внутри MinerU.
+    command: >
+      --host 0.0.0.0
+      --port 8000
+      --model-dir /models/pdf-extract-kit
+    environment:
+      TZ: ${TZ:-UTC}
+      MINERU_MODEL_SOURCE: local
+      MINERU_MODEL_DIR: /models/pdf-extract-kit
+      MINERU_TOOLS_CONFIG_JSON: /models/pdf-extract-kit/mineru.json
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    # Вместо `ipc: host`: разделяемая память нужна загрузчикам torch,
+    # а общий с хостом IPC — нет.
+    shm_size: "2gb"
+    deploy:
+      resources:
+        limits:
+          cpus: "12.0"
+          memory: 32G
+        reservations:
+          cpus: "8.0"
+          memory: 16G
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    volumes:
+      - ./models:/models
+      - shared_data:/data/shared
+    depends_on:
+      model-downloader:
+        condition: service_completed_successfully
+
+  # ============================================
+  # 4. CELERY WORKER
+  # ============================================
+  celery_worker:
+    <<: [*defaults, *app-env]
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: >
+      celery -A core.celery_app worker
+      --loglevel=info
+      --concurrency=1
+      -Q ml_gpu
+      --time-limit=${CELERY_TASK_TIME_LIMIT:-600}
+      --soft-time-limit=${CELERY_TASK_SOFT_TIME_LIMIT:-540}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mineru-api:
+        condition: service_healthy
+    # Исходники монтируются только на чтение: контейнер работает от
+    # непривилегированного пользователя и переписать рабочую копию на хосте
+    # не может. Горячая правка с хоста при этом работает как раньше.
+    volumes:
+      - shared_data:/data/shared
+      - ./core:/app/core:ro
+      - ./ingest:/app/ingest:ro
+      - ./tests:/app/tests:ro
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    networks:
+      - internal_net
+      # Единственная причина выхода наружу: чертежи читает внешняя модель
+      # под vLLM (QWEN_ENDPOINT, по умолчанию http://vllm:8001/v1). Контейнер
+      # vllm поднимается своим compose и подключается к internal_net — тогда
+      # public_net здесь не нужен. Если модель живёт на отдельном хосте,
+      # public_net заменяется на сеть этого хоста.
+      - public_net
+
+  # ============================================
+  # 5. PARSER API
+  # ============================================
+  ingest_api:
+    <<: [*defaults, *app-env]
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: sh -c "python init_db.py && uvicorn ingest.api:app --host 0.0.0.0 --port 8000"
+    # Контракт: ручки доступны только внутри сети, наружу не публикуются.
+    # Порт на localhost оставлен для разработки и ручной проверки.
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - shared_data:/data/shared
+      - ./core:/app/core:ro
+      - ./ingest:/app/ingest:ro
+      - ./alembic:/app/alembic:ro
+      - ./alembic.ini:/app/alembic.ini:ro
+      - ./init_db.py:/app/init_db.py:ro
+      - ./tests:/app/tests:ro
+      - ./pytest.ini:/app/pytest.ini:ro
+      - ./tests/fixtures:/data/shared/fixtures:ro
+    networks:
+      - internal_net
+
+  # ============================================
+  # 5A. ПРИЁМ: DATA GATEWAY -> QUALITY GATE -> НОРМАЛИЗАТОР
+  # ============================================
+  # Порядок жёсткий. Data Gateway отвечает на вопрос «относится ли это к
+  # корпоративным знаниям», Quality Gate — «пригоден ли документ технически».
+  # Смешивать нельзя: личная фотография технически безупречна и проверку
+  # качества прошла бы, поэтому отсев обязан идти первым.
+  data_gateway:
+    <<: [*defaults, *app-env]
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: uvicorn gateway.api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8010}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      quality_gate:
+        condition: service_started
+    volumes:
+      - shared_data:/data/shared
+      - ./core:/app/core:ro
+      - ./gateway:/app/gateway:ro
+      - ./config:/app/config:ro
+    networks:
+      - internal_net
+
+  quality_gate:
+    <<: [*defaults, *app-env]
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: uvicorn quality.api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "127.0.0.1:${QUALITY_GATE_PORT:-8011}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ingest_api:
+        condition: service_started
+    volumes:
+      - shared_data:/data/shared
+      - ./core:/app/core:ro
+      - ./quality:/app/quality:ro
+      - ./config:/app/config:ro
+    networks:
+      - internal_net
+
+  # ============================================
+  # 6. MINIO (S3 для разработки и тестов)
+  # ============================================
+  minio:
+    <<: *defaults
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    networks:
+      - internal_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - internal_net
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin}; do sleep 2; done;
+      mc mb local/${S3_BUCKET:-test-bucket} || true;
+      echo 'Bucket ${S3_BUCKET:-test-bucket} ready.'
+      "
