@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 
 from celery.exceptions import SoftTimeLimitExceeded
 
+from core import telemetry
 from core.celery_app import app
 from core.config import settings
 from core.db.session import SessionLocal
@@ -134,11 +135,17 @@ def process_document(
     storage = StorageProviderFactory.default()
     session = SessionLocal()
     located: Optional[LocatedFile] = None
+    # Область сбора таймингов: все замеры внутри складываются сюда, и
+    # словарь уезжает в extra_data документа. Без него на вопрос «почему
+    # этот файл обрабатывался семь минут» отвечать нечем.
+    timings_scope = telemetry.collect()
+    timings = timings_scope.__enter__()
 
     try:
         # ------------------------------------------------------ 1. Поиск файла
         try:
-            located = FileLocator(storage).locate(s3_fileid)
+            with telemetry.measure("parse.locate", s3_fileid=s3_fileid):
+                located = FileLocator(storage).locate(s3_fileid)
         except SourceFileNotFound as exc:
             logger.error("Файл не найден: %s", exc)
             finalize(request_id, dialog_id, s3_fileid,
@@ -195,7 +202,12 @@ def process_document(
         }
 
         parser = DocumentParserFactory.get_parser(storage)
-        parse_result = parser.parse(located.uri, located.file_type, metadata)
+        with telemetry.measure(
+            "parse.document", doc_id=doc_id, file_type=located.file_type
+        ) as span:
+            parse_result = parser.parse(located.uri, located.file_type, metadata)
+            span["pages"] = parse_result.page_count or len(parse_result.pages())
+            span["parser"] = parse_result.parser_name
         metadata["source_kind"] = parse_result.source_kind
         # Классификация до разбора нужна обработчику чертежей: по ней он
         # понимает, что сам документ — растровый лист, а не текст с
@@ -203,7 +215,9 @@ def process_document(
         metadata["classification"] = (parse_result.ladder or {}).get("classification") or {}
 
         normalizer = TextNormalizer()
-        fragments, flags = normalizer.normalize_with_flags(parse_result, metadata)
+        with telemetry.measure("parse.normalize", doc_id=doc_id) as span:
+            fragments, flags = normalizer.normalize_with_flags(parse_result, metadata)
+            span["fragments"] = len(fragments)
         # Пометки привязываются к фрагменту по его идентификатору, а не по
         # месту в списке: обработчик чертежей вставляет разбор листа целиком
         # в начало, и позиционное сопоставление уезжает на один фрагмент.
@@ -211,13 +225,15 @@ def process_document(
             fragment.fragment_id: extra for fragment, extra in zip(fragments, flags)
         }
 
-        fragments = DrawingProcessor(storage).enrich_fragments(fragments, metadata)
+        with telemetry.measure("parse.drawings", doc_id=doc_id):
+            fragments = DrawingProcessor(storage).enrich_fragments(fragments, metadata)
 
         # ----------------------------------------- 4. Сохранение (транзакция)
-        file_hash = compute_file_hash(storage, located.uri)
+        with telemetry.measure("parse.file_hash"):
+            file_hash = compute_file_hash(storage, located.uri)
         raw_uri = f"{settings.RAW_PARSE_S3_PREFIX.rstrip('/')}/{doc_id}.json"
 
-        with session.begin():
+        with telemetry.measure("parse.save", doc_id=doc_id), session.begin():
             chunk_repo = ChunkRepository(session)
             doc_repo = DocumentRepository(session)
 
@@ -255,6 +271,9 @@ def process_document(
                 "fallback_won": bool(ladder.get("fallback_won")),
                 "degraded": list(parse_result.degraded),
                 "text_layer_stats": parse_result.text_layer_stats or {},
+                # Время каждой операции рядом с документом: по нему видно,
+                # где именно он провёл время, без похода в логи воркера.
+                "timings_ms": dict(timings),
             })
             document = doc_repo.get(doc_id)
             doc_metadata = document_to_metadata(document)
@@ -308,6 +327,7 @@ def process_document(
         return {"status": "error", "doc_id": doc_id, "reason": str(exc)}
 
     finally:
+        timings_scope.__exit__(None, None, None)
         session.close()
 
 

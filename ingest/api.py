@@ -4,7 +4,7 @@ HTTP-интерфейс Parser по контракту RAG <-> Parser.
     POST /internal/v1/parse                      синхронная обработка
     POST /internal/v1/parse/background           фоновая обработка (202)
     GET  /internal/v1/parse/results/{request_id} готовность и результат
-    GET  /health
+    GET  /health, GET /metrics
 
 Ручки рассчитаны на внутреннюю сеть контейнеров: авторизации в MVP-контракте
 нет. Наружу порты публиковать не следует.
@@ -19,6 +19,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from core import logging_setup, telemetry
 from core.config import settings
 from core.models.api import BackgroundParseRequest, HealthResponse, ParseRequest
 from core.models.intake import IntakeFile
@@ -33,11 +34,8 @@ from core.workspace import configure_process_tempdir
 
 # Временные файлы процесса — в том сервиса, а не на слой контейнера.
 configure_process_tempdir()
+logging_setup.configure("parser")
 
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -45,6 +43,7 @@ app = FastAPI(
     description="Нормализация документов: текст, таблицы, формулы, чертежи",
     version="1.0.0",
 )
+telemetry.install_metrics_endpoint(app)
 
 SYNC_POLL_INTERVAL = 0.5
 ACTIVE_STATUSES = ("queued", "processing")

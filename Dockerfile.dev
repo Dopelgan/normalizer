@@ -5,13 +5,21 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Системные зависимости: OCR-фоллбэк (tesseract) и рендер PDF (poppler).
+# Системные зависимости: OCR-фоллбэк (tesseract), рендер PDF (poppler) и
+# конвертер старых офисных форматов.
+#
+# libreoffice-writer нужен ради .doc: двоичный Word 97-2003 разбирается
+# только через конвертацию в .docx, а плоский текст из него теряет
+# таблицы — то есть само содержание документа. Ставится без рекомендуемых
+# пакетов: в образ не едут ни Java, ни остальные модули LibreOffice.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     build-essential \
     tesseract-ocr \
     tesseract-ocr-rus \
     poppler-utils \
+    libreoffice-writer \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

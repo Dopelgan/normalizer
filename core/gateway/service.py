@@ -23,8 +23,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from core import filetypes
-from core.gateway import text_probe
+from core import filetypes, telemetry
+from core.gateway import rules, text_probe
 from core.gateway.profile import (
     CATEGORY_BUSINESS,
     CATEGORY_CORRESPONDENCE,
@@ -57,57 +57,12 @@ _SAMPLE_BYTES = 64 * 1024
 _SYSTEM_NAMES = (
     "thumbs.db", "desktop.ini", ".ds_store", "~$", "index.dat", "ntuser.dat",
 )
-# Маркеры ищутся по границам слов, а не подстрокой. Подстрочный поиск по
-# двухбуквенным маркерам («ту », «ост », «re:») срабатывал на случайных
-# сочетаниях — в том числе внутри сжатого потока PDF, где «re:» встречается
-# просто как последовательность байтов.
-def _markers(*patterns: str) -> tuple:
-    return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
-
-
-_TECHNICAL_MARKERS = _markers(
-    r"\bгост\b", r"\bост\s*\d", r"\bту\s*\d", r"\bчерт[её]ж\w*",
-    r"\bспецификац\w+", r"\bтехническ\w+", r"\bдопуск\w*",
-    r"\bшероховат\w+", r"\bсборочн\w+", r"\bдеталь\w*", r"\bузел\b",
-    r"\bсхема\w*", r"\bчертеж\w*",
-)
-_BUSINESS_MARKERS = _markers(
-    r"\bдоговор\w*", r"\bприказ\w*", r"\bрегламент\w*", r"\bинструкц\w+",
-    r"\bположение\b", r"\bакт\b", r"\bнакладн\w+", r"\bсч[ёе]т\b",
-    r"\bсчет-фактур\w*", r"\bпротокол\w*", r"\bустав\b", r"\bотч[ёе]т\w*",
-    r"\bприложение\s*№?\s*\d", r"\bграфик\b", r"\bсоглашени\w+",
-    r"\bспецификация\s+к\s+договору",
-    # Кадровый документооборот — это деловые документы организации, а не
-    # «личное»: заявление на отпуск пишется по форме и хранится в кадрах.
-    # Без этих маркеров слово «отпуск» уводило такие файлы в «личное».
-    r"\bзаявлени\w+", r"\bдолжностн\w+\s+инструкц\w+", r"\bтрудов\w+\s+договор",
-    r"\bсчет[- ]фактур\w*", r"\bнакладная\b", r"\bупд\b", r"\bтз\b",
-)
-# Переписка опознаётся по обороту письма, а не по одному слову: «кому:» в
-# бланке и «с уважением» в подписи — это переписка, а слово «письмо» в
-# названии приложения к договору — ещё нет.
-_CORRESPONDENCE_MARKERS = _markers(
-    r"(?:^|\n)\s*(?:re|fwd|fw)\s*:", r"\bкому\s*:", r"\bот\s+кого\s*:",
-    r"\bс\s+уважением\b", r"\bдобрый\s+(?:день|вечер)\b",
-    r"\bздравствуйте\b", r"\bпереписка\w*", r"\bисх\.\s*№", r"\bвх\.\s*№",
-)
-_PERSONAL_MARKERS = _markers(
-    r"\bотпуск\w*", r"\bсвадьб\w+", r"\bдень\s+рождения\b", r"\bличное\b",
-    r"\bсемья\b", r"\bфото\s+с\b",
-)
-
-# Категории в порядке разбора и уверенность, с которой правило их называет.
-_RULE_ORDER = (
-    (CATEGORY_TECHNICAL, _TECHNICAL_MARKERS, 0.8),
-    (CATEGORY_BUSINESS, _BUSINESS_MARKERS, 0.78),
-    (CATEGORY_CORRESPONDENCE, _CORRESPONDENCE_MARKERS, 0.72),
-    (CATEGORY_PERSONAL, _PERSONAL_MARKERS, 0.7),
-)
-
+# Словари маркеров и счёт по весам вынесены в core.gateway.rules: правила
+# правят чаще, чем код вокруг них, и проверять их должно быть дёшево.
 # Категории, которые нельзя объявить по одному лишь пути. Путь к файлу —
 # слабый признак: «1-2. Договора и ДС/…/Приложение 2. График.pdf» говорит о
 # деловом документе, но ничего не говорит о переписке.
-_TEXT_ONLY_CATEGORIES = (CATEGORY_CORRESPONDENCE,)
+_PATH_CATEGORIES = rules.PATH_CATEGORIES
 
 # Род растра (core.providers.raster_drawing) -> категория приёма.
 _IMAGE_CATEGORY_BY_KIND = {
@@ -175,7 +130,9 @@ class DataGateway:
         # один раз: и для опознания формата, и для классификации. Картинку
         # судить по первым 64 КБ нельзя (у BMP и TIFF в них только заголовок
         # и пара строк развёртки), а формат по обрезку zip не определяется.
-        data = self._read_all(path)
+        with telemetry.measure("data_gateway.read", uri=path) as span:
+            data = self._read_all(path)
+            span["bytes"] = len(data)
         resolved = filetypes.resolve(path, data)
 
         verdict = self.type_layer(path, resolved)
@@ -183,17 +140,28 @@ class DataGateway:
             return verdict
 
         if filetypes.is_image(resolved.file_type):
-            verdict = self.image_layer(path, data, 1.0 if data else 0.0)
+            with telemetry.measure(
+                "data_gateway.image_layer", file_type=resolved.file_type
+            ) as span:
+                verdict = self.image_layer(path, data, 1.0 if data else 0.0)
+                span["outcome"] = verdict.outcome
         else:
             inspected = 1.0 if data else 0.0
-            verdict = self.content_layer(path, data, inspected, resolved)
+            with telemetry.measure(
+                "data_gateway.content_layer", file_type=resolved.file_type
+            ) as span:
+                verdict = self.content_layer(path, data, inspected, resolved)
+                span["outcome"] = verdict.outcome
 
         if resolved.mismatch:
             verdict.signals.setdefault("type_mismatch", resolved.explanation)
 
         if verdict.confidence >= self.profile.min_confidence:
             return verdict
-        return self.escalation_layer(path, data[:_SAMPLE_BYTES], verdict)
+        with telemetry.measure("data_gateway.escalation") as span:
+            verdict = self.escalation_layer(path, data[:_SAMPLE_BYTES], verdict)
+            span["outcome"] = verdict.outcome
+        return verdict
 
     # -------------------------------------------------- G-1 формальные признаки
     def formal_layer(
@@ -461,30 +429,38 @@ class DataGateway:
         говорит о содержании; путь говорит лишь о том, куда документ
         положили, поэтому категория по одному пути объявляется с меньшей
         уверенностью, а переписку по нему не объявляют вовсе.
+
+        Считает `core.gateway.rules`: не первый сработавший маркер, а сумма
+        весов по каждой категории. Уверенность берётся из отрыва лидера —
+        документ, в котором поровну признаков договора и чертежа, уходит на
+        разбор спорных случаев, а не объявляется тем, чей маркер оказался
+        выше в списке.
         """
         probe = text_probe.extract(file_type, data)
         signals: Dict[str, Any] = probe.as_dict()
 
         if probe.reliable:
-            category, confidence, hit = _first_match(probe.text)
-            if category is not None:
+            match = rules.classify(probe.text)
+            if match.matched:
                 signals["matched_in"] = "текст"
-                signals["matched_marker"] = hit
-                return category, confidence, signals
+                signals.update(match.as_signals())
+                return match.category, match.confidence, signals
 
         # Путь целиком, а не только имя файла: каталог «Договоры и ДС» —
-        # такой же признак, как слово в названии, и раньше он отбрасывался.
-        category, confidence, hit = _first_match(path.replace("/", " "))
-        if category is not None and category not in _TEXT_ONLY_CATEGORIES:
+        # такой же признак, как слово в названии. Для скана без текстового
+        # слоя это вообще единственный признак: «Аттестат аккредитации.pdf»
+        # и «ДИ023-24 Инженер-конструктор.pdf» опознаются только так.
+        match = rules.classify(path, allowed=_PATH_CATEGORIES)
+        if match.matched:
             signals["matched_in"] = "путь"
-            signals["matched_marker"] = hit
+            signals.update(match.as_signals())
             # Путь — признак второго порядка: уверенность ниже, и спорный
             # случай уходит на разбор (G-4), а не решается молча.
-            return category, round(confidence * 0.85, 3), signals
+            return match.category, round(match.confidence * 0.85, 3), signals
 
         if file_type == "dxf":
             return CATEGORY_TECHNICAL, 0.9, signals
-        if file_type in ("xlsx", "csv"):
+        if filetypes.kind_of(file_type) == filetypes.KIND_SPREADSHEET:
             return CATEGORY_BUSINESS, 0.65, signals
 
         if not probe.reliable and not data:
@@ -519,7 +495,7 @@ class DataGateway:
         # Имя говорит «личное», а на листе чертёж — это противоречие, а не
         # повод выбросить документ: уверенность падает, и случай уходит на
         # разбор спорных (G-4), то есть человеку.
-        if _matches(name, _PERSONAL_MARKERS):
+        if rules.classify(name, allowed=[CATEGORY_PERSONAL]).matched:
             if category in (IMAGE_OBJECT_PHOTO, IMAGE_PERSONAL_PHOTO, CATEGORY_UNRECOGNIZABLE):
                 return IMAGE_PERSONAL_PHOTO, max(confidence, 0.7), signals
             signals["name_conflict"] = "имя файла помечено как личное"
@@ -535,49 +511,3 @@ class DataGateway:
             return IMAGE_SCREENSHOT, max(confidence, 0.7), signals
 
         return category, confidence, signals
-
-
-# ===========================================================================
-# Помощники
-# ===========================================================================
-
-def _haystack(value: str) -> str:
-    """
-    Строка, пригодная для поиска по границам слов.
-
-    В именах файлов слова разделяют не пробелы, а `_`, `-` и точки, причём
-    `_` для регулярного выражения — такой же символ слова, как буква:
-    в «личное_отпуск.jpg» маркер `\bличное\b` без этой нормализации не
-    находится.
-    """
-    return re.sub(r"[_\-./\\]+", " ", value or "")
-
-
-def _matches(haystack: str, markers) -> bool:
-    """Есть ли в тексте хоть один маркер набора."""
-    prepared = _haystack(haystack)
-    return any(marker.search(prepared) for marker in markers)
-
-
-def _first_match(haystack: str) -> tuple:
-    """
-    Первая подходящая категория по порядку разбора: техническое, деловое,
-    переписка, личное. Возвращает и сам сработавший маркер — он попадает в
-    сигналы приёма, чтобы решение можно было проверить, а не принять на веру.
-    """
-    prepared = _haystack(haystack)
-    for category, markers, confidence in _RULE_ORDER:
-        for marker in markers:
-            found = marker.search(prepared)
-            if found:
-                return category, confidence, found.group(0).strip()
-    return None, 0.0, None
-
-
-def _as_text(sample: bytes) -> str:
-    for encoding in ("utf-8", "cp1251"):
-        try:
-            return sample.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return sample.decode("utf-8", errors="ignore")

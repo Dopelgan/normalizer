@@ -197,7 +197,20 @@ class TestOfficeLegacyFormats:
             assert filetypes.is_supported(extension), extension
             assert filetypes.kind_of(extension) == filetypes.KIND_SPREADSHEET
 
-    def test_doc_is_known_but_not_supported(self):
+    def test_doc_is_supported_through_conversion(self):
+        """DOC разбирается через конвертацию в DOCX, а не отклоняется."""
         assert filetypes.is_known("doc")
-        assert not filetypes.is_supported("doc")
-        assert "docx" in filetypes.rejection_reason("doc")
+        assert filetypes.is_supported("doc")
+        assert filetypes.kind_of("doc") == filetypes.KIND_OFFICE_TEXT
+        assert "doc" in filetypes.PROBE_ORDER
+
+    def test_doc_is_rejected_when_converter_is_missing(self, monkeypatch):
+        """
+        Формат поддержан, но разбирается только конвертером. Нет конвертера
+        — сказать об этом нужно на приёме, а не посреди разбора.
+        """
+        from core.providers import office_convert
+
+        monkeypatch.setattr(office_convert, "available", lambda: False)
+        reason = filetypes.rejection_reason("doc")
+        assert reason and "docx" in reason

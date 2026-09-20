@@ -163,10 +163,14 @@ services:
     # Исходники монтируются только на чтение: контейнер работает от
     # непривилегированного пользователя и переписать рабочую копию на хосте
     # не может. Горячая правка с хоста при этом работает как раньше.
+    # Метрики воркера: своего веб-сервера у него нет, поэтому отдельный порт.
+    ports:
+      - "127.0.0.1:9100:9100"
     volumes:
       - shared_data:/data/shared
       - ./core:/app/core:ro
       - ./ingest:/app/ingest:ro
+      - ./config:/app/config:ro
       - ./tests:/app/tests:ro
     deploy:
       resources:
@@ -180,6 +184,50 @@ services:
       # public_net здесь не нужен. Если модель живёт на отдельном хосте,
       # public_net заменяется на сеть этого хоста.
       - public_net
+
+  # ============================================
+  # 4A. ВОРКЕР ПРИЁМА
+  # ============================================
+  # Приём и разбор разведены по разным очередям и разным воркерам.
+  #
+  # Приём — это чтение файла, открытие формата и быстрый OCR двух страниц:
+  # работа лёгкая, её можно вести в несколько потоков. Разбор занимает GPU
+  # и идёт по одному документу. В общей очереди пачка сканов вставала бы за
+  # чертежом, который внешняя модель читает минутами, — и приём, сам по
+  # себе быстрый, ждал бы вместе с ней.
+  #
+  # GPU этому воркеру не нужен, MinerU и модель чертежей — тоже, поэтому
+  # он не ждёт mineru-api и не ходит наружу.
+  intake_worker:
+    <<: [*defaults, *app-env]
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: >
+      celery -A core.celery_app worker
+      --loglevel=info
+      --concurrency=${INTAKE_WORKER_CONCURRENCY:-4}
+      -Q ${CELERY_INTAKE_QUEUE:-intake}
+      --time-limit=${INTAKE_TASK_TIME_LIMIT:-900}
+      --soft-time-limit=${INTAKE_TASK_SOFT_TIME_LIMIT:-840}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:9101:9100"
+    volumes:
+      - shared_data:/data/shared
+      - ./core:/app/core:ro
+      - ./config:/app/config:ro
+      - ./tests:/app/tests:ro
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    networks:
+      - internal_net
 
   # ============================================
   # 5. PARSER API
@@ -219,6 +267,10 @@ services:
   # корпоративным знаниям», Quality Gate — «пригоден ли документ технически».
   # Смешивать нельзя: личная фотография технически безупречна и проверку
   # качества прошла бы, поэтому отсев обязан идти первым.
+  #
+  # Сам приём идёт не здесь, а в intake_worker: ручка ставит задачу и
+  # отвечает 202. Контейнер quality_gate остаётся прямым, синхронным
+  # входом — для ручной проверки и для установок без очереди.
   data_gateway:
     <<: [*defaults, *app-env]
     build:
@@ -227,10 +279,15 @@ services:
     command: uvicorn gateway.api:app --host 0.0.0.0 --port 8000
     ports:
       - "127.0.0.1:${GATEWAY_PORT:-8010}:8000"
+    # Ручка приёма больше не ходит в Quality Gate по сети: она ставит
+    # задачу, а оба этапа идут в воркере приёма. Нужны только база (журнал
+    # решений) и Redis (состояние запроса и брокер задач).
     depends_on:
       postgres:
         condition: service_healthy
-      quality_gate:
+      redis:
+        condition: service_healthy
+      intake_worker:
         condition: service_started
     volumes:
       - shared_data:/data/shared

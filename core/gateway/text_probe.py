@@ -35,6 +35,8 @@ XLSX_ROWS = 60
 SOURCE_PDF = "pdf"
 SOURCE_DOCX = "docx"
 SOURCE_XLSX = "xlsx"
+SOURCE_XLS = "xls"
+SOURCE_ODS = "ods"
 SOURCE_PLAIN = "plain"
 SOURCE_NONE = "none"
 
@@ -69,10 +71,15 @@ def extract(file_type: str, data: bytes) -> TextProbe:
     if kind == filetypes.KIND_PDF:
         return _from_pdf(data)
     if kind == filetypes.KIND_OFFICE_TEXT:
-        return _from_docx(data)
-    if file_type == "xlsx":
-        return _from_xlsx(data)
-    if kind in (filetypes.KIND_PLAIN_TEXT, filetypes.KIND_SPREADSHEET):
+        return _from_office_text(file_type, data)
+    if kind == filetypes.KIND_SPREADSHEET:
+        # Раньше здесь по типу отбирался только `xlsx`, а всё остальное
+        # семейство таблиц — xlsm, xls, ods — уезжало в `_from_plain` и
+        # декодировалось как текст. Для zip и BIFF это случайная кириллица
+        # из двоичного потока, то есть случайные же совпадения маркеров:
+        # книга с макросами классифицировалась по мусору.
+        return _from_spreadsheet(file_type, data)
+    if kind == filetypes.KIND_PLAIN_TEXT:
         return _from_plain(data)
     if kind == filetypes.KIND_CAD:
         # DXF — текст, но это коды и координаты, а не проза: маркеры по
@@ -109,6 +116,93 @@ def _from_pdf(data: bytes) -> TextProbe:
         # содержимому не о чем — маркеры применять нельзя.
         return TextProbe("", SOURCE_NONE, "PDF без текстового слоя (скан)")
     return TextProbe(text, SOURCE_PDF)
+
+
+def _from_office_text(file_type: str, data: bytes) -> TextProbe:
+    """DOCX как есть; DOC — через конвертацию в DOCX."""
+    from core.providers import office_convert
+
+    if office_convert.converts(file_type):
+        try:
+            data = office_convert.convert(data, file_type)
+        except office_convert.ConversionUnavailable as exc:
+            return TextProbe("", SOURCE_NONE, str(exc))
+        except Exception as exc:  # noqa: BLE001 — приём не роняем
+            return TextProbe("", SOURCE_NONE, f"конвертация не удалась: {exc}")
+    return _from_docx(data)
+
+
+def _from_spreadsheet(file_type: str, data: bytes) -> TextProbe:
+    """Таблица своим инструментом: csv — текстом, xlsx/xlsm, xls, ods."""
+    if file_type in ("xlsx", "xlsm"):
+        return _from_xlsx(data)
+    if file_type == "xls":
+        return _from_xls(data)
+    if file_type == "ods":
+        return _from_ods(data)
+    # CSV и всё, что осталось, — обычный текст.
+    return _from_plain(data)
+
+
+def _from_xls(data: bytes) -> TextProbe:
+    """Excel 97-2003: двоичный BIFF, открывается xlrd."""
+    try:
+        import xlrd  # type: ignore
+    except ImportError:
+        return TextProbe("", SOURCE_NONE, "xlrd недоступен")
+    try:
+        book = xlrd.open_workbook(file_contents=data)
+    except Exception as exc:  # noqa: BLE001
+        return TextProbe("", SOURCE_NONE, f"XLS не открылся: {exc}")
+
+    parts = []
+    for sheet in book.sheets():
+        parts.append(str(sheet.name))
+        for row_no in range(min(sheet.nrows, XLSX_ROWS)):
+            parts.append(" ".join(
+                str(cell.value) for cell in sheet.row(row_no) if cell.value not in (None, "")
+            ))
+        if sum(len(p) for p in parts) >= TEXT_LIMIT:
+            break
+
+    text = _clean("\n".join(parts))
+    if not text.strip():
+        return TextProbe("", SOURCE_NONE, "XLS без содержимого")
+    return TextProbe(text, SOURCE_XLS)
+
+
+def _from_ods(data: bytes) -> TextProbe:
+    """OpenDocument: zip, внутри которого content.xml — обычный XML."""
+    import io as _io
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(_io.BytesIO(data)) as archive:
+            raw = archive.read("content.xml")
+    except Exception as exc:  # noqa: BLE001
+        return TextProbe("", SOURCE_NONE, f"ODS не открылся: {exc}")
+
+    try:
+        from defusedxml import ElementTree  # type: ignore
+    except ImportError:  # pragma: no cover — defusedxml в зависимостях есть
+        from xml.etree import ElementTree  # type: ignore
+
+    try:
+        root = ElementTree.fromstring(raw)
+    except Exception as exc:  # noqa: BLE001
+        return TextProbe("", SOURCE_NONE, f"ODS разобран не полностью: {exc}")
+
+    parts = []
+    for node in root.iter():
+        if node.text and node.text.strip():
+            parts.append(node.text.strip())
+        if sum(len(p) for p in parts) >= TEXT_LIMIT:
+            break
+
+    text = _clean(" ".join(parts))
+    if not text.strip():
+        return TextProbe("", SOURCE_NONE, "ODS без содержимого")
+    return TextProbe(text, SOURCE_ODS)
 
 
 def _from_docx(data: bytes) -> TextProbe:

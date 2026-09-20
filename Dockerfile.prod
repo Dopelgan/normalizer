@@ -20,12 +20,15 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Только то, что нужно на исполнении: распознавание и рендер PDF.
+# Только то, что нужно на исполнении: распознавание, рендер PDF и
+# конвертер .doc (см. Dockerfile.dev — там же причина).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     tesseract-ocr \
     tesseract-ocr-rus \
     poppler-utils \
+    libreoffice-writer \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /install /usr/local

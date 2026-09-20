@@ -1,22 +1,35 @@
 """
 HTTP-интерфейс Data Gateway — вход всей цепочки приёма.
 
-    POST /internal/v1/intake                          приём пакета файлов
+    POST /internal/v1/intake                          приём пакета (202)
+    GET  /internal/v1/intake/results/{request_id}     готовность и вердикты
+    POST /internal/v1/intake/sync                     приём без очереди
     GET  /internal/v1/intake/quarantine               очередь администратору
     POST /internal/v1/intake/quarantine/{id}/resolve  решение по карантину
     GET  /internal/v1/intake/report                   отчёт по массовому приёму
     GET  /internal/v1/intake/suggestions              предложения по правилам
-    GET  /health
+    GET  /health, GET /metrics
 
-Порядок жёсткий: сначала отсев непригодных данных здесь, затем проверка
-технической пригодности на Quality Gate, и только утверждённые файлы
-уходят в нормализатор. Личная фотография технически безупречна и любую
-проверку качества прошла бы — поэтому отсев обязан идти первым.
+Приём вынесен из HTTP-запроса в очередь. Ручка проверяет тело, ставит по
+задаче на файл и отвечает 202 — вердикты забираются поллингом по
+`/internal/v1/intake/results/{request_id}`.
 
-ВНИМАНИЕ: последнее звено сейчас отключено. Передача из Quality Gate в
-нормализатор закомментирована (`quality/api.py::check`), поэтому приём
-заканчивается вердиктами, разбор не запускается, а `forwarded` в ответе
-остаётся `false`.
+Повод: пятьдесят PDF без текстового слоя не укладывались ни в таймаут
+между Data Gateway и Quality Gate (120 с), ни в таймаут внешнего
+потребителя (60 с). Потребитель, не дождавшись ответа, слал запрос заново,
+и конвейер получал ту же пачку по второму кругу. Таймауты можно поднимать
+и дальше, но следующий набор файлов будет тяжелее — границу нужно убрать,
+а не отодвинуть.
+
+Порядок этапов прежний: сначала отсев непригодных данных, затем проверка
+технической пригодности на Quality Gate, и только утверждённые файлы уходят
+в нормализатор. Личная фотография технически безупречна и любую проверку
+качества прошла бы — поэтому отсев обязан идти первым. Оба этапа теперь
+выполняются в одной задаче (`core.intake.pipeline`), без сетевого запроса
+между ними.
+
+Передача принятых файлов в нормализатор включается настройкой
+INTAKE_FORWARD_TO_PARSER; по умолчанию цепочка останавливается на приёме.
 
 Тело запроса — список файлов, у каждого своя операция:
 
@@ -31,166 +44,152 @@ HTTP-интерфейс Data Gateway — вход всей цепочки при
 import logging
 from typing import List, Optional
 
-import requests
 from fastapi import FastAPI, HTTPException
 
-from core.config import settings
+from core import logging_setup, telemetry
 from core.db.session import SessionLocal
-from core.gateway.profile import load_profile
-from core.gateway.service import DataGateway
+from core.intake import state
+from core.intake.pipeline import IntakePipeline
 from core.models.intake import (
     FileVerdict,
-    IntakeFile,
+    IntakeAcceptedResponse,
     IntakeRequest,
     IntakeResponse,
+    IntakeResultsResponse,
     QuarantineItem,
     ResolveRequest,
 )
-from core.providers.file_locator import FileLocator, SourceFileNotFound
-from core.providers.storage import StorageProviderFactory
 from core.repositories import IntakeRepository
-from core.repositories.intake_repo import decision_id
 from core.workspace import configure_process_tempdir
 
 # Временные файлы процесса — в том сервиса, а не на слой контейнера.
 configure_process_tempdir()
+logging_setup.configure("data_gateway")
 
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Data Gateway",
     description="Отсев данных, не относящихся к корпоративным знаниям",
-    version="1.0.0",
+    version="2.0.0",
 )
+telemetry.install_metrics_endpoint(app)
 
 STAGE = "data_gateway"
+RESULTS_PATH = "/internal/v1/intake/results"
 
 
-@app.post("/internal/v1/intake", response_model=IntakeResponse)
-def intake(request: IntakeRequest) -> IntakeResponse:
-    storage = StorageProviderFactory.default()
-    locator = FileLocator(storage)
-    gateway = DataGateway(profile=load_profile(), storage=storage)
-    session = SessionLocal()
-    response = IntakeResponse(request_id=request.request_id)
+# ===========================================================================
+# Приём
+# ===========================================================================
 
-    try:
-        for item in request.files:
-            s3_fileid = item.s3_fileid
-            uri, size = None, None
-            try:
-                located = locator.locate(s3_fileid)
-                uri = located.uri
-                size = storage.size(uri) if hasattr(storage, "size") else None
-            except SourceFileNotFound as exc:
-                verdict = FileVerdict(
-                    s3_fileid=s3_fileid, outcome="reject", stage=STAGE,
-                    layer="G-1", reason=str(exc),
-                )
-            else:
-                result = gateway.evaluate(s3_fileid, uri, size)
-                verdict = FileVerdict(
-                    s3_fileid=s3_fileid, outcome=result.outcome, stage=STAGE,
-                    layer=result.layer, reason=result.reason,
-                    category=result.category, confidence=result.confidence,
-                    decision_id=decision_id(s3_fileid, STAGE),
-                )
-                with session.begin():
-                    IntakeRepository(session).record(
-                        s3_fileid=s3_fileid, stage=STAGE, outcome=result.outcome,
-                        reason=result.reason, layer=result.layer,
-                        category=result.category, confidence=result.confidence,
-                        signals=result.signals, source_path=uri,
-                    )
+@app.post(
+    "/internal/v1/intake",
+    response_model=IntakeAcceptedResponse,
+    status_code=202,
+)
+def intake(request: IntakeRequest) -> IntakeAcceptedResponse:
+    """
+    Ставит пакет в очередь приёма и сразу отвечает 202.
 
-            response.verdicts.append(verdict)
-            _bucket(response, verdict)
+    Повторный запрос по незавершённому request_id — конфликт: иначе
+    потребитель, у которого истёк собственный таймаут, запускает ту же
+    работу поверх ещё не законченной.
+    """
+    from core.intake.tasks import dispatch
 
-        if response.accepted:
-            forwarded = _forward_to_quality_gate(
-                request.request_id, request.subset(response.accepted)
-            )
-            response.forwarded = forwarded.get("forwarded", False)
-            response.forward_error = forwarded.get("error")
-            # Quality Gate мог отклонить что-то из принятого здесь — его
-            # вердикты дополняют наши, а не заменяют их.
-            response.verdicts.extend(forwarded.get("verdicts", []))
-            _reconcile(response, forwarded)
-
-        logger.info(
-            "Data Gateway %s: принято %d, карантин %d, отклонено %d",
-            request.request_id, len(response.accepted),
-            len(response.quarantined), len(response.rejected),
+    if state.is_active(request.request_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Приём {request.request_id} уже выполняется. Заберите "
+                f"результат по {RESULTS_PATH}/{request.request_id} "
+                f"или используйте новый request_id."
+            ),
         )
-        return response
-    finally:
-        session.close()
+
+    state.init_request(
+        request.request_id, [item.model_dump() for item in request.files]
+    )
+    dispatch(request.request_id, request.files)
+
+    logger.info(
+        "Приём %s поставлен в очередь: %d файлов",
+        request.request_id, len(request.files),
+        extra={"fields": {
+            "event": "intake_queued", "request_id": request.request_id,
+            "total": len(request.files),
+        }},
+    )
+    return IntakeAcceptedResponse(
+        request_id=request.request_id,
+        total=len(request.files),
+        poll_url=f"{RESULTS_PATH}/{request.request_id}",
+    )
 
 
-def _bucket(response: IntakeResponse, verdict: FileVerdict) -> None:
-    """Раскладка вердикта по спискам. Неизвестный исход — в карантин."""
+@app.get(RESULTS_PATH + "/{request_id}", response_model=IntakeResultsResponse)
+def intake_results(request_id: str) -> IntakeResultsResponse:
+    """Готовность приёма и вердикты по каждому файлу."""
+    snapshot = state.get_state(request_id)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Приём {request_id} не найден: он не создавался или истёк "
+                f"срок хранения результата."
+            ),
+        )
+    return IntakeResultsResponse(**snapshot)
+
+
+@app.post("/internal/v1/intake/sync", response_model=IntakeResponse)
+def intake_sync(request: IntakeRequest) -> IntakeResponse:
+    """
+    Приём без очереди: ответ отдаётся, когда готовы вердикты по всем файлам.
+
+    Оставлен для ручной проверки и для установок, где очередь не поднята.
+    На тяжёлых файлах он и упирается в таймауты, ради которых сделана
+    очередь, — поэтому штатный вход не здесь.
+    """
+    pipeline = IntakePipeline()
+    response = IntakeResponse(request_id=request.request_id)
+    for item in request.files:
+        result = pipeline.run(request.request_id, item)
+        verdicts = [FileVerdict(**v) for v in result["verdicts"]]
+        response.verdicts.extend(verdicts)
+        _bucket(response, result["outcome"], item.s3_fileid)
+        response.forwarded = response.forwarded or bool(result.get("forwarded"))
+        response.forward_error = response.forward_error or result.get("forward_error")
+
+    logger.info(
+        "Data Gateway %s: принято %d, карантин %d, отклонено %d",
+        request.request_id, len(response.accepted),
+        len(response.quarantined), len(response.rejected),
+    )
+    return response
+
+
+def _bucket(response: IntakeResponse, outcome: str, s3_fileid: str) -> None:
+    """Раскладка исхода по спискам. Неизвестный исход — в карантин."""
     buckets = {
         "accept": response.accepted,
         "quarantine": response.quarantined,
         "reject": response.rejected,
     }
-    bucket = buckets.get(verdict.outcome)
+    bucket = buckets.get(outcome)
     if bucket is None:
         logger.error(
             "Неизвестный исход %r по файлу %s — считаем карантином",
-            verdict.outcome, verdict.s3_fileid,
+            outcome, s3_fileid,
         )
         bucket = response.quarantined
-    bucket.append(verdict.s3_fileid)
+    bucket.append(s3_fileid)
 
 
-def _forward_to_quality_gate(request_id: str, files: List[IntakeFile]) -> dict:
-    url = f"{settings.QUALITY_GATE_ENDPOINT.rstrip('/')}/internal/v1/quality"
-    payload = {
-        "request_id": request_id,
-        "files": [item.model_dump() for item in files],
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=settings.INTAKE_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as exc:
-        logger.error("Quality Gate недоступен: %s", exc)
-        return {"forwarded": False, "error": f"Quality Gate недоступен: {exc}"}
-    except ValueError as exc:
-        return {"forwarded": False, "error": f"Quality Gate вернул не-JSON: {exc}"}
-
-    try:
-        verdicts = [FileVerdict(**v) for v in data.get("verdicts", [])]
-    except Exception as exc:  # noqa: BLE001 — чужой ответ не обязан быть нашим
-        logger.error("Quality Gate вернул вердикты не по контракту: %s", exc)
-        return {"forwarded": False, "error": f"Quality Gate ответил не по контракту: {exc}"}
-
-    return {
-        "forwarded": bool(data.get("forwarded")),
-        "error": data.get("forward_error"),
-        "verdicts": verdicts,
-        "accepted": data.get("accepted", []),
-        "quarantined": data.get("quarantined", []),
-        "rejected": data.get("rejected", []),
-    }
-
-
-def _reconcile(response: IntakeResponse, forwarded: dict) -> None:
-    """Итоговые списки — по решению последнего этапа, который видел файл."""
-    quarantined = set(forwarded.get("quarantined") or [])
-    rejected = set(forwarded.get("rejected") or [])
-    if not quarantined and not rejected:
-        return
-    response.accepted = [f for f in response.accepted
-                         if f not in quarantined and f not in rejected]
-    response.quarantined.extend(sorted(quarantined))
-    response.rejected.extend(sorted(rejected))
-
+# ===========================================================================
+# Карантин и отчёты
+# ===========================================================================
 
 @app.get("/internal/v1/intake/quarantine", response_model=List[QuarantineItem])
 def quarantine(limit: int = 100) -> List[QuarantineItem]:

@@ -55,17 +55,27 @@ def quality_client(session_factory, storage, monkeypatch, mocker):
 
 
 @pytest.fixture
-def gateway_client(session_factory, storage, monkeypatch, mocker):
+def gateway_client(session_factory, storage, monkeypatch, mocker, fake_redis):
+    """
+    Data Gateway с очередью, выполняемой на месте.
+
+    Celery в режиме `task_always_eager` выполняет задачу прямо в вызове
+    `delay()`, поэтому к моменту ответа 202 вердикты уже лежат в состоянии
+    приёма — ровно то, что нужно проверить одним запросом.
+    """
+    from core.celery_app import app as celery_app
+    from core.intake import pipeline as intake_pipeline
+
     monkeypatch.setattr(gateway_api, "SessionLocal", session_factory)
+    monkeypatch.setattr(intake_pipeline, "SessionLocal", session_factory)
     mocker.patch.object(
-        gateway_api.StorageProviderFactory, "default", return_value=storage
+        intake_pipeline.StorageProviderFactory, "default", return_value=storage
     )
-    forwarded = mocker.patch.object(gateway_api.requests, "post")
+    monkeypatch.setattr(celery_app.conf, "task_always_eager", True)
+    monkeypatch.setattr(celery_app.conf, "task_eager_propagates", False)
+    forwarded = mocker.patch.object(intake_pipeline.requests, "post")
     forwarded.return_value.raise_for_status.return_value = None
-    forwarded.return_value.json.return_value = {
-        "request_id": "req-1", "accepted": [], "quarantined": [], "rejected": [],
-        "verdicts": [], "forwarded": True, "forward_error": None,
-    }
+
     with TestClient(gateway_api.app) as client:
         yield client, forwarded
 
@@ -181,8 +191,17 @@ class TestQualityGate:
 
 
 class TestDataGateway:
-    def test_accepts_files_with_operations(self, gateway_client):
-        client, forwarded = gateway_client
+    """
+    Приём поставлен на очередь: ручка отвечает 202 и идентификатором, по
+    которому забираются вердикты.
+
+    Повод — пятьдесят PDF без текстового слоя: синхронный приём не
+    укладывался ни в таймаут между сервисами, ни в таймаут потребителя, и
+    тот начинал слать запрос заново.
+    """
+
+    def test_intake_is_queued(self, gateway_client):
+        client, _ = gateway_client
         response = client.post("/internal/v1/intake", json={
             "request_id": "req-10",
             "files": [
@@ -190,23 +209,91 @@ class TestDataGateway:
                 {"s3_fileid": "смета.txt", "operation": "update"},
             ],
         })
-        assert response.status_code == 200, response.text
+        assert response.status_code == 202, response.text
         body = response.json()
+        assert body["accepted"] is True
+        assert body["total"] == 2
+        assert body["poll_url"].endswith("/internal/v1/intake/results/req-10")
         assert "dialog_id" not in body
-        payload = forwarded.call_args.kwargs["json"]
-        assert {f["s3_fileid"]: f["operation"] for f in payload["files"]} == {
-            "отчёт.txt": "create", "смета.txt": "update",
-        }
 
-    def test_dialog_id_in_body_is_ignored(self, gateway_client):
+    def test_results_carry_verdicts_and_timings(self, gateway_client):
         client, _ = gateway_client
+        client.post("/internal/v1/intake", json={
+            "request_id": "req-10a",
+            "files": [{"s3_fileid": "отчёт.txt", "operation": "create"}],
+        })
+        body = client.get("/internal/v1/intake/results/req-10a").json()
+        assert body["status"] == "completed"
+        assert body["processed"] == body["total"] == 1
+        assert body["accepted"] == ["отчёт.txt"]
+        stages = {v["stage"] for v in body["verdicts"]}
+        assert stages == {"data_gateway", "quality_gate"}
+        # Время операций едет вместе с вердиктом: без него на вопрос «где
+        # файл провёл время» отвечать нечем.
+        timings = body["files"][0]["timings_ms"]
+        assert "intake.file" in timings
+        assert any(k.startswith("quality_gate.") for k in timings)
+
+    def test_unknown_request_is_404(self, gateway_client):
+        client, _ = gateway_client
+        assert client.get("/internal/v1/intake/results/нет-такого").status_code == 404
+
+    def test_repeat_while_running_is_conflict(self, gateway_client, monkeypatch):
+        """
+        Потребитель, у которого истёк свой таймаут, повторяет запрос. Пока
+        приём не закончен, повтор — конфликт, а не вторая обработка поверх
+        первой.
+        """
+        from core.intake import state as intake_state
+
+        client, _ = gateway_client
+        monkeypatch.setattr(intake_state, "is_active", lambda request_id: True)
         response = client.post("/internal/v1/intake", json={
-            "request_id": "req-11",
-            "dialog_id": "старое-поле",
+            "request_id": "req-10b",
             "files": [{"s3_fileid": "отчёт.txt"}],
         })
-        assert response.status_code == 200
-        assert "dialog_id" not in response.json()
+        assert response.status_code == 409
+
+    def test_chain_stops_before_parser_by_default(self, gateway_client):
+        client, forwarded = gateway_client
+        client.post("/internal/v1/intake", json={
+            "request_id": "req-10c",
+            "files": [{"s3_fileid": "отчёт.txt"}],
+        })
+        body = client.get("/internal/v1/intake/results/req-10c").json()
+        assert body["forwarded"] is False
+        forwarded.assert_not_called()
+
+    def test_forward_is_a_setting(self, gateway_client, monkeypatch):
+        """Передача в нормализатор включается настройкой, а не правкой кода."""
+        from core.config import settings
+
+        monkeypatch.setattr(settings, "INTAKE_FORWARD_TO_PARSER", True)
+        client, forwarded = gateway_client
+        client.post("/internal/v1/intake", json={
+            "request_id": "req-10d",
+            "files": [{"s3_fileid": "отчёт.txt", "operation": "update"}],
+        })
+        body = client.get("/internal/v1/intake/results/req-10d").json()
+        assert body["forwarded"] is True
+        payload = forwarded.call_args.kwargs["json"]
+        assert payload["files"] == [
+            {"s3_fileid": "отчёт.txt", "operation": "update"}
+        ]
+
+    def test_sync_endpoint_keeps_old_shape(self, gateway_client):
+        """Приём без очереди оставлен для ручной проверки."""
+        client, _ = gateway_client
+        body = client.post("/internal/v1/intake/sync", json={
+            "request_id": "req-10e",
+            "files": [
+                {"s3_fileid": "отчёт.txt"},
+                {"s3_fileid": "нет-такого"},
+            ],
+        }).json()
+        assert body["accepted"] == ["отчёт.txt"]
+        assert body["rejected"] == ["нет-такого"]
+        assert "dialog_id" not in body
 
     def test_old_body_shape_rejected(self, gateway_client):
         client, _ = gateway_client

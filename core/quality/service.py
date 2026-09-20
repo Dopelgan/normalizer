@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from core import filetypes
+from core import filetypes, telemetry
 from core.config import settings
 from core.gateway.profile import GatewayProfile, load_profile
 from core.gateway.service import ACCEPT, QUARANTINE, REJECT
@@ -142,7 +142,9 @@ class QualityGate:
             )
 
         try:
-            data = self.storage.read_bytes(path)
+            with telemetry.measure("quality_gate.read", uri=path) as span:
+                data = self.storage.read_bytes(path)
+                span["bytes"] = len(data)
         except Exception as exc:  # noqa: BLE001
             return QualityVerdict(
                 REJECT, f"Файл не читается из хранилища: {exc}", "QG-1"
@@ -154,7 +156,11 @@ class QualityGate:
         if resolved.mismatch:
             warnings.append(resolved.explanation)
 
-        verdict = self.technical_validation(path, data, resolved)
+        with telemetry.measure(
+            "quality_gate.technical", file_type=resolved.file_type
+        ) as span:
+            verdict = self.technical_validation(path, data, resolved)
+            span["outcome"] = verdict.outcome if verdict else "pass"
         if verdict is not None:
             verdict.warnings = warnings + verdict.warnings
             return verdict
@@ -166,16 +172,26 @@ class QualityGate:
             storage=self.storage, data=data,
         )
 
-        fingerprint = _simhash(_text_sample(context))
-        duplicate = self.duplicate_check(
-            s3_fileid, file_hash, context, warnings, fingerprint=fingerprint
-        )
+        with telemetry.measure("quality_gate.duplicates") as span:
+            fingerprint = _simhash(_text_sample(context))
+            duplicate = self.duplicate_check(
+                s3_fileid, file_hash, context, warnings, fingerprint=fingerprint
+            )
+            span["outcome"] = duplicate.outcome if duplicate else "pass"
         if duplicate is not None:
             return duplicate
 
-        self.freshness_check(path, data, warnings)
+        with telemetry.measure("quality_gate.freshness"):
+            self.freshness_check(path, data, warnings)
 
-        readability = self.ocr_check(context, warnings)
+        # Самый дорогой этап приёма: у скана без текстового слоя здесь
+        # запускается распознавание двух первых страниц. Именно он и не
+        # укладывался в таймаут на пачке из пятидесяти таких файлов.
+        with telemetry.measure(
+            "quality_gate.readability", file_type=resolved.file_type
+        ) as span:
+            readability = self.ocr_check(context, warnings)
+            span["outcome"] = readability.outcome
 
         if not fingerprint:
             # У растра текста до распознавания нет, и поиск почти-дублей на
@@ -189,7 +205,8 @@ class QualityGate:
         # QG-4 уходил без них, и в очереди карантина не было видно ни рода
         # документа, ни качества растра — того самого, по чему человек и
         # принимает решение.
-        routing, signals = self._describe(context, fingerprint)
+        with telemetry.measure("quality_gate.routing"):
+            routing, signals = self._describe(context, fingerprint)
 
         if readability.outcome != ACCEPT:
             readability.file_hash = file_hash
@@ -686,7 +703,7 @@ def _native_text(context: DocumentContext) -> Optional[str]:
         if kind == filetypes.KIND_SPREADSHEET:
             return _spreadsheet_text(context)
         if kind == filetypes.KIND_OFFICE_TEXT:
-            return _docx_text(context.data)
+            return _docx_text(_as_docx(context.data, context.file_type))
     except Exception as exc:  # noqa: BLE001 — проба не обязана удаться
         logger.info("Проба текста %s не удалась: %s", context.uri, exc)
     return None
@@ -699,6 +716,13 @@ def _decoded(data: bytes) -> Optional[str]:
         except UnicodeDecodeError:
             continue
     return None
+
+
+def _as_docx(data: bytes, file_type: str) -> bytes:
+    """DOCX как есть, DOC — сконвертированным. Ошибку решает вызывающий."""
+    from core.providers import office_convert
+
+    return office_convert.convert(data, file_type)
 
 
 def _spreadsheet_text(context: DocumentContext) -> Optional[str]:
@@ -764,11 +788,13 @@ def _can_open(data: bytes, extension: str) -> Tuple[bool, str]:
             workbook = openpyxl.load_workbook(io.BytesIO(data), read_only=True)
             workbook.close()
             return True, ""
-        if extension == "docx":
+        if extension in ("docx", "doc"):
             import io
 
             import docx
-            docx.Document(io.BytesIO(data))
+            # DOC открывается только после конвертации: её неудача — это и
+            # есть «файл не разобрать», и сказать об этом нужно здесь.
+            docx.Document(io.BytesIO(_as_docx(data, extension)))
             return True, ""
     except ImportError:  # pragma: no cover — библиотеки может не быть
         return True, ""

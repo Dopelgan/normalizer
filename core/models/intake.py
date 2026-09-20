@@ -87,6 +87,56 @@ class IntakeResponse(BaseModel):
     forward_error: Optional[str] = None
 
 
+class IntakeAcceptedResponse(BaseModel):
+    """
+    Ответ на постановку приёма в очередь.
+
+    Приём больше не держит соединение до вердиктов: на пятидесяти сканах
+    без текстового слоя ожидание не укладывалось ни в таймаут между
+    сервисами, ни в таймаут потребителя. Теперь ручка отвечает сразу, а
+    вердикты забираются по `poll_url`.
+    """
+
+    request_id: str
+    accepted: bool = True
+    status: str = "queued"
+    total: int
+    poll_url: str
+
+
+class IntakeFileResult(BaseModel):
+    """Итог приёма по одному файлу вместе со временем операций."""
+
+    s3_fileid: str
+    outcome: str                      # accept | quarantine | reject
+    verdicts: List[FileVerdict] = Field(default_factory=list)
+    timings_ms: Dict[str, float] = Field(default_factory=dict)
+    forwarded: bool = False
+    forward_error: Optional[str] = None
+
+
+class IntakeResultsResponse(BaseModel):
+    """
+    Готовность приёма и вердикты.
+
+    Поля `accepted`, `quarantined`, `rejected` и `verdicts` те же, что в
+    синхронном ответе: потребителю, который их уже разбирает, менять разбор
+    не придётся — меняется только момент получения.
+    """
+
+    request_id: str
+    status: str                       # queued | processing | completed
+    total: int
+    processed: int
+    accepted: List[str] = Field(default_factory=list)
+    quarantined: List[str] = Field(default_factory=list)
+    rejected: List[str] = Field(default_factory=list)
+    verdicts: List[FileVerdict] = Field(default_factory=list)
+    files: List[IntakeFileResult] = Field(default_factory=list)
+    forwarded: bool = False
+    forward_error: Optional[str] = None
+
+
 class ResolveRequest(BaseModel):
     """Решение администратора по карантинной записи."""
 

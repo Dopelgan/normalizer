@@ -76,7 +76,13 @@ class PdfTextLayerStrategy(Strategy):
 
 
 class DocxStrategy(Strategy):
-    """DOCX: абзацы и таблицы берутся из разметки документа как есть."""
+    """
+    DOCX: абзацы и таблицы берутся из разметки документа как есть.
+
+    DOC (Word 97-2003) обрабатывается тем же уровнем: он сначала
+    конвертируется в DOCX, потому что плоский текст из двоичного формата
+    теряет таблицы, а таблицы в этих документах и есть содержание.
+    """
 
     level = 2
     name = "docx"
@@ -84,12 +90,23 @@ class DocxStrategy(Strategy):
     exhaustive = True
 
     def applicable(self, context: DocumentContext) -> bool:
-        return DOCX_AVAILABLE and context.kind == filetypes.KIND_OFFICE_TEXT
+        if not (DOCX_AVAILABLE and context.kind == filetypes.KIND_OFFICE_TEXT):
+            return False
+        from core.providers import office_convert
+
+        # Формат, который без конвертера не открыть, уровню неприменим:
+        # пусть лестница идёт выше, к распознаванию, а не падает здесь.
+        if office_convert.converts(context.file_type):
+            return office_convert.available()
+        return True
 
     def run(self, context: DocumentContext) -> ParseResult:
         import io
 
-        document = python_docx.Document(io.BytesIO(context.data))
+        from core.providers import office_convert
+
+        data = office_convert.convert(context.data, context.file_type)
+        document = python_docx.Document(io.BytesIO(data))
         blocks: List[ParsedBlock] = []
 
         section_title: Optional[str] = None

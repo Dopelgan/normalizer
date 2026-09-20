@@ -2,14 +2,21 @@
 HTTP-интерфейс Quality Gate.
 
     POST /internal/v1/quality   проверка пригодности пакета
-    GET  /health
+    GET  /health, GET /metrics
 
 Принятые файлы отправляются в нормализатор. Отклонённые и карантинные туда
 не попадают — в этом и смысл проверки.
 
-ВНИМАНИЕ: передача в нормализатор сейчас закомментирована в `check()` —
-цепочка приёма намеренно останавливается здесь, и `/internal/v1/parse/background`
-не вызывается. `forwarded` в ответе остаётся `false`.
+Это прямой, синхронный вход: он нужен для ручной проверки и для установок,
+где очередь приёма не поднята. Штатный путь другой — Data Gateway ставит
+задачу, и оба этапа идут в ней (`core.intake.pipeline`), без сетевого
+запроса между сервисами и без таймаута на нём.
+
+Передача в нормализатор управляется настройкой INTAKE_FORWARD_TO_PARSER.
+По умолчанию она выключена: цепочка приёма останавливается здесь, и
+`/internal/v1/parse/background` не вызывается, `forwarded` в ответе
+остаётся `false`. Раньше ровно это же делалось закомментированным
+вызовом — включение требовало правки кода.
 
 Тело запроса такое же, как у Data Gateway: список файлов, у каждого своя
 операция. Дальше в нормализатор уходят только принятые — со своими
@@ -23,6 +30,7 @@ import requests
 from fastapi import FastAPI
 from sqlalchemy import select
 
+from core import logging_setup, telemetry
 from core.config import settings
 from core.db.models import IntakeDecisionDB
 from core.db.session import SessionLocal
@@ -36,18 +44,16 @@ from core.workspace import configure_process_tempdir
 
 # Временные файлы процесса — в том сервиса, а не на слой контейнера.
 configure_process_tempdir()
+logging_setup.configure("quality_gate")
 
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Quality Gate",
     description="Техническая пригодность документа перед нормализацией",
-    version="1.0.0",
+    version="2.0.0",
 )
+telemetry.install_metrics_endpoint(app)
 
 STAGE = "quality_gate"
 
@@ -93,7 +99,11 @@ def check(request: IntakeRequest) -> IntakeResponse:
             except SourceFileNotFound as exc:
                 verdict = _reject(s3_fileid, str(exc))
             else:
-                result = gate.evaluate(s3_fileid, uri)
+                with telemetry.measure(
+                    "quality_gate.file", s3_fileid=s3_fileid
+                ) as span:
+                    result = gate.evaluate(s3_fileid, uri)
+                    span["outcome"] = result.outcome
                 verdict = FileVerdict(
                     s3_fileid=s3_fileid,
                     outcome=result.outcome,
@@ -124,15 +134,14 @@ def check(request: IntakeRequest) -> IntakeResponse:
             response.verdicts.append(verdict)
             _bucket(response, verdict)
 
-        # Передача принятых файлов в нормализатор временно отключена:
-        # обработка останавливается на Quality Gate и до
-        # `/internal/v1/parse/background` не доходит. Сам `_forward` и его
-        # настройки оставлены нетронутыми — чтобы вернуть цепочку, достаточно
-        # раскомментировать эти три строки.
-        # if response.accepted:
-        #     response.forwarded, response.forward_error = _forward(
-        #         request.request_id, request.subset(response.accepted)
-        #     )
+        # Передача принятых файлов в нормализатор — настройкой, а не
+        # правкой кода. INTAKE_FORWARD_TO_PARSER=false (по умолчанию)
+        # означает, что обработка останавливается на Quality Gate и до
+        # `/internal/v1/parse/background` не доходит.
+        if response.accepted and settings.INTAKE_FORWARD_TO_PARSER:
+            response.forwarded, response.forward_error = _forward(
+                request.request_id, request.subset(response.accepted)
+            )
 
         logger.info(
             "Quality Gate %s: принято %d, карантин %d, отклонено %d",
@@ -171,8 +180,7 @@ def _forward(request_id: str, files: List[IntakeFile]):
     """
     Только утверждённые файлы уходят в нормализатор.
 
-    Сейчас не вызывается: вызов в `check()` закомментирован, обработка
-    останавливается на Quality Gate. Функция оставлена рабочей.
+    Вызывается, когда включена настройка INTAKE_FORWARD_TO_PARSER.
     """
     url = f"{settings.PARSER_ENDPOINT.rstrip('/')}/internal/v1/parse/background"
     payload = {

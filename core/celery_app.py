@@ -3,7 +3,7 @@
 import logging
 
 from celery import Celery
-from celery.signals import worker_process_shutdown
+from celery.signals import worker_process_shutdown, worker_ready
 from kombu import Queue
 
 from core.config import settings
@@ -33,29 +33,50 @@ app.conf.update(
     result_expires=settings.RESULT_TTL_SECONDS,
 )
 
-# Очередь ml_gpu объявляется здесь, иначе `celery worker -Q ml_gpu` слушает
+# Очереди объявляются здесь, иначе `celery worker -Q ml_gpu` слушает
 # очередь, в которую никто не пишет.
+#
+# Приём и разбор живут в разных очередях намеренно. Приём — это чтение,
+# открытие формата и быстрый OCR двух страниц: работа лёгкая, её можно
+# вести в несколько потоков. Разбор занимает GPU и идёт по одному
+# документу. В общей очереди пачка сканов на приёме встаёт за чертежом,
+# который модель читает семь минут, — и приём, который сам по себе быстр,
+# ждёт вместе с ней.
 app.conf.task_default_queue = "default"
 app.conf.task_queues = (
     Queue("default", routing_key="default"),
     Queue(settings.CELERY_ML_QUEUE, routing_key=settings.CELERY_ML_QUEUE),
+    Queue(settings.CELERY_INTAKE_QUEUE, routing_key=settings.CELERY_INTAKE_QUEUE),
 )
 app.conf.task_routes = {
     "ingest.tasks.process_document": {"queue": settings.CELERY_ML_QUEUE},
+    "core.intake.tasks.process_intake_file": {"queue": settings.CELERY_INTAKE_QUEUE},
 }
 
-app.autodiscover_tasks(["ingest"])
+app.autodiscover_tasks(["ingest", "core.intake"])
 
 # Задачи живут в пакете ingest — импорт нужен, чтобы они зарегистрировались
 # при запуске воркера как `celery -A core.celery_app`.
-try:  # pragma: no cover
-    import ingest.tasks  # noqa: F401,E402
-except Exception as _exc:  # noqa: BLE001
-    # API-контейнеру задачи при импорте не нужны, но молчать нельзя:
-    # ровно так когда-то и потерялась регистрация process_document.
-    logging.getLogger(__name__).warning(
-        "Задачи ingest.tasks не импортировались: %s", _exc
-    )
+for _module in ("ingest.tasks", "core.intake.tasks"):  # pragma: no cover
+    try:
+        __import__(_module)
+    except Exception as _exc:  # noqa: BLE001
+        # API-контейнеру задачи при импорте не нужны, но молчать нельзя:
+        # ровно так когда-то и потерялась регистрация process_document.
+        logging.getLogger(__name__).warning(
+            "Задачи %s не импортировались: %s", _module, _exc
+        )
+
+
+@worker_ready.connect
+def _start_metrics(**_kwargs):  # pragma: no cover — сигнал Celery
+    """
+    Метрики воркера. У сервисов FastAPI их отдаёт ручка /metrics, а у
+    воркера своего веб-сервера нет — поднимаем отдельный порт.
+    """
+    from core import telemetry
+
+    telemetry.start_metrics_server(settings.METRICS_WORKER_PORT)
 
 @worker_process_shutdown.connect
 def _close_http_pools(**_kwargs):  # pragma: no cover — сигнал Celery

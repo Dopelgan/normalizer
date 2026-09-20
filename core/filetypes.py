@@ -67,12 +67,12 @@ _TYPES: Dict[str, FileType] = {
         FileType("txt",  "text/plain",    KIND_PLAIN_TEXT),
         FileType("md",   "text/markdown", KIND_PLAIN_TEXT),
 
-        FileType(
-            "doc", "application/msword", KIND_OFFICE_TEXT, supported=False,
-            note="DOC — двоичный формат Word 97-2003. Пересохраните файл как "
-                 ".docx или поставьте конвертер (LibreOffice в режиме "
-                 "--convert-to docx).",
-        ),
+        # Word 97-2003: двоичный формат, своей библиотеки под него нет.
+        # Разбирается через конвертацию в DOCX (core.providers.office_convert),
+        # поэтому поддержан, но зависит от конвертера в образе: если его нет,
+        # файл отклоняется на приёме с внятной причиной, а не падает посреди
+        # разбора.
+        FileType("doc", "application/msword", KIND_OFFICE_TEXT),
 
         FileType("dxf",  "image/vnd.dxf", KIND_CAD),
         FileType(
@@ -88,7 +88,10 @@ _TYPES: Dict[str, FileType] = {
 # встречается чаще, — лишних обращений к хранилищу так меньше.
 PROBE_ORDER: List[str] = [
     "pdf", "png", "jpg", "jpeg", "tiff", "tif", "bmp",
-    "docx", "xlsx", "csv", "txt", "md", "dxf",
+    # Семейство офисных форматов целиком: раньше в переборе не было ни
+    # xlsm, ни xls, ни ods, ни doc, и файл без расширения в этих форматах
+    # не находился в хранилище вовсе.
+    "docx", "doc", "xlsx", "xlsm", "xls", "ods", "csv", "txt", "md", "dxf",
 ]
 
 IMAGE_EXTENSIONS: Set[str] = {e for e, t in _TYPES.items() if t.kind == KIND_IMAGE}
@@ -236,14 +239,24 @@ def _sniff_ole(data: bytes) -> Optional[str]:
     """
     Формат внутри контейнера OLE2 (Excel 97-2003, Word 97-2003).
 
-    Имена потоков лежат в каталоге контейнера в UTF-16, поэтому ищем их
-    в таком виде: «Workbook» — книга Excel, «WordDocument» — документ Word.
+    Имена потоков лежат в каталоге контейнера в UTF-16, поэтому ищем их в
+    таком виде: «Workbook» — книга Excel, «WordDocument» — документ Word.
+
+    Порядок проверки не произвольный. Короткое имя «Book» (так называется
+    поток книги Excel 5.0) — четыре буквы, и в теле документа Word оно
+    находится случайно: в реальном .doc из LibreOffice `Book` в UTF-16
+    встречается за тринадцать килобайт до настоящего каталога. Документ
+    Word объявлялся книгой Excel, попадал в табличную ветку, там не
+    открывался — и классификация уезжала на имя файла. Поэтому сперва
+    ищутся длинные однозначные имена, и только потом короткое.
     """
     window = data[:65536]
-    if _OLE_WORKBOOK in window or _OLE_BOOK in window:
-        return "xls"
     if _OLE_WORD in window:
         return "doc"
+    if _OLE_WORKBOOK in window:
+        return "xls"
+    if _OLE_BOOK in window:
+        return "xls"
     return None
 
 
@@ -312,4 +325,17 @@ def rejection_reason(file_type: str) -> Optional[str]:
         )
     if not entry.supported:
         return entry.note
-    return None
+    return _conversion_reason(normalized)
+
+
+def _conversion_reason(file_type: str) -> Optional[str]:
+    """
+    Формат поддержан, но разбирается только через конвертер. Нет конвертера
+    — нет и разбора, и сказать об этом нужно на приёме, а не в середине
+    конвейера.
+    """
+    from core.providers import office_convert
+
+    if not office_convert.converts(file_type) or office_convert.available():
+        return None
+    return office_convert.unavailable_reason(file_type)
