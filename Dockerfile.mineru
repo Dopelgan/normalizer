@@ -13,7 +13,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install -U \
-    'mineru[core]>=3.4.0' \
+    'mineru[core]==3.4.5' \
     --break-system-packages && \
     python3 -m pip cache purge
 

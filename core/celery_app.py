@@ -7,6 +7,11 @@ from celery.signals import worker_process_shutdown
 from kombu import Queue
 
 from core.config import settings
+from core.workspace import configure_process_tempdir
+
+# Воркер — главный производитель временных файлов (выкачанные из S3
+# исходники, растры страниц), поэтому каталог задаётся до старта задач.
+configure_process_tempdir()
 
 app = Celery(
     "normalizer",

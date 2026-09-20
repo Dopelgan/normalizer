@@ -226,3 +226,44 @@ class _FakeQwen:
 
     def read_table(self, image):
         return None
+
+
+# ===========================================================================
+# Размер фикстур: набор должен доезжать до ворот, а не отсеиваться раньше
+# ===========================================================================
+
+class TestFixtureSizes:
+    """
+    `valid_text.txt` (219 Б), `valid_table.csv` (111 Б) и `valid_drawing.dxf`
+    (295 Б) отклонялись на QG-1 по `min_size_bytes`, то есть строки T04 и T05
+    матрицы на этом наборе были непроверяемы: манифест обещает приём, а файл
+    до проверки читаемости не доходил.
+    """
+
+    def test_every_accepted_fixture_passes_the_size_rule(self, contract_dir):
+        import json
+
+        from core.gateway.profile import GatewayProfile
+
+        manifest = json.loads((contract_dir / "manifest.json").read_text("utf-8"))
+        minimum = GatewayProfile().min_size_bytes
+        small = {
+            name: (contract_dir / name).stat().st_size
+            for name, expected in manifest["expected"].items()
+            if expected.startswith("accept") and (contract_dir / name).exists()
+            and (contract_dir / name).stat().st_size < minimum
+        }
+        assert not small, f"меньше {minimum} Б: {small}"
+
+    def test_drawing_fixture_keeps_its_categories(self, contract_dir):
+        """Дополнение файла не должно размывать долю опознанных полей."""
+        if not EZDXF_AVAILABLE:  # pragma: no cover
+            pytest.skip("ezdxf не установлен")
+        result = CadSourceStrategy().run(_context(contract_dir, "valid_drawing.dxf"))
+        fields = [b for b in result.blocks if b.type == "drawing"][0].drawing_fields
+        assert structure_ratio(fields) > 0.5
+
+    def test_text_fixture_keeps_exact_tokens(self, contract_dir):
+        text = (contract_dir / "valid_text.txt").read_text("utf-8")
+        for token in ("expires_at", "rps", "2026-12-31", "8.5 bar", "X = 3.14 * D"):
+            assert token in text

@@ -87,7 +87,18 @@ class LayoutStrategy(Strategy):
         return self._provider
 
     def applicable(self, context: DocumentContext) -> bool:
-        return context.kind in (filetypes.KIND_PDF, filetypes.KIND_IMAGE)
+        if context.kind not in (filetypes.KIND_PDF, filetypes.KIND_IMAGE):
+            return False
+        # Сервис разбора лежит — этот уровень выродится в тот же полный OCR,
+        # который уже сделал уровень 4, только потратив на него вдвое больше
+        # времени. Лучше честно пропустить уровень: деградация уже отмечена.
+        if not MinerUParserProvider.is_available():
+            logger.warning(
+                "Уровень %d пропущен: MinerU недоступен, разбор остаётся на OCR",
+                self.level,
+            )
+            return False
+        return True
 
     def run(self, context: DocumentContext) -> ParseResult:
         result = self.provider.parse(context.uri, context.file_type, context.metadata)
@@ -125,6 +136,9 @@ class RestoreThenLayoutStrategy(Strategy):
             classification.source == SOURCE_RASTER
             and classification.needs_restoration
             and context.kind in (filetypes.KIND_IMAGE, filetypes.KIND_PDF)
+            # Уровень заканчивается вызовом уровня 5: без сервиса он
+            # бессмыслен ровно по той же причине.
+            and MinerUParserProvider.is_available()
         )
 
     def run(self, context: DocumentContext) -> ParseResult:

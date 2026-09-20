@@ -318,6 +318,30 @@ class TestOcrLayerForRaster:
         assert result.text_layer_stats["layer"] == "ocr"
         assert result.text_layer_stats["repaired_tables"] == 1
 
+    def test_source_kind_tells_the_truth_about_a_scan(self, parser, mocker, temp_storage):
+        """
+        Скан без текстового слоя — не векторный PDF. Раньше `source_kind`
+        ставился по расширению файла ещё до того, как выяснялось, что слоя
+        в файле нет, и в провенансе фрагментов скана стояло `vector_pdf`.
+        """
+        temp_storage.write_file("documents/scan.pdf", b"%PDF-1.4 fake")
+        mocker.patch.object(parser, "_read_pdf", return_value=(None, {}))
+        mocker.patch.object(parser.tesseract, "text_layer", return_value=self._layer())
+        payload = {"results": {"scan.pdf": self._payload()["results"]["formulas.png"]}}
+        with requests_mock.Mocker() as m:
+            m.post(PARSE_URL, json=payload)
+            result = parser.parse("documents/scan.pdf", "pdf")
+
+        assert result.source_kind == "scanned_pdf"
+
+    def test_source_kind_of_an_image_stays_an_image(self, parser, mocker, temp_storage):
+        temp_storage.write_file("documents/formulas.png", b"\x89PNG fake")
+        mocker.patch.object(parser.tesseract, "text_layer", return_value=self._layer())
+        with requests_mock.Mocker() as m:
+            m.post(PARSE_URL, json=self._payload())
+            result = parser.parse("documents/formulas.png", "png")
+        assert result.source_kind == "image"
+
     def test_missing_ocr_layer_changes_nothing(self, parser, mocker, temp_storage):
         """Слой не обязателен: без него разбор остаётся прежним."""
         temp_storage.write_file("documents/formulas.png", b"\x89PNG fake")

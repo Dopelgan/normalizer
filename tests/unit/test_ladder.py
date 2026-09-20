@@ -4,6 +4,7 @@ import io
 
 import pytest
 
+from core import filetypes
 from core.ladder.base import Strategy
 from core.ladder.context import (
     GENRE_DRAWING,
@@ -36,6 +37,101 @@ from core.providers.document_parser import ParserFailed
 def context(data: bytes, file_type: str, **metadata) -> DocumentContext:
     return DocumentContext(uri="documents/x", file_type=file_type,
                            metadata=metadata, data=data)
+
+
+class TestLayoutSkippedWithoutMineru:
+    """
+    Когда сервис разбора лежит, уровень 5 выродится в тот же полный OCR,
+    что уже сделал уровень 4. Раньше это стоило второго прохода OCR на
+    каждом скане — вдвое дольше и без единого нового символа.
+    """
+
+    def setup_method(self):
+        from core.providers.mineru_parser import MinerUParserProvider
+
+        MinerUParserProvider.reset_availability()
+
+    teardown_method = setup_method
+
+    def test_skipped_while_service_is_down(self):
+        from core.ladder.strategies.recognition import LayoutStrategy
+        from core.providers.mineru_parser import MinerUParserProvider
+
+        ctx = context(b"%PDF-1.4", "pdf")
+        strategy = LayoutStrategy()
+        assert strategy.applicable(ctx) is True
+
+        MinerUParserProvider.mark_unavailable()
+        assert strategy.applicable(ctx) is False
+
+    def test_availability_returns_after_ttl(self, monkeypatch):
+        from core.providers.mineru_parser import MinerUParserProvider
+
+        MinerUParserProvider.mark_unavailable()
+        assert MinerUParserProvider.is_available() is False
+        monkeypatch.setattr(
+            "core.providers.mineru_parser.time.time",
+            lambda: MinerUParserProvider._unavailable_until + 1,
+        )
+        assert MinerUParserProvider.is_available() is True
+
+
+class TestOcrPageLimits:
+    """Потолки OCR: страницы и размер листа."""
+
+    def test_large_page_is_downscaled(self, monkeypatch):
+        from PIL import Image
+
+        from core.config import settings
+        from core.providers.tesseract_fallback import TesseractFallbackProvider
+
+        monkeypatch.setattr(settings, "OCR_MAX_SIDE", 1000)
+        image = Image.new("RGB", (6614, 4677), "white")
+        fitted = TesseractFallbackProvider._fit(image)
+        assert max(fitted.size) == 1000
+        assert fitted.size[0] > fitted.size[1]
+
+    def test_small_page_is_left_alone(self, monkeypatch):
+        from PIL import Image
+
+        from core.config import settings
+        from core.providers.tesseract_fallback import TesseractFallbackProvider
+
+        monkeypatch.setattr(settings, "OCR_MAX_SIDE", 3500)
+        image = Image.new("RGB", (1200, 900), "white")
+        assert TesseractFallbackProvider._fit(image) is image
+
+
+class TestContextType:
+    """
+    Род содержимого решает, какой уровень лестницы возьмётся за документ,
+    поэтому тип уточняется по сигнатуре, а не берётся из расширения на веру.
+    """
+
+    def test_declared_type_is_corrected_by_signature(self):
+        docx = pytest.importorskip("docx")
+        import io as _io
+
+        document = docx.Document()
+        document.add_paragraph("Спецификация к договору")
+        buffer = _io.BytesIO()
+        document.save(buffer)
+
+        ctx = context(buffer.getvalue(), "pdf")
+        assert ctx.file_type == "docx"
+        assert ctx.kind == filetypes.KIND_OFFICE_TEXT
+        assert ctx.declared_type == "pdf"
+        assert "docx" in (ctx.type_mismatch or "")
+
+    def test_matching_type_is_left_alone(self):
+        ctx = context(b"%PDF-1.4 ...", "pdf")
+        assert ctx.file_type == "pdf"
+        assert ctx.type_mismatch is None
+
+    def test_unknown_signature_keeps_declared_type(self):
+        ctx = context("a;b;c".encode(), "csv")
+        assert ctx.file_type == "csv"
+        assert ctx.kind == filetypes.KIND_SPREADSHEET
 
 
 # ===========================================================================

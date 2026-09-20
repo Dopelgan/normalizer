@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import statistics
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -33,9 +34,18 @@ logger = logging.getLogger(__name__)
 # обычный межстрочный, чтобы считаться границей строки таблицы.
 _ROW_GAP_FACTOR = 1.8
 
-# Минимальный разрыв между колонками в долях ширины таблицы. Ниже этого
+# Минимальный разрыв между колонками в долях ширины листа. Ниже этого
 # «две колонки» — это одна колонка с неровным левым краем.
 _MIN_COLUMN_GAP = 0.02
+
+# Доля слов, которая обязана доехать из строк в ячейки, чтобы починку
+# считать состоявшейся. Ниже — геометрия разложила строки не по тем
+# клеткам, и часть листа пропала бы молча.
+_KEEP_RATIO = 0.9
+
+# Слово, по которому проверяется сохранность. Короче четырёх букв берутся
+# обозначения величин («м», «с», «мм»), они есть и в формулах.
+_WORD_RE = re.compile(r"[^\W\d_]{4,}")
 
 
 def grid_of(table_data: Optional[Dict[str, Any]]) -> List[List[str]]:
@@ -65,9 +75,15 @@ def repair_cells(block: ParsedBlock, lines: Sequence[Any]) -> bool:
     """
     Заменяет ячейки с LaTeX-кашей текстом строк, попавших в ту же клетку.
 
-    Возвращает True, только если заменены **все** испорченные ячейки. False
-    означает «геометрия не сошлась» — таблицу надо деградировать, а не
-    оставлять наполовину починенной.
+    Возвращает True, только если заменены **все** испорченные ячейки и в
+    ячейки доехало содержимое строк. False означает «геометрия не сошлась»
+    — таблицу надо деградировать, а не оставлять наполовину починенной.
+
+    Заполнить все испорченные ячейки мало: строка, отнесённая не к той
+    колонке, попадает в клетку, которую никто не чинит, и пропадает совсем.
+    Так `physical_formulas.png` потерял больше половины описаний при
+    заявленной полноте 1.0. Поэтому после раскладки проверяется, что слова
+    строк действительно лежат в сетке.
     """
     table = block.table_data or {}
     grid = grid_of(table)
@@ -104,6 +120,14 @@ def repair_cells(block: ParsedBlock, lines: Sequence[Any]) -> bool:
             filled += 1
 
     if filled != len(broken):
+        return False
+
+    total, kept = _word_recall(grid, lines)
+    if total and kept < total * _KEEP_RATIO:
+        logger.info(
+            "Таблица на стр. %s: в ячейки доехало слов %d из %d — не чиним",
+            block.page, kept, total,
+        )
         return False
 
     apply_grid(table, grid)
@@ -160,34 +184,66 @@ def degrade(block: ParsedBlock, lines: Sequence[Any]) -> List[ParsedBlock]:
 # Геометрия
 # ===========================================================================
 
+
 def _column_bands(lines: Sequence[Any], count: int) -> Optional[List[List[Any]]]:
-    """Строки, разложенные по колонкам. None — разложить не удалось."""
-    if count <= 0 or len(lines) < count:
+    """
+    Строки, разложенные по колонкам. None — разложить не удалось.
+
+    Режем по вертикальным коридорам пустоты: берём занятые строками отрезки
+    по горизонтали, склеиваем пересекающиеся и смотрим, что осталось между
+    ними. Раньше разрез искался по разрыву в левых краях — на таблице, где
+    формулы в первой колонке выключены по центру, самый большой такой
+    разрыв оказывался внутри колонки, и строки уезжали не туда.
+    """
+    if count <= 0 or not lines:
         return None
     if count == 1:
         return [list(lines)]
-
-    ordered = sorted(lines, key=lambda l: l.bbox[0])
-    starts = [l.bbox[0] for l in ordered]
-    gaps = sorted(
-        ((starts[i + 1] - starts[i], i) for i in range(len(starts) - 1)),
-        reverse=True,
-    )[: count - 1]
-    if len(gaps) < count - 1 or any(gap < _MIN_COLUMN_GAP for gap, _ in gaps):
+    if len(lines) < count:
         return None
 
-    cuts = sorted(index for _gap, index in gaps)
-    bands: List[List[Any]] = []
-    previous = 0
-    for cut in cuts:
-        bands.append(ordered[previous:cut + 1])
-        previous = cut + 1
-    bands.append(ordered[previous:])
+    corridors = _corridors([(l.bbox[0], l.bbox[2]) for l in lines], _MIN_COLUMN_GAP)
+    if len(corridors) < count - 1:
+        return None
+    # Коридоров бывает больше, чем колонок: числа в ячейках выключены по
+    # правому краю и оставляют пустоту внутри колонки. Берём самые широкие.
+    cuts = sorted(x for x, _width in sorted(corridors, key=lambda c: -c[1])[: count - 1])
+
+    bands: List[List[Any]] = [[] for _ in range(count)]
+    for line in lines:
+        center = (line.bbox[0] + line.bbox[2]) / 2
+        index = sum(1 for cut in cuts if center > cut)
+        bands[index].append(line)
     return bands if all(bands) else None
 
 
+def _corridors(spans: Sequence[tuple], min_width: float) -> List[tuple]:
+    """Пустые вертикальные полосы между занятыми отрезками: (середина, ширина)."""
+    merged: List[List[float]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    result: List[tuple] = []
+    for left, right in zip(merged, merged[1:]):
+        width = right[0] - left[1]
+        if width >= min_width:
+            result.append(((left[1] + right[0]) / 2, width))
+    return result
+
+
 def _row_bands(lines: Sequence[Any], count: int) -> Optional[List[List[Any]]]:
-    """Строки колонки, разложенные по строкам таблицы. None — не сошлось."""
+    """
+    Строки колонки, разложенные по строкам таблицы. None — не сошлось.
+
+    Разрывы берутся естественные: те, что заметно шире обычного
+    межстрочного. Раньше бралось ровно `count - 1` самых больших разрывов,
+    и если строк таблицы на листе оказывалось меньше, чем заявила модель,
+    лишний разрез проходил посреди строки и сдвигал всё содержимое на
+    клетку. Теперь несовпадение — повод деградировать, а не сдвигать.
+    """
     if count <= 0 or not lines:
         return None
     ordered = sorted(lines, key=lambda l: l.bbox[1])
@@ -199,18 +255,16 @@ def _row_bands(lines: Sequence[Any], count: int) -> Optional[List[List[Any]]]:
     heights = [l.bbox[3] - l.bbox[1] for l in ordered if l.bbox[3] > l.bbox[1]]
     if not heights:
         return None
-    typical = statistics.median(heights)
+    threshold = statistics.median(heights) * (_ROW_GAP_FACTOR - 1)
 
-    gaps: List[tuple] = []
-    for index in range(len(ordered) - 1):
-        gap = ordered[index + 1].bbox[1] - ordered[index].bbox[3]
-        gaps.append((gap, index))
-
-    wide = sorted(gaps, reverse=True)[: count - 1]
-    if len(wide) < count - 1 or any(gap < typical * (_ROW_GAP_FACTOR - 1) for gap, _ in wide):
+    cuts = [
+        index
+        for index in range(len(ordered) - 1)
+        if ordered[index + 1].bbox[1] - ordered[index].bbox[3] >= threshold
+    ]
+    if len(cuts) != count - 1:
         return None
 
-    cuts = sorted(index for _gap, index in wide)
     bands: List[List[Any]] = []
     previous = 0
     for cut in cuts:
@@ -218,6 +272,30 @@ def _row_bands(lines: Sequence[Any], count: int) -> Optional[List[List[Any]]]:
         previous = cut + 1
     bands.append(ordered[previous:])
     return bands if all(bands) else None
+
+
+def _word_recall(grid: List[List[str]], lines: Sequence[Any]) -> tuple:
+    """
+    Сколько слов из строк доехало до сетки: (всего, доехало).
+
+    Сравниваются слова, а не строки целиком: ячейка, которую чинить не
+    пришлось, несёт текст от модели, и он отличается от строки распознавания
+    мелочами. Короткие обозначения величин не считаются — они встречаются
+    и в формулах, где ничего чинить не нужно.
+    """
+    haystack = _fold(" ".join(cell for row in grid for cell in row))
+    total = kept = 0
+    for line in lines:
+        for word in _WORD_RE.findall(getattr(line, "text", "") or ""):
+            total += 1
+            if _fold(word) in haystack:
+                kept += 1
+    return total, kept
+
+
+def _fold(text: str) -> str:
+    """Представление для сравнения: без пробелов, знаков и регистра."""
+    return "".join(ch.lower() for ch in text if ch.isalnum())
 
 
 def _text_of(lines: Sequence[Any]) -> str:

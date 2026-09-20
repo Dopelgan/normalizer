@@ -8,6 +8,8 @@ from core.providers.document_parser_factory import DocumentParserFactory
 from core.providers.file_locator import FileLocator, LocatedFile, SourceFileNotFound
 from core.providers.storage import (
     LocalStorageProvider,
+    ReadOnlyStorageError,
+    ReadThroughS3Provider,
     S3StorageProvider,
     StorageProvider,
     StorageProviderFactory,
@@ -23,6 +25,8 @@ __all__ = [
     "LocatedFile",
     "ParserFailed",
     "ParserUnavailable",
+    "ReadOnlyStorageError",
+    "ReadThroughS3Provider",
     "S3StorageProvider",
     "SourceFileNotFound",
     "StorageProvider",

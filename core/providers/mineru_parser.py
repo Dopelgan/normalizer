@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import time
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -132,6 +133,26 @@ def parse_table_html(html: str) -> Optional[Dict[str, Any]]:
 # ===========================================================================
 
 class MinerUParserProvider(DocumentParserProvider):
+    # Когда сервис не отвечает, об этом помнит весь процесс: иначе каждый
+    # уровень лестницы заново ждёт таймаут соединения и заново прогоняет
+    # полный OCR — на сканах это удваивает время разбора и ничего не
+    # добавляет к результату.
+    _unavailable_until: float = 0.0
+    UNAVAILABLE_TTL = 60.0
+
+    @classmethod
+    def mark_unavailable(cls) -> None:
+        cls._unavailable_until = time.time() + cls.UNAVAILABLE_TTL
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return time.time() >= cls._unavailable_until
+
+    @classmethod
+    def reset_availability(cls) -> None:
+        """Нужна тестам и ручной проверке после подъёма сервиса."""
+        cls._unavailable_until = 0.0
+
     def __init__(self, storage: Optional[StorageProvider] = None):
         self.storage = storage or StorageProviderFactory.default()
         self.tesseract = TesseractFallbackProvider(storage=self.storage)
@@ -195,10 +216,24 @@ class MinerUParserProvider(DocumentParserProvider):
                 result.blocks = blocks
                 result.text_layer_chars = stats.layer_chars_by_page
                 result.text_layer_stats = {**stats.as_dict(), "layer": "ocr"}
+                # Происхождение известно только здесь: слоя в файле не
+                # оказалось и текст собран распознаванием. До этой ветки
+                # `source_kind` ставился по расширению, и скан уезжал в
+                # провенанс векторным PDF.
+                result.source_kind = (
+                    "image" if filetypes.is_image(file_type) else "scanned_pdf"
+                )
                 if stats.degraded_tables:
                     result.degraded.append(
                         f"table_not_parsed: таблиц разобрано на текст и формулы "
                         f"{stats.degraded_tables}"
+                    )
+                if stats.decoded_formulas:
+                    # Проза под разметкой, которой нечем заменить: текст
+                    # остался нечитаемым, и молчать об этом нельзя.
+                    result.degraded.append(
+                        f"formula_not_text: блоков с разметкой вместо текста "
+                        f"{stats.decoded_formulas}"
                     )
                 return result
 
@@ -341,6 +376,7 @@ class MinerUParserProvider(DocumentParserProvider):
         try:
             response = requests.post(url, files=files, data=data, timeout=self.timeout)
         except requests.RequestException as exc:
+            self.mark_unavailable()
             raise ParserUnavailable(f"нет связи с MinerU: {exc}") from exc
 
         if response.status_code >= 500:
@@ -657,9 +693,18 @@ class MinerUParserProvider(DocumentParserProvider):
         blocks = self.tesseract.parse_all_pages(uri)
         for block in blocks:
             block.method = block.method or "tesseract"
+        degraded: List[str] = []
+        truncated = getattr(self.tesseract, "truncated_at", None)
+        if truncated:
+            done, total = truncated
+            degraded.append(
+                f"OCR выполнен для первых {done} страниц из {total}: "
+                f"предел OCR_FULL_MAX_PAGES."
+            )
         return ParseResult(
             blocks=blocks,
             is_fallback=True,
+            degraded=degraded,
             parser_name="tesseract_full",
             source_kind="image" if filetypes.is_image(file_type) else "scanned_pdf",
             raw_output={},

@@ -82,17 +82,39 @@ class DocumentContext:
         data: Optional[bytes] = None,
     ):
         self.uri = uri
-        self.file_type = filetypes.normalize(file_type)
+        self.declared_type = filetypes.normalize(file_type)
+        self._file_type = self.declared_type
         self.metadata: Dict[str, Any] = dict(metadata or {})
         self.storage = storage or StorageProviderFactory.default()
         self._data = data
         self._layer: Optional[TextLayer] = None
         self._layer_loaded = False
         self._classification: Optional[Classification] = None
+        self._type_resolved = False
+        self.type_mismatch: Optional[str] = None
+        if data is not None:
+            self._resolve_type()
 
     # --------------------------------------------------------------- данные
     @property
+    def file_type(self) -> str:
+        """
+        Фактический тип файла. Уточняется по сигнатуре при первом обращении:
+        стратегии спрашивают то `kind`, то сам тип, и ответ должен быть один
+        и тот же независимо от порядка вопросов.
+        """
+        self._resolve_type()
+        return self._file_type
+
+    @property
     def kind(self) -> Optional[str]:
+        """
+        Род содержимого — им лестница отбирает применимые уровни. Считается
+        по фактическому типу файла: расширение приходит от отправителя и
+        бывает чужим, а от рода зависит, какая стратегия возьмётся за
+        документ. Выбрать разбор DOCX для файла, который на самом деле PDF,
+        дороже, чем один раз посмотреть на сигнатуру.
+        """
         return filetypes.kind_of(self.file_type)
 
     @property
@@ -100,6 +122,24 @@ class DocumentContext:
         if self._data is None:
             self._data = self.storage.read_bytes(self.uri)
         return self._data
+
+    def _resolve_type(self) -> None:
+        """Уточнить тип по сигнатуре. Молчит, если содержимое недоступно."""
+        if self._type_resolved:
+            return
+        try:
+            head = self.data
+        except Exception as exc:  # noqa: BLE001 — недоступный файл решает вызывающий
+            logger.debug("Тип %s не уточнён, файл не прочитан: %s", self.uri, exc)
+            return
+        self._type_resolved = True
+        verdict = filetypes.resolve_declared(self.declared_type, head)
+        if verdict.mismatch:
+            logger.info("%s: %s", self.uri, verdict.explanation)
+            self.type_mismatch = verdict.explanation
+            self.metadata.setdefault("declared_type", verdict.declared)
+            self.metadata.setdefault("detected_type", verdict.detected)
+        self._file_type = verdict.file_type or self.declared_type
 
     @property
     def text_layer(self) -> Optional[TextLayer]:

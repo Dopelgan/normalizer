@@ -195,3 +195,75 @@ class TestColumnsAndRows:
     def test_single_column_is_taken_as_is(self):
         lines = [line("а", 0.1, 0.1)]
         assert table_from_lines._column_bands(lines, 1) == [lines]
+
+
+class TestConservation:
+    """
+    Заполнить все испорченные ячейки мало. Строка, отнесённая не к той
+    колонке, попадает в клетку, которую никто не чинит, и пропадает совсем:
+    так `physical_formulas.png` потерял больше половины описаний при
+    заявленной полноте 1.0 и уверенности 0.96.
+    """
+
+    def test_lines_that_did_not_reach_the_grid_degrade_the_table(self):
+        block = table_block()
+        lines = ocr_lines()
+        # Подписи разделов стоят в колонке формул: в ячейки они не поедут,
+        # потому что формульные ячейки чинить не требуется.
+        lines += [
+            line("Раздел кинематика поступательная", 0.05, 0.30),
+            line("Раздел кинематика вращательная", 0.05, 0.55),
+        ]
+        layer = TextLayer(pages={1: lines}, page_count=1)
+
+        blocks, stats = reconcile_with_text_layer([block], layer, source=OCR_LAYER)
+
+        assert stats.repaired_tables == 0
+        assert stats.degraded_tables == 1
+        # Ничего не потеряно: то, что не влезло в ячейки, уехало текстом.
+        recovered = " ".join(b.text or "" for b in blocks if b.type == "text")
+        assert "Раздел кинематика поступательная" in recovered
+        assert "Прямолинейное равномерное движение" in recovered
+
+    def test_healthy_geometry_still_repairs(self):
+        """Проверка сохранности не мешает обычному случаю."""
+        block = table_block()
+        layer = TextLayer(pages={1: ocr_lines()}, page_count=1)
+        _blocks, stats = reconcile_with_text_layer([block], layer, source=OCR_LAYER)
+        assert stats.repaired_tables == 1
+
+
+class TestColumnCorridors:
+    """
+    Колонки ищутся по вертикальным коридорам пустоты, а не по разрыву в
+    левых краях строк: в таблице `physical_formulas.png` формулы выключены
+    по центру, и самый большой разрыв левых краёв приходился на середину
+    колонки формул.
+    """
+
+    def test_centred_column_does_not_fool_the_split(self):
+        lines = [
+            # Колонка формул: левые края разъезжаются на 0.12.
+            TextLine(text="x = x0 + vt", bbox=[0.05, 0.10, 0.30, 0.12], page=1),
+            TextLine(text="a = (v - v0) / t", bbox=[0.17, 0.30, 0.32, 0.32], page=1),
+            # Колонка описаний: левый край ровный.
+            TextLine(text="x [м] – координата", bbox=[0.40, 0.10, 0.90, 0.12], page=1),
+            TextLine(text="a [м/с2] – ускорение", bbox=[0.40, 0.30, 0.90, 0.32], page=1),
+        ]
+        bands = table_from_lines._column_bands(lines, 2)
+        assert bands is not None
+        assert [l.text for l in bands[0]] == ["x = x0 + vt", "a = (v - v0) / t"]
+        assert [l.text for l in bands[1]] == ["x [м] – координата", "a [м/с2] – ускорение"]
+
+    def test_rows_must_match_the_declared_shape(self):
+        """
+        Строк таблицы на листе меньше, чем заявила модель. Раньше лишний
+        разрез проходил посреди строки и сдвигал содержимое на клетку —
+        теперь это повод деградировать.
+        """
+        lines = [
+            TextLine(text="первая", bbox=[0.4, 0.10, 0.9, 0.12], page=1),
+            TextLine(text="вторая", bbox=[0.4, 0.30, 0.9, 0.32], page=1),
+        ]
+        assert table_from_lines._row_bands(lines, 3) is None
+        assert table_from_lines._row_bands(lines, 2) is not None

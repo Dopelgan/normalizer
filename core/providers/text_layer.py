@@ -22,6 +22,7 @@ from __future__ import annotations
 import difflib
 import logging
 import math
+import re
 import statistics
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -47,6 +48,8 @@ METHOD_TEXT_LAYER_RECOVERED = "text_layer_recovered"
 METHOD_PARSER_OCR = "mineru_ocr"
 METHOD_OCR_LAYER = "ocr_layer"
 METHOD_OCR_LAYER_RECOVERED = "ocr_layer_recovered"
+#: Разметку сняли, не имея чем заменить: читается глазами, но не более.
+METHOD_LATEX_DECODED = "latex_decoded"
 
 _MONO_MARKERS = ("mono", "courier", "consol", "menlo", "inconsolata", "hack", "fira code")
 
@@ -62,6 +65,14 @@ _REBUILD_MIN_RATIO = 0.6
 # одним и тем же текстом. Сравнение идёт по «свёрнутым» буквам, поэтому
 # сходство ниже 0.85 означает уже разные строки, а не ошибку распознавания.
 _CELL_MATCH_RATIO = 0.85
+
+# Доля слов строки, которая должна найтись в разобранных таблицах, чтобы
+# счесть строку повтором содержимого таблицы, и минимальная длина строки
+# в словах: по двум словам повтор не опознаётся.
+_DUPLICATE_RATIO = 0.8
+_DUPLICATE_MIN_WORDS = 4
+
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 # Пары визуально неразличимых букв латиницы и кириллицы. Распознавание
 # постоянно их путает — `rps` превращается в `грs`, `БД` в `БD`, — и для
@@ -366,6 +377,16 @@ class ReconcileStats:
     recovered_chars: int = 0
     repaired_cells: int = 0
     #: Таблицы, в ячейках которых нашлась проза под LaTeX-разметкой.
+    mangled_formulas: int = 0
+    """Формульных блоков, в которых лежала проза под разметкой."""
+    repaired_formulas: int = 0
+    """Из них заменено текстом строк слоя."""
+    decoded_formulas: int = 0
+    """Из них заменить было нечем — снята разметка, блок на проверку."""
+    duplicate_lines: int = 0
+    """Строк, погашенных как повтор содержимого разобранной таблицы."""
+    dropped_empty_tables: int = 0
+    """Пустых рамок-продолжений многостраничной таблицы, убранных из выдачи."""
     mangled_tables: int = 0
     #: Из них починенные по строкам слоя.
     repaired_tables: int = 0
@@ -379,6 +400,11 @@ class ReconcileStats:
             "recovered_blocks": self.recovered_blocks,
             "recovered_chars": self.recovered_chars,
             "repaired_cells": self.repaired_cells,
+            "mangled_formulas": self.mangled_formulas,
+            "repaired_formulas": self.repaired_formulas,
+            "decoded_formulas": self.decoded_formulas,
+            "duplicate_lines": self.duplicate_lines,
+            "dropped_empty_tables": self.dropped_empty_tables,
             "mangled_tables": self.mangled_tables,
             "repaired_tables": self.repaired_tables,
             "degraded_tables": self.degraded_tables,
@@ -406,6 +432,11 @@ def reconcile_with_text_layer(
 
     pages = sorted(set(by_page) | set(p for p in layer.pages if layer.char_count(p)))
     result: List[ParsedBlock] = []
+    # Содержимое всех разобранных таблиц документа одной строкой. Нужно на
+    # многостраничной таблице: MinerU отдаёт её целиком в рамке первой
+    # страницы, а на страницах-продолжениях — пустую рамку. Строки из такой
+    # рамки иначе уезжают в индекс плоским текстом второй копией.
+    parsed_tables = _table_index(blocks)
 
     for page in pages:
         page_blocks = by_page.get(page, [])
@@ -428,6 +459,7 @@ def reconcile_with_text_layer(
         leftovers = list(assignments.get(None) or [])
 
         extra_blocks: List[ParsedBlock] = []
+        dropped: List[ParsedBlock] = []
         for block in page_blocks:
             matched = assignments.get(id(block)) or []
             if block.type == "text":
@@ -435,6 +467,12 @@ def reconcile_with_text_layer(
                     _rebuild_text_block(block, matched, stats, source)
                 else:
                     block.method = block.method or METHOD_PARSER_OCR
+            elif block.type == "formula" and latex_text.is_mangled_text(block.text or ""):
+                # Модель формул MinerU заворачивает в LaTeX любую строку,
+                # которую сочла формулой, — на скане так уезжают заголовки
+                # и подписи целиком. Строки слоя внутри такой рамки раньше
+                # просто отбрасывались вместе с их текстом.
+                _fix_formula(block, matched, stats, source)
             elif block.type == "table" and matched and _carries_own_text(block):
                 # Структуру таблицы строит MinerU — слой про неё ничего не
                 # знает. Но текст ячеек всё равно распознан, поэтому его
@@ -444,9 +482,22 @@ def reconcile_with_text_layer(
                 # Рамка распознана как таблица или картинка, но содержимого
                 # в ней не оказалось (у MinerU это обычное дело на сложной
                 # вёрстке). Текст из слоя внутри такой рамки иначе пропал бы
-                # молча — возвращаем его отдельным блоком.
-                leftovers.extend(matched)
+                # молча — возвращаем его отдельным блоком. Кроме случая,
+                # когда это продолжение таблицы, уже разобранной целиком:
+                # тогда возвращать нечего, а пустую рамку незачем держать.
+                if block.type == "table":
+                    fresh = _drop_duplicates(matched, parsed_tables, stats)
+                    if not fresh:
+                        stats.dropped_empty_tables += 1
+                        dropped.append(block)
+                else:
+                    # Гашение повторов — про таблицы. Подпись под картинкой
+                    # может повторять строку таблицы на законных основаниях.
+                    fresh = list(matched)
+                leftovers.extend(fresh)
 
+        if dropped:
+            page_blocks = [b for b in page_blocks if not any(b is d for d in dropped)]
         page_blocks.extend(extra_blocks)
 
         for group in group_lines(leftovers):
@@ -541,6 +592,86 @@ def _rebuild_text_block(
     block.method = source.method
     block.confidence = source.confidence_of(matched)
     stats.rebuilt_blocks += 1
+
+
+def _fix_formula(
+    block: ParsedBlock,
+    matched: Sequence[TextLine],
+    stats: "ReconcileStats",
+    source: LayerSource = VECTOR_LAYER,
+) -> None:
+    """
+    Формульный блок, в котором лежит не формула, а проза под разметкой.
+
+    Модель формул MinerU заворачивает в LaTeX всё, что сочла формулой, и на
+    скане так уезжает обычный текст: `\\mathsf { A K T T E X H M 4 E C K O
+    P O O C M O T P A }` — это «АКТ ТЕХНИЧЕСКОГО ОСМОТРА». Собрать строку
+    обратно из разметки нельзя, буквы потеряны при распознавании. Зато тот
+    же кусок листа прочитан построчно, и текст можно взять оттуда — ровно
+    так же, как это делается для ячеек таблиц.
+
+    Заменить нечем — снимаем разметку и помечаем блок фоллбэком: голый
+    текст хотя бы читается и ищется, а `is_fallback` отправит фрагмент на
+    проверку человеку. Отдавать побуквенную разметку в индекс хуже.
+    """
+    stats.mangled_formulas += 1
+    rebuilt = lines_to_text(matched)
+    if rebuilt:
+        block.type = "text"
+        block.text = rebuilt
+        block.bbox = merge_line_bboxes(matched)
+        block.method = source.method
+        block.confidence = source.confidence_of(matched)
+        stats.repaired_formulas += 1
+        return
+
+    block.type = "text"
+    block.text = latex_text.decode(block.text or "")
+    block.method = METHOD_LATEX_DECODED
+    block.is_fallback = True
+    stats.decoded_formulas += 1
+
+
+def _table_index(blocks: Sequence[ParsedBlock]) -> str:
+    """Содержимое всех разобранных таблиц документа одной свёрнутой строкой."""
+    parts: List[str] = []
+    for block in blocks:
+        table = block.table_data or {}
+        parts.extend(str(h) for h in (table.get("headers") or []))
+        for row in table.get("rows") or []:
+            parts.extend(str(cell) for cell in row)
+    return fold_homoglyphs(" ".join(parts)) if parts else ""
+
+
+def _drop_duplicates(
+    lines: Sequence[TextLine], parsed_tables: str, stats: "ReconcileStats"
+) -> List[TextLine]:
+    """
+    Строки, которых ещё нет ни в одной разобранной таблице документа.
+
+    Многостраничную таблицу MinerU отдаёт целиком в рамке первой страницы,
+    а дальше присылает пустые рамки-продолжения. Строки слоя из такой рамки
+    — это те же самые данные во второй раз, уже без колонок: в индексе от
+    них один шум, а в поиске они перебивают разобранную таблицу.
+
+    Сравнение по словам, а не по строке целиком: модель таблиц теряет и
+    переставляет содержимое ячеек, так что дословно строка в разобранной
+    таблице не находится почти никогда. Короткие слова не в счёт — из
+    «шт» и «5» повтора не соберёшь.
+    """
+    if not parsed_tables:
+        return list(lines)
+
+    fresh: List[TextLine] = []
+    for line in lines:
+        words = [w for w in _TOKEN_RE.findall(line.text or "") if len(w) >= 3]
+        folded = [fold_homoglyphs(w) for w in words]
+        found = sum(1 for w in folded if w and w in parsed_tables)
+        if len(folded) >= _DUPLICATE_MIN_WORDS and found >= len(folded) * _DUPLICATE_RATIO:
+            stats.duplicate_lines += 1
+            continue
+        fresh.append(line)
+    return fresh
 
 
 def fold_homoglyphs(text: str) -> str:

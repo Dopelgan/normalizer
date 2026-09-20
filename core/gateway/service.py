@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from core import filetypes
+from core.gateway import text_probe
 from core.gateway.profile import (
     CATEGORY_BUSINESS,
     CATEGORY_CORRESPONDENCE,
@@ -56,21 +57,57 @@ _SAMPLE_BYTES = 64 * 1024
 _SYSTEM_NAMES = (
     "thumbs.db", "desktop.ini", ".ds_store", "~$", "index.dat", "ntuser.dat",
 )
-_TECHNICAL_MARKERS = (
-    "гост", "ост ", "ту ", "чертёж", "чертеж", "спецификац", "техническ",
-    "допуск", "шероховат", "сборочн", "деталь", "узел", "схема",
+# Маркеры ищутся по границам слов, а не подстрокой. Подстрочный поиск по
+# двухбуквенным маркерам («ту », «ост », «re:») срабатывал на случайных
+# сочетаниях — в том числе внутри сжатого потока PDF, где «re:» встречается
+# просто как последовательность байтов.
+def _markers(*patterns: str) -> tuple:
+    return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
+
+
+_TECHNICAL_MARKERS = _markers(
+    r"\bгост\b", r"\bост\s*\d", r"\bту\s*\d", r"\bчерт[её]ж\w*",
+    r"\bспецификац\w+", r"\bтехническ\w+", r"\bдопуск\w*",
+    r"\bшероховат\w+", r"\bсборочн\w+", r"\bдеталь\w*", r"\bузел\b",
+    r"\bсхема\w*", r"\bчертеж\w*",
 )
-_BUSINESS_MARKERS = (
-    "договор", "приказ", "регламент", "инструкц", "положение", "акт ",
-    "накладн", "счёт", "счет-фактур", "протокол", "устав", "отчёт", "отчет",
+_BUSINESS_MARKERS = _markers(
+    r"\bдоговор\w*", r"\bприказ\w*", r"\bрегламент\w*", r"\bинструкц\w+",
+    r"\bположение\b", r"\bакт\b", r"\bнакладн\w+", r"\bсч[ёе]т\b",
+    r"\bсчет-фактур\w*", r"\bпротокол\w*", r"\bустав\b", r"\bотч[ёе]т\w*",
+    r"\bприложение\s*№?\s*\d", r"\bграфик\b", r"\bсоглашени\w+",
+    r"\bспецификация\s+к\s+договору",
+    # Кадровый документооборот — это деловые документы организации, а не
+    # «личное»: заявление на отпуск пишется по форме и хранится в кадрах.
+    # Без этих маркеров слово «отпуск» уводило такие файлы в «личное».
+    r"\bзаявлени\w+", r"\bдолжностн\w+\s+инструкц\w+", r"\bтрудов\w+\s+договор",
+    r"\bсчет[- ]фактур\w*", r"\bнакладная\b", r"\bупд\b", r"\bтз\b",
 )
-_CORRESPONDENCE_MARKERS = (
-    "re:", "fwd:", "кому:", "от кого:", "с уважением", "добрый день",
-    "здравствуйте", "переписка",
+# Переписка опознаётся по обороту письма, а не по одному слову: «кому:» в
+# бланке и «с уважением» в подписи — это переписка, а слово «письмо» в
+# названии приложения к договору — ещё нет.
+_CORRESPONDENCE_MARKERS = _markers(
+    r"(?:^|\n)\s*(?:re|fwd|fw)\s*:", r"\bкому\s*:", r"\bот\s+кого\s*:",
+    r"\bс\s+уважением\b", r"\bдобрый\s+(?:день|вечер)\b",
+    r"\bздравствуйте\b", r"\bпереписка\w*", r"\bисх\.\s*№", r"\bвх\.\s*№",
 )
-_PERSONAL_MARKERS = (
-    "отпуск", "свадьб", "день рождения", "личное", "семья", "фото с",
+_PERSONAL_MARKERS = _markers(
+    r"\bотпуск\w*", r"\bсвадьб\w+", r"\bдень\s+рождения\b", r"\bличное\b",
+    r"\bсемья\b", r"\bфото\s+с\b",
 )
+
+# Категории в порядке разбора и уверенность, с которой правило их называет.
+_RULE_ORDER = (
+    (CATEGORY_TECHNICAL, _TECHNICAL_MARKERS, 0.8),
+    (CATEGORY_BUSINESS, _BUSINESS_MARKERS, 0.78),
+    (CATEGORY_CORRESPONDENCE, _CORRESPONDENCE_MARKERS, 0.72),
+    (CATEGORY_PERSONAL, _PERSONAL_MARKERS, 0.7),
+)
+
+# Категории, которые нельзя объявить по одному лишь пути. Путь к файлу —
+# слабый признак: «1-2. Договора и ДС/…/Приложение 2. График.pdf» говорит о
+# деловом документе, но ничего не говорит о переписке.
+_TEXT_ONLY_CATEGORIES = (CATEGORY_CORRESPONDENCE,)
 
 # Род растра (core.providers.raster_drawing) -> категория приёма.
 _IMAGE_CATEGORY_BY_KIND = {
@@ -129,35 +166,59 @@ class DataGateway:
         """Пропустить файл дальше, отправить в карантин или отклонить."""
         path = uri or s3_fileid
 
-        verdict = self.formal_layer(path, size)
+        # Имя, каталог и размер известны без файла — эти проверки первыми.
+        verdict = self.path_layer(path) or self.size_layer(size)
         if verdict is not None:
             return verdict
 
-        if filetypes.is_image(filetypes.extension_of(path)):
-            # Картинку нельзя судить по первым 64 КБ. У сжатых форматов в них
-            # умещается весь файл, у BMP и TIFF — кусок заголовка и несколько
-            # первых строк развёртки: декодер такой обрезок не открывает, и
-            # безобидный чертёж получал «нераспознаваемое» с уверенностью
-            # 0.06 только из-за формата хранения. Картинка читается целиком.
-            image_bytes = self._read_all(path)
-            sample = image_bytes[:_SAMPLE_BYTES]
-            verdict = self.image_layer(path, image_bytes, 1.0 if image_bytes else 0.0)
+        # Дальше решение принимается по содержимому, поэтому файл читается
+        # один раз: и для опознания формата, и для классификации. Картинку
+        # судить по первым 64 КБ нельзя (у BMP и TIFF в них только заголовок
+        # и пара строк развёртки), а формат по обрезку zip не определяется.
+        data = self._read_all(path)
+        resolved = filetypes.resolve(path, data)
+
+        verdict = self.type_layer(path, resolved)
+        if verdict is not None:
+            return verdict
+
+        if filetypes.is_image(resolved.file_type):
+            verdict = self.image_layer(path, data, 1.0 if data else 0.0)
         else:
-            sample, inspected = self._sample(path, size)
-            verdict = self.content_layer(path, sample, inspected)
+            inspected = 1.0 if data else 0.0
+            verdict = self.content_layer(path, data, inspected, resolved)
+
+        if resolved.mismatch:
+            verdict.signals.setdefault("type_mismatch", resolved.explanation)
 
         if verdict.confidence >= self.profile.min_confidence:
             return verdict
-        return self.escalation_layer(path, sample, verdict)
+        return self.escalation_layer(path, data[:_SAMPLE_BYTES], verdict)
 
     # -------------------------------------------------- G-1 формальные признаки
-    def formal_layer(self, path: str, size: Optional[int]) -> Optional[GatewayVerdict]:
+    def formal_layer(
+        self,
+        path: str,
+        size: Optional[int],
+        resolved: Optional[filetypes.TypeVerdict] = None,
+    ) -> Optional[GatewayVerdict]:
         """
         Тип, размер, путь, имя. Самый дешёвый слой отсекает большую часть
         очевидного мусора, не открывая файл вовсе.
+
+        `resolved` — тип, уже определённый по содержимому. Без него формат
+        берётся из расширения: так слой работает и там, где файла в руках
+        ещё нет.
         """
+        return (
+            self.path_layer(path)
+            or self.size_layer(size)
+            or self.type_layer(path, resolved)
+        )
+
+    def path_layer(self, path: str) -> Optional[GatewayVerdict]:
+        """Имя и каталог: системный файл, запрещённая или личная область."""
         name = os.path.basename(path).lower()
-        extension = filetypes.extension_of(path)
 
         if any(marker in name for marker in _SYSTEM_NAMES):
             return GatewayVerdict(
@@ -181,12 +242,36 @@ class DataGateway:
                 "G-1", category=CATEGORY_PERSONAL, confidence=1.0,
             )
 
-        if extension not in {e.lower() for e in self.profile.allowed_extensions}:
-            reason = filetypes.rejection_reason(extension) or (
-                f"Тип .{extension} не разрешён профилем приёма."
-            )
-            return GatewayVerdict(REJECT, reason, "G-1")
+        return None
 
+    def type_layer(
+        self, path: str, resolved: Optional[filetypes.TypeVerdict] = None
+    ) -> Optional[GatewayVerdict]:
+        """
+        Формат файла. Расширение — утверждение отправителя, поэтому когда
+        байты уже прочитаны, тип берётся по сигнатуре: от него зависит, какой
+        уровень разбора возьмётся за документ дальше.
+        """
+        if resolved is None:
+            resolved = filetypes.TypeVerdict(
+                filetypes.extension_of(path), filetypes.extension_of(path), None, False
+            )
+        file_type = resolved.file_type
+
+        if file_type not in {e.lower() for e in self.profile.allowed_extensions}:
+            reason = filetypes.rejection_reason(file_type) or (
+                f"Тип .{file_type} не разрешён профилем приёма."
+            )
+            if resolved.mismatch:
+                reason = f"{reason} {resolved.explanation}"
+            return GatewayVerdict(
+                REJECT, reason, "G-1",
+                signals={"file_type": file_type, "declared_type": resolved.declared},
+            )
+        return None
+
+    def size_layer(self, size: Optional[int]) -> Optional[GatewayVerdict]:
+        """Размер, известный из метаданных хранилища."""
         if size is not None:
             if size < self.profile.min_size_bytes:
                 return GatewayVerdict(
@@ -206,22 +291,35 @@ class DataGateway:
 
     # ------------------------------------------- G-2 быстрый классификатор
     def content_layer(
-        self, path: str, sample: bytes, inspected: float
+        self,
+        path: str,
+        data: bytes,
+        inspected: float,
+        resolved: Optional[filetypes.TypeVerdict] = None,
     ) -> GatewayVerdict:
         """
         Категория документа. Сначала спрашиваем модель, если она настроена;
-        иначе решают правила по имени и содержимому.
+        иначе решают правила по тексту документа и пути к нему.
+
+        `data` — файл целиком: текст достаётся инструментом формата, а не
+        поиском подстрок в байтах. Раньше здесь искали маркеры прямо в первых
+        64 КБ, и сжатый поток PDF давал случайные совпадения — приложение к
+        договору становилось перепиской из-за байтов «re:» внутри потока.
 
         Доля осмотренного важна не меньше самой категории: классификатор,
         увидевший пять процентов документа, не может быть в нём уверен,
         сколько бы он ни заявлял.
         """
+        file_type = (resolved.file_type if resolved else filetypes.extension_of(path))
+        sample = data[:_SAMPLE_BYTES]
+
         remote = self.classifier.classify_document(path, sample)
         if remote is not None:
             category, confidence = remote["category"], float(remote["confidence"])
             source = "модель"
+            signals: Dict[str, Any] = {}
         else:
-            category, confidence = self._categorize(path, sample)
+            category, confidence, signals = self._categorize(path, data, file_type)
             source = "правила"
 
         confidence = self._discount(confidence, inspected)
@@ -232,7 +330,11 @@ class DataGateway:
             layer="G-2",
             category=category,
             confidence=confidence,
-            signals={"inspected_fraction": round(inspected, 3), "decided_by": source},
+            signals={
+                "inspected_fraction": round(inspected, 3),
+                "decided_by": source,
+                **signals,
+            },
         )
 
     # ---------------------------------------- G-3 классификация изображений
@@ -351,30 +453,45 @@ class DataGateway:
             f"по профилю приёма {verdicts[outcome]}."
         )
 
-    def _categorize(self, path: str, sample: bytes) -> tuple:
-        """Правила по имени файла и началу содержимого."""
-        haystack = (os.path.basename(path) + " " + _as_text(sample)).lower()
+    def _categorize(self, path: str, data: bytes, file_type: str) -> tuple:
+        """
+        Правила по тексту документа и пути к нему.
 
-        if _matches(haystack, _TECHNICAL_MARKERS):
-            return CATEGORY_TECHNICAL, 0.8
-        if _matches(haystack, _BUSINESS_MARKERS):
-            return CATEGORY_BUSINESS, 0.78
-        if _matches(haystack, _CORRESPONDENCE_MARKERS):
-            return CATEGORY_CORRESPONDENCE, 0.72
-        if _matches(haystack, _PERSONAL_MARKERS):
-            return CATEGORY_PERSONAL, 0.7
+        Текст и путь — признаки разного веса. Текст извлечён из файла и
+        говорит о содержании; путь говорит лишь о том, куда документ
+        положили, поэтому категория по одному пути объявляется с меньшей
+        уверенностью, а переписку по нему не объявляют вовсе.
+        """
+        probe = text_probe.extract(file_type, data)
+        signals: Dict[str, Any] = probe.as_dict()
 
-        extension = filetypes.extension_of(path)
-        if extension in ("dxf",):
-            return CATEGORY_TECHNICAL, 0.9
-        if extension in ("xlsx", "csv"):
-            return CATEGORY_BUSINESS, 0.65
+        if probe.reliable:
+            category, confidence, hit = _first_match(probe.text)
+            if category is not None:
+                signals["matched_in"] = "текст"
+                signals["matched_marker"] = hit
+                return category, confidence, signals
 
-        if not _as_text(sample).strip():
-            return CATEGORY_UNRECOGNIZABLE, 0.55
+        # Путь целиком, а не только имя файла: каталог «Договоры и ДС» —
+        # такой же признак, как слово в названии, и раньше он отбрасывался.
+        category, confidence, hit = _first_match(path.replace("/", " "))
+        if category is not None and category not in _TEXT_ONLY_CATEGORIES:
+            signals["matched_in"] = "путь"
+            signals["matched_marker"] = hit
+            # Путь — признак второго порядка: уверенность ниже, и спорный
+            # случай уходит на разбор (G-4), а не решается молча.
+            return category, round(confidence * 0.85, 3), signals
+
+        if file_type == "dxf":
+            return CATEGORY_TECHNICAL, 0.9, signals
+        if file_type in ("xlsx", "csv"):
+            return CATEGORY_BUSINESS, 0.65, signals
+
+        if not probe.reliable and not data:
+            return CATEGORY_UNRECOGNIZABLE, 0.55, signals
         # Ничего характерного не нашлось: это не повод выбрасывать документ,
         # но и уверенно принимать его не за что — решит слой G-4.
-        return CATEGORY_BUSINESS, 0.5
+        return CATEGORY_BUSINESS, 0.5, signals
 
     @staticmethod
     def _categorize_image(path: str, data: bytes) -> tuple:
@@ -424,8 +541,37 @@ class DataGateway:
 # Помощники
 # ===========================================================================
 
+def _haystack(value: str) -> str:
+    """
+    Строка, пригодная для поиска по границам слов.
+
+    В именах файлов слова разделяют не пробелы, а `_`, `-` и точки, причём
+    `_` для регулярного выражения — такой же символ слова, как буква:
+    в «личное_отпуск.jpg» маркер `\bличное\b` без этой нормализации не
+    находится.
+    """
+    return re.sub(r"[_\-./\\]+", " ", value or "")
+
+
 def _matches(haystack: str, markers) -> bool:
-    return any(marker in haystack for marker in markers)
+    """Есть ли в тексте хоть один маркер набора."""
+    prepared = _haystack(haystack)
+    return any(marker.search(prepared) for marker in markers)
+
+
+def _first_match(haystack: str) -> tuple:
+    """
+    Первая подходящая категория по порядку разбора: техническое, деловое,
+    переписка, личное. Возвращает и сам сработавший маркер — он попадает в
+    сигналы приёма, чтобы решение можно было проверить, а не принять на веру.
+    """
+    prepared = _haystack(haystack)
+    for category, markers, confidence in _RULE_ORDER:
+        for marker in markers:
+            found = marker.search(prepared)
+            if found:
+                return category, confidence, found.group(0).strip()
+    return None, 0.0, None
 
 
 def _as_text(sample: bytes) -> str:

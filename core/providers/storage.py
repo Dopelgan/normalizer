@@ -19,6 +19,10 @@ from core.config import settings
 logger = logging.getLogger(__name__)
 
 
+class ReadOnlyStorageError(RuntimeError):
+    """Попытка записать в хранилище, выданное только на чтение."""
+
+
 class StorageProvider(ABC):
     """Базовый интерфейс для всех провайдеров хранилища."""
 
@@ -170,12 +174,26 @@ class S3StorageProvider(StorageProvider):
         )
 
     def write_file(self, uri: str, content: bytes) -> None:
+        # Бакет выдан на чтение. Молча уронить запись в AccessDenied из
+        # глубины boto3 хуже, чем сказать прямо: производное пишется в
+        # ARTIFACTS_MOUNT, а сюда — только если S3_READONLY снят осознанно.
+        self._ensure_writable(uri)
         bucket, key = self._parse_s3_uri(uri)
         self.s3_client.put_object(Bucket=bucket, Key=key, Body=content)
 
     def delete_file(self, uri: str) -> None:
+        self._ensure_writable(uri)
         bucket, key = self._parse_s3_uri(uri)
         self.s3_client.delete_object(Bucket=bucket, Key=key)
+
+    @staticmethod
+    def _ensure_writable(uri: str) -> None:
+        if settings.S3_READONLY:
+            raise ReadOnlyStorageError(
+                f"S3 доступен только на чтение, запись в {uri} запрещена. "
+                "Производные файлы пишутся в ARTIFACTS_MOUNT; снимите "
+                "S3_READONLY, только если бакет действительно writable."
+            )
 
     def size(self, uri: str) -> Optional[int]:
         bucket, key = self._parse_s3_uri(uri)
@@ -210,6 +228,65 @@ class S3StorageProvider(StorageProvider):
         return bucket, key
 
 
+class ReadThroughS3Provider(StorageProvider):
+    """
+    Чтение из S3, запись — в собственный том.
+
+    Рабочая конфигурация сервиса: документы лежат в общем S3, доступном
+    только на чтение, а всё, что мы производим сами, остаётся у нас. Чтение
+    маршрутизируется по схеме URI (`s3://` — в S3, остальное — локально),
+    поэтому вызывающему коду не нужно знать, где именно лежит файл: он
+    получает URI от `write_file` и потом тем же провайдером его читает.
+    """
+
+    def __init__(
+        self,
+        remote: Optional[StorageProvider] = None,
+        local: Optional[StorageProvider] = None,
+    ):
+        self.remote = remote or S3StorageProvider()
+        self.local = local or LocalStorageProvider(settings.ARTIFACTS_MOUNT)
+
+    # ----------------------------------------------------------- интерфейс
+    def _for(self, uri: str) -> StorageProvider:
+        return self.remote if uri.startswith("s3://") else self.local
+
+    def get_stream(self, uri: str) -> BinaryIO:
+        return self._for(uri).get_stream(uri)
+
+    def exists(self, uri: str) -> bool:
+        return self._for(uri).exists(uri)
+
+    def get_presigned_url(self, uri: str, expires_in: int = 3600) -> str:
+        return self._for(uri).get_presigned_url(uri, expires_in)
+
+    def write_file(self, uri: str, content: bytes) -> None:
+        if uri.startswith("s3://"):
+            raise ReadOnlyStorageError(
+                f"S3 доступен только на чтение, запись в {uri} запрещена."
+            )
+        self.local.write_file(uri, content)
+
+    def delete_file(self, uri: str) -> None:
+        if uri.startswith("s3://"):
+            raise ReadOnlyStorageError(
+                f"S3 доступен только на чтение, удаление {uri} запрещено."
+            )
+        self.local.delete_file(uri)
+
+    def size(self, uri: str) -> Optional[int]:
+        return self._for(uri).size(uri)
+
+    def get_uri_type(self, uri: str) -> str:
+        return self._for(uri).get_uri_type(uri)
+
+    def get_accessible_uri(self, uri: str) -> str:
+        return self._for(uri).get_accessible_uri(uri)
+
+    def read_bytes(self, uri: str) -> bytes:
+        return self._for(uri).read_bytes(uri)
+
+
 class StorageProviderFactory:
     """Фабрика провайдера по префиксу URI."""
 
@@ -231,11 +308,21 @@ class StorageProviderFactory:
     def default(cls) -> StorageProvider:
         """Провайдер, соответствующий STORAGE_TYPE из конфигурации."""
         kind = settings.STORAGE_TYPE.lower()
+        # Ключ кэша учитывает режим доступа: смена S3_READONLY меняет
+        # провайдера, а не только его поведение.
+        key = f"{kind}:ro" if kind == "s3" and settings.S3_READONLY else kind
         with cls._default_lock:
-            provider = cls._default.get(kind)
+            provider = cls._default.get(key)
             if provider is None:
-                provider = S3StorageProvider() if kind == "s3" else LocalStorageProvider()
-                cls._default[kind] = provider
+                if kind == "s3":
+                    provider = (
+                        ReadThroughS3Provider()
+                        if settings.S3_READONLY
+                        else S3StorageProvider()
+                    )
+                else:
+                    provider = LocalStorageProvider()
+                cls._default[key] = provider
             return provider
 
     @classmethod

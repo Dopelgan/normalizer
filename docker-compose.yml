@@ -99,11 +99,13 @@ services:
     command: >
       --host 0.0.0.0
       --port 8000
-      --model-dir /models/pdf-extract-kit
     environment:
       TZ: ${TZ:-UTC}
+      # Источник моделей и путь к конфигу: MinerU 3.4.x при local читает
+      # корень моделей только из mineru.json, который пишет download.sh.
+      # MINERU_MODEL_DIR тут раньше тоже стоял — такой переменной MinerU
+      # не знает, она ничего не задавала.
       MINERU_MODEL_SOURCE: local
-      MINERU_MODEL_DIR: /models/pdf-extract-kit
       MINERU_TOOLS_CONFIG_JSON: /models/pdf-extract-kit/mineru.json
     ulimits:
       memlock: -1

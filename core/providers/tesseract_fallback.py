@@ -24,8 +24,10 @@ from pdf2image import convert_from_path
 from PIL import Image
 
 from core import filetypes
+from core.config import settings
 from core.models.parse_result import ParsedBlock
 from core.providers.storage import StorageProvider, StorageProviderFactory
+from core.workspace import temp_dir
 from core.providers.text_layer import TextLayer, TextLine, group_lines, merge_line_bboxes
 
 logger = logging.getLogger(__name__)
@@ -63,26 +65,45 @@ class TesseractFallbackProvider:
     def __init__(self, lang: str = "rus+eng", storage: Optional[StorageProvider] = None):
         self.lang = lang
         self.storage = storage or StorageProviderFactory.default()
+        # (сколько распознали, сколько всего) последнего полного прохода;
+        # None — усечения не было.
+        self.truncated_at: Optional[tuple] = None
 
     # ------------------------------------------------------------- публичное
-    def parse_pages(self, uri: str, pages: List[int]) -> List[ParsedBlock]:
-        """Распознаёт только указанные страницы PDF (нумерация с 1)."""
+    def parse_pages(
+        self, uri: str, pages: List[int], file_type: Optional[str] = None,
+        data: Optional[bytes] = None,
+    ) -> List[ParsedBlock]:
+        """
+        Распознаёт только указанные страницы PDF (нумерация с 1).
+
+        `file_type` — фактический тип файла, если он уже определён по
+        содержимому. Имя файла приходит от отправителя и бывает чужим:
+        картинка под именем `.pdf` уезжала в pdf2image, тот падал, и
+        читаемость объявлялась непроверенной на файле, который читается.
+
+        `data` — уже прочитанные байты. Приём держит их в руках к моменту
+        проверки читаемости, и без них каждый растровый документ выкачивался
+        из S3 второй раз.
+        """
         if not pages:
             return []
 
-        local_path, cleanup = self._materialize(uri)
+        local_path, cleanup = self._materialize(uri, data)
         if not local_path:
             raise OcrUnavailable(f"Файл {uri} не удалось получить локально")
 
         try:
-            if self._is_image(local_path):
+            if self._treat_as_image(local_path, file_type):
                 logger.info("Постраничный OCR неприменим к изображению, обрабатываем целиком")
                 return self._ocr_single_image(local_path, page=pages[0])
 
             blocks: List[ParsedBlock] = []
             first, last = min(pages), max(pages)
             try:
-                images = convert_from_path(local_path, first_page=first, last_page=last)
+                images = convert_from_path(
+                    local_path, first_page=first, last_page=last, dpi=settings.OCR_DPI
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.error("pdf2image не смог обработать страницы %s: %s", pages, exc)
                 raise OcrUnavailable(str(exc)) from exc
@@ -98,7 +119,16 @@ class TesseractFallbackProvider:
             cleanup()
 
     def parse_all_pages(self, uri: str) -> List[ParsedBlock]:
-        """Распознаёт весь документ (или всё изображение)."""
+        """
+        Распознаёт документ целиком (или всё изображение).
+
+        Страницы рендерятся пачками и не больше, чем `OCR_FULL_MAX_PAGES`.
+        Прежний код звал `convert_from_path` без границ: на техническом
+        задании в несколько сотен листов это разворачивало в память весь
+        документ разом. Усечение видно снаружи — `truncated_at` последнего
+        разбора, его читает вызывающий и пишет в degraded.
+        """
+        self.truncated_at = None
         local_path, cleanup = self._materialize(uri)
         if not local_path:
             logger.error("Не удалось получить локальный путь для %s", uri)
@@ -108,18 +138,49 @@ class TesseractFallbackProvider:
             if self._is_image(local_path):
                 return self._ocr_single_image(local_path, page=1)
 
-            try:
-                images = convert_from_path(local_path)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("pdf2image не смог обработать %s: %s", local_path, exc)
-                return []
+            total = self._page_count(local_path)
+            limit = max(1, settings.OCR_FULL_MAX_PAGES)
+            last_page = min(total, limit) if total else limit
+            if total and total > limit:
+                logger.warning(
+                    "OCR %s усечён: %d страниц из %d", uri, limit, total
+                )
+                self.truncated_at = (limit, total)
 
             blocks: List[ParsedBlock] = []
-            for page_num, img in enumerate(images, start=1):
-                blocks.extend(self._blocks_from_image(img, page_num))
+            batch = max(1, settings.OCR_BATCH_PAGES)
+            for first in range(1, last_page + 1, batch):
+                last = min(first + batch - 1, last_page)
+                try:
+                    images = convert_from_path(
+                        local_path, first_page=first, last_page=last,
+                        dpi=settings.OCR_DPI,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "pdf2image не смог обработать страницы %d-%d файла %s: %s",
+                        first, last, local_path, exc,
+                    )
+                    break
+                if not images:
+                    break
+                for index, img in enumerate(images):
+                    blocks.extend(self._blocks_from_image(img, first + index))
+                    img.close()
             return blocks
         finally:
             cleanup()
+
+    @staticmethod
+    def _page_count(local_path: str) -> int:
+        """Сколько страниц в PDF. 0 — узнать не вышло, работаем по лимиту."""
+        try:
+            from pdf2image import pdfinfo_from_path
+
+            return int(pdfinfo_from_path(local_path).get("Pages") or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Число страниц %s не определено: %s", local_path, exc)
+            return 0
 
     # ------------------------------------------------------------ внутреннее
     def text_layer(self, uri: str) -> Optional[TextLayer]:
@@ -156,7 +217,14 @@ class TesseractFallbackProvider:
             cleanup()
 
     def _images_of(self, local_path: str):
-        """[(номер страницы, картинка), ...] — для картинки одна страница."""
+        """
+        Страницы документа по одной: (номер, картинка).
+
+        Рендер идёт пачками и не дальше `OCR_FULL_MAX_PAGES`. Прежняя версия
+        разворачивала весь PDF в список картинок разом — на многостраничном
+        сканированном приложении это съедало память воркера целиком, ещё до
+        первой строки распознавания.
+        """
         if self._is_image(local_path):
             try:
                 image = Image.open(local_path)
@@ -164,10 +232,34 @@ class TesseractFallbackProvider:
             except Exception as exc:  # noqa: BLE001
                 raise OcrUnavailable(f"Изображение не открылось: {exc}") from exc
             return [(1, image)]
-        try:
-            return list(enumerate(convert_from_path(local_path), start=1))
-        except Exception as exc:  # noqa: BLE001
-            raise OcrUnavailable(str(exc)) from exc
+        return self._pdf_pages(local_path)
+
+    def _pdf_pages(self, local_path: str):
+        """Генератор страниц PDF: рендерим пачками, лишнего в памяти не держим."""
+        total = self._page_count(local_path)
+        limit = max(1, settings.OCR_FULL_MAX_PAGES)
+        last_page = min(total, limit) if total else limit
+        if total and total > limit:
+            logger.warning(
+                "Слой OCR %s усечён: %d страниц из %d", local_path, limit, total
+            )
+            self.truncated_at = (limit, total)
+        batch = max(1, settings.OCR_BATCH_PAGES)
+        for first in range(1, last_page + 1, batch):
+            last = min(first + batch - 1, last_page)
+            try:
+                images = convert_from_path(
+                    local_path, first_page=first, last_page=last, dpi=settings.OCR_DPI
+                )
+            except Exception as exc:  # noqa: BLE001
+                if first == 1:
+                    raise OcrUnavailable(str(exc)) from exc
+                logger.error("Страницы %d-%d не отрендерились: %s", first, last, exc)
+                return
+            if not images:
+                return
+            for index, image in enumerate(images):
+                yield first + index, image
 
     def _ocr_single_image(self, path: str, page: int) -> List[ParsedBlock]:
         try:
@@ -176,6 +268,40 @@ class TesseractFallbackProvider:
         except Exception as exc:  # noqa: BLE001
             logger.error("OCR изображения %s не удался: %s", path, exc)
             return []
+
+    @staticmethod
+    def _fit(image: "Image.Image") -> "Image.Image":
+        """
+        Уменьшить страницу до рабочего размера распознавания.
+
+        Скан A3 приходит листом в 6600 пикселей по длинной стороне: OCR на
+        нём идёт минутами, а строки читаются не лучше — их высота и так
+        кратно выше порога распознавания. Координаты остаются в долях, так
+        что масштабирование ничего не ломает ниже по конвейеру.
+
+        Граница есть и снизу. Tesseract работает по высоте строки, и на
+        мелком растре она ниже порога: лист 80x50 не давал ни одного слова,
+        тот же лист крупнее читается уверенностью около 0.65. Пустой
+        результат на приёме означает карантин «документ нечитаем», поэтому
+        мелкое увеличивается до рабочего размера.
+        """
+        limit = max(512, settings.OCR_MAX_SIDE)
+        floor = min(limit, max(0, settings.OCR_MIN_SIDE))
+        side = max(image.width, image.height)
+        if not side:
+            return image
+        if side > limit:
+            scale = limit / float(side)
+        elif side < floor:
+            scale = floor / float(side)
+        else:
+            return image
+        size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+        try:
+            return image.resize(size, Image.LANCZOS)
+        except Exception as exc:  # noqa: BLE001 — не вышло, читаем как есть
+            logger.debug("Страница не приведена к рабочему размеру: %s", exc)
+            return image
 
     def _blocks_from_image(self, image: "Image.Image", page: int) -> List[ParsedBlock]:
         """
@@ -228,6 +354,7 @@ class TesseractFallbackProvider:
         Строки с координатами и уверенностью распознавания. Координаты в
         долях изображения — как и везде в конвейере.
         """
+        image = self._fit(image)
         try:
             data = pytesseract.image_to_data(
                 image, lang=self.lang, config=f"--psm {psm}",
@@ -302,19 +429,24 @@ class TesseractFallbackProvider:
             logger.error("Ошибка OCR: %s", exc)
             return ""
 
-    def _materialize(self, uri: str):
+    def _materialize(self, uri: str, data: Optional[bytes] = None):
         """
         Возвращает (локальный путь, функция очистки).
         Для S3 файл выкачивается во временный, для локального — резолвится
-        через StorageProvider (с проверкой path traversal).
+        через StorageProvider (с проверкой path traversal). Переданные байты
+        избавляют от повторной выкачки.
         """
         noop = lambda: None  # noqa: E731
 
         if uri.startswith("s3://"):
             try:
                 ext = os.path.splitext(uri.split("/")[-1])[1] or ".pdf"
-                content = self.storage.read_bytes(uri)
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                content = data if data is not None else self.storage.read_bytes(uri)
+                # dir= задаётся явно: даже если TMPDIR кто-то перебил,
+                # выкачанный из S3 исходник остаётся в томе сервиса.
+                tmp = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=ext, dir=str(temp_dir())
+                )
                 tmp.write(content)
                 tmp.close()
                 return tmp.name, lambda: self._safe_unlink(tmp.name)
@@ -343,6 +475,13 @@ class TesseractFallbackProvider:
     @staticmethod
     def _is_image(path: str) -> bool:
         return os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
+
+    @staticmethod
+    def _treat_as_image(path: str, file_type: Optional[str] = None) -> bool:
+        """Читать ли файл одной картинкой. Явный тип старше расширения."""
+        if file_type:
+            return filetypes.kind_of(file_type) == filetypes.KIND_IMAGE
+        return TesseractFallbackProvider._is_image(path)
 
 
 def _weighted_lines(lines: Sequence[Any]) -> float:

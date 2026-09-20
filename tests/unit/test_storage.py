@@ -7,9 +7,22 @@ import pytest
 from core.config import settings
 from core.providers.storage import (
     LocalStorageProvider,
+    ReadOnlyStorageError,
+    ReadThroughS3Provider,
     S3StorageProvider,
     StorageProviderFactory,
 )
+
+
+@pytest.fixture
+def s3_settings(monkeypatch):
+    """Полная конфигурация S3 — без неё провайдер не создаётся."""
+    for key, value in [
+        ("S3_ENDPOINT", "http://minio:9000"), ("S3_ACCESS_KEY", "k"),
+        ("S3_SECRET_KEY", "s"), ("S3_BUCKET", "bucket"),
+    ]:
+        monkeypatch.setattr(settings, key, value)
+    return settings
 
 
 class TestLocalStorageProvider:
@@ -121,12 +134,124 @@ class TestFactory:
         assert isinstance(StorageProviderFactory.default(), LocalStorageProvider)
 
 
+class TestReadOnlyS3:
+    """Бакет выдан на чтение: запись должна отбиваться на нашей стороне."""
+
+    def test_write_rejected(self, s3_settings, monkeypatch):
+        monkeypatch.setattr(settings, "S3_READONLY", True)
+        with pytest.raises(ReadOnlyStorageError, match="только на чтение"):
+            S3StorageProvider().write_file("s3://bucket/a.txt", b"x")
+
+    def test_delete_rejected(self, s3_settings, monkeypatch):
+        monkeypatch.setattr(settings, "S3_READONLY", True)
+        with pytest.raises(ReadOnlyStorageError):
+            S3StorageProvider().delete_file("s3://bucket/a.txt")
+
+    def test_write_allowed_when_readonly_disabled(self, s3_settings, monkeypatch):
+        monkeypatch.setattr(settings, "S3_READONLY", False)
+        provider = S3StorageProvider()
+        calls = {}
+
+        class _Stub:
+            @staticmethod
+            def put_object(Bucket, Key, Body):
+                calls["args"] = (Bucket, Key, Body)
+
+        provider.s3_client = _Stub()
+        provider.write_file("s3://bucket/a.txt", b"x")
+        assert calls["args"] == ("bucket", "a.txt", b"x")
+
+
+class TestReadThroughS3Provider:
+    """Чтение по схеме URI, запись — всегда в том сервиса."""
+
+    @pytest.fixture
+    def provider(self, tmp_path):
+        class _Remote(LocalStorageProvider):
+            """Заглушка удалённой стороны: запоминает, что у неё спросили."""
+
+            def __init__(self, base):
+                super().__init__(base_path=str(base))
+                self.asked = []
+
+            def read_bytes(self, uri):
+                self.asked.append(uri)
+                return b"from-s3"
+
+            def exists(self, uri):
+                self.asked.append(uri)
+                return True
+
+            def get_uri_type(self, uri):
+                return "s3"
+
+        remote = _Remote(tmp_path / "remote")
+        local = LocalStorageProvider(base_path=str(tmp_path / "local"))
+        return ReadThroughS3Provider(remote=remote, local=local), remote, tmp_path
+
+    def test_write_goes_to_local_volume(self, provider):
+        storage, remote, tmp_path = provider
+        storage.write_file("assets/doc/img.png", b"png")
+        assert (tmp_path / "local" / "assets" / "doc" / "img.png").read_bytes() == b"png"
+        assert remote.asked == []
+
+    def test_written_file_reads_back(self, provider):
+        storage, _, _ = provider
+        storage.write_file("raw_parse/1.json", b"{}")
+        assert storage.read_bytes("raw_parse/1.json") == b"{}"
+        assert storage.exists("raw_parse/1.json")
+
+    def test_s3_uri_reads_from_remote(self, provider):
+        storage, remote, _ = provider
+        assert storage.read_bytes("s3://bucket/documents/a.pdf") == b"from-s3"
+        assert remote.asked == ["s3://bucket/documents/a.pdf"]
+
+    def test_write_to_s3_uri_rejected(self, provider):
+        storage, _, _ = provider
+        with pytest.raises(ReadOnlyStorageError):
+            storage.write_file("s3://bucket/documents/a.pdf", b"x")
+
+    def test_delete_of_s3_uri_rejected(self, provider):
+        storage, _, _ = provider
+        with pytest.raises(ReadOnlyStorageError):
+            storage.delete_file("s3://bucket/documents/a.pdf")
+
+    def test_uri_type_follows_scheme(self, provider):
+        storage, _, _ = provider
+        assert storage.get_uri_type("s3://bucket/a.pdf") == "s3"
+        assert storage.get_uri_type("assets/a.png") == "local"
+
+
+class TestDefaultUnderReadonlyS3:
+    def test_readonly_s3_gives_read_through_provider(self, s3_settings, monkeypatch):
+        monkeypatch.setattr(settings, "STORAGE_TYPE", "s3")
+        monkeypatch.setattr(settings, "S3_READONLY", True)
+        StorageProviderFactory.reset_default()
+        try:
+            assert isinstance(StorageProviderFactory.default(), ReadThroughS3Provider)
+        finally:
+            StorageProviderFactory.reset_default()
+
+    def test_writable_s3_gives_plain_provider(self, s3_settings, monkeypatch):
+        monkeypatch.setattr(settings, "STORAGE_TYPE", "s3")
+        monkeypatch.setattr(settings, "S3_READONLY", False)
+        StorageProviderFactory.reset_default()
+        try:
+            provider = StorageProviderFactory.default()
+            assert isinstance(provider, S3StorageProvider)
+            assert not isinstance(provider, ReadThroughS3Provider)
+        finally:
+            StorageProviderFactory.reset_default()
+
+
 @pytest.mark.integration
 class TestS3Integration:
     """Требуют поднятого MinIO: docker compose up -d minio minio-init."""
 
     @pytest.fixture
-    def s3_provider(self):
+    def s3_provider(self, monkeypatch):
+        # Локальный MinIO поднимается writable: снимаем защиту только здесь.
+        monkeypatch.setattr(settings, "S3_READONLY", False)
         try:
             provider = S3StorageProvider()
             provider.s3_client.head_bucket(Bucket=provider.bucket)

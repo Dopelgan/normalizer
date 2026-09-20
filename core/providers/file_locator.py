@@ -17,6 +17,10 @@ from core.providers.storage import StorageProvider, StorageProviderFactory
 
 logger = logging.getLogger(__name__)
 
+# Сигнатуре формата хватает первых байтов: качать весь объект ради типа
+# незачем, тем более что хранилище может быть удалённым.
+_HEAD_BYTES = 8192
+
 
 class SourceFileNotFound(FileNotFoundError):
     """Файл по s3_fileid не найден ни с одним из проверенных расширений."""
@@ -61,7 +65,7 @@ class FileLocator:
                     return LocatedFile(
                         s3_fileid=s3_fileid,
                         uri=uri,
-                        file_type=self._file_type(candidate),
+                        file_type=self._file_type(candidate, uri),
                     )
             except Exception as exc:  # недоступное хранилище — не молчим
                 logger.warning("Проверка %s не удалась: %s", uri, exc)
@@ -81,6 +85,37 @@ class FileLocator:
             return f"s3://{settings.S3_BUCKET}/{path}"
         return path
 
-    @staticmethod
-    def _file_type(key: str) -> str:
-        return filetypes.extension_of(key) or "pdf"
+    def _file_type(self, key: str, uri: str) -> str:
+        """
+        Тип найденного файла. Расширения в ключе может не быть вовсе —
+        тогда спрашиваем не догадку, а сам файл: прежний код в этом случае
+        возвращал "pdf", и DOCX под безымянным ключом уезжал на разбор PDF.
+        """
+        extension = filetypes.extension_of(key)
+        if extension:
+            return extension
+        detected = filetypes.sniff(self._head(uri))
+        if detected:
+            logger.info("Тип %s определён по сигнатуре: .%s", uri, detected)
+            return detected
+        # Формат не опознан по голове файла (так бывает у docx и xlsx —
+        # это zip, и его состав виден только целиком). Пустой тип честнее
+        # выдуманного: он уточнится, когда файл будет прочитан.
+        return ""
+
+    def _head(self, uri: str) -> bytes:
+        """Первые байты файла: дешевле полного чтения и хватает сигнатуре."""
+        try:
+            stream = self.storage.get_stream(uri)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Голова файла %s не прочитана: %s", uri, exc)
+            return b""
+        try:
+            return stream.read(_HEAD_BYTES)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Голова файла %s не прочитана: %s", uri, exc)
+            return b""
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()

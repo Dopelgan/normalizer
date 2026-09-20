@@ -57,6 +57,25 @@ class TestLocate:
         located = FileLocator(AlwaysExists()).locate("file-1.pdf")
         assert located.uri == "s3://docs/incoming/file-1.pdf"
 
+    def test_type_of_extensionless_key_comes_from_signature(self, locator, temp_storage):
+        """
+        Ключ без расширения — обычное дело в контракте RAG. Раньше такому
+        файлу молча приписывался тип pdf, и DOCX уезжал на разбор PDF.
+        """
+        temp_storage.write_file("documents/8e00bee8", b"%PDF-1.5\n1 0 obj")
+        assert locator.locate("8e00bee8").file_type == "pdf"
+
+    def test_png_without_extension(self, locator, temp_storage):
+        temp_storage.write_file("documents/img-1", b"\x89PNG\r\n\x1a\nIHDR")
+        located = locator.locate("img-1")
+        assert located.file_type == "png"
+        assert located.is_image is True
+
+    def test_unknown_signature_gives_empty_type(self, locator, temp_storage):
+        """Пустой тип честнее выдуманного: он уточнится при чтении файла."""
+        temp_storage.write_file("documents/unknown-1", "просто текст".encode())
+        assert locator.locate("unknown-1").file_type == ""
+
     def test_traversal_attempt_is_not_found(self, locator):
         """Путь наружу из хранилища не должен ни находиться, ни падать."""
         with pytest.raises(SourceFileNotFound):

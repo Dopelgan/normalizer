@@ -32,6 +32,10 @@ from core.providers.storage import StorageProviderFactory
 from core.quality.service import QualityGate
 from core.repositories import IntakeRepository
 from core.repositories.intake_repo import decision_id
+from core.workspace import configure_process_tempdir
+
+# Временные файлы процесса — в том сервиса, а не на слой контейнера.
+configure_process_tempdir()
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),

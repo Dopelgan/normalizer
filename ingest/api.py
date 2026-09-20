@@ -29,6 +29,10 @@ from core.models.contract import (
     ResultsResponse,
 )
 from core.result_aggregator import get_request_state, init_request_state
+from core.workspace import configure_process_tempdir
+
+# Временные файлы процесса — в том сервиса, а не на слой контейнера.
+configure_process_tempdir()
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),

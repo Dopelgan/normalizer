@@ -6,3 +6,27 @@ Owner: Engineering
 
 This document contains plain text with identifiers rps and expires_at.
 Expected: preserve exact text and metadata-like tokens.
+
+Parameters
+----------
+expires_at = 2026-12-31
+rps = 250
+Pressure = 8.5 bar
+Temperature = 72 C
+X = 3.14 * D
+
+Notes
+-----
+The block above exists for exact-token checks: every line must survive
+normalization character for character, including the equals signs and the
+spaces around them. Line breaks inside this section are meaningful and the
+section must not be glued to the paragraphs around it.
+
+Revision history
+----------------
+Rev 1  2026-02-14  initial issue
+Rev 2  2026-05-30  parameters block added
+Rev 3  2026-08-11  expiry date confirmed by the process engineer
+
+The file is deliberately larger than the intake minimum size so that it
+reaches the quality gate instead of being refused as an empty document.
