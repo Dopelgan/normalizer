@@ -1,5 +1,6 @@
 """
-Модели контракта RAG <-> Parser (PARSER API SPEC DRAFT 2026-09-07).
+Модели контракта RAG <-> Parser (PARSER API SPEC DRAFT 2026-09-07,
+изменения контракта от 2026-09-22 — см. docs/PARSER-CONTRACT-CHANGES.md).
 
 Правила контракта, которые здесь закодированы:
 
@@ -8,7 +9,11 @@
   (поэтому нигде не используется `exclude_none`);
 * `confidence` и `completeness` лежат в диапазоне [0, 1];
 * `position.bbox` — нормализованные координаты [x1, y1, x2, y2] в [0, 1];
-* поля доступа (container / legal_entity / sensitivity) Parser не формирует.
+* поля доступа (container / legal_entity / sensitivity) Parser не формирует;
+* синхронная ручка работает с `dialog_id`, фоновая — только с `event_id`:
+  в фоне диалога нет, а событие жизненного цикла есть;
+* ошибка — объект с кодом причины, а не строка: по строке потребитель не
+  может решить, повторять запрос или отправлять файл человеку.
 """
 
 from datetime import datetime, timezone
@@ -20,6 +25,27 @@ FragmentType = Literal["text", "table", "formula", "drawing", "image", "structur
 DocumentStatus = Literal["pending", "indexed", "error"]
 RequestStatus = Literal["queued", "processing", "completed", "partial", "error"]
 Operation = Literal["create", "update"]
+# Итог разбора одного файла. Отличается от `DocumentStatus`: тот описывает
+# состояние записи в хранилище, а этот — чем закончился именно этот разбор.
+DocumentOutcome = Literal["completed", "partial", "error"]
+
+# Минимальный набор кодов причины по контракту. Список расширяемый, но
+# сужать его нельзя: потребитель принимает решение о повторе по коду.
+ReasonCode = Literal[
+    "SOURCE_NOT_FOUND",
+    "SOURCE_READ_ERROR",
+    "UNSUPPORTED_FORMAT",
+    "OCR_FAILED",
+    "EXTRACTION_FAILED",
+    "TABLE_EXTRACTION_FAILED",
+    "PARSER_TIMEOUT",
+    "INTERNAL_ERROR",
+]
+
+FactKind = Literal[
+    "number", "range", "date", "duration", "text", "boolean", "identifier", "enum"
+]
+FactOperator = Literal["=", "<=", ">=", "<", ">", "range"]
 
 
 def _iso_utc(value: datetime) -> str:
@@ -27,6 +53,39 @@ def _iso_utc(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ===========================================================================
+# Ошибка
+# ===========================================================================
+
+class ParserError(BaseModel):
+    """
+    Структурированная ошибка разбора.
+
+    `retryable` отвечает на единственный вопрос потребителя: повторять или
+    нет. Неподдерживаемый формат повторять бессмысленно, недоступное
+    хранилище — наоборот.
+    """
+
+    reason_code: ReasonCode = "INTERNAL_ERROR"
+    message: str = ""
+    retryable: bool = False
+    attempt: int = Field(1, ge=1)
+
+    @classmethod
+    def coerce(cls, value: Any) -> Optional["ParserError"]:
+        """
+        Приводит к объекту то, что пришло строкой.
+
+        Нужно ради совместимости: в Redis могут лежать документы, сложенные
+        до перехода на объект ошибки, и терять их из-за формата нельзя.
+        """
+        if value is None or isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(**value)
+        return cls(reason_code="INTERNAL_ERROR", message=str(value))
 
 
 # ===========================================================================
@@ -57,7 +116,13 @@ class Position(BaseModel):
 
 
 class Provenance(BaseModel):
-    """Происхождение фрагмента: чем получен и из какого источника."""
+    """
+    Происхождение фрагмента: чем получен и из какого источника.
+
+    `source_file_id` и `source_page` добавлены контрактом: без них RAG не
+    может открыть страницу-доказательство и не отличает повторный разбор
+    того же файла от нового документа.
+    """
 
     method: str          # cad_source | text_layer_extraction | mineru_ocr | ...
     # Уровень лестницы стратегий, 1..7 по возрастанию стоимости:
@@ -66,6 +131,8 @@ class Provenance(BaseModel):
     # 6 восстановление растра плюс 5, 7 мультимодальная модель.
     strategy_level: int = Field(..., ge=1, le=7)
     source: str          # vector_pdf | scanned_pdf | document_parser | drawing | ...
+    source_file_id: Optional[str] = None
+    source_page: Optional[int] = None
 
 
 class GraphNode(BaseModel):
@@ -130,6 +197,61 @@ class Content(BaseModel):
 
 
 # ===========================================================================
+# Извлечённые факты
+# ===========================================================================
+
+class FactValue(BaseModel):
+    """
+    Значение факта. `raw` хранит исходную запись — она остаётся
+    доказательством, когда разбор числа спорный.
+
+    Выдумывать значение или единицу, которых нет в документе, нельзя:
+    пустое поле честнее подставленного по умолчанию.
+    """
+
+    kind: FactKind
+    raw: str
+    number: Optional[float] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
+    unit: Optional[str] = None
+    operator: Optional[FactOperator] = None
+
+    @field_validator("unit")
+    @classmethod
+    def _empty_unit_is_none(cls, v: Optional[str]) -> Optional[str]:
+        return v or None
+
+    @field_validator("max")
+    @classmethod
+    def _ordered_range(cls, v: Optional[float], info) -> Optional[float]:
+        low = info.data.get("min")
+        if v is not None and low is not None and v < low:
+            raise ValueError("max диапазона меньше min")
+        return v
+
+
+class ExtractedFact(BaseModel):
+    """
+    Явно извлечённое значение из фрагмента.
+
+    Parser извлекает факт, но не решает, нужен ли он для конкретного
+    пользовательского вопроса: отбор — работа RAG.
+    """
+
+    fact_id: str
+    fragment_id: str
+    # Расширяемый ключ типа факта: фиксированного списка под один проект нет.
+    key: str = "document.parameter"
+    label: str = ""
+    value: FactValue
+    confidence: float = Field(1.0, ge=0, le=1)
+    # Координаты внутри фрагмента: для таблиц — {row, column, header}.
+    # Без них факт из таблицы нельзя показать в исходной ячейке.
+    provenance: Optional[Dict[str, Any]] = None
+
+
+# ===========================================================================
 # Фрагмент и документ
 # ===========================================================================
 
@@ -142,6 +264,7 @@ class Fragment(BaseModel):
     confidence: float = Field(..., ge=0, le=1)
     completeness: float = Field(..., ge=0, le=1)
     provenance: Provenance
+    extracted_facts: List[ExtractedFact] = Field(default_factory=list)
     graph_nodes: List[GraphNode] = Field(default_factory=list)
     relations: List[Relation] = Field(default_factory=list)
 
@@ -160,10 +283,33 @@ class DocumentMetadata(BaseModel):
 
 
 class DocumentResult(BaseModel):
+    """
+    Результат по одному файлу.
+
+    `processed_pages` и `failed_pages` заполняются всегда, а не только при
+    `status: partial`: по ним потребитель индексирует разобранное и ставит
+    файл на проверку, не гадая, что именно пропало.
+    """
+
     s3_fileid: str
+    status: DocumentOutcome = "completed"
+    # `sha256:<hex>` содержимого файла и нормализованного текста. Второй
+    # отвечает на вопрос «изменился ли смысл», когда байты файла изменились.
+    content_hash: Optional[str] = None
+    normalized_content_hash: Optional[str] = None
+    mime_type: Optional[str] = None
+    pages: Optional[int] = None
+    processed_pages: List[int] = Field(default_factory=list)
+    failed_pages: List[int] = Field(default_factory=list)
     document_metadata: DocumentMetadata
     fragments: List[Fragment] = Field(default_factory=list)
-    error: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
+    error: Optional[ParserError] = None
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def _error_object(cls, v: Any) -> Any:
+        return ParserError.coerce(v)
 
 
 # ===========================================================================
@@ -171,34 +317,72 @@ class DocumentResult(BaseModel):
 # ===========================================================================
 
 class ParseResponse(BaseModel):
-    """Ответ синхронной ручки POST /internal/v1/parse."""
+    """
+    Ответ синхронной ручки POST /internal/v1/parse.
+
+    `dialog_id` здесь остаётся: синхронный разбор вызывается из
+    пользовательского диалога.
+    """
 
     request_id: str
     dialog_id: str
     documents: List[DocumentResult] = Field(default_factory=list)
+
+
+class SyncPendingResponse(BaseModel):
+    """
+    Ответ 504 синхронной ручки: работа не уложилась в таймаут.
+
+    Это по-прежнему синхронный ответ, поэтому `dialog_id` в нём есть.
+    Готовый результат забирается по /internal/v1/parse/results/{request_id}.
+    """
+
+    request_id: str
+    dialog_id: str
+    status: RequestStatus
+    documents: List[DocumentResult] = Field(default_factory=list)
+    error: Optional[ParserError] = None
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def _error_object(cls, v: Any) -> Any:
+        return ParserError.coerce(v)
 
 
 class BackgroundAcceptedResponse(BaseModel):
     """
     Ответ POST /internal/v1/parse/background (202 Accepted).
 
+    `dialog_id` из фонового контракта убран: связь события, запроса и
+    результата держит `event_id`, пришедший от Backend через RAG, и заменять
+    его новым идентификатором нельзя.
+
     `operation` — общая операция пакета. Когда файлы просят разное, общей
     операции нет, и поле приходит пустым: выдумывать её нельзя.
     """
 
     request_id: str
-    dialog_id: str
+    event_id: str = ""
     operation: Optional[Operation] = None
     accepted: bool = True
     status: RequestStatus = "queued"
 
 
 class ResultsResponse(BaseModel):
-    """Ответ GET /internal/v1/parse/results/{request_id}."""
+    """
+    Envelope фонового результата: и для поллинга
+    GET /internal/v1/parse/results/{request_id}, и для отправки в
+    POST /internal/v1/parser/results на стороне RAG.
+    """
 
     request_id: str
-    dialog_id: str
+    event_id: str = ""
     operation: Optional[Operation] = None
     status: RequestStatus
     documents: List[DocumentResult] = Field(default_factory=list)
-    error: Optional[str] = None
+    error: Optional[ParserError] = None
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def _error_object(cls, v: Any) -> Any:
+        return ParserError.coerce(v)

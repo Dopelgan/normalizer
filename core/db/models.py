@@ -66,7 +66,12 @@ class ChunkDB(Base):
     section_title = Column(String(256), nullable=True)
     confidence = Column(Float, nullable=False, default=0.0)
     completeness = Column(Float, nullable=False, default=0.0)
-    provenance = Column(JSON, nullable=False)         # {method, strategy_level, source}
+    # {method, strategy_level, source, source_file_id, source_page}
+    provenance = Column(JSON, nullable=False)
+    # Извлечённые значения фрагмента по контракту: числа, диапазоны, даты,
+    # идентификаторы. Хранятся рядом с фрагментом, иначе повторная выдача
+    # уже разобранного документа отдавала бы его без фактов.
+    extracted_facts = Column(MutableList.as_mutable(JSON), default=list)
     graph_nodes = Column(MutableList.as_mutable(JSON), default=list)
     relations = Column(MutableList.as_mutable(JSON), default=list)
     order_index = Column(Integer, nullable=True)

@@ -414,7 +414,8 @@ POST /internal/v1/intake
 
 Операция принадлежит файлу, а не пакету: в одном приёме приходят и новые
 документы, и обновления уже принятых. `dialog_id` на приёме нет — цепочка
-приёма его не использует; в ручках `/internal/v1/parse*` он остался.
+приёма его не использует; в синхронной ручке `/internal/v1/parse` он остался,
+из фоновой убран (см. «Изменения контракта 2026-09-22»).
 
 Один и тот же `s3_fileid` дважды в пакете — `422`: неясно, какую операцию по
 нему выполнять. Потолок размера пакета — `INTAKE_MAX_FILES`.
@@ -505,18 +506,24 @@ curl -X POST http://127.0.0.1:8000/internal/v1/parse \
 curl -X POST http://127.0.0.1:8000/internal/v1/parse/background \
   -H 'Content-Type: application/json' \
   -d '{
-    "request_id": "req-002",
-    "dialog_id": "background-dialog-001",
+    "request_id": "parser-request-123",
+    "event_id": "event-123",
     "operation": "create",
-    "s3_fileid": ["file-id-003"]
+    "s3_fileid": ["cluster-a/document.pdf"]
   }'
 ```
 
-`202 Accepted`, `status: queued`. `operation` принимает `create` или `update`;
-`update` переобрабатывает документ, даже если он уже проиндексирован.
+`202 Accepted`, `status: queued`, в ответе — тот же `event_id`. `operation`
+принимает `create` или `update`; `update` переобрабатывает документ, даже
+если он уже проиндексирован.
+
+`dialog_id` в фоновой ручке не передаётся и не проверяется: связь
+lifecycle-события, запроса Parser и результата держит `event_id`, и заменять
+его новым идентификатором нельзя. Пришедший `dialog_id` игнорируется.
 
 Тело принимается и в виде списка файлов со своими операциями — так присылает
-Quality Gate, и `dialog_id` в нём необязателен:
+Quality Gate, и `event_id` в нём необязателен: у цепочки приёма события
+жизненного цикла нет:
 
 ```json
 {
@@ -538,14 +545,64 @@ curl http://127.0.0.1:8000/internal/v1/parse/results/req-002
 ```
 
 `status`: `queued` → `processing` → `completed` (либо `partial`, если часть
-файлов не обработалась, либо `error`, если не обработался ни один).
-Результат хранится `RESULT_TTL_SECONDS` (по умолчанию сутки).
+файлов или страниц не обработалась, либо `error`, если не обработался ни
+один). Результат хранится `RESULT_TTL_SECONDS` (по умолчанию сутки).
+
+Envelope ответа — тот же, что уходит push-каналом в
+`POST /internal/v1/parser/results` на стороне RAG:
+
+```json
+{
+  "request_id": "parser-request-123",
+  "event_id": "event-123",
+  "operation": "create",
+  "status": "partial",
+  "documents": [
+    {
+      "s3_fileid": "cluster-a/document.pdf",
+      "status": "partial",
+      "content_hash": "sha256:...",
+      "normalized_content_hash": "sha256:...",
+      "mime_type": "application/pdf",
+      "pages": 18,
+      "processed_pages": [1, 2, 3, 4, 5, 6, 8, 9],
+      "failed_pages": [7],
+      "document_metadata": {"doc_id": "doc-...", "status": "indexed"},
+      "fragments": [],
+      "warnings": ["PAGE_NOT_PARSED: page 7"],
+      "error": null
+    }
+  ],
+  "error": null
+}
+```
+
+`normalized_content_hash` считается по нормализованному тексту: он отвечает
+на вопрос «изменился ли смысл», когда байты файла изменились, а текст — нет.
+
+Ошибка — объект, а не строка: по коду причины потребитель решает, повторять
+запрос или отправлять файл человеку.
+
+```json
+{
+  "error": {
+    "reason_code": "UNSUPPORTED_FORMAT",
+    "message": "Parser does not support this MIME type",
+    "retryable": false,
+    "attempt": 1
+  }
+}
+```
+
+Коды: `SOURCE_NOT_FOUND`, `SOURCE_READ_ERROR`, `UNSUPPORTED_FORMAT`,
+`OCR_FAILED`, `EXTRACTION_FAILED`, `TABLE_EXTRACTION_FAILED`,
+`PARSER_TIMEOUT`, `INTERNAL_ERROR`.
 
 ### Формат фрагмента
 
 ```json
 {
-  "fragment_id": "doc-001-frag-001",
+  "fragment_id": "doc-001:p001:text:6f2a1c9b40d7",
   "type": "text",
   "content": {
     "text": "Нормализованный текст",
@@ -560,7 +617,27 @@ curl http://127.0.0.1:8000/internal/v1/parse/results/req-002
   "section_title": null,
   "confidence": 0.97,
   "completeness": 1.0,
-  "provenance": {"method": "text_layer_extraction", "strategy_level": 2, "source": "vector_pdf"},
+  "provenance": {
+    "method": "text_layer_extraction",
+    "strategy_level": 2,
+    "source": "vector_pdf",
+    "source_file_id": "cluster-a/document.pdf",
+    "source_page": 1
+  },
+  "extracted_facts": [
+    {
+      "fact_id": "doc-001:p001:text:6f2a1c9b40d7:fact-1",
+      "fragment_id": "doc-001:p001:text:6f2a1c9b40d7",
+      "key": "document.parameter",
+      "label": "максимальная температура",
+      "value": {
+        "kind": "number", "raw": "80 °C", "number": 80,
+        "min": null, "max": null, "unit": "°C", "operator": "<="
+      },
+      "confidence": 0.98,
+      "provenance": null
+    }
+  ],
   "graph_nodes": [],
   "relations": []
 }
@@ -569,6 +646,21 @@ curl http://127.0.0.1:8000/internal/v1/parse/results/req-002
 Все поля присутствуют всегда, даже со значением `null`. `bbox` нормализован
 в диапазон `[0, 1]`. Поля доступа (`container`, `legal_entity`, `sensitivity`)
 Parser не формирует.
+
+**`fragment_id` стабилен.** Он считается от содержимого фрагмента — тип,
+страница, лист, текст, — а не от его номера по порядку. Повторный разбор
+того же файла даёт те же идентификаторы, и RAG обновляет фрагмент вместо
+того, чтобы завести дубль; появление нового фрагмента на первой странице не
+сдвигает идентификаторы на десятой.
+
+**`extracted_facts`** — явно извлечённые значения фрагмента: числа,
+диапазоны, даты, сроки, единицы измерения и обозначения. `value.kind`:
+`number`, `range`, `date`, `duration`, `text`, `boolean`, `identifier`,
+`enum`; `value.operator`: `=`, `<=`, `>=`, `<`, `>`, `range`. `value.raw`
+сохраняет исходную запись. Значение или единицу, которых нет в документе,
+Parser не выдумывает, и отбирать факты под конкретный вопрос — работа RAG.
+У факта из таблицы в `provenance` лежат координаты ячейки:
+`{"row": 0, "column": 1, "header": "Значение"}`.
 
 **Порядок фрагментов — порядок документа.** `position.order` сквозной по
 документу и расставлен по месту блока-источника: для таблицы, формулы,
@@ -986,7 +1078,8 @@ docker compose run --rm --user root celery_worker chown -R 1000:1000 /data/share
 | Модель не найдена | `docker compose logs model-downloader`, содержимое `./models` |
 | GPU недоступна | `nvidia-smi`, секция `deploy.resources` в compose |
 | Задачи не выполняются | `docker compose logs celery_worker`; очередь должна быть `ml_gpu` |
-| `status: error` в результатах | поле `error` в документе и логи воркера |
+| `status: error` в результатах | `error.reason_code` в документе и логи воркера; `retryable` говорит, есть ли смысл повторять |
+| `status: partial` в результатах | `failed_pages` и `warnings` документа: там видно, какие страницы не прочитались |
 | Пустые фрагменты у скана | установлен ли `tesseract-ocr-rus` в образе |
 | Чертёж не разобран | задан ли `QWEN_ENDPOINT`; `curl $QWEN_ENDPOINT/models` из воркера |
 | Модель отвечает не-JSON | лог воркера: там первые 200 символов ответа; проверьте, что поднята VL-модель |

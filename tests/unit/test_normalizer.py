@@ -24,7 +24,10 @@ class TestTextFragments:
 
         assert fragments
         fragment = fragments[0]
-        assert fragment.fragment_id == "doc-001-frag-001"
+        # Идентификатор считается от содержимого, а не от номера по порядку:
+        # он обязан пережить повторный разбор того же файла.
+        assert fragment.fragment_id.startswith("doc-001:p001:text:")
+        assert fragment.fragment_id == TextNormalizer().normalize(result, META)[0].fragment_id
         assert fragment.type == "text"
         assert fragment.content.text
         assert fragment.position.page == 1

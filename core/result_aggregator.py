@@ -7,7 +7,7 @@ JSON — дописал — записал обратно», результат�
 полю на файл: HSET атомарен, а число готовых документов — это HLEN.
 
 Ключи:
-    req:{request_id}:meta   строка JSON — dialog_id, операции, список файлов
+    req:{request_id}:meta   строка JSON — event_id/dialog_id, операции, файлы
     req:{request_id}:docs   hash   s3_fileid -> JSON документа
     req:{request_id}:start  строка — счётчик начатых задач
     req:{request_id}:pub    флаг «результат уже опубликован» (SET NX)
@@ -63,23 +63,29 @@ def _published_key(request_id: str) -> str:
 
 def init_request_state(
     request_id: str,
-    dialog_id: str,
     s3_fileids: List[str],
     operation: Optional[str] = None,
     ttl: Optional[int] = None,
     operations: Optional[Dict[str, str]] = None,
+    dialog_id: str = "",
+    event_id: str = "",
 ) -> Dict[str, Any]:
     """
     Создаёт запись о запросе. Возвращает мету.
 
     `operation` — общая операция пакета, если она одна на все файлы;
     `operations` — операция по каждому файлу, когда они разные.
+
+    `dialog_id` заполняется только синхронным разбором, `event_id` — только
+    фоновым: в фоне диалога нет, и подставлять туда `event_id` под именем
+    диалога, как делалось раньше, значит врать в обе стороны.
     """
     client = get_client()
     ttl = ttl or settings.RESULT_TTL_SECONDS
     meta = {
         "request_id": request_id,
         "dialog_id": dialog_id,
+        "event_id": event_id,
         "operation": operation,
         "operations": dict(operations or {}),
         "s3_fileids": list(s3_fileids),
@@ -161,8 +167,8 @@ def get_documents(request_id: str) -> Dict[str, Dict[str, Any]]:
 def get_request_state(request_id: str) -> Optional[Dict[str, Any]]:
     """
     Полное состояние запроса:
-    {request_id, dialog_id, operation, operations, total, processed,
-     status, documents}
+    {request_id, dialog_id, event_id, operation, operations, total,
+     processed, status, documents}
     """
     meta = get_meta(request_id)
     if meta is None:
@@ -181,6 +187,7 @@ def get_request_state(request_id: str) -> Optional[Dict[str, Any]]:
     return {
         "request_id": meta.get("request_id", request_id),
         "dialog_id": meta.get("dialog_id", ""),
+        "event_id": meta.get("event_id", ""),
         "operation": meta.get("operation"),
         "operations": meta.get("operations") or {},
         "total": total,
@@ -199,15 +206,22 @@ def compute_status(total: int, documents: List[Dict[str, Any]], started: bool) -
         return "processing"
 
     failed = sum(1 for d in documents if _is_failed(d))
-    if failed == 0:
-        return "completed"
     if failed == processed:
         return "error"
-    return "partial"
+    if failed or any(_is_partial(d) for d in documents):
+        return "partial"
+    return "completed"
 
 
 def _is_failed(document: Dict[str, Any]) -> bool:
     if document.get("error"):
         return True
+    if document.get("status") == "error":
+        return True
     metadata = document.get("document_metadata") or {}
     return metadata.get("status") == "error"
+
+
+def _is_partial(document: Dict[str, Any]) -> bool:
+    """Файл разобран не целиком: часть страниц не прочиталась."""
+    return bool(document.get("status") == "partial" or document.get("failed_pages"))

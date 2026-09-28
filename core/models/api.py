@@ -29,14 +29,20 @@ class BackgroundParseRequest(BaseModel):
     * `s3_fileid: [...]` плюс одна `operation` на весь пакет — прежний вид,
       оставлен ради совместимости.
 
-    `dialog_id` необязателен: в цепочке приёма его больше нет, а прямой
-    вызов RAG его по-прежнему передаёт и получает обратно.
+    `dialog_id` в фоновом контракте больше нет: связь lifecycle-события,
+    запроса Parser и результата держит `event_id`. Пришедший `dialog_id`
+    молча игнорируется (`extra="ignore"`) — старый вызов не ломается, но и
+    полем контракта он больше не является.
+
+    `event_id` приходит от Backend через RAG и не заменяется новым UUID.
+    Он необязателен: в цепочке приёма (Data Gateway -> Quality Gate ->
+    Parser) события жизненного цикла нет, и выдумывать его нечем.
     """
 
     model_config = ConfigDict(extra="ignore")
 
     request_id: str = Field(..., min_length=1)
-    dialog_id: str = ""
+    event_id: str = ""
     s3_fileid: List[str] = Field(default_factory=list)
     operation: Operation = "create"
     files: List[IntakeFile] = Field(default_factory=list)

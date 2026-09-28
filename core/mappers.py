@@ -3,7 +3,14 @@
 from typing import Any, Dict, Optional
 
 from core.db.models import ChunkDB, DocumentDB
-from core.models.contract import Content, DocumentMetadata, Fragment, Position, Provenance
+from core.models.contract import (
+    Content,
+    DocumentMetadata,
+    ExtractedFact,
+    Fragment,
+    Position,
+    Provenance,
+)
 
 
 def fragment_to_row(
@@ -21,6 +28,7 @@ def fragment_to_row(
         "confidence": float(fragment.confidence),
         "completeness": float(fragment.completeness),
         "provenance": fragment.provenance.model_dump(),
+        "extracted_facts": [f.model_dump(mode="json") for f in fragment.extracted_facts],
         "graph_nodes": [n.model_dump() for n in fragment.graph_nodes],
         "relations": [r.model_dump() for r in fragment.relations],
         "order_index": (position or {}).get("order"),
@@ -41,6 +49,9 @@ def row_to_fragment(row: ChunkDB) -> Fragment:
         provenance=Provenance(**(row.provenance or {
             "method": "unknown", "strategy_level": 1, "source": "unknown",
         })),
+        extracted_facts=[
+            ExtractedFact(**fact) for fact in (row.extracted_facts or [])
+        ],
         graph_nodes=row.graph_nodes or [],
         relations=row.relations or [],
     )

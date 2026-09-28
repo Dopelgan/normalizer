@@ -31,7 +31,7 @@ class ParserUser(HttpUser):
             "/internal/v1/parse/background",
             json={
                 "request_id": request_id,
-                "dialog_id": "load-test",
+                "event_id": f"event-{request_id}",
                 "operation": "create",
                 "s3_fileid": FILEIDS[:3],
             },

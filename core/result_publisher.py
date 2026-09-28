@@ -3,13 +3,15 @@
 import logging
 from typing import Union
 
-from core.models.contract import ParseResponse, ResultsResponse
+from core.models.contract import ParseResponse, ResultsResponse, SyncPendingResponse
 from core.result_delivery import ResultDeliveryError, get_delivery_provider
 
 logger = logging.getLogger(__name__)
 
 
-def publish_result(response: Union[ParseResponse, ResultsResponse, dict]) -> bool:
+def publish_result(
+    response: Union[ParseResponse, ResultsResponse, SyncPendingResponse, dict]
+) -> bool:
     """
     Отправляет результат push-каналом, если он включён.
     Ошибка доставки не считается ошибкой обработки: результат уже лежит в

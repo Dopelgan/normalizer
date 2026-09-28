@@ -89,8 +89,8 @@ class TestDocId:
 @pytest.mark.usefixtures("pipeline")
 class TestHappyPath:
     def test_document_and_fragments_persisted(self, task_db):
-        init_request_state("req-1", "dlg-1", ["file-1"])
-        result = process_document("req-1", "dlg-1", "file-1")
+        init_request_state("req-1", ["file-1"])
+        result = process_document("req-1", "file-1")
 
         assert result["status"] == "success"
         assert result["fragments"] >= 1
@@ -104,8 +104,8 @@ class TestHappyPath:
         session.close()
 
     def test_request_state_completed(self):
-        init_request_state("req-1", "dlg-1", ["file-1"])
-        process_document("req-1", "dlg-1", "file-1")
+        init_request_state("req-1", ["file-1"])
+        process_document("req-1", "file-1")
 
         state = get_request_state("req-1")
         assert state["status"] == "completed"
@@ -113,19 +113,29 @@ class TestHappyPath:
         assert state["documents"][0]["document_metadata"]["status"] == "indexed"
 
     def test_raw_parse_saved(self, temp_storage):
-        init_request_state("req-1", "dlg-1", ["file-1"])
-        result = process_document("req-1", "dlg-1", "file-1")
+        init_request_state("req-1", ["file-1"])
+        result = process_document("req-1", "file-1")
         assert temp_storage.exists(f"raw_parse/{result['doc_id']}.json")
 
     def test_fragments_validate_against_contract(self):
-        init_request_state("req-1", "dlg-1", ["file-1"])
-        process_document("req-1", "dlg-1", "file-1")
+        init_request_state("req-1", ["file-1"])
+        process_document("req-1", "file-1")
 
-        fragment = get_request_state("req-1")["documents"][0]["fragments"][0]
+        document = get_request_state("req-1")["documents"][0]
+        fragment = document["fragments"][0]
         assert set(fragment) == {
             "fragment_id", "type", "content", "position", "section_title",
-            "confidence", "completeness", "provenance", "graph_nodes", "relations",
+            "confidence", "completeness", "provenance", "extracted_facts",
+            "graph_nodes", "relations",
         }
+        # Поля контракта уровня документа приезжают вместе с фрагментами.
+        assert document["status"] == "completed"
+        assert document["mime_type"]
+        assert document["normalized_content_hash"].startswith("sha256:")
+        assert document["processed_pages"]
+        assert document["failed_pages"] == []
+        assert fragment["provenance"]["source_file_id"] == "file-1"
+        assert fragment["provenance"]["source_page"] == fragment["position"]["page"]
 
 
 class TestFlags:
@@ -176,10 +186,8 @@ class TestFlags:
 
         monkeypatch.setattr(tasks.DrawingProcessor, "enrich_fragments", insert_sheet)
 
-        init_request_state("req-flags", "dlg", ["file-flags"])
-        process_document(
-            request_id="req-flags", dialog_id="dlg", s3_fileid="file-flags"
-        )
+        init_request_state("req-flags", ["file-flags"])
+        process_document(request_id="req-flags", s3_fileid="file-flags")
 
         session = task_db()
         try:
@@ -206,12 +214,12 @@ class TestFlags:
 @pytest.mark.usefixtures("pipeline")
 class TestIdempotency:
     def test_second_create_reuses_stored_result(self, pipeline):
-        init_request_state("req-1", "dlg-1", ["file-1"])
-        process_document("req-1", "dlg-1", "file-1")
+        init_request_state("req-1", ["file-1"])
+        process_document("req-1", "file-1")
         assert len(pipeline.calls) == 1
 
-        init_request_state("req-2", "dlg-1", ["file-1"])
-        result = process_document("req-2", "dlg-1", "file-1")
+        init_request_state("req-2", ["file-1"])
+        result = process_document("req-2", "file-1")
 
         assert result["status"] == "already_processed"
         assert len(pipeline.calls) == 1        # повторного парсинга не было
@@ -219,21 +227,21 @@ class TestIdempotency:
         assert get_request_state("req-2")["documents"][0]["fragments"]
 
     def test_update_forces_reprocessing(self, pipeline):
-        init_request_state("req-1", "dlg-1", ["file-1"])
-        process_document("req-1", "dlg-1", "file-1")
+        init_request_state("req-1", ["file-1"])
+        process_document("req-1", "file-1")
 
-        init_request_state("req-2", "dlg-1", ["file-1"])
-        result = process_document("req-2", "dlg-1", "file-1", operation="update")
+        init_request_state("req-2", ["file-1"])
+        result = process_document("req-2", "file-1", operation="update")
 
         assert result["status"] == "success"
         assert len(pipeline.calls) == 2
 
     def test_reprocessing_does_not_duplicate_fragments(self, task_db):
-        init_request_state("req-1", "dlg-1", ["file-1"])
-        first = process_document("req-1", "dlg-1", "file-1")
+        init_request_state("req-1", ["file-1"])
+        first = process_document("req-1", "file-1")
 
-        init_request_state("req-2", "dlg-1", ["file-1"])
-        process_document("req-2", "dlg-1", "file-1", operation="update")
+        init_request_state("req-2", ["file-1"])
+        process_document("req-2", "file-1", operation="update")
 
         session = task_db()
         assert ChunkRepository(session).count_by_doc_id(first["doc_id"]) == first["fragments"]
@@ -250,13 +258,16 @@ class TestFailures:
             lambda self, fileid: (_ for _ in ()).throw(SourceFileNotFound("файл не найден")),
         )
 
-        init_request_state("req-1", "dlg-1", ["file-1"])
-        result = process_document("req-1", "dlg-1", "file-1")
+        init_request_state("req-1", ["file-1"])
+        result = process_document("req-1", "file-1")
 
         assert result["status"] == "error"
         state = get_request_state("req-1")
         assert state["status"] == "error"
-        assert "не найден" in state["documents"][0]["error"]
+        error = state["documents"][0]["error"]
+        assert "не найден" in error["message"]
+        assert error["reason_code"] == "SOURCE_NOT_FOUND"
+        assert error["retryable"] is False
         assert state["documents"][0]["document_metadata"]["status"] == "error"
 
     def test_parser_failure_marks_document_error(self, monkeypatch, temp_storage, task_db, fake_redis):
@@ -277,8 +288,8 @@ class TestFailures:
         # Без повторов — проверяем финальную ветку.
         monkeypatch.setattr(process_document, "max_retries", 0)
 
-        init_request_state("req-1", "dlg-1", ["file-1"])
-        result = process_document("req-1", "dlg-1", "file-1")
+        init_request_state("req-1", ["file-1"])
+        result = process_document("req-1", "file-1")
 
         assert result["status"] == "error"
         session = task_db()
@@ -294,26 +305,39 @@ class TestHelpers:
         payload = build_error_document("file-1", "doc-1", "documents/a.pdf", "боль")
         DocumentResult(**payload)
         assert payload["document_metadata"]["status"] == "error"
-        assert payload["error"] == "боль"
+        assert payload["status"] == "error"
+        assert payload["error"]["message"] == "боль"
+        assert payload["error"]["reason_code"] == "INTERNAL_ERROR"
+
+    def test_error_document_from_exception_carries_reason_code(self):
+        payload = build_error_document(
+            "file-1", "doc-1", "", SourceFileNotFound("файл не найден"), attempt=2
+        )
+        assert payload["error"] == {
+            "reason_code": "SOURCE_NOT_FOUND",
+            "message": "файл не найден",
+            "retryable": False,
+            "attempt": 2,
+        }
 
     def test_finalize_publishes_once_batch_is_complete(self, fake_redis, mocker):
         published = mocker.patch("ingest.tasks.publish_result")
-        init_request_state("req-1", "dlg-1", ["f1", "f2"])
+        init_request_state("req-1", ["f1", "f2"])
 
-        tasks.finalize("req-1", "dlg-1", "f1", build_error_document("f1", "d1", "", "x"))
+        tasks.finalize("req-1", "f1", build_error_document("f1", "d1", "", "x"))
         published.assert_not_called()
 
-        tasks.finalize("req-1", "dlg-1", "f2", build_error_document("f2", "d2", "", "x"))
+        tasks.finalize("req-1", "f2", build_error_document("f2", "d2", "", "x"))
         published.assert_called_once()
 
     def test_finalize_publishes_only_once_on_repeat(self, fake_redis, mocker):
         """acks_late допускает повтор задачи — подписчик не должен получить дубль."""
         published = mocker.patch("ingest.tasks.publish_result")
-        init_request_state("req-2", "dlg-1", ["f1"])
+        init_request_state("req-2", ["f1"])
 
         document = build_error_document("f1", "d1", "", "x")
-        tasks.finalize("req-2", "dlg-1", "f1", document)
-        tasks.finalize("req-2", "dlg-1", "f1", document)
-        tasks.finalize("req-2", "dlg-1", "f1", document)
+        tasks.finalize("req-2", "f1", document)
+        tasks.finalize("req-2", "f1", document)
+        tasks.finalize("req-2", "f1", document)
 
         published.assert_called_once()

@@ -12,6 +12,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.config import settings
+from core.contract_finalize import finalize_fragments
 from core.models.contract import (
     Content,
     DrawingField,
@@ -269,10 +270,7 @@ class TextNormalizer:
         fragments: List[Fragment] = []
         flags: List[Dict[str, Any]] = []
         degraded = bool(parse_result.degraded)
-        for index, (_block, fragment, flag) in enumerate(collected, start=1):
-            fragment.fragment_id = self.make_fragment_id(doc_id, index)
-            if fragment.position is not None:
-                fragment.position.order = index
+        for _block, fragment, flag in collected:
             # Признак остаётся служебным: набор ключей контракта
             # зафиксирован, и расширять его в одностороннем порядке нельзя.
             # Наружу деградация видна через честный `completeness`.
@@ -285,6 +283,14 @@ class TextNormalizer:
             )
             fragments.append(fragment)
             flags.append(flag)
+
+        # Стабильный `fragment_id`, порядок и поля происхождения — одним
+        # шагом и тем же кодом, что после обработки чертежей: двух разных
+        # способов выдавать идентификаторы быть не должно. Факты извлекаются
+        # позже — после того, как чертёжная ветка заменит свои фрагменты.
+        fragments, _ = finalize_fragments(
+            fragments, doc_id, str(metadata.get("s3_fileid") or ""), extract=False
+        )
 
         low = sum(1 for f in flags if f["needs_review"])
         if degraded:
@@ -301,10 +307,6 @@ class TextNormalizer:
         return fragments, flags
 
     # ------------------------------------------------------------ внутреннее
-    @staticmethod
-    def make_fragment_id(doc_id: str, index: int) -> str:
-        return f"{doc_id or 'doc'}-frag-{index:03d}"
-
     @staticmethod
     def _text_runs(blocks: List[ParsedBlock]) -> List[List[ParsedBlock]]:
         """

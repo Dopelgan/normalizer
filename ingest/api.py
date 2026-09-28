@@ -27,7 +27,9 @@ from core.models.contract import (
     BackgroundAcceptedResponse,
     DocumentResult,
     ParseResponse,
+    ParserError,
     ResultsResponse,
+    SyncPendingResponse,
 )
 from core.result_aggregator import get_request_state, init_request_state
 from core.workspace import configure_process_tempdir
@@ -53,16 +55,27 @@ ACTIVE_STATUSES = ("queued", "processing")
 # Вспомогательное
 # ===========================================================================
 
-def _dispatch(request_id: str, dialog_id: str, items: List[IntakeFile]) -> None:
-    """Ставит по задаче на каждый файл пакета — со своей операцией."""
+def _dispatch(
+    request_id: str,
+    items: List[IntakeFile],
+    dialog_id: str = "",
+    event_id: str = "",
+) -> None:
+    """
+    Ставит по задаче на каждый файл пакета — со своей операцией.
+
+    В фоне задача несёт `event_id` события жизненного цикла, в синхронном
+    разборе — `dialog_id`. Технического `dialog_id=event_id` больше нет.
+    """
     from ingest.tasks import process_document
 
     for item in items:
         task = process_document.delay(
             request_id=request_id,
-            dialog_id=dialog_id,
             s3_fileid=item.s3_fileid,
             operation=item.operation,
+            dialog_id=dialog_id,
+            event_id=event_id,
         )
         logger.info(
             "Задача %s поставлена для файла %s (%s)",
@@ -107,9 +120,12 @@ async def parse_sync(request: ParseRequest):
     items = [IntakeFile(s3_fileid=fileid) for fileid in request.s3_fileid]
     await asyncio.to_thread(
         init_request_state,
-        request.request_id, request.dialog_id, request.s3_fileid, "create",
+        request.request_id, request.s3_fileid, "create",
+        dialog_id=request.dialog_id,
     )
-    await asyncio.to_thread(_dispatch, request.request_id, request.dialog_id, items)
+    await asyncio.to_thread(
+        _dispatch, request.request_id, items, request.dialog_id, ""
+    )
 
     deadline = asyncio.get_event_loop().time() + settings.PROCESSING_TIMEOUT_SECONDS
     while True:
@@ -122,13 +138,18 @@ async def parse_sync(request: ParseRequest):
             )
         if asyncio.get_event_loop().time() >= deadline:
             logger.warning("Синхронный запрос %s не уложился в таймаут", request.request_id)
-            partial = ResultsResponse(
+            partial = SyncPendingResponse(
                 request_id=request.request_id,
                 dialog_id=request.dialog_id,
                 status="processing",
                 documents=_documents(state) if state else [],
-                error="Обработка не завершилась в отведённое время, "
-                      "результат доступен через /internal/v1/parse/results/{request_id}",
+                error=ParserError(
+                    reason_code="PARSER_TIMEOUT",
+                    message="Обработка не завершилась в отведённое время, "
+                            "результат доступен через "
+                            "/internal/v1/parse/results/{request_id}",
+                    retryable=True,
+                ),
             )
             return JSONResponse(status_code=504, content=partial.model_dump(mode="json"))
         await asyncio.sleep(SYNC_POLL_INTERVAL)
@@ -147,14 +168,16 @@ async def parse_background(request: BackgroundParseRequest):
 
     await asyncio.to_thread(
         init_request_state,
-        request.request_id, request.dialog_id,
-        [item.s3_fileid for item in items], common, operations=operations,
+        request.request_id, [item.s3_fileid for item in items], common,
+        operations=operations, event_id=request.event_id,
     )
-    await asyncio.to_thread(_dispatch, request.request_id, request.dialog_id, items)
+    await asyncio.to_thread(
+        _dispatch, request.request_id, items, "", request.event_id
+    )
 
     return BackgroundAcceptedResponse(
         request_id=request.request_id,
-        dialog_id=request.dialog_id,
+        event_id=request.event_id,
         operation=common,
         accepted=True,
         status="queued",
@@ -173,7 +196,7 @@ async def parse_results(request_id: str):
 
     return ResultsResponse(
         request_id=state["request_id"],
-        dialog_id=state["dialog_id"],
+        event_id=state.get("event_id", ""),
         operation=state.get("operation"),
         status=state["status"],
         documents=_documents(state),
@@ -181,14 +204,24 @@ async def parse_results(request_id: str):
     )
 
 
-def _first_error(state: Dict[str, Any]) -> str:
+def _first_error(state: Dict[str, Any]) -> ParserError:
+    """
+    Ошибка пакета — объект, а не строка: по коду причины потребитель
+    решает, повторять запрос или отправлять файл человеку.
+    """
     for raw in state.get("documents", []):
         if raw.get("error"):
-            return str(raw["error"])
+            return ParserError.coerce(raw["error"])
         metadata = raw.get("document_metadata") or {}
         if metadata.get("status") == "error":
-            return f"Документ {metadata.get('doc_id')} обработан с ошибкой"
-    return "Часть документов обработана с ошибкой"
+            return ParserError(
+                reason_code="INTERNAL_ERROR",
+                message=f"Документ {metadata.get('doc_id')} обработан с ошибкой",
+            )
+    return ParserError(
+        reason_code="EXTRACTION_FAILED",
+        message="Часть документов обработана не полностью",
+    )
 
 
 # ===========================================================================

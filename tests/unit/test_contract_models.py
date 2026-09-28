@@ -66,6 +66,7 @@ class TestFragment:
             "parsed_expression", "structured_drawing_fields", "structured_payload",
         }
         assert payload["content"]["table_data"] is None
+        assert payload["extracted_facts"] == []
         assert payload["graph_nodes"] == []
         assert payload["relations"] == []
 
@@ -121,10 +122,13 @@ class TestResponseShape:
         fragment = document["fragments"][0]
         assert set(fragment) == {
             "fragment_id", "type", "content", "position", "section_title",
-            "confidence", "completeness", "provenance", "graph_nodes", "relations",
+            "confidence", "completeness", "provenance", "extracted_facts",
+            "graph_nodes", "relations",
         }
         assert set(fragment["position"]) == {"page", "sheet", "bbox", "order"}
-        assert set(fragment["provenance"]) == {"method", "strategy_level", "source"}
+        assert set(fragment["provenance"]) == {
+            "method", "strategy_level", "source", "source_file_id", "source_page",
+        }
 
     def test_table_fragment(self):
         fragment = make_fragment(

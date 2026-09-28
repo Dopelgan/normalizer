@@ -54,7 +54,7 @@ class TestBackgroundFlow:
 
         accepted = requests.post(f"{API}/internal/v1/parse/background", json={
             "request_id": request_id,
-            "dialog_id": "integration",
+            "event_id": f"event-{request_id}",
             "operation": "create",
             "s3_fileid": [uploaded_file],
         }, timeout=30)
@@ -91,7 +91,7 @@ class TestBackgroundFlow:
         request_id = f"it-{uuid.uuid4().hex[:8]}"
 
         requests.post(f"{API}/internal/v1/parse/background", json={
-            "request_id": request_id, "dialog_id": "integration",
+            "request_id": request_id, "event_id": f"event-{request_id}",
             "s3_fileid": ["точно-нет-такого-файла"],
         }, timeout=30)
 
@@ -142,7 +142,7 @@ class TestIdempotency:
         for _ in range(2):
             request_id = f"it-{uuid.uuid4().hex[:8]}"
             requests.post(f"{API}/internal/v1/parse/background", json={
-                "request_id": request_id, "dialog_id": "integration",
+                "request_id": request_id, "event_id": f"event-{request_id}",
                 "s3_fileid": [uploaded_file],
             }, timeout=30)
 

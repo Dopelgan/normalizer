@@ -5,6 +5,10 @@
 `GET /internal/v1/parse/results/{request_id}`, поэтому доставка по умолчанию
 выключена (`RESULT_DELIVERY_TYPE=none`). Каналы ниже — для интеграций, где
 push всё-таки нужен: Redis Streams, HTTP callback, NATS JetStream.
+
+Отправляется тот же envelope, что отдаёт поллинг: в фоне — с `event_id` и
+без `dialog_id`. Для HTTP-канала `RESULT_CALLBACK_URL` указывает на ручку
+приёма результатов на стороне RAG (`POST /internal/v1/parser/results`).
 """
 
 import json
