@@ -141,4 +141,5 @@ class TestRoundTrip:
         assert result["mode"] == MODE_VISION_VLM
         assert result["payload"]["sheet_type"] == "assembly"
         assert 0 < result["avg_confidence"] <= 1
-        assert result["completeness"] == 1.0
+        assert result["structure_score"] == 1.0
+        assert result["completeness"] is None

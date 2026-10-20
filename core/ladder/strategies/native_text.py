@@ -110,25 +110,35 @@ class DocxStrategy(Strategy):
         blocks: List[ParsedBlock] = []
 
         section_title: Optional[str] = None
-        for paragraph in document.paragraphs:
-            text = " ".join(paragraph.text.split())
-            if not text:
-                continue
-            is_heading = (paragraph.style.name or "").lower().startswith("heading")
-            if is_heading:
-                section_title = text[:200]
-            blocks.append(ParsedBlock(
-                type="text", text=text, page=1, confidence=1.0,
-                section_title=section_title, method=self.method,
-            ))
+        sections = []
+        from docx.text.paragraph import Paragraph
 
-        for table in document.tables:
-            parsed = self._table(table)
-            if parsed:
+        # Порядок XML, а не сначала все абзацы, потом все таблицы:
+        # иначе таблица получает последний раздел всего документа.
+        for element in document.iter_inner_content():
+            if isinstance(element, Paragraph):
+                text = element.text
+                if not text.strip():
+                    continue
+                heading = re.match(r"(?:heading|заголовок)\s*(\d+)", element.style.name or "", re.I)
+                if heading:
+                    level = int(heading.group(1))
+                    section_title = text.strip()[:200]
+                    sections = [entry for entry in sections if entry[0] < level]
+                    sections.append((level, section_title))
                 blocks.append(ParsedBlock(
-                    type="table", table_data=parsed, page=1, confidence=1.0,
-                    section_title=section_title, method=self.method,
+                    type="text", text=text, page=1, confidence=1.0,
+                    order=len(blocks), section_title=section_title,
+                    section_path=[title for _, title in sections], method=self.method,
                 ))
+            else:
+                parsed = self._table(element)
+                if parsed:
+                    blocks.append(ParsedBlock(
+                        type="table", table_data=parsed, page=1, confidence=1.0,
+                        order=len(blocks), section_title=section_title,
+                        section_path=[title for _, title in sections], method=self.method,
+                    ))
 
         if not blocks:
             raise ValueError("DOCX не содержит текста")
@@ -139,7 +149,7 @@ class DocxStrategy(Strategy):
 
     @staticmethod
     def _table(table) -> Optional[dict]:
-        rows = [[" ".join(cell.text.split()) for cell in row.cells] for row in table.rows]
+        rows = [[cell.text for cell in row.cells] for row in table.rows]
         rows = [row for row in rows if any(cell for cell in row)]
         if not rows:
             return None
@@ -175,12 +185,14 @@ class PlainTextStrategy(Strategy):
         is_markdown = context.file_type == "md"
         blocks: List[ParsedBlock] = []
         section_title: Optional[str] = None
+        sections = []
 
         for kind, payload in self._segments(text, is_markdown):
             if kind == "table":
                 blocks.append(ParsedBlock(
                     type="table", page=1, confidence=1.0,
                     section_title=section_title, method=self.method,
+                    section_path=[title for _, title in sections],
                     table_data=payload,
                 ))
                 continue
@@ -192,9 +204,13 @@ class PlainTextStrategy(Strategy):
                 heading = self._heading(body)
                 if heading:
                     section_title = heading
+                    level = len(body.lstrip()) - len(body.lstrip().lstrip("#"))
+                    sections = [entry for entry in sections if entry[0] < level]
+                    sections.append((level, heading))
             blocks.append(ParsedBlock(
                 type="text", text=body.strip(), page=1, confidence=1.0,
                 section_title=section_title, method=self.method,
+                section_path=[title for _, title in sections],
             ))
 
         if not blocks:
@@ -215,6 +231,12 @@ class PlainTextStrategy(Strategy):
         buffer: List[str] = []
         index = 0
         while index < len(lines):
+            if re.match(r"^\s*#{1,6}\s+", lines[index]):
+                yield from cls._flush(buffer)
+                buffer = []
+                yield "text", lines[index]
+                index += 1
+                continue
             table, consumed = cls._read_table(lines, index)
             if table is not None:
                 yield from cls._flush(buffer)
@@ -260,8 +282,8 @@ class PlainTextStrategy(Strategy):
             # это опечатка разметки, а не другая таблица.
             if len(row) < len(header):
                 row = row + [""] * (len(header) - len(row))
-            elif len(row) > len(header):
-                row = row[:len(header)]
+            # Дополнительные ячейки сохраняются: опечатка Markdown не
+            # должна приводить к потере значений за пределами шапки.
             rows.append(row)
             index += 1
 

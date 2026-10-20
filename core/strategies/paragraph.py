@@ -107,6 +107,14 @@ class ParagraphChunkingStrategy(ChunkingStrategy):
                 merged
                 and len(item.text) < self.min_chunk_size
                 and merged[-1].page == item.page
+                and merged[-1].section_title == item.section_title
+                and len(merged[-1].text) + 1 + len(item.text) <= self.chunk_size
+                and merged[-1].blocks and item.blocks
+                and merged[-1].blocks[-1].sheet_name == item.blocks[0].sheet_name
+                and not self._far_apart(merged[-1].blocks[-1], item.blocks[0])
+                # Фрагменты с диапазонами могут перекрываться; повторная
+                # склейка добавила бы дубль текста и испортила смещения.
+                and merged[-1].start_char is None and item.start_char is None
             ):
                 host = merged[-1]
                 host.text = f"{host.text} {item.text}".strip()

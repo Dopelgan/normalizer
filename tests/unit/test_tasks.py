@@ -127,6 +127,8 @@ class TestHappyPath:
             "fragment_id", "type", "content", "position", "section_title",
             "confidence", "completeness", "provenance", "extracted_facts",
             "graph_nodes", "relations",
+            "section_path", "review_required", "warnings", "missing_regions",
+            "completeness_mechanisms", "structure_score",
         }
         # Поля контракта уровня документа приезжают вместе с фрагментами.
         assert document["status"] == "completed"
@@ -205,7 +207,8 @@ class TestFlags:
             by_type.setdefault(chunk_type, []).append(extra)
 
         # Вставленный лист не наследует чужих пометок.
-        assert by_type["drawing"] == [{}]
+        assert "is_fallback" not in by_type["drawing"][0]
+        assert by_type["drawing"][0]["contract_quality"]["completeness_unknown"] is True
         # А текст и таблица сохраняют свои.
         assert by_type["text"][0]["is_fallback"] is False
         assert by_type["table"][0]["is_fallback"] is True
@@ -246,6 +249,61 @@ class TestIdempotency:
         session = task_db()
         assert ChunkRepository(session).count_by_doc_id(first["doc_id"]) == first["fragments"]
         session.close()
+
+
+@pytest.mark.usefixtures("pipeline")
+class TestStructuralProfile:
+    def test_current_profile_and_source_coordinates_survive_cached_response(self):
+        from core.processing_contract import PROCESSING_PROFILE_VERSION
+        init_request_state("profile-first", ["file-profile"])
+        process_document("profile-first", "file-profile")
+        first = get_request_state("profile-first")["documents"][0]
+        init_request_state("profile-again", ["file-profile"])
+        result = process_document("profile-again", "file-profile")
+        again = get_request_state("profile-again")["documents"][0]
+        assert result["status"] == "already_processed"
+        assert again == first
+        assert first["processing_profile_version"] == PROCESSING_PROFILE_VERSION
+        assert first["schema_version"] == "2.0"
+        assert first["fragments"][0]["position"]["text_offsets_exact"]
+
+    def test_old_processing_profile_is_reprocessed(self, pipeline, task_db):
+        init_request_state("old-first", ["file-old"])
+        result = process_document("old-first", "file-old")
+        session = task_db()
+        with session.begin():
+            DocumentRepository(session).update_extra(result["doc_id"], {
+                "processing_profile_version": "legacy-chunking",
+            })
+        session.close()
+        init_request_state("old-again", ["file-old"])
+        assert process_document("old-again", "file-old")["status"] == "success"
+        assert len(pipeline.calls) == 2
+
+    def test_partial_drawing_quality_survives_cached_response(self, monkeypatch):
+        from core.models.contract import DrawingField
+
+        def add_drawing(self, fragments, metadata):
+            return fragments + [Fragment(
+                fragment_id="", type="drawing",
+                content=Content(structured_drawing_fields=[DrawingField(
+                    category="size", value="20", confidence=0.95,
+                )]),
+                position=Position(page=1), confidence=0.95, completeness=None,
+                provenance=Provenance(method="vision_plus_vlm", strategy_level=7, source="drawing"),
+            )]
+
+        monkeypatch.setattr(tasks.DrawingProcessor, "enrich_fragments", add_drawing)
+        init_request_state("partial-first", ["file-partial"])
+        process_document("partial-first", "file-partial")
+        first = get_request_state("partial-first")["documents"][0]
+        init_request_state("partial-again", ["file-partial"])
+        process_document("partial-again", "file-partial")
+        again = get_request_state("partial-again")["documents"][0]
+        assert first == again
+        assert first["status"] == "partial" and first["review_required"]
+        assert first["fragments"][-1]["completeness"] is None
+        assert first["fragments"][-1]["extracted_facts"][0]["confirmed"]
 
 
 class TestFailures:

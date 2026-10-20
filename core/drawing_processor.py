@@ -44,6 +44,7 @@ from core.providers import drawing_text, drawing_vision, raster_drawing, vector_
 from core.providers.qwen_client import CATEGORIES, QwenVisionClient
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.vector_drawing import structure_ratio
+from core.drawing_quality import apply_drawing_quality
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,8 @@ class DrawingProcessor:
 
         fields: List[Dict[str, Any]] = []
         payload: Dict[str, Any] = {"layout": layout.as_dict(), "tables": []}
+        payload["coordinate_reference"] = "deskewed_page"
+        missing_regions: List[Dict[str, Any]] = []
 
         reading = self.qwen.read_sheet(layout.image, hint=layout.hint())
         if reading is None:
@@ -126,12 +129,16 @@ class DrawingProcessor:
         for region in regions:
             if self._out_of_time(started):
                 skipped += 1
+                missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "time_budget"})
                 continue
             piece = drawing_vision.crop(layout.image, region.bbox)
             if region.kind == drawing_vision.KIND_TITLE_BLOCK:
-                regions_read += int(self._read_title_block(piece, region, fields, payload))
+                read = self._read_title_block(piece, region, fields, payload)
             else:
-                regions_read += int(self._read_table(piece, region, payload))
+                read = self._read_table(piece, region, payload)
+            regions_read += int(read)
+            if not read:
+                missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "region_not_read"})
         if skipped:
             logger.warning(
                 "На %d областей листа %s не хватило бюджета времени (%d с)",
@@ -153,10 +160,19 @@ class DrawingProcessor:
             "detected_count": len(fields),
             "parsed_fields": fields,
             "avg_confidence": round(confidence, 3),
-            # Полнота — доля полей, которым нашлась категория. Связей «размер
-            # — к какому элементу» ветка по-прежнему не строит, и полнотой
-            # это не считается.
-            "completeness": structure_ratio(fields),
+            # Покрытие найденных таблиц — независимый сигнал, но не
+            # доказательство чтения всех размеров/видов листа.
+            "completeness": None,
+            "structure_score": structure_ratio(fields),
+            "completeness_mechanisms": {
+                "geometry_regions": {
+                    "expected": len(regions), "read": regions_read,
+                    "coverage": regions_read / len(regions) if regions else None,
+                },
+                "whole_sheet": {"coverage": None, "reason": "not_independently_measured"},
+            },
+            "missing_regions": missing_regions,
+            "warnings": ["DRAWING_COMPLETENESS_UNKNOWN"],
             "mode": mode,
             "payload": payload,
         }
@@ -179,7 +195,7 @@ class DrawingProcessor:
             "detected_count": drawing_result.get("detected_count", 0),
             "recognition_mode": mode,
         })
-        return Fragment(
+        fragment = Fragment(
             fragment_id=source.fragment_id,
             type="drawing",
             content=Content(
@@ -187,14 +203,29 @@ class DrawingProcessor:
                 structured_drawing_fields=[DrawingField(**f) for f in fields],
                 structured_payload=payload,
             ),
-            position=source.position or Position(page=1, bbox=[0, 0, 1, 1]),
+            position=source.position.model_copy(deep=True) if source.position else Position(page=1, bbox=[0, 0, 1, 1]),
             section_title=source.section_title,
+            section_path=list(source.section_path),
             confidence=round(float(drawing_result.get("avg_confidence", 0.0)), 3),
-            completeness=round(float(drawing_result.get("completeness", 0.0)), 3),
-            provenance=Provenance(method=method, strategy_level=level, source="drawing"),
+            completeness=drawing_result.get("completeness"),
+            structure_score=drawing_result.get("structure_score"),
+            completeness_mechanisms=drawing_result.get("completeness_mechanisms") or {},
+            missing_regions=[
+                {**region, "page": source.position.page if source.position else 0,
+                 "sheet": source.position.sheet if source.position else None}
+                for region in drawing_result.get("missing_regions") or []
+            ],
+            warnings=list(dict.fromkeys(source.warnings + list(drawing_result.get("warnings") or []))),
+            provenance=Provenance(method=method, strategy_level=level, source="drawing",
+                                  source_unit_id=source.provenance.source_unit_id),
             graph_nodes=list(source.graph_nodes),
             relations=list(source.relations),
         )
+        if fragment.position:
+            fragment.position.bbox_exact = False
+            fragment.position.page_start = fragment.position.page_end = fragment.position.page
+        apply_drawing_quality(fragment)
+        return fragment
 
     def enrich_fragments(
         self, fragments: List[Fragment], metadata: Dict[str, Any]
@@ -222,11 +253,18 @@ class DrawingProcessor:
                 logger.error("Обработка чертежа %s не удалась: %s",
                              fragment.content.image_ref, exc)
                 enriched = None
+            if enriched is None and self._source_is_raster_drawing(metadata):
+                fragment.review_required = True
+                fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
             result.append(enriched or fragment)
 
         sheet = self._sheet_drawing(result, metadata)
         if sheet is not None:
             result.insert(0, sheet)
+        elif not any(f.type == "drawing" for f in result) and self._source_is_raster_drawing(metadata):
+            for fragment in result:
+                fragment.review_required = True
+                fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
         return result
 
     # -------------------------------------------------- лист-картинка целиком
@@ -466,7 +504,11 @@ def _empty(mode: str) -> Dict[str, Any]:
         "detected_count": 0,
         "parsed_fields": [],
         "avg_confidence": 0.0,
-        "completeness": 0.0,
+        "completeness": None,
+        "structure_score": 0.0,
+        "missing_regions": [],
+        "warnings": ["DRAWING_NOT_RECOGNIZED"],
+        "completeness_mechanisms": {},
         "mode": mode,
         "payload": {},
     }

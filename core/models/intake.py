@@ -1,11 +1,18 @@
 """Модели ручек приёма: Data Gateway и Quality Gate."""
 
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
 from core.config import settings
 from core.models.contract import Operation
+
+
+S3_FILEID_MAX_LENGTH = 2048
+S3FileId = Annotated[
+    str,
+    Field(min_length=1, max_length=S3_FILEID_MAX_LENGTH),
+]
 
 
 class IntakeFile(BaseModel):
@@ -17,7 +24,7 @@ class IntakeFile(BaseModel):
     сразу значит либо переразбирать лишнее, либо не переразобрать нужное.
     """
 
-    s3_fileid: str = Field(..., min_length=1, max_length=256)
+    s3_fileid: S3FileId
     operation: Operation = "create"
 
 

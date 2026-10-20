@@ -19,7 +19,7 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 FragmentType = Literal["text", "table", "formula", "drawing", "image", "structured"]
 DocumentStatus = Literal["pending", "indexed", "error"]
@@ -92,6 +92,22 @@ class ParserError(BaseModel):
 # Вложенные структуры фрагмента
 # ===========================================================================
 
+class SourceSpan(BaseModel):
+    """[char_start, char_end) в Unicode code points исходного блока."""
+
+    source_unit_id: str = Field(min_length=1)
+    page: int = Field(ge=0)
+    sheet: Optional[str] = None
+    char_start: int = Field(ge=0)
+    char_end: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _ordered(self):
+        if self.char_end < self.char_start:
+            raise ValueError("char_end меньше char_start")
+        return self
+
+
 class Position(BaseModel):
     """Положение фрагмента в исходном документе."""
 
@@ -99,6 +115,20 @@ class Position(BaseModel):
     sheet: Optional[str] = None
     bbox: List[float] = Field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])
     order: Optional[int] = None
+    page_start: Optional[int] = Field(None, ge=0)
+    page_end: Optional[int] = Field(None, ge=0)
+    source_spans: List[SourceSpan] = Field(default_factory=list)
+    offset_reference: Literal["extracted_block_unicode_codepoints_v1"] = "extracted_block_unicode_codepoints_v1"
+    text_offsets_exact: bool = False
+    bbox_exact: bool = False
+
+    @model_validator(mode="after")
+    def _check_range(self):
+        if (self.page_start is None) != (self.page_end is None):
+            raise ValueError("Нужны обе границы страниц")
+        if self.page_start is not None and self.page_end < self.page_start:
+            raise ValueError("page_end меньше page_start")
+        return self
 
     @field_validator("bbox")
     @classmethod
@@ -133,6 +163,8 @@ class Provenance(BaseModel):
     source: str          # vector_pdf | scanned_pdf | document_parser | drawing | ...
     source_file_id: Optional[str] = None
     source_page: Optional[int] = None
+    source_unit_id: Optional[str] = None
+    processing_profile_version: Optional[str] = None
 
 
 class GraphNode(BaseModel):
@@ -148,9 +180,22 @@ class Relation(BaseModel):
 
 
 class TableData(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     headers: List[str] = Field(default_factory=list)
     rows: List[List[Any]] = Field(default_factory=list)
     total_row: Optional[Dict[str, Any]] = None
+    table_id: Optional[str] = None
+    row_start: int = Field(0, ge=0)
+    row_end: Optional[int] = Field(None, ge=0)
+
+    @model_validator(mode="after")
+    def _row_range(self):
+        if self.row_end is None:
+            self.row_end = self.row_start + len(self.rows)
+        if self.row_end != self.row_start + len(self.rows):
+            raise ValueError("Диапазон строк не соответствует переданной таблице")
+        return self
 
 
 class FormulaData(BaseModel):
@@ -171,6 +216,7 @@ class DrawingField(BaseModel):
     # «мм» по умолчанию нельзя: так помечался и текст, у которого единицы нет.
     unit: str = ""
     confidence: float = Field(0.0, ge=0, le=1)
+    confirmed: bool = False
     bbox: List[float] = Field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])
     source_of_tolerance: Literal[
         "explicit", "general_tolerance_table", "fit_notation", "unknown"
@@ -246,6 +292,7 @@ class ExtractedFact(BaseModel):
     label: str = ""
     value: FactValue
     confidence: float = Field(1.0, ge=0, le=1)
+    confirmed: Optional[bool] = None
     # Координаты внутри фрагмента: для таблиц — {row, column, header}.
     # Без них факт из таблицы нельзя показать в исходной ячейке.
     provenance: Optional[Dict[str, Any]] = None
@@ -262,11 +309,17 @@ class Fragment(BaseModel):
     position: Optional[Position] = None
     section_title: Optional[str] = None
     confidence: float = Field(..., ge=0, le=1)
-    completeness: float = Field(..., ge=0, le=1)
+    completeness: Optional[float] = Field(..., ge=0, le=1)
     provenance: Provenance
     extracted_facts: List[ExtractedFact] = Field(default_factory=list)
     graph_nodes: List[GraphNode] = Field(default_factory=list)
     relations: List[Relation] = Field(default_factory=list)
+    section_path: List[str] = Field(default_factory=list)
+    review_required: bool = False
+    warnings: List[str] = Field(default_factory=list)
+    missing_regions: List[Dict[str, Any]] = Field(default_factory=list)
+    completeness_mechanisms: Dict[str, Any] = Field(default_factory=dict)
+    structure_score: Optional[float] = Field(None, ge=0, le=1)
 
 
 class DocumentMetadata(BaseModel):
@@ -304,6 +357,9 @@ class DocumentResult(BaseModel):
     document_metadata: DocumentMetadata
     fragments: List[Fragment] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
+    schema_version: Literal["2.0"] = "2.0"
+    processing_profile_version: Optional[str] = None
+    review_required: bool = False
     error: Optional[ParserError] = None
 
     @field_validator("error", mode="before")

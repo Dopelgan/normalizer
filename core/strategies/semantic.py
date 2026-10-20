@@ -63,7 +63,10 @@ class SemanticChunkingStrategy(ChunkingStrategy):
                 continue
 
             header = self.is_header(block)
-            page_changed = bool(buffer) and block.page != buffer[-1].page
+            page_changed = bool(buffer) and (
+                block.page != buffer[-1].page
+                or block.sheet_name != buffer[-1].sheet_name
+            )
             overflow = bool(buffer) and buffer_len + len(text) > self.chunk_size
 
             if buffer and (header or page_changed or overflow):
@@ -72,6 +75,19 @@ class SemanticChunkingStrategy(ChunkingStrategy):
 
             if header:
                 section = block.section_title or text[:200]
+
+            if len(text) > self.chunk_size:
+                for start, end in self.split_positions(text, self.chunk_size, self.overlap):
+                    piece = text[start:end].strip()
+                    if not piece:
+                        continue
+                    item = self._item(piece, [block], order, section_title=section)
+                    # Смещения пока относятся к обрезанному тексту блока:
+                    # изменение публичной системы координат требует схемы API.
+                    item.start_char, item.end_char = start, end
+                    items.append(item)
+                    order += 1
+                continue
 
             buffer.append(block)
             buffer_len += len(text) + 1

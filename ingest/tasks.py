@@ -22,6 +22,8 @@ from celery.exceptions import SoftTimeLimitExceeded
 from core import filetypes, telemetry
 from core.celery_app import app
 from core.config import settings
+from core.processing_contract import PROCESSING_PROFILE_VERSION
+from core.drawing_quality import document_quality
 from core.contract_finalize import finalize_fragments, normalized_content_hash
 from core.db.session import SessionLocal
 from core.drawing_processor import DrawingProcessor
@@ -130,6 +132,7 @@ def build_error_document(
     return DocumentResult(
         s3_fileid=s3_fileid,
         status="error",
+        processing_profile_version=PROCESSING_PROFILE_VERSION,
         document_metadata=DocumentMetadata(
             doc_id=doc_id,
             language=settings.DEFAULT_LANGUAGE,
@@ -192,6 +195,8 @@ def build_document_result(
         document_metadata=document_to_metadata(document),
         fragments=fragments,
         warnings=list(extra.get("warnings") or []),
+        processing_profile_version=extra.get("processing_profile_version"),
+        review_required=bool(extra.get("review_required", False)),
     ).model_dump(mode="json")
 
 
@@ -308,7 +313,8 @@ def process_document(
             doc_repo = DocumentRepository(session)
             document = doc_repo.get(doc_id, for_update=True)
 
-            if document is not None and document.status == "indexed" and operation != "update":
+            if (document is not None and document.status == "indexed" and operation != "update"
+                    and (document.extra_data or {}).get("processing_profile_version") == PROCESSING_PROFILE_VERSION):
                 logger.info("Документ %s уже проиндексирован, отдаём из БД", doc_id)
                 fragments = [row_to_fragment(r) for r in ChunkRepository(session).get_by_doc_id(doc_id)]
                 cached = build_document_result(
@@ -395,7 +401,13 @@ def process_document(
 
         report = page_report(parse_result)
         warnings = build_warnings(parse_result, report["failed_pages"])
-        document_status = "partial" if report["failed_pages"] else "completed"
+        review_required, drawing_warnings = document_quality(fragments)
+        if (metadata["classification"].get("genre") == "drawing"
+                and not any(f.type == "drawing" for f in fragments)):
+            review_required = True
+            drawing_warnings.append("DRAWING_NOT_RECOGNIZED")
+        warnings = list(dict.fromkeys(warnings + drawing_warnings))
+        document_status = "partial" if report["failed_pages"] or review_required else "completed"
         mime_type = filetypes.mime_for(located.file_type)
         normalized_hash = normalized_content_hash(fragments)
 
@@ -427,13 +439,15 @@ def process_document(
                 "processed_pages": report["processed_pages"],
                 "failed_pages": report["failed_pages"],
                 "warnings": warnings,
+                "processing_profile_version": PROCESSING_PROFILE_VERSION,
+                "review_required": review_required,
                 "normalized_content_hash": normalized_hash,
                 "parsed_pages_count": parse_result.page_count or len(parse_result.pages()),
                 "total_fragments": len(fragments),
                 "parser": parse_result.parser_name,
                 "source_kind": parse_result.source_kind,
                 "is_fallback": parse_result.is_fallback,
-                "needs_review": sum(1 for f in flags if f.get("needs_review")),
+                "needs_review": sum(1 for f in fragments if f.review_required),
                 "raw_parse_uri": raw_uri,
                 "last_operation": operation,
                 # Как выбирался уровень — рядом с документом, а не только в
@@ -475,6 +489,8 @@ def process_document(
             document_metadata=doc_metadata,
             fragments=fragments,
             warnings=warnings,
+            processing_profile_version=PROCESSING_PROFILE_VERSION,
+            review_required=review_required,
         ).model_dump(mode="json")
         finalize(request_id, s3_fileid, result, dialog_id, event_id)
 

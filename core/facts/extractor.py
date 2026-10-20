@@ -406,7 +406,8 @@ def facts_from_drawing_fields(fields, fragment_id: str) -> List[ExtractedFact]:
             key=f"drawing.{category}",
             label=category,
             value=value,
-            confidence=round(float(getattr(field, "confidence", 0.0) or 0.0), 3),
+            confidence=float(getattr(field, "confidence", 0.0) or 0.0),
+            confirmed=bool(getattr(field, "confirmed", False)),
             provenance={
                 "nature": getattr(field, "nature", None),
                 "source_of_tolerance": getattr(field, "source_of_tolerance", None),

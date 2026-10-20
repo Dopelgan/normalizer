@@ -222,6 +222,9 @@ class Settings(BaseSettings):
     CONFIDENCE_THRESHOLD: float = 0.6
     PROCESSING_TIMEOUT_SECONDS: int = 900
     DEFAULT_LANGUAGE: str = "ru"
+    # Лимит ресурсов, а не усечение результата: при превышении файл
+    # завершается явной ошибкой вместо успешной выдачи неполной таблицы.
+    SPREADSHEET_MAX_CELLS: int = 5_000_000
 
     # ----------------------------------------------------------------- Celery
     CELERY_TASK_TIME_LIMIT: int = 600

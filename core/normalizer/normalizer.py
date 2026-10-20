@@ -1,9 +1,9 @@
 """
 Нормализатор: ParseResult -> список фрагментов контракта.
 
-Принимает результат парсинга и метаданные документа, применяет стратегию
-нарезки к текстовым блокам и превращает таблицы, формулы и изображения в
-отдельные фрагменты. Заполняет все поля контракта, включая честные
+Принимает результат парсинга и метаданные документа, сохраняет исходные
+структурные блоки и превращает таблицы, формулы и изображения в отдельные
+фрагменты. Финальную нарезку выполняет RAG. Заполняет поля контракта, включая
 `confidence`, `completeness` и `provenance`.
 """
 
@@ -30,7 +30,8 @@ from core.normalizer.completeness import (
     table_completeness,
 )
 from core.providers.vector_drawing import structure_ratio
-from core.strategies.factory import StrategySelector
+from core.providers.chunking_strategy import ChunkItem
+from core.source_contract import attach_source, source_unit_ids
 
 logger = logging.getLogger(__name__)
 
@@ -100,13 +101,18 @@ class TextNormalizer:
         collected: List[Tuple[ParsedBlock, Fragment, Dict[str, Any]]] = []
 
         # ------------------------------------------------------------- текст
-        # Нарезке отдаются не все текстовые блоки разом, а цепочками подряд
-        # идущих в документе. Иначе она склеивает абзацы, между которыми в
-        # документе стояла таблица: склейка встаёт на место своего первого
-        # блока, таблица уезжает за неё, и порядок документа ломается.
-        strategy = self._strategy_override or StrategySelector.build(meta)
+        # Блоки сохраняют порядок и границы; в явном legacy override
+        # цепочки дополнительно защищают порядок вокруг нетекстовых блоков.
+        # Финальную токеновую нарезку делает RAG. Явный strategy override
+        # оставлен для совместимости локальных инструментов и тестов.
+        strategy = self._strategy_override
         for run in self._text_runs(parse_result.blocks):
-            for item in strategy.chunk(run, meta):
+            items = strategy.chunk(run, meta) if strategy else [
+                ChunkItem(text=block.text, page=block.page, bbox=block.bbox,
+                          order=block.order or 0, section_title=block.section_title,
+                          blocks=[block]) for block in run
+            ]
+            for item in items:
                 # Короткие строки не выбрасываются: в технической документации
                 # `POST /cart/add`, `race condition` или `Go:` — это и есть
                 # содержание, а не мусор. Отбрасываем только пустое.
@@ -145,12 +151,9 @@ class TextNormalizer:
                 fragment_id="",
                 type="table",
                 content=Content(
-                    table_data=TableData(
-                        headers=[str(h) for h in table_data.get("headers", [])],
-                        rows=table_data.get("rows", []),
-                        total_row=table_data.get("total_row"),
-                    ) if table_data else None,
+                    table_data=TableData(**table_data) if table_data else None,
                     image_ref=block.image_ref,
+                    structured_payload={"table_html": block.table_html} if block.table_html else None,
                 ),
                 position=Position(
                     page=block.page, sheet=block.sheet_name or sheet,
@@ -214,9 +217,11 @@ class TextNormalizer:
                 ),
                 section_title=block.section_title or metadata.get("section_title"),
                 confidence=round(sum(confidences) / len(confidences), 3) if confidences else 0.0,
-                # Полнота разбора — доля полей с определённой категорией.
-                # Текст при этом взят из файла целиком и не потерян.
-                completeness=structure_ratio(block.drawing_fields),
+                # Полнота листа неизвестна без независимого измерения.
+                completeness=block.drawing_completeness if block.completeness_mechanisms else None,
+                structure_score=structure_ratio(block.drawing_fields),
+                completeness_mechanisms=block.completeness_mechanisms,
+                missing_regions=block.missing_regions,
                 provenance=self._provenance(
                     "drawing", parse_result, block.is_fallback, block.method
                 ),
@@ -270,17 +275,25 @@ class TextNormalizer:
         fragments: List[Fragment] = []
         flags: List[Dict[str, Any]] = []
         degraded = bool(parse_result.degraded)
+        unit_ids = source_unit_ids(parse_result.blocks, doc_id)
         for _block, fragment, flag in collected:
-            # Признак остаётся служебным: набор ключей контракта
-            # зафиксирован, и расширять его в одностороннем порядке нельзя.
-            # Наружу деградация видна через честный `completeness`.
+            attach_source(fragment, _block, unit_ids[id(_block)], exact_text=(
+                strategy is None and fragment.type in ("text", "formula")
+                and fragment.content.text == _block.text
+            ))
+            if strategy is not None and fragment.position:
+                fragment.position.bbox_exact = False
+            # Старый needs_review остаётся служебным; согласованный публичный
+            # review_required передаётся отдельно и сохраняется в JSON.
             # Деградация разбора — повод на проверку независимо от полноты.
             # Победивший фоллбэк и недоступный MinerU дают внешне приличные
             # цифры: у OCR-страницы полнота 0.72 при пороге 0.5, и документ,
             # в котором формулы превратились в кашу, выглядел нормальным.
             flag["needs_review"] = (
-                fragment.completeness < self.completeness_threshold or degraded
+                fragment.completeness is None
+                or fragment.completeness < self.completeness_threshold or degraded
             )
+            fragment.review_required = flag["needs_review"]
             fragments.append(fragment)
             flags.append(flag)
 

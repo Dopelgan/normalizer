@@ -145,11 +145,15 @@ class TestSheetReadingFields:
         processor.qwen.reading = reading({"category": "size", "value": "20"})
         assert processor.process(SHEET_URI, {})["parsed_fields"][0]["bbox"] == [0, 0, 1, 1]
 
-    def test_completeness_is_the_share_of_classified_fields(self, processor):
+    def test_structure_score_does_not_claim_whole_sheet_completeness(self, processor):
         processor.qwen.reading = reading(
             annotation("size", "20"), annotation("note", "Технические требования"),
         )
-        assert processor.process(SHEET_URI, {})["completeness"] == pytest.approx(0.5)
+        result = processor.process(SHEET_URI, {})
+        assert result["structure_score"] == pytest.approx(0.5)
+        assert result["completeness"] is None
+        assert result["missing_regions"]
+        assert result["completeness_mechanisms"]["whole_sheet"]["coverage"] is None
 
 
 class TestRegions:

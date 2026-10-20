@@ -74,6 +74,7 @@ class TestProcessor:
         assert set(result) == {
             "detected_count", "parsed_fields", "avg_confidence",
             "completeness", "mode", "payload",
+            "structure_score", "missing_regions", "warnings", "completeness_mechanisms",
         }
         assert result["mode"] in (MODE_VISION_VLM, MODE_SHEET_ONLY, "none")
         for field in result["parsed_fields"]:

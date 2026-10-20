@@ -5,7 +5,7 @@ from typing import List
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core.models.contract import Operation
-from core.models.intake import IntakeFile
+from core.models.intake import IntakeFile, S3FileId
 
 
 class ParseRequest(BaseModel):
@@ -15,7 +15,7 @@ class ParseRequest(BaseModel):
 
     request_id: str = Field(..., min_length=1)
     dialog_id: str = Field(..., min_length=1)
-    s3_fileid: List[str] = Field(..., min_length=1)
+    s3_fileid: List[S3FileId] = Field(..., min_length=1)
 
 
 class BackgroundParseRequest(BaseModel):
@@ -43,7 +43,7 @@ class BackgroundParseRequest(BaseModel):
 
     request_id: str = Field(..., min_length=1)
     event_id: str = ""
-    s3_fileid: List[str] = Field(default_factory=list)
+    s3_fileid: List[S3FileId] = Field(default_factory=list)
     operation: Operation = "create"
     files: List[IntakeFile] = Field(default_factory=list)
 

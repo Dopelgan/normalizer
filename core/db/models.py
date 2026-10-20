@@ -27,8 +27,8 @@ class DocumentDB(Base):
     __tablename__ = "documents"
 
     id = Column(String(64), primary_key=True)              # стабильный doc_id
-    s3_fileid = Column(String(256), nullable=True, index=True)
-    source_path = Column(String(1024), nullable=False)     # URI файла (трассировка)
+    s3_fileid = Column(String(2048), nullable=True)
+    source_path = Column(String(4096), nullable=False)     # URI файла (трассировка)
     doc_version = Column(String(50), nullable=True)
     language = Column(String(10), nullable=False, default="ru")
     title = Column(String(256), nullable=True)
@@ -41,6 +41,10 @@ class DocumentDB(Base):
     chunks = relationship("ChunkDB", back_populates="document", cascade="all, delete-orphan")
 
     __table_args__ = (
+        # Длинный идентификатор может превысить предел ключа B-tree в
+        # PostgreSQL. Поиск здесь только по равенству, поэтому hash-индекс
+        # сохраняет быстрый lookup для всех допустимых 2048 символов.
+        Index("ix_documents_s3_fileid", "s3_fileid", postgresql_using="hash"),
         Index("idx_documents_status", "status"),
         Index("idx_documents_file_hash", "file_hash"),
     )
@@ -102,8 +106,8 @@ class IntakeDecisionDB(Base):
     __tablename__ = "intake_decisions"
 
     id = Column(String(80), primary_key=True)          # стабильный по s3_fileid и этапу
-    s3_fileid = Column(String(256), nullable=False)
-    source_path = Column(String(1024), nullable=True)
+    s3_fileid = Column(String(2048), nullable=False)
+    source_path = Column(String(4096), nullable=True)
     stage = Column(String(20), nullable=False)         # data_gateway | quality_gate
     layer = Column(String(10), nullable=True)          # G-1..G-4, QG-1..QG-5
     outcome = Column(String(20), nullable=False)       # accept|quarantine|reject
@@ -124,7 +128,7 @@ class IntakeDecisionDB(Base):
     # 0002_intake_decisions: иначе create_all() и alembic создают одно и то
     # же под разными именами, и следующий upgrade падает.
     __table_args__ = (
-        Index("idx_intake_fileid", "s3_fileid"),
+        Index("idx_intake_fileid", "s3_fileid", postgresql_using="hash"),
         Index("idx_intake_hash", "file_hash"),
         Index("idx_intake_outcome", "outcome"),
         Index("idx_intake_stage_created", "stage", "created_at"),

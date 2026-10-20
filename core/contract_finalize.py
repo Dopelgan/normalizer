@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.facts.extractor import extract_facts
 from core.models.contract import Fragment
+from core.processing_contract import PROCESSING_PROFILE_VERSION
+from core.drawing_quality import apply_drawing_quality
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +35,19 @@ def _content_signature(fragment: Fragment) -> str:
     content = fragment.content
     if fragment.type == "table" and content.table_data is not None:
         return json.dumps(
-            content.table_data.model_dump(), ensure_ascii=False, sort_keys=True,
+            content.table_data.model_dump(exclude={"table_id", "row_start", "row_end"}), ensure_ascii=False, sort_keys=True,
             default=str,
         )
     if fragment.type == "drawing":
         fields = content.structured_drawing_fields or []
         parts = [f"{f.category}={f.value}" for f in fields]
-        return f"{content.image_ref or ''}|" + "|".join(parts)
+        tables = [
+            {key: table.get(key) for key in ("kind", "title", "headers", "rows", "total_row")}
+            for table in (content.structured_payload or {}).get("tables", [])
+        ]
+        return f"{content.image_ref or ''}|" + "|".join(parts) + json.dumps(
+            tables, ensure_ascii=False, sort_keys=True, default=str,
+        )
     if fragment.type == "image":
         return content.image_ref or ""
     if content.text:
@@ -57,7 +65,8 @@ def stable_fragment_id(doc_id: str, fragment: Fragment) -> str:
     position = fragment.position
     page = position.page if position else 0
     sheet = (position.sheet if position else None) or ""
-    payload = f"{fragment.type}|{page}|{sheet}|{_content_signature(fragment)}"
+    source_unit = fragment.provenance.source_unit_id or ""
+    payload = f"{fragment.type}|{page}|{sheet}|{source_unit}|{_content_signature(fragment)}"
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:_DIGEST_LENGTH]
     return f"{doc_id or 'doc'}:p{page:03d}:{fragment.type}:{digest}"
 
@@ -77,6 +86,14 @@ def finalize_fragments(
     seen: Dict[str, int] = {}
 
     for order, fragment in enumerate(fragments, start=1):
+        if fragment.type == "drawing":
+            apply_drawing_quality(fragment)
+        if fragment.provenance.source_unit_id is None:
+            # До вычисления fragment_id, чтобы повторная финализация была
+            # идемпотентной, в том числе для производных drawing-фрагментов.
+            fragment.provenance.source_unit_id = "unit-" + hashlib.sha256(
+                stable_fragment_id(doc_id, fragment).encode("utf-8")
+            ).hexdigest()[:24]
         previous = fragment.fragment_id
         fragment_id = stable_fragment_id(doc_id, fragment)
         # Два одинаковых по содержимому фрагмента на одной странице —
@@ -96,6 +113,11 @@ def finalize_fragments(
             fragment.provenance.source_page = fragment.position.page
         if s3_fileid:
             fragment.provenance.source_file_id = s3_fileid
+        fragment.provenance.processing_profile_version = PROCESSING_PROFILE_VERSION
+        for index, table in enumerate((fragment.content.structured_payload or {}).get("tables", [])):
+            table.setdefault("table_id", f"{fragment.provenance.source_unit_id}:table-{index + 1}")
+            table.setdefault("row_start", 0)
+            table.setdefault("row_end", len(table.get("rows") or []))
 
         if extract:
             try:

@@ -81,9 +81,11 @@ class TestBackgroundFlow:
         assert set(fragment) == {
             "fragment_id", "type", "content", "position", "section_title",
             "confidence", "completeness", "provenance", "graph_nodes", "relations",
+            "extracted_facts", "section_path", "review_required", "warnings",
+            "missing_regions", "completeness_mechanisms", "structure_score",
         }
         assert 0 <= fragment["confidence"] <= 1
-        assert 0 <= fragment["completeness"] <= 1
+        assert fragment["completeness"] is None or 0 <= fragment["completeness"] <= 1
         assert all(0 <= c <= 1 for c in fragment["position"]["bbox"])
 
     def test_unknown_file_reports_error_not_crash(self):

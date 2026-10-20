@@ -173,3 +173,43 @@ def test_non_text_blocks_ignored():
     items = FixedSizeChunkingStrategy(chunk_size=1000).chunk([table, text], {})
     assert len(items) == 1
     assert items[0].text == "Только этот текст."
+
+
+@pytest.mark.parametrize("strategy_type", [
+    FixedSizeChunkingStrategy, ParagraphChunkingStrategy, SemanticChunkingStrategy,
+])
+def test_different_sheets_with_same_page_are_not_merged(strategy_type):
+    source = [
+        ParsedBlock(type="text", text="Первый лист", page=1, sheet_name="A", order=0),
+        ParsedBlock(type="text", text="Второй лист", page=1, sheet_name="B", order=1),
+    ]
+    items = strategy_type(chunk_size=500, overlap=0).chunk(source, {})
+    assert len(items) == 2
+    assert [item.text for item in items] == [b.text for b in source]
+    assert all(len({b.sheet_name for b in item.blocks}) == 1 for item in items)
+
+
+def test_semantic_splits_single_oversized_block_without_losing_content():
+    source = "x" * 200
+    items = SemanticChunkingStrategy(chunk_size=50, overlap=0).chunk(
+        blocks((source, 1, [0, 0, 1, 1])), {},
+    )
+    assert len(items) == 4
+    assert all(len(item.text) <= 50 for item in items)
+    assert "".join(item.text for item in items) == source
+
+
+def test_paragraph_tiny_absorption_never_exceeds_limit():
+    items = ParagraphChunkingStrategy(chunk_size=50, overlap=0).chunk(blocks(
+        ("a" * 45, 1, [0, 0, 1, 1]),
+        ("b" * 20, 1, [0, 0, 1, 1]),
+    ), {})
+    assert [item.text for item in items] == ["a" * 45, "b" * 20]
+
+
+def test_paragraph_tiny_absorption_respects_vertical_gap():
+    items = ParagraphChunkingStrategy(chunk_size=500, overlap=0).chunk(blocks(
+        ("Первый абзац.", 1, [0.1, 0.1, 0.9, 0.2]),
+        ("Подпись.", 1, [0.1, 0.8, 0.9, 0.9]),
+    ), {})
+    assert len(items) == 2

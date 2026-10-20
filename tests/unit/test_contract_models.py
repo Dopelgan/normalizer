@@ -124,10 +124,16 @@ class TestResponseShape:
             "fragment_id", "type", "content", "position", "section_title",
             "confidence", "completeness", "provenance", "extracted_facts",
             "graph_nodes", "relations",
+            "section_path", "review_required", "warnings", "missing_regions",
+            "completeness_mechanisms", "structure_score",
         }
-        assert set(fragment["position"]) == {"page", "sheet", "bbox", "order"}
+        assert set(fragment["position"]) == {
+            "page", "sheet", "bbox", "order", "page_start", "page_end",
+            "source_spans", "offset_reference", "text_offsets_exact", "bbox_exact",
+        }
         assert set(fragment["provenance"]) == {
             "method", "strategy_level", "source", "source_file_id", "source_page",
+            "source_unit_id", "processing_profile_version",
         }
 
     def test_table_fragment(self):

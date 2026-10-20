@@ -84,7 +84,7 @@ class TestTextFragments:
     def test_empty_parse_result(self):
         assert TextNormalizer().normalize(ParseResult(blocks=[]), META) == []
 
-    def test_short_noise_dropped(self):
+    def test_short_structural_units_are_preserved_for_rag(self):
         blocks = [
             text_block("ок", order=0),
             text_block("Полноценный абзац достаточной длины для индексации. " * 2, order=1),
@@ -92,7 +92,7 @@ class TestTextFragments:
         fragments = TextNormalizer().normalize(
             ParseResult(blocks=blocks, parser_name="mineru"), META
         )
-        assert all(len(f.content.text) >= 30 for f in fragments)
+        assert [f.content.text for f in fragments] == [b.text for b in blocks]
 
 
 class TestCompleteness:
@@ -235,14 +235,15 @@ class TestFragmentOrder:
         )
         assert [f.type for f in fragments] == ["table", "text"]
 
-    def test_chunks_of_one_block_keep_their_own_order(self):
-        """Куски одного блока различаются только номером куска — по нему и идут."""
+    def test_long_block_is_not_chunked_before_rag(self):
+        """Финальная нарезка согласована на стороне RAG."""
         long_text = " ".join(f"Предложение номер {i} в длинном абзаце." for i in range(1, 120))
         fragments = TextNormalizer().normalize(
             ParseResult(blocks=[text_block(long_text, page=1, order=7)], parser_name="mineru"),
             META,
         )
-        assert len(fragments) > 1
+        assert len(fragments) == 1
+        assert fragments[0].content.text == long_text
         assert [f.position.order for f in fragments] == list(range(1, len(fragments) + 1))
         assert fragments[0].content.text.startswith("Предложение номер 1")
 

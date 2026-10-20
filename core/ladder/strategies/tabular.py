@@ -18,6 +18,7 @@ import logging
 from typing import List
 
 from core import filetypes
+from core.config import settings
 from core.ladder.base import Strategy
 from core.ladder.context import DocumentContext
 from core.models.parse_result import ParsedBlock, ParseResult
@@ -41,9 +42,12 @@ except ImportError:  # pragma: no cover
     xlrd = None
     XLRD_AVAILABLE = False
 
-# Больше этого числа строк на лист не забираем: остальное всё равно не
-# помещается в осмысленный фрагмент, а память съедает.
-_MAX_ROWS = 5000
+def _check_budget(cells: int) -> None:
+    if cells > settings.SPREADSHEET_MAX_CELLS:
+        raise ValueError(
+            "Таблица превышает SPREADSHEET_MAX_CELLS; результат не усечён, "
+            "нужен больший ресурсный бюджет"
+        )
 
 
 class SpreadsheetStrategy(Strategy):
@@ -88,11 +92,14 @@ class SpreadsheetStrategy(Strategy):
     def _from_csv(self, data: bytes) -> List[ParsedBlock]:
         text = self._decode(data)
         dialect = self._dialect(text)
-        rows = [
-            [str(cell).strip() for cell in row]
-            for row in csv.reader(io.StringIO(text), dialect)
-        ]
-        rows = [row for row in rows if any(row)][:_MAX_ROWS]
+        rows = []
+        cells = 0
+        for row in csv.reader(io.StringIO(text), dialect):
+            cells += max(1, len(row))
+            _check_budget(cells)
+            values = [str(cell).strip() for cell in row]
+            if any(values):
+                rows.append(values)
         if not rows:
             return []
         return [ParsedBlock(
@@ -151,7 +158,8 @@ class SpreadsheetStrategy(Strategy):
         blocks: List[ParsedBlock] = []
         for page_no, sheet in enumerate(book.sheets(), start=1):
             rows: List[List[str]] = []
-            for index in range(min(sheet.nrows, _MAX_ROWS)):
+            _check_budget(sheet.nrows * max(1, sheet.ncols))
+            for index in range(sheet.nrows):
                 values = [
                     self._xls_cell(cell, book.datemode) for cell in sheet.row(index)
                 ]
@@ -207,23 +215,27 @@ class SpreadsheetStrategy(Strategy):
         for page_no, table in enumerate(root.iter(f"{table_ns}table"), start=1):
             name = table.get(f"{table_ns}name") or f"Лист {page_no}"
             rows: List[List[str]] = []
+            cells = 0
             for row in table.iter(f"{table_ns}table-row"):
                 values: List[str] = []
                 for cell in row.iter(f"{table_ns}table-cell"):
                     text = "".join(
                         node.text or "" for node in cell.iter(f"{text_ns}p")
                     ).strip()
-                    # Повторы пустых ячеек в ODS кодируются числом, а не
-                    # копиями: разворачиваем, но в разумных пределах.
                     repeat = int(cell.get(f"{table_ns}number-columns-repeated") or 1)
-                    values.extend([text] * min(repeat, 64))
+                    if repeat < 1:
+                        raise ValueError("Некорректный повтор колонок ODS")
+                    _check_budget(cells + len(values) + repeat)
+                    values.extend([text] * repeat)
                 while values and not values[-1]:
                     values.pop()
                 if values:
-                    rows.append(values)
-                if len(rows) >= _MAX_ROWS:
-                    logger.warning("Лист %s обрезан на %d строках", name, _MAX_ROWS)
-                    break
+                    repeat = int(row.get(f"{table_ns}number-rows-repeated") or 1)
+                    if repeat < 1:
+                        raise ValueError("Некорректный повтор строк ODS")
+                    cells += repeat * len(values)
+                    _check_budget(cells)
+                    rows.extend([list(values) for _ in range(repeat)])
             if not rows:
                 continue
             blocks.append(ParsedBlock(
@@ -236,11 +248,11 @@ class SpreadsheetStrategy(Strategy):
     @staticmethod
     def _sheet_rows(sheet) -> List[List[str]]:
         rows: List[List[str]] = []
+        cells = 0
         for raw in sheet.iter_rows(values_only=True):
+            cells += max(1, len(raw))
+            _check_budget(cells)
             values = ["" if cell is None else str(cell).strip() for cell in raw]
             if any(values):
                 rows.append(values)
-            if len(rows) >= _MAX_ROWS:
-                logger.warning("Лист %s обрезан на %d строках", sheet.title, _MAX_ROWS)
-                break
         return rows

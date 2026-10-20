@@ -37,6 +37,14 @@ class ParsedBlock(BaseModel):
     # Разобранные поля чертежа (для type="drawing"). Заполняются парсером,
     # который единственный держит в руках исходный PDF и его текстовый слой.
     drawing_fields: Optional[List[Dict[str, Any]]] = None
+    source_unit_id: Optional[str] = None
+    bbox_exact: bool = False
+    section_path: List[str] = Field(default_factory=list)
+    # Независимая полнота не выводится из количества извлечённых полей.
+    drawing_completeness: Optional[float] = Field(None, ge=0, le=1)
+    completeness_mechanisms: Dict[str, Any] = Field(default_factory=dict)
+    missing_regions: List[Dict[str, Any]] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
 
     @field_validator("bbox")
     @classmethod

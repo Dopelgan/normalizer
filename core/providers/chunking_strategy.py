@@ -92,11 +92,20 @@ class ChunkingStrategy(ABC):
 
     @staticmethod
     def group_by_page(blocks: List[ParsedBlock]) -> List[tuple]:
-        """[(page, [blocks...]), ...] с сохранением порядка страниц."""
-        groups: Dict[int, List[ParsedBlock]] = {}
+        """Последовательные группы одной страницы и листа.
+
+        Возвращаемый ключ остаётся номером страницы для совместимости.
+        Повторное появление листа после другого листа не склеивает группы.
+        """
+        groups: List[tuple] = []
+        previous_key = None
         for block in blocks:
-            groups.setdefault(block.page, []).append(block)
-        return [(page, groups[page]) for page in sorted(groups)]
+            key = (block.page, block.sheet_name)
+            if key != previous_key:
+                groups.append((block.page, []))
+                previous_key = key
+            groups[-1][1].append(block)
+        return groups
 
     @staticmethod
     def split_positions(text: str, size: int, overlap: int) -> List[tuple]:
