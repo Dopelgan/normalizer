@@ -78,6 +78,36 @@ class TestUsability:
         )
         assert layer.is_usable() is True
 
+    def test_stamp_over_scanned_pages_is_not_usable(self):
+        # Скан чертежа на двух листах, на первом поверх картинки — штамп экспертизы.
+        layer = layer_of(
+            line('ЭКСПЕРТНОЕ ЗАКЛЮЧЕНИЕ № 04.03.0280 от "02" октября 2020 г.', 0.1, page=1),
+            line('АНО "АтомТехноТест"', 0.13, page=1),
+            page_count=2,
+        )
+        layer.image_share = {1: 0.71, 2: 0.71}
+        assert layer.pages_with_text() == 0
+        assert layer.is_usable() is False
+
+    def test_ocr_layer_over_scan_stays_usable(self):
+        text = "Распознанный текст страницы скана с невидимым слоем OCR поверх картинки. " * 4
+        layer = layer_of(line(text, 0.1, page=1), line(text, 0.1, page=2), page_count=2)
+        layer.image_share = {1: 1.0, 2: 1.0}
+        assert layer.is_usable() is True
+
+    def test_image_share_is_measured(self):
+        pymupdf = pytest.importorskip("pymupdf")
+        document = pymupdf.open()
+        page = document.new_page(width=600, height=800)
+        pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 20, 20), False)
+        page.insert_image(pymupdf.Rect(0, 0, 600, 600), pixmap=pixmap)
+        page.insert_text((60, 700), "ЭКСПЕРТНОЕ ЗАКЛЮЧЕНИЕ", fontsize=10)
+        data = document.tobytes()
+        document.close()
+        layer = extract_text_layer(data)
+        assert layer.image_share[1] == pytest.approx(0.75, abs=0.01)
+        assert layer.overlay_only(1)
+
 
 class TestGrouping:
     def test_close_lines_form_one_paragraph(self):

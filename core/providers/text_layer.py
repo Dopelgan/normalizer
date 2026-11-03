@@ -53,6 +53,13 @@ METHOD_LATEX_DECODED = "latex_decoded"
 
 _MONO_MARKERS = ("mono", "courier", "consol", "menlo", "inconsolata", "hack", "fira code")
 
+# Скан с наложенной надписью: страницу занимает одна картинка, а в слое лежит
+# только штамп («ЭКСПЕРТНОЕ ЗАКЛЮЧЕНИЕ № …», ~70 символов). Такая страница —
+# растр, её текст есть только в картинке. Распознанный скан (невидимый слой
+# OCR поверх картинки) несёт сотни символов и остаётся текстовым.
+_SCAN_IMAGE_SHARE = 0.5
+_OVERLAY_MAX_CHARS = 200
+
 # Строка считается попавшей в рамку, если её центр внутри рамки с этим допуском
 # (в долях страницы) — layout-рамки MinerU обычно чуть у́же реального текста.
 _CONTAINMENT_SLACK = 0.004
@@ -130,6 +137,8 @@ class TextLayer:
     pages: Dict[int, List[TextLine]] = field(default_factory=dict)
     page_sizes: Dict[int, Tuple[float, float]] = field(default_factory=dict)
     page_count: int = 0
+    # Доля страницы под самой большой растровой картинкой.
+    image_share: Dict[int, float] = field(default_factory=dict)
 
     def lines(self, page: int) -> List[TextLine]:
         return self.pages.get(page, [])
@@ -142,8 +151,14 @@ class TextLayer:
     def char_counts_by_page(self) -> Dict[int, int]:
         return {page: self.char_count(page) for page in range(1, self.page_count + 1)}
 
+    def overlay_only(self, page: int) -> bool:
+        """Страница — скан, а слой несёт только наложенную на него надпись."""
+        return (self.image_share.get(page, 0.0) >= _SCAN_IMAGE_SHARE
+                and self.char_count(page) < _OVERLAY_MAX_CHARS)
+
     def pages_with_text(self) -> int:
-        return sum(1 for lines in self.pages.values() if any(l.char_count() for l in lines))
+        return sum(1 for page, lines in self.pages.items()
+                   if any(l.char_count() for l in lines) and not self.overlay_only(page))
 
     def is_usable(self, min_ratio: float = 0.5, min_chars: int = 40) -> bool:
         """
@@ -208,6 +223,7 @@ def layer_from_document(document: Any) -> TextLayer:
             width, height = float(page.rect.width), float(page.rect.height)
             layer.page_sizes[page_no] = (width, height)
             layer.pages[page_no] = _lines_from_page(page, page_no, width, height)
+            layer.image_share[page_no] = _largest_image_share(page)
         except Exception as exc:  # noqa: BLE001 — одна битая страница не роняет документ
             logger.warning("Страница %d не прочиталась из текстового слоя: %s", page_no, exc)
             layer.pages[page_no] = []
@@ -217,6 +233,20 @@ def layer_from_document(document: Any) -> TextLayer:
         layer.page_count, layer.pages_with_text(), layer.char_count(),
     )
     return layer
+
+
+def _largest_image_share(page: Any) -> float:
+    """Доля страницы, которую закрывает самая большая растровая картинка."""
+    area = abs(page.rect)
+    if not area:
+        return 0.0
+    try:
+        images = page.get_image_info()
+    except Exception as exc:  # noqa: BLE001 — без картинок страница остаётся текстовой
+        logger.debug("Картинки страницы не прочитаны: %s", exc)
+        return 0.0
+    shares = [abs(_pymupdf.Rect(item["bbox"]) & page.rect) / area for item in images if item.get("bbox")]
+    return round(min(1.0, max(shares, default=0.0)), 3)
 
 
 def _lines_from_page(page: Any, page_no: int, width: float, height: float) -> List[TextLine]:
