@@ -174,13 +174,22 @@ class LadderRouter:
         best: Optional[ParseResult] = None
         best_score: Optional[Score] = None
         best_strategy: Optional[Strategy] = None
-        best_rank: Optional[tuple] = None
+        candidates: List[tuple[ParseResult, Score, Strategy, float]] = []
 
         # Объём лучшего фоллбэка — мерка сохранности для структурных
         # уровней: фоллбэк читает страницу целиком и годится как нижняя
         # граница того, сколько текста на ней вообще есть.
         fallback_chars = 0
         structural_seen = False
+
+        def candidate_rank(candidate):
+            parsed, evaluated, _, unit_coverage = candidate
+            structured = not parsed.is_fallback
+            retains = self._keeps_content(text_chars(parsed), fallback_chars)
+            # Дополнительная страница не оправдывает доказанную потерю уже
+            # извлечённого текста. После нового fallback переоцениваем и
+            # прежних кандидатов относительно той же мерки сохранности.
+            return (int(retains), unit_coverage, int(structured and retains), evaluated.value)
 
         for strategy in applicable:
             try:
@@ -193,6 +202,19 @@ class LadderRouter:
                 continue
 
             chars = text_chars(result)
+            source_count = context.source_page_count or result.source_page_count
+            if source_count is not None:
+                result.source_page_count = source_count
+                result.page_count = source_count
+                covered = (set(result.pages()) | set(result.confirmed_blank_pages)) - set(result.failed_pages)
+                coverage = len({page for page in covered if 1 <= page <= source_count}) / source_count
+            else:
+                # Неизвестная граница будет partial в отчёте; порядок
+                # существующих стратегий не заменяется догадкой о числе.
+                coverage = 1.0
+            references = set(result.pages()) | set(result.confirmed_blank_pages) | set(result.failed_pages)
+            units_complete = (source_count is not None and coverage == 1.0 and not result.failed_pages
+                              and all(1 <= page <= source_count for page in references))
             structural = not result.is_fallback
             score = score_result(
                 result, context, exhaustive=strategy.exhaustive,
@@ -224,12 +246,14 @@ class LadderRouter:
             # старше тот, у кого есть структура. Но только если он её не
             # купил ценой потерянного текста, иначе оговорка о сохранности
             # обходилась бы через ничью.
-            rank = (1 if keeps else 0, score.value, 1 if keeps else 0)
-            if best_rank is None or rank > best_rank:
-                best, best_score, best_strategy, best_rank = result, score, strategy, rank
+            candidates.append((result, score, strategy, coverage))
+            best, best_score, best_strategy, _ = max(candidates, key=candidate_rank)
 
             if score.value >= self.threshold:
-                if keeps:
+                if keeps and not units_complete:
+                    logger.info("Уровень %d не подтвердил все исходные единицы — пробуем следующий", strategy.level)
+                    continue
+                if keeps and units_complete:
                     break
                 if structural:
                     logger.info(

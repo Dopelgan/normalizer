@@ -323,6 +323,8 @@ class MinerUParserProvider(DocumentParserProvider):
         """
         blocks: List[ParsedBlock] = []
         for page in sorted(layer.pages):
+            if layer.overlay_only(page):
+                continue
             for group in group_lines([l for l in layer.lines(page) if l.char_count()]):
                 text = lines_to_text(group)
                 if not text:

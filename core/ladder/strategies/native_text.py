@@ -55,6 +55,8 @@ class PdfTextLayerStrategy(Strategy):
 
         blocks: List[ParsedBlock] = []
         for page in sorted(layer.pages):
+            if layer.overlay_only(page):
+                continue
             lines = [line for line in layer.lines(page) if line.char_count()]
             for group in group_lines(lines):
                 text = lines_to_text(group)

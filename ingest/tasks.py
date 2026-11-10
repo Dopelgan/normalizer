@@ -53,6 +53,7 @@ from core.result_aggregator import (
 from core.result_publisher import publish_result
 
 logger = logging.getLogger(__name__)
+PAGE_COVERAGE_VERSION = 1
 
 
 # ===========================================================================
@@ -152,18 +153,31 @@ def page_report(parse_result: ParseResult) -> Dict[str, Any]:
     Без этого списка потребитель по статусу `partial` знает только то, что
     что-то потерялось, но не знает — что именно.
     """
-    failed = sorted({int(page) for page in parse_result.failed_pages})
-    seen = {int(page) for page in parse_result.pages()}
-    total = parse_result.page_count or (max(seen | set(failed)) if (seen or failed) else 0)
-    expected = set(range(1, total + 1)) if total else seen
-    processed = sorted((expected | seen) - set(failed))
-    return {"pages": total or None, "processed_pages": processed, "failed_pages": failed}
+    references = set(parse_result.pages()) | set(parse_result.failed_pages) | set(parse_result.confirmed_blank_pages)
+    failed = {page for page in parse_result.failed_pages if page > 0}
+    seen = {page for page in parse_result.pages() if page > 0}
+    blank = {page for page in parse_result.confirmed_blank_pages if page > 0}
+    total = parse_result.source_page_count or 0
+    expected = set(range(1, total + 1)) if total > 0 else set()
+    processed = (seen | blank) - failed
+    unknown = sorted(expected - processed - failed)
+    warnings = [f"PAGE_COVERAGE_UNKNOWN: page {page}" for page in unknown]
+    mismatch = any(page <= 0 or (total > 0 and page > total) for page in references)
+    if total <= 0:
+        warnings.append("PAGE_COUNT_UNKNOWN")
+    if mismatch:
+        warnings.append("PAGE_COUNT_MISMATCH")
+    return {"pages": total if total > 0 and not mismatch else None,
+            "processed_pages": sorted(processed), "failed_pages": sorted(failed),
+            "unknown_pages": unknown, "coverage_unknown": bool(unknown) or total <= 0 or mismatch,
+            "coverage_warnings": warnings}
 
 
 def build_warnings(parse_result: ParseResult, failed_pages: List[int]) -> List[str]:
     """Деградации разбора и непрочитанные страницы — одним списком."""
     warnings = list(parse_result.degraded)
     warnings += [f"PAGE_NOT_PARSED: page {page}" for page in failed_pages]
+    warnings += page_report(parse_result)["coverage_warnings"]
     return warnings
 
 
@@ -189,9 +203,11 @@ def build_document_result(
         content_hash=f"sha256:{document.file_hash}" if document.file_hash else None,
         normalized_content_hash=extra.get("normalized_content_hash"),
         mime_type=extra.get("mime_type"),
-        pages=extra.get("pages_reported") or extra.get("parsed_pages_count") or None,
+        pages=(extra.get("pages_reported") if extra.get("page_coverage_version") == PAGE_COVERAGE_VERSION
+               else extra.get("pages_reported") or extra.get("parsed_pages_count") or None),
         processed_pages=list(extra.get("processed_pages") or []),
         failed_pages=list(extra.get("failed_pages") or []),
+        unknown_pages=list(extra.get("unknown_pages") or []),
         document_metadata=document_to_metadata(document),
         fragments=fragments,
         warnings=list(extra.get("warnings") or []),
@@ -314,7 +330,8 @@ def process_document(
             document = doc_repo.get(doc_id, for_update=True)
 
             if (document is not None and document.status == "indexed" and operation != "update"
-                    and (document.extra_data or {}).get("processing_profile_version") == PROCESSING_PROFILE_VERSION):
+                    and (document.extra_data or {}).get("processing_profile_version") == PROCESSING_PROFILE_VERSION
+                    and (document.extra_data or {}).get("page_coverage_version") == PAGE_COVERAGE_VERSION):
                 logger.info("Документ %s уже проиндексирован, отдаём из БД", doc_id)
                 fragments = [row_to_fragment(r) for r in ChunkRepository(session).get_by_doc_id(doc_id)]
                 cached = build_document_result(
@@ -407,7 +424,7 @@ def process_document(
             review_required = True
             drawing_warnings.append("DRAWING_NOT_RECOGNIZED")
         warnings = list(dict.fromkeys(warnings + drawing_warnings))
-        document_status = "partial" if report["failed_pages"] or review_required else "completed"
+        document_status = "partial" if report["failed_pages"] or report["coverage_unknown"] or review_required else "completed"
         mime_type = filetypes.mime_for(located.file_type)
         normalized_hash = normalized_content_hash(fragments)
 
@@ -438,6 +455,8 @@ def process_document(
                 "pages_reported": report["pages"],
                 "processed_pages": report["processed_pages"],
                 "failed_pages": report["failed_pages"],
+                "unknown_pages": report["unknown_pages"],
+                "page_coverage_version": PAGE_COVERAGE_VERSION,
                 "warnings": warnings,
                 "processing_profile_version": PROCESSING_PROFILE_VERSION,
                 "review_required": review_required,
@@ -486,6 +505,7 @@ def process_document(
             pages=report["pages"],
             processed_pages=report["processed_pages"],
             failed_pages=report["failed_pages"],
+            unknown_pages=report["unknown_pages"],
             document_metadata=doc_metadata,
             fragments=fragments,
             warnings=warnings,

@@ -52,6 +52,7 @@ def pipeline(monkeypatch, temp_storage, task_db, fake_redis):
         parser_name="mineru",
         source_kind="vector_pdf",
         page_count=1,
+        source_page_count=1,
     )
     parser = StubParser(parse_result)
 
@@ -253,6 +254,41 @@ class TestIdempotency:
 
 @pytest.mark.usefixtures("pipeline")
 class TestStructuralProfile:
+    @pytest.mark.parametrize('page_count,unknown', [(3, [2, 3]), (0, [])])
+    def test_unknown_pages_survive_fresh_cached_and_request_results(self, pipeline, page_count, unknown):
+        pipeline.result.page_count = page_count
+        pipeline.result.source_page_count = page_count or None
+        init_request_state("coverage-first", ["file-coverage"])
+        process_document("coverage-first", "file-coverage")
+        first = get_request_state("coverage-first")
+        init_request_state("coverage-again", ["file-coverage"])
+        result = process_document("coverage-again", "file-coverage")
+        again = get_request_state("coverage-again")
+        assert result["status"] == "already_processed"
+        assert len(pipeline.calls) == 1
+        assert first["status"] == again["status"] == "partial"
+        assert first["documents"] == again["documents"]
+        document = first["documents"][0]
+        assert document["processed_pages"] == [1]
+        assert document["failed_pages"] == []
+        assert document["unknown_pages"] == unknown
+        if page_count:
+            assert "PAGE_COVERAGE_UNKNOWN: page 2" in document["warnings"]
+        else:
+            assert document["pages"] is None
+            assert "PAGE_COUNT_UNKNOWN" in document["warnings"]
+
+    def test_legacy_coverage_report_is_reprocessed(self, pipeline, task_db):
+        init_request_state("coverage-old", ["file-old-coverage"])
+        result = process_document("coverage-old", "file-old-coverage")
+        session = task_db()
+        with session.begin():
+            DocumentRepository(session).update_extra(result["doc_id"], {"page_coverage_version": None})
+        session.close()
+        init_request_state("coverage-new", ["file-old-coverage"])
+        assert process_document("coverage-new", "file-old-coverage")["status"] == "success"
+        assert len(pipeline.calls) == 2
+
     def test_current_profile_and_source_coordinates_survive_cached_response(self):
         from core.processing_contract import PROCESSING_PROFILE_VERSION
         init_request_state("profile-first", ["file-profile"])

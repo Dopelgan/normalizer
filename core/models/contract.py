@@ -354,6 +354,8 @@ class DocumentResult(BaseModel):
     pages: Optional[int] = None
     processed_pages: List[int] = Field(default_factory=list)
     failed_pages: List[int] = Field(default_factory=list)
+    # Страница ожидается, но нет ни результата, ни подтверждённого отказа.
+    unknown_pages: List[int] = Field(default_factory=list)
     document_metadata: DocumentMetadata
     fragments: List[Fragment] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)

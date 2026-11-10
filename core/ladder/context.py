@@ -87,6 +87,8 @@ class DocumentContext:
         self.metadata: Dict[str, Any] = dict(metadata or {})
         self.storage = storage or StorageProviderFactory.default()
         self._data = data
+        self._source_count_loaded = False
+        self._source_page_count: Optional[int] = None
         self._layer: Optional[TextLayer] = None
         self._layer_loaded = False
         self._classification: Optional[Classification] = None
@@ -150,6 +152,66 @@ class DocumentContext:
                 layer = extract_text_layer(self.data)
                 self._layer = layer if (layer and layer.is_usable()) else None
         return self._layer
+
+    @property
+    def source_page_count(self) -> Optional[int]:
+        """Количество единиц исходника, независимо от найденных блоков."""
+        if self._source_count_loaded:
+            return self._source_page_count
+        self._source_count_loaded = True
+        try:
+            import io
+
+            if self.kind == filetypes.KIND_PDF:
+                import fitz
+
+                with fitz.open(stream=self.data, filetype="pdf") as document:
+                    self._source_page_count = document.page_count or None
+            elif self.kind == filetypes.KIND_IMAGE:
+                from PIL import Image
+
+                with Image.open(io.BytesIO(self.data)) as image:
+                    self._source_page_count = getattr(image, "n_frames", 1)
+            elif self.file_type == "xlsx":
+                import zipfile
+                from defusedxml import ElementTree
+
+                with zipfile.ZipFile(io.BytesIO(self.data)) as archive:
+                    info = archive.getinfo("xl/workbook.xml")
+                    if info.file_size > 4 * 1024 * 1024:
+                        raise ValueError("Метаданные книги превышают бюджет")
+                    root = ElementTree.fromstring(archive.read(info))
+                self._source_page_count = len(root.findall(
+                    "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheets/"
+                    "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet"
+                )) or None
+            elif self.file_type == "xls":
+                import xlrd
+
+                book = xlrd.open_workbook(file_contents=self.data, on_demand=True)
+                try:
+                    self._source_page_count = book.nsheets or None
+                finally:
+                    book.release_resources()
+            elif self.file_type == "ods":
+                import zipfile
+                from defusedxml import ElementTree
+
+                with zipfile.ZipFile(io.BytesIO(self.data)) as archive:
+                    info = archive.getinfo("content.xml")
+                    if info.file_size > 32 * 1024 * 1024:
+                        raise ValueError("Метаданные ODS превышают бюджет")
+                    root = ElementTree.fromstring(archive.read(info))
+                self._source_page_count = sum(1 for _ in root.iter(
+                    "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}table"
+                )) or None
+            elif self.kind in (filetypes.KIND_PLAIN_TEXT, filetypes.KIND_OFFICE_TEXT) or self.file_type == "csv":
+                # Это одна логическая единица, а не утверждение о печатных
+                # страницах Word. Текущий контракт использует page=1.
+                self._source_page_count = 1
+        except Exception as exc:  # noqa: BLE001 — неизвестность не подменяется числом блоков.
+            logger.warning("Количество единиц исходника не установлено: %s", type(exc).__name__)
+        return self._source_page_count
 
     # ------------------------------------------------------- классификация
     @property

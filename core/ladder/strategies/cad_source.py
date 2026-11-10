@@ -74,9 +74,12 @@ class CadSourceStrategy(Strategy):
     def run(self, context: DocumentContext) -> ParseResult:
         document = self._open(context.data)
         blocks: List[ParsedBlock] = []
+        layouts = self._layouts(document)
+        blank_pages = []
 
-        for page_no, (layout_name, entities) in enumerate(self._layouts(document), start=1):
+        for page_no, (layout_name, entities) in enumerate(layouts, start=1):
             if not entities:
+                blank_pages.append(page_no)
                 continue
             layer, attrib_texts, layer_of = self._to_text_layer(entities, page_no)
             fields = extract_drawing_fields(layer, page_no)
@@ -103,7 +106,8 @@ class CadSourceStrategy(Strategy):
         if not blocks:
             raise ValueError("В DXF не нашлось ни одной текстовой подписи")
 
-        return self.build_result(blocks, source_kind="cad", page_count=len(blocks))
+        return self.build_result(blocks, source_kind="cad", page_count=len(layouts),
+                                 source_page_count=len(layouts), confirmed_blank_pages=blank_pages)
 
     # ------------------------------------------------------------ внутреннее
     @staticmethod
@@ -132,7 +136,7 @@ class CadSourceStrategy(Strategy):
                     continue
                 layouts.append((name, list(document.layouts.get(name))))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Не удалось перечислить листы DXF: %s", exc)
+            raise ValueError("Не удалось перечислить все листы DXF") from exc
         return layouts
 
     def _to_text_layer(self, entities, page_no: int) -> Tuple[TextLayer, set, Dict[str, str]]:

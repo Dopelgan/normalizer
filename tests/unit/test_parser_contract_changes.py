@@ -241,15 +241,71 @@ class TestProvenance:
 # ===========================================================================
 
 class TestPartialResult:
+    def test_inferred_block_count_does_not_confirm_source_count(self):
+        result = ParseResult(blocks=[text_block("текст", page=1)], page_count=1)
+        report = page_report(result)
+        assert report["pages"] is None
+        assert report["coverage_unknown"]
+        assert "PAGE_COUNT_UNKNOWN" in tasks.build_warnings(result, [])
+
+    @pytest.mark.parametrize('total,observed,failed,processed,unknown', [
+        (3, [1], [], [1], [2, 3]),
+        (3, [1, 3], [2], [1, 3], []),
+        (3, [1, 2], [2], [1], [3]),
+        (3, [1, 2, 3], [], [1, 2, 3], []),
+        (0, [1], [], [1], []),
+    ])
+    def test_coverage_requires_positive_evidence(self, total, observed, failed, processed, unknown):
+        result = ParseResult(blocks=[text_block("текст", page=p) for p in observed],
+                             page_count=total, source_page_count=total or None, failed_pages=failed)
+        report = page_report(result)
+        assert report["processed_pages"] == processed
+        assert report["unknown_pages"] == unknown
+        assert report["coverage_unknown"] is (bool(unknown) or not total)
+        if not total:
+            assert report["pages"] is None
+            assert "PAGE_COUNT_UNKNOWN" in tasks.build_warnings(result, failed)
+
+    def test_only_explicitly_confirmed_blank_page_is_processed(self):
+        result = ParseResult(blocks=[text_block("текст", page=1)], page_count=3, source_page_count=3,
+                             confirmed_blank_pages=[2])
+        report = page_report(result)
+        assert report["processed_pages"] == [1, 2]
+        assert report["unknown_pages"] == [3]
+
+    def test_conflicting_page_count_never_becomes_complete(self):
+        result = ParseResult(blocks=[text_block("текст", page=3)], page_count=2, source_page_count=2)
+        report = page_report(result)
+        assert report["coverage_unknown"]
+        assert "PAGE_COUNT_MISMATCH" in tasks.build_warnings(result, [])
+
+    def test_failed_pages_override_observed_and_confirmed_blank_pages(self):
+        result = ParseResult(blocks=[text_block("текст", page=p) for p in (1, 1, 2)],
+                             page_count=3, source_page_count=3, failed_pages=[2, 2], confirmed_blank_pages=[2, 3, 3])
+        report = page_report(result)
+        assert report["processed_pages"] == [1, 3]
+        assert report["failed_pages"] == [2]
+        assert report["unknown_pages"] == []
+
+    @pytest.mark.parametrize('page', [0, -1, 3])
+    def test_invalid_or_out_of_range_page_reference_is_explicit(self, page):
+        result = ParseResult(blocks=[text_block("текст", page=page)], page_count=2, source_page_count=2)
+        report = page_report(result)
+        assert report["coverage_unknown"]
+        assert report["pages"] is None
+        assert "PAGE_COUNT_MISMATCH" in tasks.build_warnings(result, [])
+        assert all(p > 0 for p in report["processed_pages"])
+
     def test_pages_split_into_processed_and_failed(self):
         parse_result = ParseResult(
             blocks=[text_block("текст", page=page) for page in (1, 2, 3)],
-            page_count=4, failed_pages=[3],
+            page_count=4, source_page_count=4, failed_pages=[3],
         )
         report = page_report(parse_result)
         assert report["pages"] == 4
         assert report["failed_pages"] == [3]
-        assert report["processed_pages"] == [1, 2, 4]
+        assert report["processed_pages"] == [1, 2]
+        assert report["unknown_pages"] == [4]
 
     def test_warnings_mention_failed_page(self):
         parse_result = ParseResult(blocks=[], page_count=2, failed_pages=[2],

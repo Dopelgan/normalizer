@@ -77,7 +77,13 @@ class ParseResult(BaseModel):
     source_kind: str = "vector_pdf"               # vector_pdf | scanned_pdf | image | office
     raw_output: Dict[str, Any] = Field(default_factory=dict)
     failed_pages: List[int] = Field(default_factory=list)
+    # Только положительное подтверждение пустой исходной страницы. Отсутствие
+    # блоков или текста не доказывает пустоту скана/чертежа.
+    confirmed_blank_pages: List[int] = Field(default_factory=list)
     page_count: int = 0
+    # Число исходных единиц, прочитанное из контейнера документа/книги.
+    # page_count старых producers может быть числом страниц с блоками.
+    source_page_count: Optional[int] = Field(None, ge=1)
     # Символов (без пробелов) в текстовом слое PDF по страницам. Пусто, если
     # слоя нет или PyMuPDF недоступен. Это эталон для расчёта полноты.
     text_layer_chars: Dict[int, int] = Field(default_factory=dict)
