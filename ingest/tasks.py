@@ -21,6 +21,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from core import filetypes, telemetry
 from core.celery_app import app
+from core import deadline
 from core.config import settings
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import document_quality
@@ -311,6 +312,12 @@ def process_document(
     # этот файл обрабатывался семь минут» отвечать нечем.
     timings_scope = telemetry.collect()
     timings = timings_scope.__enter__()
+    # Один срок на все уровни лестницы: запас оставлен на сохранение
+    # результата и запись ошибки до мягкого лимита Celery.
+    deadline_scope = deadline.scope(
+        settings.PARSE_TASK_SOFT_TIME_LIMIT - settings.PARSE_DEADLINE_RESERVE
+    )
+    deadline_scope.__enter__()
 
     try:
         # ------------------------------------------------------ 1. Поиск файла
@@ -550,6 +557,7 @@ def process_document(
         return {"status": "error", "doc_id": doc_id, "reason": str(exc)}
 
     finally:
+        deadline_scope.__exit__(None, None, None)
         timings_scope.__exit__(None, None, None)
         session.close()
 

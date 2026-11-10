@@ -257,6 +257,10 @@ class Settings(BaseSettings):
     # Бюджет OCR на документ: дальше разбор останавливается с честной
     # пометкой об усечении, а не обрывается таймаутом задачи.
     OCR_TIME_BUDGET: int = 1200
+    # Запас до мягкого лимита на сохранение результата и запись ошибки.
+    PARSE_DEADLINE_RESERVE: int = 120
+    # Уровень лестницы не начинается, если до срока осталось меньше этого.
+    LADDER_MIN_REMAINING: int = 60
     CELERY_ML_QUEUE: str = "ml_gpu"
     CELERY_TASK_MAX_RETRIES: int = 3
 

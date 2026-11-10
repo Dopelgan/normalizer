@@ -25,6 +25,9 @@ from pdf2image import convert_from_path
 from PIL import Image
 
 from core import filetypes
+from celery.exceptions import SoftTimeLimitExceeded
+
+from core import deadline
 from core.config import settings
 from core.models.parse_result import ParsedBlock
 from core.providers.storage import StorageProvider, StorageProviderFactory
@@ -236,11 +239,11 @@ class TesseractFallbackProvider:
             logger.warning("OCR %s усечён: %d страниц из %d", local_path, limit, total)
             self.truncated_at = (limit, total)
         batch = max(1, settings.OCR_BATCH_PAGES)
-        deadline = time.monotonic() + settings.OCR_TIME_BUDGET
+        until = time.monotonic() + deadline.bounded(settings.OCR_TIME_BUDGET)
         yielded, error = 0, None
         for first in range(1, last_page + 1, batch):
             last = min(first + batch - 1, last_page)
-            if time.monotonic() > deadline:
+            if time.monotonic() > until:
                 logger.warning("OCR %s остановлен по бюджету времени на странице %d", local_path, first)
                 self.truncated_at = (first - 1, total)
                 break
@@ -248,6 +251,8 @@ class TesseractFallbackProvider:
                 images = convert_from_path(
                     local_path, first_page=first, last_page=last, dpi=settings.OCR_DPI
                 )
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as exc:  # noqa: BLE001
                 error = exc
                 if not total:
@@ -372,6 +377,8 @@ class TesseractFallbackProvider:
                 image, lang=self.lang, config=f"--psm {psm}",
                 output_type=pytesseract.Output.DICT,
             )
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.error("Ошибка OCR (разбивка по словам): %s", exc)
             return []
@@ -450,6 +457,8 @@ class TesseractFallbackProvider:
             return None
         try:
             prepared = prepare_page(image, upscaled=upscaled)
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("Подготовка листа к OCR не удалась, читаем как есть: %s", exc)
             return None

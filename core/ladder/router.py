@@ -36,6 +36,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
+from celery.exceptions import SoftTimeLimitExceeded
+
+from core import deadline
 from core.config import settings
 from core.ladder.base import Strategy, text_chars
 from core.ladder.context import DocumentContext
@@ -192,8 +195,17 @@ class LadderRouter:
             return (int(retains), unit_coverage, int(structured and retains), evaluated.value)
 
         for strategy in applicable:
+            left = deadline.remaining()
+            if left is not None and left < settings.LADDER_MIN_REMAINING:
+                logger.warning("Уровень %d пропущен: до срока задачи %.0f с", strategy.level, left)
+                attempts.append(Attempt(strategy.level, strategy.name,
+                                        error="нет бюджета времени задачи"))
+                continue
             try:
                 result = strategy.run(context)
+            except SoftTimeLimitExceeded:
+                # Лимит задачи — не «неудача уровня»: его обрабатывает задача.
+                raise
             except Exception as exc:  # noqa: BLE001 — неудача уровня не фатальна
                 logger.warning(
                     "Уровень %d (%s) не справился: %s", strategy.level, strategy.name, exc

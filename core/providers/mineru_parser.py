@@ -25,6 +25,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from core import filetypes
+from celery.exceptions import SoftTimeLimitExceeded
+
+from core import deadline
 from core.config import settings
 from core.models.parse_result import ParsedBlock, ParseResult
 from core.providers.document_parser import (
@@ -305,6 +308,8 @@ class MinerUParserProvider(DocumentParserProvider):
             return None
         try:
             layer = self.tesseract.text_layer(uri)
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 — слой не обязателен
             logger.warning("Слой распознавания для %s не собрался: %s", uri, exc)
             return None
@@ -429,7 +434,12 @@ class MinerUParserProvider(DocumentParserProvider):
         потеряется целиком вместо деградации до OCR.
         """
         wanted = max(self.timeout, max(1, pages) * settings.MINERU_TIMEOUT_PER_PAGE)
-        return int(min(wanted, settings.PARSE_TASK_SOFT_TIME_LIMIT * 0.4))
+        wanted = min(wanted, settings.PARSE_TASK_SOFT_TIME_LIMIT * 0.4)
+        # Остаток срока задачи: половина — MinerU, половина — OCR-слою/фоллбэку.
+        left = deadline.remaining()
+        if left is not None:
+            wanted = min(wanted, max(1.0, left / 2))
+        return int(max(1, wanted))
 
     # ------------------------------------------------------ разбор ответа
     def _extract(self, payload: Dict[str, Any], asset_prefix: str) -> Tuple[List[ParsedBlock], int]:

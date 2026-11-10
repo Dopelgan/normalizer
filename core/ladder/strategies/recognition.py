@@ -155,14 +155,10 @@ class RestoreThenLayoutStrategy(Strategy):
         from core.ladder.restoration import restore, restore_pages
 
         is_pdf = context.kind == filetypes.KIND_PDF
-        if is_pdf:
-            restored, applied, sample = restore_pages(
-                context.data, max_pages=settings.OCR_FULL_MAX_PAGES
-            )
-        else:
-            restored, applied = restore(context.data)
-            sample = restored
-        if restored is None:
+        # Сначала выправляется и оценивается один лист: если лучше не стало,
+        # восстанавливать остальные страницы незачем (В-5 до затрат).
+        sample, applied = restore(context.data, pdf=is_pdf)
+        if sample is None:
             raise ValueError("Восстановление изображения недоступно")
 
         quality = self._quality_after(sample, context.classification.signals)
@@ -177,6 +173,19 @@ class RestoreThenLayoutStrategy(Strategy):
                 "документ нечитаем в оригинале"
             )
 
+        restored, notes = sample, []
+        if is_pdf:
+            restored, applied, _ = restore_pages(
+                context.data, max_pages=settings.OCR_FULL_MAX_PAGES
+            )
+            if restored is None:
+                raise ValueError("Восстановление страниц PDF не удалось")
+            total = context.source_page_count or 0
+            if total > settings.OCR_FULL_MAX_PAGES:
+                notes.append(
+                    f"восстановлены первые {settings.OCR_FULL_MAX_PAGES} страниц из {total}"
+                )
+
         file_type = "pdf" if is_pdf else "png"
         uri = self._store(context, restored, file_type)
         restored_context = DocumentContext(
@@ -187,6 +196,7 @@ class RestoreThenLayoutStrategy(Strategy):
         for block in result.blocks:
             block.method = self.method
         result.parser_name = self.name
+        result.degraded.extend(notes)
         return result
 
     @staticmethod

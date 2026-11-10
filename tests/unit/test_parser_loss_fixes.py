@@ -192,3 +192,75 @@ def test_restoration_keeps_every_page_of_a_scan():
     restored, applied, sample = restore_pages(document.tobytes(), max_pages=50)
     assert fitz.open(stream=restored, filetype="pdf").page_count == 3
     assert sample and applied
+
+
+# ------------------------------------------- общий срок задачи (ревью 6ff80ed)
+
+def test_deadline_bounds_budgets_only_inside_task():
+    from core import deadline
+
+    assert deadline.bounded(1200) == 1200
+    with deadline.scope(100):
+        assert 99 < deadline.bounded(1200) <= 100
+        assert deadline.bounded(1200, reserve=30) <= 70
+    assert deadline.remaining() is None
+
+
+def test_mineru_timeout_leaves_half_of_remaining_time(mineru):
+    from core import deadline
+
+    with deadline.scope(200):
+        assert mineru._timeout_for(100) <= 100
+
+
+class _Level:
+    level, name, exhaustive = 4, "fake", False
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    def applicable(self, context):
+        return True
+
+    def run(self, context):
+        raise self.exc
+
+
+def _context():
+    from types import SimpleNamespace
+
+    classification = SimpleNamespace(source="raster", genre="text", raster_quality=0.5,
+                                     as_dict=lambda: {})
+    return SimpleNamespace(uri="documents/x.pdf", file_type="pdf", kind="pdf",
+                           classification=classification, source_page_count=1)
+
+
+def test_router_does_not_swallow_celery_soft_time_limit():
+    from celery.exceptions import SoftTimeLimitExceeded
+    from core.ladder.router import LadderRouter
+
+    router = LadderRouter(strategies=[_Level(SoftTimeLimitExceeded())], enabled_levels=[4])
+    with pytest.raises(SoftTimeLimitExceeded):
+        router.parse(_context())
+
+
+def test_router_skips_levels_without_time_left():
+    from core import deadline
+    from core.ladder.router import LadderRouter
+    from core.providers.document_parser import ParserFailed
+
+    level = _Level(AssertionError("уровень не должен запускаться"))
+    router = LadderRouter(strategies=[level], enabled_levels=[4])
+    with deadline.scope(1), pytest.raises(ParserFailed, match="бюджета времени"):
+        router.parse(_context())
+
+
+def test_ocr_render_does_not_swallow_soft_time_limit(pdf_provider, monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    def render(*args, **kwargs):
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(tesseract_fallback, "convert_from_path", render)
+    with pytest.raises(SoftTimeLimitExceeded):
+        pdf_provider.parse_all_pages("documents/doc.pdf")
