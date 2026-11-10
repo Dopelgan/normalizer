@@ -81,6 +81,24 @@ _DUPLICATE_MIN_WORDS = 4
 
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
+# Склейка строк ячейки. Модель таблиц MinerU собирает многострочную ячейку
+# скана без разделителя («Креплениебиозащитына»), и слова пропадают для
+# поиска. Режутся только токены не короче стольких букв и цифр и не длиннее
+# предела: дальше перебор разбиений дорог, а склейки такой длины не бывает.
+_GLUED_MIN_ALNUM = 6
+_GLUED_MAX_LEN = 200
+# Знаки, которые снимаются с краёв слова слоя при сборке словаря.
+_WORD_EDGE = "|.,;:!?()[]{}<>«»\"'*_-–—/\\"
+_MARKUP_RE = re.compile(r"(<[^>]*>)")
+
+# Строки слоя внутри разобранной таблицы, не пошедшие на починку ячеек.
+# Строка возвращается текстом, только если несёт слова (длиннее трёх букв),
+# которых в таблице нет: не меньше стольких новых слов и не меньше такой
+# их доли среди слов строки длиннее двух букв. Иначе это
+# повтор содержимого ячеек или мусор от линий сетки.
+_TABLE_LINE_MIN_NEW_WORDS = 2
+_TABLE_LINE_MIN_NEW_SHARE = 0.5
+
 # Пары визуально неразличимых букв латиницы и кириллицы. Распознавание
 # постоянно их путает — `rps` превращается в `грs`, `БД` в `БD`, — и для
 # сравнения обе стороны сводятся к одному представлению.
@@ -422,6 +440,10 @@ class ReconcileStats:
     repaired_tables: int = 0
     #: Из них разобранные на текст и формулы, потому что починить не вышло.
     degraded_tables: int = 0
+    #: Склеенных токенов в ячейках таблиц, разрезанных по словам слоя.
+    split_tokens: int = 0
+    #: Строк слоя из рамки таблицы, возвращённых текстом: их слов в ячейках нет.
+    table_lines_kept: int = 0
     layer_chars_by_page: Dict[int, int] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -438,6 +460,8 @@ class ReconcileStats:
             "mangled_tables": self.mangled_tables,
             "repaired_tables": self.repaired_tables,
             "degraded_tables": self.degraded_tables,
+            "split_tokens": self.split_tokens,
+            "table_lines_kept": self.table_lines_kept,
         }
 
 
@@ -485,6 +509,9 @@ def reconcile_with_text_layer(
             page_blocks = [b for b in page_blocks if b.type != "text"]
 
         assignments = _assign_lines(page_lines, page_blocks)
+        # Словарь страницы нужен только распознанному слою: склейку ячеек
+        # даёт OCR модели таблиц, у векторного PDF её не измеряли.
+        vocab = layer_vocabulary(page_lines) if not source.exact else None
 
         leftovers = list(assignments.get(None) or [])
 
@@ -507,7 +534,9 @@ def reconcile_with_text_layer(
                 # Структуру таблицы строит MinerU — слой про неё ничего не
                 # знает. Но текст ячеек всё равно распознан, поэтому его
                 # значения выправляются по слою.
-                extra_blocks.extend(_fix_table(block, matched, stats))
+                replacements, kept = _fix_table(block, matched, stats, vocab)
+                extra_blocks.extend(replacements)
+                leftovers.extend(kept)
             elif matched and not _carries_own_text(block):
                 # Рамка распознана как таблица или картинка, но содержимого
                 # в ней не оказалось (у MinerU это обычное дело на сложной
@@ -714,8 +743,11 @@ def fold_homoglyphs(text: str) -> str:
 
 
 def _fix_table(
-    block: ParsedBlock, matched: Sequence[TextLine], stats: ReconcileStats
-) -> List[ParsedBlock]:
+    block: ParsedBlock,
+    matched: Sequence[TextLine],
+    stats: ReconcileStats,
+    vocab: Optional[set] = None,
+) -> Tuple[List[ParsedBlock], List[TextLine]]:
     """
     Содержимое ячеек — по строкам слоя. Возвращает блоки, которыми таблицу
     пришлось заменить (пусто, если заменять не пришлось).
@@ -727,33 +759,40 @@ def _fix_table(
     строкой бессмысленно: её надо заменить целиком, и решает это геометрия.
     Не сошлась геометрия — таблица разбирается на текст и формулы, потому
     что выдать разметку побуквенно в индекс хуже любой потери структуры.
+
+    `vocab` — словарь распознанного слоя страницы; есть только у OCR-слоя.
+    С ним склеенные строки ячеек режутся по словам, а строки слоя, слов
+    которых в таблице нет, возвращаются вторым значением — текстом.
     """
-    if not latex_text.mangled_cells(block.table_data):
-        _repair_table_cells(block, matched, stats)
-        return []
-
-    stats.mangled_tables += 1
-    if table_from_lines.repair_cells(block, matched):
+    if latex_text.mangled_cells(block.table_data):
+        stats.mangled_tables += 1
+        if not table_from_lines.repair_cells(block, matched):
+            stats.degraded_tables += 1
+            return table_from_lines.degrade(block, matched), []
         stats.repaired_tables += 1
-        _repair_table_cells(block, matched, stats)
-        return []
 
-    stats.degraded_tables += 1
-    return table_from_lines.degrade(block, matched)
+    unused = _repair_table_cells(block, matched, stats)
+    if vocab is None:
+        return [], []
+    _split_glued_cells(block, vocab, stats)
+    kept = _lines_with_new_words(unused, block)
+    stats.table_lines_kept += len(kept)
+    return [], kept
 
 
 def _repair_table_cells(
     block: ParsedBlock, matched: Sequence[TextLine], stats: ReconcileStats
-) -> None:
+) -> List[TextLine]:
     """
     Значения ячеек заменяются на текст из слоя, если это заведомо та же
     строка. Каждая строка слоя расходуется один раз, поэтому одинаковые
-    ячейки не схлопываются в одну.
+    ячейки не схлопываются в одну. Возвращает строки, не пошедшие в дело.
     """
     table = block.table_data or {}
-    pool = [" ".join(line.text.split()) for line in matched if line.text.strip()]
+    pool_lines = [line for line in matched if line.text.strip()]
+    pool = [" ".join(line.text.split()) for line in pool_lines]
     if not pool:
-        return
+        return []
 
     folded_pool = [fold_homoglyphs(text) for text in pool]
     used: set = set()
@@ -780,6 +819,166 @@ def _repair_table_cells(
     table["headers"] = [repair(h) for h in (table.get("headers") or [])]
     table["rows"] = [[repair(c) for c in row] for row in (table.get("rows") or [])]
     block.table_data = table
+    return [line for index, line in enumerate(pool_lines) if index not in used]
+
+
+# ===========================================================================
+# Склеенные строки ячеек
+# ===========================================================================
+
+def _fold_char(ch: str) -> str:
+    """Посимвольная свёртка: длина строки сохраняется, позиции совпадают."""
+    low = ch.lower()
+    folded = _HOMOGLYPHS.get(low, low)
+    return folded if len(folded) == 1 else ch
+
+
+def _fold_word(word: str) -> str:
+    return "".join(_fold_char(ch) for ch in word)
+
+
+def layer_vocabulary(lines: Sequence[TextLine]) -> set:
+    """Слова строк слоя, свёрнутые и без знаков по краям."""
+    vocab = set()
+    for line in lines:
+        for raw in (line.text or "").split():
+            word = raw.strip(_WORD_EDGE)
+            if word:
+                vocab.add(_fold_word(word))
+    return vocab
+
+
+def _split_token(token: str, vocab: set) -> Optional[List[int]]:
+    """
+    Позиции, перед которыми в склеенный токен вставляется пробел, или None.
+
+    Токен должен целиком разложиться на слова словаря; из разложений берётся
+    то, где кусков меньше. Между кусками допустимы знаки (точка после «См.»),
+    но не дефис — это перенос слова, а не граница. Между двумя цифрами
+    граница не ставится никогда: шифр «123456.007» не режется, даже если
+    его части встречаются в слое по отдельности.
+    """
+    if len(token) > _GLUED_MAX_LEN or sum(ch.isalnum() for ch in token) < _GLUED_MIN_ALNUM:
+        return None
+    folded = _fold_word(token)
+    if folded.strip(_WORD_EDGE) in vocab:
+        return None
+    size = len(folded)
+    # best[stop] — (кусков, начало последнего куска, конец предыдущего или
+    # None) для лучшего разбора folded[:stop].
+    best: Dict[int, Tuple[int, int, Optional[int]]] = {}
+
+    def extend(start: int, pieces: int, prev_end: Optional[int]) -> None:
+        for stop in range(start + 1, size + 1):
+            if not folded[stop - 1].isalnum():
+                continue
+            piece = folded[start:stop]
+            if piece not in vocab or (len(piece) == 1 and not piece.isalpha()):
+                continue
+            if stop not in best or best[stop][0] > pieces + 1:
+                best[stop] = (pieces + 1, start, prev_end)
+
+    lead = 0
+    while lead < size and not folded[lead].isalnum():
+        lead += 1
+    extend(lead, 0, None)
+    # Кусок кончается правее, чем начинается, поэтому к моменту обхода
+    # позиции `end` лучший разбор до неё уже окончателен.
+    for end in range(1, size):
+        if end not in best:
+            continue
+        gap = end
+        while gap < size and not folded[gap].isalnum():
+            gap += 1
+        if gap >= size or any(ch in "-–—" for ch in token[end:gap]):
+            continue
+        if token[end - 1].isdigit() and token[gap].isdigit():
+            continue
+        extend(gap, best[end][0], end)
+
+    finishes = [end for end in best if not any(ch.isalnum() for ch in folded[end:])]
+    if not finishes:
+        return None
+    end = min(finishes, key=lambda e: best[e][0])
+    if best[end][0] < 2:
+        return None
+    cuts: List[int] = []
+    while best[end][2] is not None:
+        cuts.append(best[end][1])
+        end = best[end][2]
+    return sorted(cuts)
+
+
+def split_glued_text(text: str, vocab: set) -> Tuple[str, int]:
+    """
+    Текст (или HTML таблицы) с разрезанными склейками и число разрезанных
+    токенов. Разметка не трогается: режется только текст между тегами.
+    """
+    if not text or not vocab:
+        return text, 0
+    count = 0
+
+    def fix(match: "re.Match[str]") -> str:
+        nonlocal count
+        token = match.group(0)
+        cuts = _split_token(token, vocab)
+        if not cuts:
+            return token
+        count += 1
+        bounds = [0] + cuts + [len(token)]
+        return " ".join(token[a:b] for a, b in zip(bounds, bounds[1:]))
+
+    parts = _MARKUP_RE.split(text)
+    for index in range(0, len(parts), 2):
+        parts[index] = re.sub(r"\S+", fix, parts[index])
+    return "".join(parts), count
+
+
+def _split_glued_cells(block: ParsedBlock, vocab: set, stats: ReconcileStats) -> None:
+    """Склейки режутся во всех видах таблицы: ячейки, HTML и текст блока."""
+    table = block.table_data or {}
+
+    def fix(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        fixed, count = split_glued_text(value, vocab)
+        stats.split_tokens += count
+        return fixed
+
+    if table:
+        table["headers"] = [fix(h) for h in (table.get("headers") or [])]
+        table["rows"] = [[fix(c) for c in row] for row in (table.get("rows") or [])]
+        block.table_data = table
+    if block.table_html:
+        block.table_html = split_glued_text(block.table_html, vocab)[0]
+    if block.text:
+        block.text = split_glued_text(block.text, vocab)[0]
+
+
+def _lines_with_new_words(lines: Sequence[TextLine], block: ParsedBlock) -> List[TextLine]:
+    """
+    Строки слоя из рамки таблицы, чьих слов в ячейках нет.
+
+    Модель таблиц теряет подписи столбцов и куски ячеек целиком; слой их
+    читает, но раньше такие строки молча выбрасывались вместе с рамкой.
+    Повтором считается слово, которое уже есть в таблице, — строка из
+    повторов не возвращается, чтобы содержимое не двоилось.
+    """
+    table = block.table_data or {}
+    cells = [str(h) for h in (table.get("headers") or [])]
+    for row in table.get("rows") or []:
+        cells.extend(str(c) for c in row)
+    known = {_fold_word(w) for w in _TOKEN_RE.findall(" ".join(cells))}
+    kept: List[TextLine] = []
+    for line in lines:
+        words = [_fold_word(w) for w in _TOKEN_RE.findall(line.text or "") if len(w) >= 3]
+        # Новым считается только слово длиннее трёх букв: обрывки линий
+        # сетки Tesseract читает как «ООО», «ОИ», «ne».
+        new = [w for w in words if w not in known and len(w) >= 4]
+        if len(new) >= _TABLE_LINE_MIN_NEW_WORDS and len(new) >= len(words) * _TABLE_LINE_MIN_NEW_SHARE:
+            kept.append(line)
+            known.update(new)
+    return kept
 
 
 def _all_text_is_coordinateless(blocks: Sequence[ParsedBlock]) -> bool:
