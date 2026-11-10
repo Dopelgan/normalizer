@@ -373,3 +373,37 @@ class TestEskdDesignation:
         """«ПС» или «изм. 1» без обозначения — подтверждение, а не решение."""
         match = rules.classify("Отчёт ПС (изм. 1).pdf")
         assert match.category == CATEGORY_BUSINESS
+
+
+class TestEskdReviewFixes:
+    """Замечания ревью к правилу ЕСКД: ложные срабатывания и перевес над личным."""
+
+    @pytest.mark.parametrize("value", [
+        "ОКПД 25.11.23", "ОКПД 25.11.23.110", "ОКПО 1234.5678", "РЕСО 12.34",
+        "DSCN 0012.034", "ГОСТ 123456.001", "IMG 123456.001",
+    ])
+    def test_designation_false_positives(self, value):
+        assert not rules.ESKD_DESIGNATION.pattern.search(rules.prepare(value))
+
+    def test_three_letter_code_with_six_digits(self):
+        match = rules.classify(
+            "АДУ 305179.001.15.02 CБ изм.1 - Пробка ЭК150 сборная d30.pdf",
+            allowed=rules.PATH_CATEGORIES,
+        )
+        assert match.category == CATEGORY_TECHNICAL
+
+    @pytest.mark.parametrize("value", ["Подстанция ПС 110 кВ", "изм. 3", "СБ КД ПЭ3"])
+    def test_codes_without_designation_do_not_count(self, value):
+        assert rules.classify(value).category != CATEGORY_TECHNICAL
+
+    def test_personal_name_beats_designation(self):
+        match = rules.classify("личное_ТАДУ 687000.001.pdf", allowed=rules.PATH_CATEGORIES)
+        assert match.category == rules.CATEGORY_PERSONAL
+
+    def test_letter_referencing_drawing_is_not_technical(self):
+        text = "Исх. № 15-3 от 01.02.2026\nНаправляем ТАДУ 687000.001 СБ на согласование"
+        assert rules.classify(text).category == CATEGORY_BUSINESS
+
+    def test_mail_thread_referencing_drawing_is_correspondence(self):
+        text = "Re: ТАДУ 687000.001 СБ\nДобрый день! Замечания к чертежу во вложении."
+        assert rules.classify(text).category == CATEGORY_CORRESPONDENCE

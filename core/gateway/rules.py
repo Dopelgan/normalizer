@@ -98,23 +98,36 @@ def _marker(category: str, weight: float, pattern: str, title: str = "") -> Mark
 # чужих документах («акт», «график», «деталь»): он подтверждает категорию,
 # но не объявляет её в одиночку.
 
-# Обозначение изделия по ЕСКД (ГОСТ 2.201): код организации — четыре
-# заглавные буквы, затем группы цифр через точку: «ТАДУ 687000.001»,
-# «ТАДУ 305179.001.01.01.011», «АЕГН.01.00017.111.0015». Сканы КД приходят без
-# текстового слоя, и обозначение в имени — единственный их признак.
-# Регистр важен намеренно: «июня 12.05.20» и «от 12.05.2024» — даты, а не
-# обозначения, поэтому шаблон без IGNORECASE и требует именно четыре буквы.
+# Обозначение изделия по ЕСКД (ГОСТ 2.201): код организации — три-четыре
+# заглавные буквы, затем группы цифр через точку. Форматов на проде два:
+# «ТАДУ 687000.001», «ТАДУ 305179.001.01.01.011», «АДУ 305179.001.15.02» —
+# классификационная характеристика из шести цифр; и «АЕГН.01.00017.111.0015» —
+# короткие группы, но не меньше четырёх. Сканы КД приходят без текстового
+# слоя, и обозначение в имени — единственный их признак.
+#
+# Регистр важен намеренно: «июня 12.05.20» и «от 12.05.2024» — даты. Коды
+# классификаторов («ОКПД 25.11.23.110»), стандартов и камер («DSCN 0012.034»)
+# под формат подходят, поэтому исключены явно.
+_ESKD_STOP = (
+    "ОКПД", "ОКПО", "ОКВЭД", "ОКАТО", "ОКТМО", "ОКОФ", "ОКУД", "ОКВ", "ОКС",
+    "ГОСТ", "СНИП", "СТО", "ОСТ", "РСТ", "DSCN", "DSC", "IMG", "PIC", "SAM",
+)
 ESKD_DESIGNATION = Marker(
     category=CATEGORY_TECHNICAL,
     weight=1.2,
     pattern=re.compile(
-        r"(?<![А-ЯЁA-Zа-яёa-z\d])[А-ЯЁA-Z]{4}[ .]\d{2,6}(?:\.\d{2,5}){1,6}(?![\d.]*\d)"
+        r"(?<![А-ЯЁA-Zа-яёa-z\d])"
+        r"(?!(?:" + "|".join(_ESKD_STOP) + r")[ .])"
+        r"[А-ЯЁA-Z]{3,4}[ .]"
+        r"(?:\d{6}(?:\.\d{2,5}){1,6}|\d{2,5}(?:\.\d{2,5}){3,6})"
+        r"(?![\d])"
     ),
     title="обозначение ЕСКД",
 )
 
-# Код документа КД после обозначения (ГОСТ 2.102): «СБ», «ПЭ3», «РЭ»… Сам по
-# себе слаб — «ПС» встречается где угодно, — поэтому только подтверждает.
+# Код документа КД после обозначения (ГОСТ 2.102): «СБ», «ПЭ3», «РЭ»… и номер
+# изменения. Сами по себе ничего не значат — «Подстанция ПС 110 кВ», «изм. 3»
+# в протоколе, — поэтому считаются только рядом с обозначением (см. classify).
 # Латинская «C» в «CБ» встречается в реальных именах файлов.
 ESKD_DOCUMENT_CODE = Marker(
     category=CATEGORY_TECHNICAL,
@@ -124,11 +137,17 @@ ESKD_DOCUMENT_CODE = Marker(
     ),
     title="код документа КД",
 )
+ESKD_REVISION = _marker(CATEGORY_TECHNICAL, 0.3, r"\bизм\.?\s*\d+", "изм. N")
+
+# Маркеры, рядом с которыми обозначение ЕСКД не считается вовсе. Личное в
+# имени важнее шифра («личное_ТАДУ 687000.001.pdf» — не КД), а письмо или
+# почтовая ветка, ссылающиеся на чертёж, остаются письмом.
+_ESKD_YIELDS_TO_TITLES = frozenset({"исх. №", "вх. №", "письмо №"})
 
 _TECHNICAL: Tuple[Marker, ...] = (
     ESKD_DESIGNATION,
     ESKD_DOCUMENT_CODE,
-    _marker(CATEGORY_TECHNICAL, 0.3, r"\bизм\.?\s*\d+", "изм. N"),
+    ESKD_REVISION,
     _marker(CATEGORY_TECHNICAL, 1.2, r"\bгост\b", "ГОСТ"),
     _marker(CATEGORY_TECHNICAL, 1.0, r"\bост\s*\d", "ОСТ"),
     _marker(CATEGORY_TECHNICAL, 1.0, r"\bту\s*\d", "ТУ"),
@@ -312,12 +331,19 @@ def classify(haystack: str, allowed: Optional[Sequence[str]] = None) -> RuleMatc
     hits: Dict[str, int] = {}
     best_marker: Dict[str, Tuple[float, str]] = {}
 
+    counts: Dict[Marker, int] = {}
     for marker in MARKERS:
         if permitted is not None and marker.category not in permitted:
             continue
         count = marker.count(prepared)
-        if not count:
-            continue
+        if count:
+            counts[marker] = count
+
+    if not _eskd_counts(counts):
+        for marker in _ESKD_GROUP:
+            counts.pop(marker, None)
+
+    for marker, count in counts.items():
         value = marker.weight * min(_REPEAT_CAP, 1.0 + math.log2(count))
         scores[marker.category] = scores.get(marker.category, 0.0) + value
         hits[marker.title] = count
@@ -341,6 +367,25 @@ def classify(haystack: str, allowed: Optional[Sequence[str]] = None) -> RuleMatc
         scores=scores,
         hits=hits,
     )
+
+
+_ESKD_GROUP = (ESKD_DESIGNATION, ESKD_DOCUMENT_CODE, ESKD_REVISION)
+
+
+def _eskd_counts(counts: Dict[Marker, int]) -> bool:
+    """
+    Учитывать ли признаки ЕСКД. Код документа и «изм. N» без обозначения не
+    значат ничего, а обозначение уступает личному, переписке и служебному
+    письму: это ссылка на чертёж, а не сам чертёж.
+    """
+    if ESKD_DESIGNATION not in counts:
+        return False
+    for marker in counts:
+        if marker.category in (CATEGORY_PERSONAL, CATEGORY_CORRESPONDENCE):
+            return False
+        if marker.title in _ESKD_YIELDS_TO_TITLES:
+            return False
+    return True
 
 
 def _confidence(best: float, second: float, distinct_hits: int) -> float:
