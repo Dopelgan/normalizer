@@ -161,7 +161,7 @@ class TestMixedScript:
 
     @pytest.mark.parametrize("word, expected", [
         ("HOCТЬ", "НОСТЬ"),            # есть буква, которой нет в латинице
-        ("Пοпроекту", "Попроекту"),    # греческая ο среди кириллицы
+        ("Пοпроекту", "Пοпроекту"),    # греческое — только по словарю слоя
         ("Πoпроекту", "Πoпроекту"),    # три алфавита — только по словарю слоя
         ("exрires", "expires"),        # латинское слово с кириллицей
         ("OTK", "OTK"),                # один алфавит — не трогаем
@@ -233,3 +233,21 @@ class TestLegitMixedTokens:
     ])
     def test_substitutions_still_fixed(self, token, expected):
         assert split_glued_text(token, {})[0] == expected
+
+
+class TestGostSymbols:
+    """Ревью e501bde: греческая буква с русским индексом — законное обозначение."""
+
+    @pytest.mark.parametrize("token", ["τср", "αт", "ρв", "κп", "εр", "ТипA1"])
+    def test_kept_without_vocabulary(self, token):
+        assert split_glued_text(token, {})[0] == token
+        assert unify_script(token) == token
+
+    def test_greek_fixed_only_by_layer(self):
+        vocab = layer_vocabulary([line("Попроекту", 0.1)])
+        assert split_glued_text("Пοпроекту", vocab)[0] == "Попроекту"
+
+    def test_layer_spelling_never_turns_digit_into_letter(self):
+        # OCR прочитал «3» как «з»; свёртка их не различает.
+        vocab = layer_vocabulary([line("АБВГ 681821.001ПМз", 0.1)])
+        assert split_glued_text("681821.001ПM3", vocab)[0] == "681821.001ПM3"

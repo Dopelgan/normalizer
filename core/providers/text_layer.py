@@ -898,24 +898,20 @@ def _single_script(text: str) -> bool:
 def unify_script(word: str) -> str:
     """
     Слово из одного алфавита, если смесь в нём объяснима подменой похожих
-    букв. Подмена — это всегда кириллица плюс ровно один чужой алфавит:
-    слово без кириллицы не трогается никогда — смесь латиницы с греческим
-    законна («kΩ», «μm», «Δp», «τmax»), как и смесь трёх алфавитов. Есть в
+    букв. Здесь — только кириллица с латиницей: слово с греческой буквой
+    не трогается никогда, потому что «τср», «αт», «ρв» — законные
+    обозначения ГОСТ, а «kΩ», «μm», «τmax» — единицы и индексы; греческая
+    буква становится кириллицей только сверкой со словарём слоя. Есть в
     слове буква, которой нет в латинице («НачальникOTK», «HOCТЬ»), — похожие
-    латинские буквы становятся кириллицей; греческие — тоже, но только в
-    слове из кириллицы и греческого («Πoпроекту» сюда не относится: там
-    латинская o, и слово остаётся как есть до сверки со слоем). Есть буква,
-    которой нет в кириллице («exрires»), — наоборот. Есть и те и другие
-    («priёmki») — слово не трогается: это не подмена, а каша.
+    латинские буквы становятся кириллицей; есть буква, которой нет в
+    кириллице («exрires»), — наоборот; есть и те и другие («priёmki») —
+    слово не трогается: это не подмена, а каша. Латинская буква рядом с
+    цифрой не меняется никогда: это код («ТипA1»), а не подмена.
     """
     def fix(match: "re.Match[str]") -> str:
         run = match.group(0)
-        scripts = _scripts(run)
-        if scripts not in ({"cyr", "lat"}, {"cyr", "grk"}):
+        if _scripts(run) != {"cyr", "lat"}:
             return run
-        if "grk" in scripts:
-            return "".join(_TO_CYRILLIC.get(ch, ch) if _script(ch) == "grk" else ch
-                           for ch in run)
         cyr_only = any(_script(ch) == "cyr" and ch not in _TO_LATIN for ch in run)
         lat_only = any(_script(ch) == "lat" and ch not in _TO_CYRILLIC for ch in run)
         if cyr_only and lat_only:
@@ -926,9 +922,21 @@ def unify_script(word: str) -> str:
         else:
             to_cyrillic = cyr_only
         table = _TO_CYRILLIC if to_cyrillic else _TO_LATIN
-        return "".join(table.get(ch, ch) for ch in run)
+        source = "lat" if to_cyrillic else "cyr"
+        return "".join(
+            table.get(ch, ch)
+            if _script(ch) == source and not _near_digit(word, match.start() + i) else ch
+            for i, ch in enumerate(run)
+        )
 
     return _LETTER_RUN_RE.sub(fix, word)
+
+
+def _near_digit(text: str, index: int) -> bool:
+    """Буква стоит вплотную к цифре — часть кода («A1», «M8»)."""
+    return (index > 0 and text[index - 1].isdigit()) or (
+        index + 1 < len(text) and text[index + 1].isdigit()
+    )
 
 
 def _fold_char(ch: str) -> str:
@@ -982,7 +990,9 @@ def _lookup(piece: str, vocab: Dict[str, str]) -> Optional[str]:
     return None
 
 
-def _respell(piece: str, spelling: str, trusted: bool) -> str:
+def _respell(
+    piece: str, spelling: str, trusted: bool, token: str = "", offset: int = 0
+) -> str:
     """
     Кусок в написании слоя, с регистром куска. Только если слой надёжен
     (`trusted`: векторный слой или смешанный алфавит в самом токене) и
@@ -992,9 +1002,16 @@ def _respell(piece: str, spelling: str, trusted: bool) -> str:
         return piece
     if not _single_script(spelling):
         return piece
-    return "".join(
-        new.upper() if old.isupper() else new.lower() for old, new in zip(piece, spelling)
-    )
+    # Меняются только буквы на буквы: цифра не становится буквой («3» и «з»
+    # сворачиваются одинаково), а латинская буква у цифры — часть кода.
+    context = token or piece
+    out = []
+    for i, (old, new) in enumerate(zip(piece, spelling)):
+        keep = not (old.isalpha() and new.isalpha()) or (
+            _script(old) == "lat" and _near_digit(context, offset + i)
+        )
+        out.append(old if keep else (new.upper() if old.isupper() else new.lower()))
+    return "".join(out)
 
 
 def _letter_run(text: str, from_end: bool) -> int:
@@ -1125,9 +1142,13 @@ def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
         for index, (start, stop, spelling) in enumerate(pieces):
             if index:
                 out.append(" ")
-            piece = _respell(token[start:stop], spelling, trusted)
-            if russian and all(ch in _TO_CYRILLIC for ch in piece if ch.isalpha()):
-                piece = "".join(_TO_CYRILLIC.get(ch, ch) for ch in piece)
+            piece = _respell(token[start:stop], spelling, trusted, token, start)
+            if russian and all(_script(ch) == "lat" and ch in _TO_CYRILLIC
+                               for ch in piece if ch.isalpha()):
+                piece = "".join(
+                    ch if _near_digit(token, start + i) else _TO_CYRILLIC.get(ch, ch)
+                    for i, ch in enumerate(piece)
+                )
             out.append(piece)
             following = pieces[index + 1][0] if index + 1 < len(pieces) else len(token)
             out.append(token[stop:following])
@@ -1139,7 +1160,8 @@ def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
     if spelling is None:
         return token
     start = token.index(core)
-    return token[:start] + _respell(core, spelling, trusted) + token[start + len(core):]
+    fixed = _respell(core, spelling, trusted, token, start)
+    return token[:start] + fixed + token[start + len(core):]
 
 
 def split_glued_text(
