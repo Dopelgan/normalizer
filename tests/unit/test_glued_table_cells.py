@@ -261,7 +261,8 @@ class TestDrawingStamp:
         return ParsedBlock(
             type="table", page=1, bbox=[0.05, 0.80, 0.95, 0.99],
             table_data={"headers": ["Изм.", "Лист", "№ докум.", "Подп.", "Дата"],
-                        "rows": [list(r) for r in rows], "total_row": None},
+                        "rows": [list(r) for r in rows] + [["Пров.", "Сидоров", "", "", ""]],
+                        "total_row": None},
         )
 
     def _reconcile(self, block, *texts):
@@ -308,6 +309,7 @@ class TestDrawingStamp:
     @pytest.mark.parametrize("token, expected", [
         ("12X18H10T", "12Х18Н10Т"), ("08X18H10T", "08Х18Н10Т"),
         ("770X520X320", None), ("10X20", None), ("IP65", None), ("M8", None),
+        ("10AT", None), ("25MBA", None), ("1K5M", None), ("100KT", None), ("10TA", None),
     ])
     def test_steel_grade(self, token, expected):
         assert steel_grade(token) == expected
@@ -324,3 +326,48 @@ class TestOcrTextBlocks:
         layer = layer_of(line("Прочий текст", 0.5))
         blocks, _ = reconcile_with_text_layer([block], layer, source=OCR_LAYER)
         assert blocks[0].text == "НОСТЬ размеры YxXxZ, мм"
+
+
+class TestStampDetection:
+    """Ревью d54e808: обычная таблица не штамп, коды — не марки стали."""
+
+    def _reconcile(self, headers, rows, bbox=(0.05, 0.80, 0.95, 0.99)):
+        block = ParsedBlock(type="table", page=1, bbox=list(bbox),
+                            table_data={"headers": headers, "rows": rows, "total_row": None})
+        # Строка слоя внутри рамки: без неё таблица сшивкой не обрабатывается.
+        layer = layer_of(line("Прочий текст", bbox[1] + 0.02, x=bbox[0] + 0.01, width=0.3))
+        blocks, _ = reconcile_with_text_layer([block], layer, source=OCR_LAYER)
+        return next(b for b in blocks if b.type == "table").table_data["rows"]
+
+    def test_revision_table_is_not_a_stamp(self):
+        rows = self._reconcile(["Изм.", "Лист", "№ докум.", "Подп.", "Дата"],
+                               [["прав.", "Инд", "Дота", "", ""]])
+        assert rows[0][:3] == ["прав.", "Инд", "Дота"]
+
+    def test_spec_with_gost_is_not_a_stamp(self):
+        rows = self._reconcile(["Обозначение", "Материал", "Масса"],
+                               [["ГОСТ 5582-75", "ГОСТ 19904-90", "Дама"]])
+        assert rows[0][2] == "Дама"
+
+    def test_stamp_must_sit_at_the_bottom(self):
+        rows = self._reconcile(["Изм.", "Лист", "Подп.", "Дата", "Масса"],
+                               [["Пров.", "Разрад.", "", "", ""]], bbox=(0.05, 0.05, 0.95, 0.30))
+        assert rows[0][1] == "Разрад."
+
+    def test_prav_is_not_prov_even_in_stamp(self):
+        rows = self._reconcile(["Изм.", "Лист", "Подп.", "Дата", "Масса"],
+                               [["Пров.", "прав.", "", "", ""]])
+        assert rows[0][1] == "прав."
+
+    @pytest.mark.parametrize("text", ["10AT", "25MBA", "1K5M", "100KT", "10TA",
+                                      "type 10AT", "12X18H10T"])
+    def test_codes_outside_stamp_are_kept(self, text):
+        rows = self._reconcile(["Code", "Value"], [[text, "1"]], bbox=(0.05, 0.1, 0.9, 0.3))
+        assert rows[0][0] == text
+
+    def test_stamp_recognised_by_control_signature(self):
+        # Курсивные «Разрад.»/«Проб.» не совпадают буква в букву, но
+        # «Т.контр.» штамп выдаёт.
+        rows = self._reconcile(["Изм.", "Лист", "Подп.", "Дама", "Т.контр."],
+                               [["Разрад.", "Проб.", "Macca", "", ""]])
+        assert rows[0][:3] == ["Разраб.", "Пров.", "Масса"]

@@ -108,18 +108,32 @@ _VOWELS = set("аеёиоуыэюяaeiouy")
 # MinerU и Tesseract читают с устойчивыми подменами: «Разрад.», «Проб.»,
 # «Лucт», «Macwmad», «FOCT», «Дама». Словарь закрытый, поэтому сверка с ним
 # идёт по «курсивной» свёртке, которая склеивает эти пары букв, — и только в
-# таблице, которая сама похожа на штамп (см. `_STAMP_MIN_LABELS`).
-_STAMP_LABELS = (
-    "Изм Лист Листов докум Подп Дата Разраб Пров контр Утв Лит Масса Масштаб "
-    "Копировал Формат ГОСТ Инв подл Взам инв дубл Перв примен Справ"
-).split()
-# Сколько подписей штампа должно стоять в таблице буква в букву, чтобы
-# считать её основной надписью.
-_STAMP_MIN_LABELS = 2
-# Курсивные подмены поверх обычной свёртки: т/m, и/у/u, б/в/д/6, г/F, ш/w,
-# а/о. В открытом тексте так сравнивать нельзя — только с закрытым словарём.
+# таблице, которая сама похожа на штамп (см. `_looks_like_stamp`).
+# Группы подписей: графы изменений, подписи, характеристики листа, поля
+# формата и учёта. «ГОСТ» — не подпись: в штамп он попадает графой
+# материала, но признаком штампа не считается.
+_STAMP_GROUPS = (
+    ("Изм", "Лист", "Листов", "докум", "Подп", "Дата"),
+    ("Разраб", "Пров", "контр", "Утв"),
+    ("Лит", "Масса", "Масштаб"),
+    ("Копировал", "Формат", "Инв", "подл", "Взам", "дубл", "Перв", "примен", "Справ"),
+)
+# Подписи исполнителей; «контр» — из «Т.контр.»/«Н.контр.»: графа есть
+# только в штампе и читается чаще, чем курсивные «Разраб.»/«Пров.».
+_STAMP_SIGNATURES = ("Разраб", "Пров", "Утв", "контр")
+_STAMP_LABELS = [label for group in _STAMP_GROUPS for label in group] + ["ГОСТ"]
+# Штамп: не меньше стольких разных подписей буква в букву, из не меньше
+# стольких групп, среди них подпись исполнителя, и таблица внизу листа
+# (нижний край рамки ниже этой доли высоты). Таблица изменений или
+# спецификация с «Изм. Лист № докум. Подп. Дата» штампом так не станет.
+_STAMP_MIN_LABELS = 4
+_STAMP_MIN_GROUPS = 2
+_STAMP_MIN_BOTTOM = 0.75
+# Курсивные подмены поверх обычной свёртки: т/m, и/у/u, б/в/д/6, г/F, ш/w.
+# Пары а/о здесь нет: «прав.» не должно стать «Пров.». В открытом тексте
+# так сравнивать нельзя — только с закрытым словарём штампа.
 _CURSIVE = {"m": "t", "y": "u", "b": "d", "б": "d", "6": "d", "f": "r",
-            "ш": "w", "щ": "w", "a": "o"}
+            "ш": "w", "щ": "w"}
 # Наименование в штампе с приклеенной цифрой соседней графы («Крышка2»).
 _WORD_NUMBER_RE = re.compile(r"^([^\W\d_]{4,})(\d{1,3})$")
 # Число внутри склейки: цифры со знаками, начинается и кончается цифрой.
@@ -989,16 +1003,34 @@ def _cursive_fold(word: str) -> str:
     return "".join(_CURSIVE.get(ch, ch) for ch in folded)
 
 
-_STAMP_LEXICON = {_cursive_fold(word): word for word in _STAMP_LABELS}
-_STAMP_EXACT = {_fold_word(word) for word in _STAMP_LABELS}
+def _unambiguous(words: Sequence[str]) -> Dict[str, str]:
+    """Курсивная свёртка -> подпись; свёртки, общие для двух подписей, выкинуты."""
+    seen: Dict[str, set] = {}
+    for word in words:
+        seen.setdefault(_cursive_fold(word), set()).add(word.lower())
+    first = {}
+    for word in words:
+        first.setdefault(_cursive_fold(word), word)
+    return {key: first[key] for key, labels in seen.items() if len(labels) == 1}
+
+
+_STAMP_LEXICON = _unambiguous(_STAMP_LABELS)
+_STAMP_EXACT = {
+    _fold_word(word): (index, word)
+    for index, group in enumerate(_STAMP_GROUPS) for word in group
+}
 
 
 def steel_grade(token: str) -> Optional[str]:
-    """Марка стали по ГОСТ в кириллице, если токен — она, записанная латиницей."""
+    """
+    Марка стали по ГОСТ в кириллице, если токен — она, записанная латиницей.
+    Нужны хром или никель (Х/Н): «10AT», «25MBA», «1K5M», «100KT» — коды, а
+    не марки. Вызывается только внутри штампа чертежа.
+    """
     if not _STEEL_GRADE_RE.match(token):
         return None
     latin = {ch for ch in token if _script(ch) == "lat"}
-    if not latin or latin <= {"X"}:
+    if not latin or latin <= {"X"} or not ({"X", "H"} & set(token.upper())):
         return None
     return "".join(_TO_CYRILLIC.get(ch, ch) if _script(ch) == "lat" else ch for ch in token)
 
@@ -1008,7 +1040,14 @@ def _stamp_label(word: str, vocab: Dict[str, str]) -> Optional[str]:
     lexicon = getattr(vocab, "lexicon", None)
     if not lexicon or sum(ch.isalpha() for ch in word) < 2 or sum(ch.isalnum() for ch in word) < 3:
         return None
-    return lexicon.get(_cursive_fold(word))
+    label = lexicon.get(_cursive_fold(word))
+    if label is None or _fold_word(word) == _fold_word(label):
+        return label
+    # Совпадение только по курсиву: слово, которое слой прочитал так же
+    # буква в букву, — скорее настоящее слово, чем искажённая подпись.
+    if word in getattr(vocab, "verbatim", ()):
+        return None
+    return label
 
 
 def _match_case(spelling: str, original: str) -> str:
@@ -1028,13 +1067,21 @@ def _with_stamp_lexicon(vocab: Dict[str, str]) -> Dict[str, str]:
     return merged
 
 
-def _looks_like_stamp(cells: Sequence[str]) -> bool:
-    found = 0
+def _looks_like_stamp(cells: Sequence[str], bbox: Sequence[float]) -> bool:
+    """Таблица — основная надпись чертежа (см. `_STAMP_MIN_LABELS`)."""
+    if not bbox or float(bbox[3]) < _STAMP_MIN_BOTTOM:
+        return False
+    found = {}
     for cell in cells:
-        for raw in str(cell).split():
-            if _fold_word(raw.strip(_WORD_EDGE)) in _STAMP_EXACT:
-                found += 1
-    return found >= _STAMP_MIN_LABELS
+        for raw in re.split(r"[\s.]+", str(cell)):
+            hit = _STAMP_EXACT.get(_fold_word(raw.strip(_WORD_EDGE)))
+            if hit is not None:
+                found[hit[1]] = hit[0]
+    return (
+        len(found) >= _STAMP_MIN_LABELS
+        and len(set(found.values())) >= _STAMP_MIN_GROUPS
+        and any(label in found for label in _STAMP_SIGNATURES)
+    )
 
 
 class _Vocabulary(dict):
@@ -1152,7 +1199,8 @@ def _split_token(
         original = token[start:stop]
         # Число и марка стали — куски и без словаря: слово к ним приклеено
         # («Крышка2», «Лист12X18H10T»), а сами они в слое бывают искажены.
-        spelling = (_lookup(original, vocab) or steel_grade(original)
+        stamp = bool(getattr(vocab, "lexicon", None))
+        spelling = (_lookup(original, vocab) or (stamp and steel_grade(original))
                     or (original if _NUMBER_RE.match(original) else None))
         if spelling is None:
             return False
@@ -1247,7 +1295,8 @@ def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
                 out.append(" ")
             original = token[start:stop]
             label = _stamp_label(original, vocab)
-            piece = (steel_grade(original)
+            stamp = bool(getattr(vocab, "lexicon", None))
+            piece = ((stamp and steel_grade(original))
                      or (label and _match_case(label, original))
                      or _respell(original, spelling, trusted, token, start))
             if russian and all(_script(ch) == "lat" and ch in _TO_CYRILLIC
@@ -1264,7 +1313,7 @@ def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
     if not core or not any(ch.isalpha() for ch in core):
         return token
     start = token.index(core)
-    grade = steel_grade(core)
+    grade = steel_grade(core) if getattr(vocab, "lexicon", None) else None
     if grade is not None:
         return token[:start] + grade + token[start + len(core):]
     spelling = _lookup(core, vocab)
@@ -1339,7 +1388,7 @@ def _split_glued_cells(
     """Склейки режутся во всех видах таблицы: ячейки, HTML и текст блока."""
     table = block.table_data or {}
     cells = list(table.get("headers") or []) + [c for row in table.get("rows") or [] for c in row]
-    if not exact and _looks_like_stamp(cells):
+    if not exact and _looks_like_stamp(cells, block.bbox):
         vocab = _with_stamp_lexicon(vocab)
 
     def fix(value: Any) -> Any:
