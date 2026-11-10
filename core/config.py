@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     # Значение по умолчанию собирается из core.filetypes — единого реестра
     # поддерживаемых форматов, чтобы список не расходился с ним.
     SOURCE_PROBE_EXTENSIONS: List[str] = ["." + ext for ext in PROBE_ORDER]
+    # Бакет вложений чата Backend (на проде — `chat-attachments`). Ключ там —
+    # голый uuid в нижнем регистре без расширения, исходное имя файла лежит
+    # в метаданных объекта `filename` (URL-encoded). Пусто — поиск во
+    # вложениях выключен. Смотрим туда, только если в основном бакете по
+    # такому uuid ничего не нашлось.
+    S3_ATTACHMENTS_BUCKET: str = ""
     # Куда складываются изображения, вырезанные из PDF.
     ASSETS_PREFIX: str = "assets/"
 

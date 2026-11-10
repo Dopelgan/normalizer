@@ -80,3 +80,101 @@ class TestLocate:
         """Путь наружу из хранилища не должен ни находиться, ни падать."""
         with pytest.raises(SourceFileNotFound):
             locator.locate("../../etc/passwd")
+
+
+# ---------------------------------------------------------------- вложения чата
+_UUID = "0b9f3c2e-5d1a-4c6b-9e8f-1a2b3c4d5e6f"
+_ZIP_HEAD = b"PK\x03\x04" + b"\x00" * 60
+
+
+class _FakeS3:
+    """Хранилище из двух бакетов: основной (docs) и вложений чата."""
+
+    def __init__(self, objects, meta=None):
+        self.objects = objects          # uri -> bytes
+        self.meta = meta or {}          # uri -> dict
+        self.checked = []
+
+    def exists(self, uri):
+        self.checked.append(uri)
+        return uri in self.objects
+
+    def get_stream(self, uri):
+        import io
+        return io.BytesIO(self.objects[uri])
+
+    def metadata(self, uri):
+        return self.meta.get(uri, {})
+
+
+@pytest.fixture
+def s3_settings(monkeypatch):
+    monkeypatch.setattr(settings, "STORAGE_TYPE", "s3")
+    monkeypatch.setattr(settings, "S3_BUCKET", "knowledge-base")
+    monkeypatch.setattr(settings, "SOURCE_PREFIX", "")
+    monkeypatch.setattr(settings, "S3_ATTACHMENTS_BUCKET", "chat-attachments")
+
+
+class TestChatAttachments:
+    """
+    Регрессия: uuid вложения чата искался только в основном бакете
+    (uuid + 17 расширений) и всегда давал SourceFileNotFound.
+    """
+
+    def test_docx_attachment_found_with_type_from_metadata(self, s3_settings):
+        uri = f"s3://chat-attachments/{_UUID}"
+        storage = _FakeS3(
+            {uri: _ZIP_HEAD},
+            {uri: {"filename": "%D0%BF%D1%80%D0%B8%D0%BA%D0%B0%D0%B7.docx"}},
+        )
+        located = FileLocator(storage).locate(_UUID)
+        assert located.uri == uri
+        assert located.file_type == "docx"
+        assert located.s3_fileid == _UUID
+
+    def test_xlsx_attachment_type_from_metadata(self, s3_settings):
+        uri = f"s3://chat-attachments/{_UUID}"
+        storage = _FakeS3({uri: _ZIP_HEAD}, {uri: {"filename": "report%202026.XLSX"}})
+        assert FileLocator(storage).locate(_UUID).file_type == "xlsx"
+
+    def test_without_metadata_type_is_sniffed(self, s3_settings):
+        uri = f"s3://chat-attachments/{_UUID}"
+        storage = _FakeS3({uri: b"%PDF-1.7\n"})
+        assert FileLocator(storage).locate(_UUID).file_type == "pdf"
+
+    def test_knowledge_base_checked_first(self, s3_settings):
+        kb = f"s3://knowledge-base/{_UUID}.pdf"
+        att = f"s3://chat-attachments/{_UUID}"
+        storage = _FakeS3({kb: b"%PDF-1.7", att: _ZIP_HEAD})
+        assert FileLocator(storage).locate(_UUID).uri == kb
+        assert att not in storage.checked
+
+    def test_attachment_probed_exactly_once_without_extensions(self, s3_settings):
+        storage = _FakeS3({})
+        with pytest.raises(SourceFileNotFound):
+            FileLocator(storage).locate(_UUID)
+        attachment_checks = [u for u in storage.checked if "chat-attachments" in u]
+        assert attachment_checks == [f"s3://chat-attachments/{_UUID}"]
+
+    def test_disabled_when_setting_empty(self, s3_settings, monkeypatch):
+        monkeypatch.setattr(settings, "S3_ATTACHMENTS_BUCKET", "")
+        att = f"s3://chat-attachments/{_UUID}"
+        storage = _FakeS3({att: _ZIP_HEAD})
+        with pytest.raises(SourceFileNotFound):
+            FileLocator(storage).locate(_UUID)
+        assert att not in storage.checked
+
+    @pytest.mark.parametrize("fileid", [
+        _UUID.upper(),
+        _UUID + ".docx",
+        "x/" + _UUID,
+        "../" + _UUID,
+        _UUID + "/..",
+        "cluster-a/document",
+        "not-a-uuid",
+    ])
+    def test_only_bare_lowercase_uuid_goes_to_attachments(self, s3_settings, fileid):
+        storage = _FakeS3({})
+        with pytest.raises(SourceFileNotFound):
+            FileLocator(storage).locate(fileid)
+        assert not any("chat-attachments" in u for u in storage.checked)

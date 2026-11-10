@@ -123,6 +123,24 @@ class TestS3Config:
         provider.s3_client = _Stub()
         assert provider.size("a.pdf") == 4096
 
+    def test_metadata_reads_other_bucket(self, monkeypatch):
+        """Метаданные вложения читаются из бакета, указанного в URI."""
+        for key, value in [
+            ("S3_ENDPOINT", "http://minio:9000"), ("S3_ACCESS_KEY", "k"),
+            ("S3_SECRET_KEY", "s"), ("S3_BUCKET", "bucket"),
+        ]:
+            monkeypatch.setattr(settings, key, value)
+        provider = S3StorageProvider()
+
+        class _Stub:
+            @staticmethod
+            def head_object(Bucket, Key):
+                assert (Bucket, Key) == ("chat-attachments", "abc")
+                return {"ContentLength": 1, "Metadata": {"filename": "a.docx"}}
+
+        provider.s3_client = _Stub()
+        assert provider.metadata("s3://chat-attachments/abc") == {"filename": "a.docx"}
+
 
 class TestFactory:
     def test_local_for_plain_and_file_uri(self):

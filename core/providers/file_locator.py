@@ -8,8 +8,10 @@
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import unquote
 
 from core import filetypes
 from core.config import settings
@@ -20,6 +22,14 @@ logger = logging.getLogger(__name__)
 # Сигнатуре формата хватает первых байтов: качать весь объект ради типа
 # незачем, тем более что хранилище может быть удалённым.
 _HEAD_BYTES = 8192
+
+# Ключ вложения чата в бакете Backend: голый uuid в нижнем регистре.
+# Ничего другого (путей, расширений, `..`) туда не пускаем.
+_ATTACHMENT_ID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+# Имя метаданных, в котором Backend кладёт исходное имя файла.
+_ATTACHMENT_FILENAME_META = "filename"
 
 
 class SourceFileNotFound(FileNotFoundError):
@@ -70,10 +80,55 @@ class FileLocator:
             except Exception as exc:  # недоступное хранилище — не молчим
                 logger.warning("Проверка %s не удалась: %s", uri, exc)
 
+        attachment = self._locate_attachment(s3_fileid, fileid)
+        if attachment is not None:
+            return attachment
+
         raise SourceFileNotFound(
             f"Файл для s3_fileid={s3_fileid!r} не найден "
             f"(префикс {settings.SOURCE_PREFIX!r}, проверено {len(candidates)} вариантов)"
         )
+
+    def _locate_attachment(self, s3_fileid: str, fileid: str) -> Optional[LocatedFile]:
+        """
+        Вложение чата: Backend хранит его в отдельном бакете под голым uuid,
+        и RAG передаёт этот uuid как s3_fileid. Проверяется ровно один ключ —
+        без перебора расширений и без префикса, только для точного uuid.
+        """
+        bucket = (settings.S3_ATTACHMENTS_BUCKET or "").strip()
+        if not bucket or not self.is_s3:
+            return None
+        if not _ATTACHMENT_ID.fullmatch(fileid):
+            return None
+        uri = f"s3://{bucket}/{fileid}"
+        try:
+            if not self.storage.exists(uri):
+                return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Проверка вложения %s не удалась: %s", uri, exc)
+            return None
+        return LocatedFile(
+            s3_fileid=s3_fileid,
+            uri=uri,
+            file_type=self._attachment_type(uri),
+        )
+
+    def _attachment_type(self, uri: str) -> str:
+        """
+        Тип вложения — по расширению исходного имени из метаданных объекта:
+        docx и xlsx по сигнатуре не опознаются (это zip). Нет имени или
+        расширение неизвестно — спрашиваем сам файл.
+        """
+        try:
+            meta = self.storage.metadata(uri) or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Метаданные вложения %s не получены: %s", uri, exc)
+            meta = {}
+        raw_name = {k.lower(): v for k, v in meta.items()}.get(_ATTACHMENT_FILENAME_META) or ""
+        extension = filetypes.extension_of(unquote(raw_name))
+        if extension and filetypes.is_known(extension):
+            return extension
+        return self._file_type("", uri)
 
     # ------------------------------------------------------------ внутреннее
     def _build_uri(self, key: str) -> str:

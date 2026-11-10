@@ -61,6 +61,13 @@ class StorageProvider(ABC):
         """
         raise NotImplementedError
 
+    def metadata(self, uri: str) -> Dict[str, str]:
+        """
+        Пользовательские метаданные объекта (x-amz-meta-*), без скачивания.
+        У хранилищ без метаданных — пустой словарь.
+        """
+        return {}
+
     def read_bytes(self, uri: str) -> bytes:
         stream = self.get_stream(uri)
         try:
@@ -206,6 +213,15 @@ class S3StorageProvider(StorageProvider):
             logger.warning("Размер объекта %s не получен: %s", uri, exc)
             return None
 
+    def metadata(self, uri: str) -> Dict[str, str]:
+        bucket, key = self._parse_s3_uri(uri)
+        try:
+            head = self.s3_client.head_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            logger.warning("Метаданные объекта %s не получены: %s", uri, exc)
+            return {}
+        return dict(head.get("Metadata") or {})
+
     def get_uri_type(self, uri: str) -> str:
         return "s3"
 
@@ -276,6 +292,9 @@ class ReadThroughS3Provider(StorageProvider):
 
     def size(self, uri: str) -> Optional[int]:
         return self._for(uri).size(uri)
+
+    def metadata(self, uri: str) -> Dict[str, str]:
+        return self._for(uri).metadata(uri)
 
     def get_uri_type(self, uri: str) -> str:
         return self._for(uri).get_uri_type(uri)
