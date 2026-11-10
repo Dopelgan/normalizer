@@ -74,6 +74,35 @@ class TestSplitGluedText:
         )
 
 
+class TestSplitGuards:
+    """Замечания ревью: шифры, мусор словаря OCR, буквы с цифрами."""
+
+    def test_designation_code_is_not_cut_at_punctuation(self):
+        vocab = layer_vocabulary([line("АБВГ 301611.002", 0.1)])
+        assert split_glued_text("АБВГ.301611.002", vocab) == ("АБВГ.301611.002", 0)
+
+    def test_slash_is_not_a_cut(self):
+        vocab = layer_vocabulary([line("кгс см2 давление", 0.1)])
+        assert split_glued_text("давление/см2", vocab)[1] == 0
+
+    def test_junk_short_pieces_do_not_cut_real_words(self):
+        vocab = layer_vocabulary([line("ре дуктор ный", 0.1)])
+        assert split_glued_text("редукторный", vocab) == ("редукторный", 0)
+
+    def test_short_letter_digit_mix_is_not_cut(self):
+        vocab = layer_vocabulary([line("М12 х50 Ст3 сп", 0.1)])
+        assert split_glued_text("М12х50", vocab)[1] == 0
+        assert split_glued_text("Ст3сп20", layer_vocabulary([line("Ст3 сп20", 0.1)]))[1] == 0
+
+    def test_word_glued_to_number_is_cut(self):
+        vocab = layer_vocabulary([line("ГОСТ 7798-70 Сталь 45", 0.1)])
+        assert split_glued_text("ГОСТ7798-70", vocab)[0] == "ГОСТ 7798-70"
+        assert split_glued_text("Сталь45", vocab)[0] == "Сталь 45"
+
+    def test_function_word_piece_is_allowed(self):
+        assert split_glued_text("Креплениебиозащитына", VOCAB)[0] == "Крепление биозащиты на"
+
+
 class TestReconcileOcrTable:
     def _table(self):
         cell = "Креплениебиозащитына фильтрах"
@@ -95,6 +124,8 @@ class TestReconcileOcrTable:
             line("Количество деталей изделия", 0.30),
             # Обрывки линий сетки, прочитанные как буквы.
             line("О ООО ОИО | i ОИ И", 0.35),
+            # Длинные обрывки без гласных — тоже не слова.
+            line("ВКЛМ ПРСТ ||||", 0.40),
         )
 
     def test_glued_cells_are_split_in_data_and_html(self):

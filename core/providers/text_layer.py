@@ -90,6 +90,16 @@ _GLUED_MAX_LEN = 200
 # Знаки, которые снимаются с краёв слова слоя при сборке словаря.
 _WORD_EDGE = "|.,;:!?()[]{}<>«»\"'*_-–—/\\"
 _MARKUP_RE = re.compile(r"(<[^>]*>)")
+# Кусок склейки короче трёх букв берётся, только если это служебное слово:
+# словарь слоя с мусором OCR («ре», «ный») иначе режет настоящие слова.
+_SHORT_WORDS = frozenset(
+    "в во на по с со к ко и о об у от до из за не ни для а но же ли "
+    "a an of to in on at by or and the for".split()
+)
+# Знаки, после которых склейка режется, если за ними идёт слово из букв
+# («См.ТАДУ»). Перед цифрами и после «/» граница не ставится: это шифр.
+_CUT_AFTER = ".,;:)»"
+_VOWELS = set("аеёиоуыэюяaeiouy")
 
 # Строки слоя внутри разобранной таблицы, не пошедшие на починку ячеек.
 # Строка возвращается текстом, только если несёт слова (длиннее трёх букв),
@@ -848,15 +858,31 @@ def layer_vocabulary(lines: Sequence[TextLine]) -> set:
     return vocab
 
 
+def _letter_run(text: str, from_end: bool) -> int:
+    """Длина серии букв у края строки."""
+    chars = reversed(text) if from_end else iter(text)
+    run = 0
+    for ch in chars:
+        if not ch.isalpha():
+            break
+        run += 1
+    return run
+
+
 def _split_token(token: str, vocab: set) -> Optional[List[int]]:
     """
     Позиции, перед которыми в склеенный токен вставляется пробел, или None.
 
     Токен должен целиком разложиться на слова словаря; из разложений берётся
-    то, где кусков меньше. Между кусками допустимы знаки (точка после «См.»),
-    но не дефис — это перенос слова, а не граница. Между двумя цифрами
-    граница не ставится никогда: шифр «123456.007» не режется, даже если
-    его части встречаются в слое по отдельности.
+    то, где кусков меньше. Кусок короче трёх букв допустим, только если это
+    служебное слово, сокращение с точкой или число. Граница ставится:
+    - в чистой склейке без знаков: между буквами, а между буквами и цифрами —
+      только если с буквенной стороны слово не короче трёх букв («ГОСТ7798»,
+      «Сталь45»; не «М12х50», «Ст3сп»);
+    - после точки, запятой и подобных знаков — только перед словом из букв
+      («См.ТАДУ»). Знак перед цифрами, «/» и дефис означают шифр или перенос:
+      «ТАДУ.301611.002» и «мо-дуле» не режутся. Между двумя цифрами граница
+      не ставится никогда.
     """
     if len(token) > _GLUED_MAX_LEN or sum(ch.isalnum() for ch in token) < _GLUED_MIN_ALNUM:
         return None
@@ -864,16 +890,39 @@ def _split_token(token: str, vocab: set) -> Optional[List[int]]:
     if folded.strip(_WORD_EDGE) in vocab:
         return None
     size = len(folded)
+    short_words = {_fold_word(w) for w in _SHORT_WORDS}
     # best[stop] — (кусков, начало последнего куска, конец предыдущего или
     # None) для лучшего разбора folded[:stop].
     best: Dict[int, Tuple[int, int, Optional[int]]] = {}
 
+    def piece_ok(start: int, stop: int) -> bool:
+        piece = folded[start:stop]
+        if piece not in vocab:
+            return False
+        letters = sum(ch.isalpha() for ch in token[start:stop])
+        # Сокращение с точкой («См.», «Рис.») — тоже слово.
+        abbreviation = token[stop:stop + 1] == "."
+        return letters == 0 or letters >= 3 or piece in short_words or abbreviation
+
+    def cut_ok(prev_end: int, start: int, stop: int) -> bool:
+        gap = token[prev_end:start]
+        left, right = token[prev_end - 1], token[start]
+        word = token[start:stop]
+        if gap:
+            return all(ch in _CUT_AFTER for ch in gap) and word.isalpha() and len(word) >= 3
+        if left.isdigit() and right.isdigit():
+            return False
+        if left.isalpha() and right.isdigit():
+            return _letter_run(token[:prev_end], from_end=True) >= 3
+        if left.isdigit() and right.isalpha():
+            return _letter_run(word, from_end=False) >= 3
+        return True
+
     def extend(start: int, pieces: int, prev_end: Optional[int]) -> None:
         for stop in range(start + 1, size + 1):
-            if not folded[stop - 1].isalnum():
+            if not folded[stop - 1].isalnum() or not piece_ok(start, stop):
                 continue
-            piece = folded[start:stop]
-            if piece not in vocab or (len(piece) == 1 and not piece.isalpha()):
+            if prev_end is not None and not cut_ok(prev_end, start, stop):
                 continue
             if stop not in best or best[stop][0] > pieces + 1:
                 best[stop] = (pieces + 1, start, prev_end)
@@ -890,11 +939,8 @@ def _split_token(token: str, vocab: set) -> Optional[List[int]]:
         gap = end
         while gap < size and not folded[gap].isalnum():
             gap += 1
-        if gap >= size or any(ch in "-–—" for ch in token[end:gap]):
-            continue
-        if token[end - 1].isdigit() and token[gap].isdigit():
-            continue
-        extend(gap, best[end][0], end)
+        if gap < size:
+            extend(gap, best[end][0], end)
 
     finishes = [end for end in best if not any(ch.isalnum() for ch in folded[end:])]
     if not finishes:
@@ -955,6 +1001,19 @@ def _split_glued_cells(block: ParsedBlock, vocab: set, stats: ReconcileStats) ->
         block.text = split_glued_text(block.text, vocab)[0]
 
 
+def _looks_like_word(word: str) -> bool:
+    """
+    Слово, а не обрывок линий сетки: длиннее трёх знаков, почти одни буквы,
+    есть гласная и не одна и та же буква подряд («ООО», «ВКЛМ», «||||»).
+    """
+    if len(word) < 4:
+        return False
+    letters = [ch for ch in word.lower() if ch.isalpha()]
+    if len(letters) < len(word) * 0.8 or len(set(letters)) < 2:
+        return False
+    return any(ch in _VOWELS for ch in letters)
+
+
 def _lines_with_new_words(lines: Sequence[TextLine], block: ParsedBlock) -> List[TextLine]:
     """
     Строки слоя из рамки таблицы, чьих слов в ячейках нет.
@@ -971,10 +1030,11 @@ def _lines_with_new_words(lines: Sequence[TextLine], block: ParsedBlock) -> List
     known = {_fold_word(w) for w in _TOKEN_RE.findall(" ".join(cells))}
     kept: List[TextLine] = []
     for line in lines:
-        words = [_fold_word(w) for w in _TOKEN_RE.findall(line.text or "") if len(w) >= 3]
-        # Новым считается только слово длиннее трёх букв: обрывки линий
-        # сетки Tesseract читает как «ООО», «ОИ», «ne».
-        new = [w for w in words if w not in known and len(w) >= 4]
+        words = [w for w in _TOKEN_RE.findall(line.text or "") if len(w) >= 3]
+        # Новым считается только настоящее слово: обрывки линий сетки
+        # Tesseract читает как «ООО», «ОИ», «ne».
+        new = [_fold_word(w) for w in words
+               if _fold_word(w) not in known and _looks_like_word(w)]
         if len(new) >= _TABLE_LINE_MIN_NEW_WORDS and len(new) >= len(words) * _TABLE_LINE_MIN_NEW_SHARE:
             kept.append(line)
             known.update(new)
