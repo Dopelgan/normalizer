@@ -87,7 +87,9 @@ class DrawingProcessor:
         self.vision_enabled = settings.DRAWING_VISION_ENABLED
 
     # ------------------------------------------------------------- публичное
-    def process(self, image_ref: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    def process(
+        self, image_ref: str, metadata: Dict[str, Any], page: int = 1
+    ) -> Dict[str, Any]:
         """
         Возвращает:
         {'detected_count', 'parsed_fields', 'avg_confidence', 'completeness',
@@ -100,7 +102,7 @@ class DrawingProcessor:
             )
             return _empty(MODE_NONE)
 
-        image = self._open(image_ref)
+        image = self._open(image_ref, page)
         if image is None:
             return _empty(MODE_NONE)
 
@@ -271,9 +273,9 @@ class DrawingProcessor:
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
             result.append(enriched or fragment)
 
-        sheet = self._sheet_drawing(result, metadata)
-        if sheet is not None:
-            result.insert(0, sheet)
+        sheets = self._sheet_drawings(result, metadata)
+        if sheets:
+            result[0:0] = sheets
         elif not any(f.type == "drawing" for f in result) and self._source_is_raster_drawing(metadata):
             for fragment in result:
                 fragment.review_required = True
@@ -281,42 +283,56 @@ class DrawingProcessor:
         return result
 
     # -------------------------------------------------- лист-картинка целиком
-    def _sheet_drawing(
+    def _sheet_drawings(
         self, fragments: List[Fragment], metadata: Dict[str, Any]
-    ) -> Optional[Fragment]:
-        """Разбор всего листа, когда документ — это скан или фото чертежа."""
+    ) -> List[Fragment]:
+        """
+        Разбор листов целиком, когда документ — скан или фото чертежа.
+
+        У скана PDF разбирается каждый чертёжный лист (по классификации
+        лестницы), а не только файл как одна картинка: раньше PDF не
+        открывался как растр, и ветка молча возвращала пустой результат.
+        """
         if any(fragment.type == "drawing" for fragment in fragments):
-            return None
+            return []
         if not self._source_is_raster_drawing(metadata):
-            return None
+            return []
 
         source_uri = str(metadata.get("source_path") or "")
         if not source_uri:
-            return None
+            return []
 
-        left = deadline.remaining()
-        if left is not None and left < settings.VLM_TIMEOUT:
-            logger.warning("Разбор листа %s пропущен: до срока задачи %.0f с", source_uri, left)
-            return None
-        try:
-            drawing_result = self.process(source_uri, metadata)
-        except SoftTimeLimitExceeded:
-            raise
-        except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
-            logger.error("Разбор листа %s не удался: %s", source_uri, exc)
-            return None
-
-        anchor = Fragment(
-            # Нулевой номер: лист целиком идёт перед своими фрагментами и не
-            # сталкивается с нумерацией нормализатора, которая с единицы.
-            fragment_id=f"{metadata.get('doc_id') or 'doc'}-frag-000",
-            type="image",
-            content=Content(image_ref=source_uri),
-            position=Position(page=1, bbox=[0.0, 0.0, 1.0, 1.0], order=0),
-            confidence=0.0, completeness=0.0,
-            provenance=Provenance(method="vision_plus_vlm", strategy_level=7, source="drawing"),
-        )
-        return self.build_fragment(drawing_result, anchor, metadata)
+        signals = (metadata.get("classification") or {}).get("signals") or {}
+        pages = signals.get("raster_drawing_pages") or signals.get("drawing_pages") or [1]
+        sheets: List[Fragment] = []
+        for page in list(pages)[: settings.DRAWING_MAX_SHEETS]:
+            left = deadline.remaining()
+            if left is not None and left < settings.VLM_TIMEOUT:
+                logger.warning("Разбор листа %s стр. %d пропущен: до срока задачи %.0f с",
+                               source_uri, page, left)
+                break
+            try:
+                drawing_result = self.process(source_uri, metadata, page)
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
+                logger.error("Разбор листа %s стр. %d не удался: %s", source_uri, page, exc)
+                continue
+            anchor = Fragment(
+                # Нулевой номер: лист целиком идёт перед своими фрагментами и не
+                # сталкивается с нумерацией нормализатора, которая с единицы.
+                fragment_id=f"{metadata.get('doc_id') or 'doc'}-frag-000"
+                + ("" if int(page) == 1 else f"-{page}"),
+                type="image",
+                content=Content(image_ref=source_uri),
+                position=Position(page=int(page), bbox=[0.0, 0.0, 1.0, 1.0], order=0),
+                confidence=0.0, completeness=0.0,
+                provenance=Provenance(method="vision_plus_vlm", strategy_level=7, source="drawing"),
+            )
+            sheet = self.build_fragment(drawing_result, anchor, metadata)
+            if sheet is not None:
+                sheets.append(sheet)
+        return sheets
 
     def _source_is_raster_drawing(self, metadata: Dict[str, Any]) -> bool:
         """Растровый чертёж по классификации лестницы, иначе — по самому файлу."""
@@ -417,10 +433,14 @@ class DrawingProcessor:
         return fields
 
     # ------------------------------------------------------------ хранилище
-    def _open(self, image_ref: str):
+    def _open(self, image_ref: str, page: int = 1):
         data = self._read(image_ref)
         if not data:
             return None
+        if data[:5] == b"%PDF-":
+            # Скан чертежа в PDF: лист рендерится в растр, иначе модель
+            # получала бы «картинку», которая не открывается.
+            return _render_pdf_page(data, page)
         image = raster_drawing.open_image(data)
         if image is None:
             logger.error("Чертёж %s не открылся как растр", image_ref)
@@ -437,6 +457,27 @@ class DrawingProcessor:
 # ===========================================================================
 # Поля
 # ===========================================================================
+
+def _render_pdf_page(data: bytes, page: int):
+    """Страница PDF как растр в рабочем разрешении чертежей."""
+    try:
+        import fitz
+        from PIL import Image
+    except ImportError:  # pragma: no cover
+        return None
+    try:
+        document = fitz.open(stream=data, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("PDF чертежа не открылся: %s", exc)
+        return None
+    try:
+        if not 1 <= page <= document.page_count:
+            return None
+        pixmap = document[page - 1].get_pixmap(dpi=settings.DRAWING_RENDER_DPI)
+        return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+    finally:
+        document.close()
+
 
 def _field(
     category: str,

@@ -307,6 +307,16 @@ def _classify_pdf(context: DocumentContext) -> Classification:
         # решает, нужен ли этап восстановления.
         quality, raster_signals = assess_raster(context.data, pdf=True)
         signals.update(raster_signals)
+        if not drawing_pages:
+            # Векторный детектор на скане не видит ничего: линии там —
+            # пиксели. Без растровой проверки скан чертежа получал жанр
+            # unknown, и ветка чертежей (Qwen-VL) на него не включалась.
+            drawing_pages, checked = _raster_drawing_pages(context.data)
+            signals["raster_drawing_pages"] = drawing_pages
+            if checked:
+                share = len(drawing_pages) / checked
+                signals["drawing_share"] = round(share, 3)
+                mostly_drawings = share >= _DRAWING_GENRE_SHARE
         if mostly_drawings:
             genre = GENRE_DRAWING
         elif drawing_pages:
@@ -328,6 +338,35 @@ def _classify_pdf(context: DocumentContext) -> Classification:
         genre = GENRE_MIXED if _looks_structured(context.data, signals) else GENRE_TEXT
 
     return Classification(source=SOURCE_VECTOR_TEXT, genre=genre, signals=signals)
+
+
+# Сколько первых страниц скана проверять растровым детектором чертежа.
+_RASTER_DRAWING_PAGES = 8
+
+
+def _raster_drawing_pages(data: bytes):
+    """Номера чертёжных листов среди первых страниц скана и число проверенных."""
+    try:
+        import fitz
+    except ImportError:  # pragma: no cover
+        return [], 0
+    from core.providers import raster_drawing
+
+    try:
+        document = fitz.open(stream=data, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Скан не открылся для поиска чертежей: %s", exc)
+        return [], 0
+    pages = []
+    try:
+        checked = min(document.page_count, _RASTER_DRAWING_PAGES)
+        for index in range(checked):
+            png = document[index].get_pixmap(dpi=100).tobytes("png")
+            if raster_drawing.analyse(png).is_drawing:
+                pages.append(index + 1)
+    finally:
+        document.close()
+    return pages, checked
 
 
 def _looks_structured(data: bytes, signals: Dict[str, Any]) -> bool:

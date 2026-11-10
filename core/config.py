@@ -192,6 +192,10 @@ class Settings(BaseSettings):
     OCR_MIN_SIDE: int = 900
     # Подготовка листа перед OCR: поворот по OSD, выравнивание, очистка,
     # бинаризация и удаление линий таблиц (core/providers/ocr_prepare.py).
+    # Ветка чертежей для сканов PDF: сколько листов разбирать моделью и в
+    # каком разрешении рендерить лист.
+    DRAWING_MAX_SHEETS: int = 6
+    DRAWING_RENDER_DPI: int = 200
     OCR_PREPROCESS_ENABLED: bool = True
     OCR_DESKEW_LIMIT: float = 6.0
     # Ниже этой уверенности OSD лист не поворачивается (ложный поворот

@@ -297,3 +297,52 @@ def test_restoration_stops_before_task_deadline():
     with deadline.scope(10):
         restored, applied, _ = restore_pages(document.tobytes(), max_pages=50)
     assert restored is None and applied == []  # ни одной страницы не начато
+
+
+# ------------------------------------------------- сканы чертежей в PDF (10.11)
+
+def _scanned_drawing_pdf(pages: int = 1) -> bytes:
+    """Скан чертежа: рамка ГОСТ с полем подшивки 20 мм, лёгкий перекос, без текстового слоя."""
+    import fitz
+    from PIL import ImageDraw
+
+    document = fitz.open()
+    for _ in range(pages):
+        sheet = Image.new("L", (1654, 2339), 255)
+        draw = ImageDraw.Draw(sheet)
+        draw.rectangle([157, 39, 1615, 2300], outline=0, width=4)  # 20 мм слева, 5 мм остальные
+        for y in range(1990, 2300, 40):
+            draw.line([(800, y), (1615, y)], fill=0, width=2)  # штамп
+        draw.line([(800, 1990), (800, 2300)], fill=0, width=2)
+        draw.arc([400, 400, 1200, 1400], 90, 270, fill=0, width=6)
+        for y in (300, 1500, 1700):
+            draw.line([(250, y), (1500, y)], fill=0, width=2)  # размерные и выносные линии
+        draw.line([(1450, 200), (1450, 1900)], fill=0, width=2)
+        sheet = sheet.rotate(0.4, expand=False, fillcolor=255)
+        buffer = io.BytesIO()
+        sheet.save(buffer, format="PNG")
+        page = document.new_page(width=595, height=842)
+        page.insert_image(page.rect, stream=buffer.getvalue())
+    return document.tobytes()
+
+
+def test_scanned_pdf_drawing_is_classified_as_drawing():
+    from core.ladder.context import GENRE_DRAWING, DocumentContext
+
+    context = DocumentContext(uri="x", file_type="pdf", data=_scanned_drawing_pdf())
+    assert context.classification.genre == GENRE_DRAWING
+
+
+def test_drawing_branch_renders_pdf_scan_pages(monkeypatch):
+    from core.drawing_processor import DrawingProcessor
+
+    data = _scanned_drawing_pdf(pages=2)
+
+    class Storage:
+        def read_bytes(self, uri):
+            return data
+
+    processor = DrawingProcessor(Storage())
+    image = processor._open("src/sheet.pdf", page=2)
+    assert image is not None and image.size[0] > 1000
+    assert processor._open("src/sheet.pdf", page=3) is None

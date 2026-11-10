@@ -56,7 +56,8 @@ _INK_DRAWING = 0.25         # чертёж — редкая графика на 
 _INK_BLANK = 0.002          # ниже — лист пустой
 _RULE_COVERAGE = 0.5        # линия считается длинной с этой доли стороны
 _FRAME_COVERAGE = 0.7       # сторона рамки формата почти во всю сторону листа
-_FRAME_MARGIN = 0.06        # рамка ищется в этой полосе у края
+_FRAME_MARGIN = 0.12        # рамка ищется в этой полосе у края (поле подшивки 9,5 % A4)
+_FRAME_BAND = 0.012         # толщина полосы, в которой ищется перекошенная линия рамки
 _TEXT_ROW_MIN = 0.005       # плотность строки текста: от
 _TEXT_ROW_MAX = 0.60        #                          до
 _TEXT_BANDS_PAGE = 6        # столько полос строк — это уже страница текста
@@ -132,8 +133,9 @@ def analyse_image(image) -> RasterVerdict:
 
     rows = ink_mask.sum(axis=1)
     columns = ink_mask.sum(axis=0)
-    horizontal = _rule_bands(rows, ink_mask.shape[1])
-    vertical = _rule_bands(columns, ink_mask.shape[0])
+    band = _band(ink_mask)
+    horizontal = _rule_bands(_banded_coverage(ink_mask, band, numpy), ink_mask.shape[1])
+    vertical = _rule_bands(_banded_coverage(ink_mask.T, band, numpy), ink_mask.shape[0])
     rules = horizontal + vertical
     frame = _has_frame(ink_mask)
 
@@ -143,6 +145,11 @@ def analyse_image(image) -> RasterVerdict:
     long_columns = columns >= _RULE_COVERAGE * ink_mask.shape[0]
     body = ink_mask[:, ~long_columns]
     text_bands = _text_bands(body.sum(axis=1), body.shape[1])
+    # Лист, отсканированный боком (паспорт, альбомная страница), несёт строки
+    # вертикально — по рядам их не видно, и лист текста шёл как чертёж.
+    long_rows = rows >= _RULE_COVERAGE * ink_mask.shape[1]
+    turned = ink_mask[~long_rows, :]
+    text_bands = max(text_bands, _text_bands(turned.sum(axis=0), turned.shape[0]))
 
     signals.update({
         "colourfulness": round(colourfulness, 3),
@@ -300,24 +307,48 @@ def _text_bands(rows, width: int) -> int:
     ])
 
 
+def _band(ink_mask) -> int:
+    """Толщина полосы, в которой ищется слегка перекошенная линия."""
+    return max(1, int(min(ink_mask.shape) * _FRAME_BAND))
+
+
+def _banded_coverage(ink_mask, band: int, numpy):
+    """
+    Покрытие строки с учётом соседних: сколько столбцов тёмные хотя бы в
+    одной из `band` строк подряд. На скане длинная линия перекошена и
+    размазана по нескольким строкам, и покрытие одной строки её не видело:
+    рамка и линии чертежа не находились, чертёж шёл как «страница текста».
+    """
+    rows = ink_mask.shape[0]
+    if band <= 1 or rows <= band:
+        return ink_mask.sum(axis=1)
+    window = numpy.zeros((rows - band + 1, ink_mask.shape[1]), dtype=bool)
+    for shift in range(band):
+        window |= ink_mask[shift:rows - band + 1 + shift]
+    coverage = window.sum(axis=1)
+    # Длина профиля сохраняется: хвост дополняется последним значением.
+    return numpy.concatenate([coverage, numpy.repeat(coverage[-1:], band - 1)])
+
+
 def _has_frame(ink_mask) -> bool:
     """
-    Рамка формата: тёмная линия почти во всю сторону в узкой полосе у края.
+    Рамка формата: тёмная линия почти во всю сторону в полосе у края.
     Хватает трёх сторон из четырёх — сканы часто обрезаны с одного края.
+    Полоса у края — до 12 %: поле подшивки по ГОСТ 2.104 — 20 мм, это 9,5 %
+    ширины A4.
     """
+    import numpy
+
     height, width = ink_mask.shape
     margin_y = max(1, int(height * _FRAME_MARGIN))
     margin_x = max(1, int(width * _FRAME_MARGIN))
-
-    rows = ink_mask.sum(axis=1)
-    columns = ink_mask.sum(axis=0)
-    needed_h = _FRAME_COVERAGE * width
-    needed_v = _FRAME_COVERAGE * height
-
+    band = _band(ink_mask)
+    rows = _banded_coverage(ink_mask, band, numpy)
+    columns = _banded_coverage(ink_mask.T, band, numpy)
     sides = [
-        bool((rows[:margin_y] >= needed_h).any()),
-        bool((rows[height - margin_y:] >= needed_h).any()),
-        bool((columns[:margin_x] >= needed_v).any()),
-        bool((columns[width - margin_x:] >= needed_v).any()),
+        bool((rows[:margin_y] >= _FRAME_COVERAGE * width).any()),
+        bool((rows[height - margin_y:] >= _FRAME_COVERAGE * width).any()),
+        bool((columns[:margin_x] >= _FRAME_COVERAGE * height).any()),
+        bool((columns[width - margin_x:] >= _FRAME_COVERAGE * height).any()),
     ]
     return sum(sides) >= 3
