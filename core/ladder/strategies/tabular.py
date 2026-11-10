@@ -131,10 +131,17 @@ class SpreadsheetStrategy(Strategy):
         workbook = openpyxl.load_workbook(
             io.BytesIO(data), read_only=True, data_only=True
         )
+        # Вторая копия — с формулами. Значение формулы хранится в файле только
+        # если его сохранила программа с пересчётом; у выгрузок и файлов,
+        # собранных скриптами, кэша нет, и `data_only` отдаёт пустую ячейку.
+        # Тогда лучше текст формулы, чем молча пропавшее значение.
+        formulas = openpyxl.load_workbook(io.BytesIO(data), read_only=True)
         blocks: List[ParsedBlock] = []
         try:
-            for page_no, sheet in enumerate(workbook.worksheets, start=1):
-                rows = self._sheet_rows(sheet)
+            for page_no, (sheet, formula_sheet) in enumerate(
+                zip(workbook.worksheets, formulas.worksheets), start=1
+            ):
+                rows = self._sheet_rows(sheet, formula_sheet)
                 if not rows:
                     continue
                 blocks.append(ParsedBlock(
@@ -149,6 +156,7 @@ class SpreadsheetStrategy(Strategy):
                 ))
         finally:
             workbook.close()
+            formulas.close()
         return blocks
 
     # ------------------------------------------------------------------ XLS
@@ -246,13 +254,29 @@ class SpreadsheetStrategy(Strategy):
         return blocks
 
     @staticmethod
-    def _sheet_rows(sheet) -> List[List[str]]:
+    def _sheet_rows(sheet, formula_sheet=None) -> List[List[str]]:
         rows: List[List[str]] = []
         cells = 0
+        formula_rows = (
+            formula_sheet.iter_rows(values_only=True) if formula_sheet is not None else None
+        )
         for raw in sheet.iter_rows(values_only=True):
             cells += max(1, len(raw))
             _check_budget(cells)
-            values = ["" if cell is None else str(cell).strip() for cell in raw]
+            source = next(formula_rows, ()) if formula_rows is not None else ()
+            values = [
+                _cell_text(cell, source[index] if index < len(source) else None)
+                for index, cell in enumerate(raw)
+            ]
             if any(values):
                 rows.append(values)
         return rows
+
+
+def _cell_text(cached, raw) -> str:
+    """Значение ячейки; для формулы без сохранённого значения — её текст."""
+    if cached is not None:
+        return str(cached).strip()
+    if isinstance(raw, str) and raw.startswith("="):
+        return raw.strip()
+    return ""

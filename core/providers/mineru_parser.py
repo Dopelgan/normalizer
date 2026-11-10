@@ -173,7 +173,8 @@ class MinerUParserProvider(DocumentParserProvider):
         # ним с того же открытого документа снимается вердикт по чертёжным
         # листам — файл за проход открывается один раз.
         file_bytes = self._read_source(uri)
-        layer, drawing_verdicts = self._read_pdf(file_bytes, file_type)
+        layer, drawing_verdicts, pages = self._read_pdf(file_bytes, file_type)
+        self._source_pages = pages
 
         try:
             result = self._parse_with_mineru(uri, file_type, metadata, file_bytes)
@@ -263,7 +264,7 @@ class MinerUParserProvider(DocumentParserProvider):
     @staticmethod
     def _read_pdf(
         file_bytes: Optional[bytes], file_type: str
-    ) -> Tuple[Optional[TextLayer], Dict[int, DrawingPage]]:
+    ) -> Tuple[Optional[TextLayer], Dict[int, DrawingPage], int]:
         """
         Всё, что читается из самого файла, за одно открытие: текстовый слой
         векторного PDF и вердикт по чертёжным листам. Раньше файл открывался
@@ -275,17 +276,18 @@ class MinerUParserProvider(DocumentParserProvider):
         стоит дорого.
         """
         if not file_bytes or file_type.lower() != "pdf":
-            return None, {}
+            return None, {}, 1
 
         document = open_pdf(file_bytes)
         if document is None:
-            return None, {}
+            return None, {}, 1
         try:
+            pages = max(1, document.page_count)
             layer = layer_from_document(document)
             if not layer.is_usable():
                 logger.info("Текстовый слой пуст или разрежен — работаем по распознаванию")
-                return None, {}
-            return layer, drawing_pages_from_document(document)
+                return None, {}, pages
+            return layer, drawing_pages_from_document(document), pages
         finally:
             document.close()
 
@@ -374,9 +376,17 @@ class MinerUParserProvider(DocumentParserProvider):
         }
         files = [("files", (filename, file_bytes, filetypes.mime_for(file_type)))]
 
-        logger.info("MinerU: %s file=%s size=%d B", url, filename, len(file_bytes))
+        timeout = self._timeout_for(getattr(self, "_source_pages", 1))
+        logger.info(
+            "MinerU: %s file=%s size=%d B timeout=%ds", url, filename, len(file_bytes), timeout
+        )
         try:
-            response = requests.post(url, files=files, data=data, timeout=self.timeout)
+            response = requests.post(url, files=files, data=data, timeout=timeout)
+        except requests.ReadTimeout as exc:
+            # Долгий разбор большого скана — свойство документа, а не отказ
+            # сервиса. Раньше таймаут помечал MinerU недоступным на минуту, и
+            # все соседние документы уходили в плоский OCR без таблиц.
+            raise ParserUnavailable(f"MinerU не уложился в {timeout} с: {exc}") from exc
         except requests.RequestException as exc:
             self.mark_unavailable()
             raise ParserUnavailable(f"нет связи с MinerU: {exc}") from exc
@@ -406,6 +416,10 @@ class MinerUParserProvider(DocumentParserProvider):
             failed_pages=[],
             page_count=page_count or (1 if is_image else len({b.page for b in blocks})),
         )
+
+    def _timeout_for(self, pages: int) -> int:
+        """Таймаут разбора: не меньше общего и не меньше бюджета на страницу."""
+        return int(max(self.timeout, max(1, pages) * settings.MINERU_TIMEOUT_PER_PAGE))
 
     # ------------------------------------------------------ разбор ответа
     def _extract(self, payload: Dict[str, Any], asset_prefix: str) -> Tuple[List[ParsedBlock], int]:
@@ -712,7 +726,7 @@ class MinerUParserProvider(DocumentParserProvider):
             raw_output={},
             # failed_pages — страницы, которые распознать НЕ удалось. Раньше
             # сюда клались как раз успешные, и сырой результат врал наоборот.
-            failed_pages=[],
+            failed_pages=list(getattr(self.tesseract, "failed_pages", []) or []),
             page_count=len({b.page for b in blocks}),
         )
 

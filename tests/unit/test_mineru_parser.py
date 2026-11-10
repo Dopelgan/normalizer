@@ -325,7 +325,7 @@ class TestOcrLayerForRaster:
         в файле нет, и в провенансе фрагментов скана стояло `vector_pdf`.
         """
         temp_storage.write_file("documents/scan.pdf", b"%PDF-1.4 fake")
-        mocker.patch.object(parser, "_read_pdf", return_value=(None, {}))
+        mocker.patch.object(parser, "_read_pdf", return_value=(None, {}, 1))
         mocker.patch.object(parser.tesseract, "text_layer", return_value=self._layer())
         payload = {"results": {"scan.pdf": self._payload()["results"]["formulas.png"]}}
         with requests_mock.Mocker() as m:

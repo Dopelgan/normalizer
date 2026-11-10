@@ -57,6 +57,7 @@ class PlainOcrStrategy(Strategy):
             blocks,
             source_kind="image" if context.kind == filetypes.KIND_IMAGE else "scanned_pdf",
             is_fallback=True,
+            failed_pages=list(getattr(self.provider, "failed_pages", []) or []),
         )
 
 

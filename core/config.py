@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     MINERU_PORT: int = 8000
     MINERU_ENDPOINT: str = "http://mineru-api:8000"
     MINERU_TIMEOUT: int = 300
+    # Бюджет на страницу: большой скан получает таймаут pages × это значение,
+    # если он больше MINERU_TIMEOUT.
+    MINERU_TIMEOUT_PER_PAGE: int = 15
     MINERU_MODEL_CACHE: str = "/models/pdf-extract-kit"
     MINERU_BACKEND: str = "pipeline"
     MINERU_DEFAULT_LANG: str = "east_slavic"
@@ -172,7 +175,9 @@ class Settings(BaseSettings):
     # техническом задании в несколько сотен листов это обрывало воркер по
     # памяти, а не возвращало результат. Усечение не молчит: оно попадает в
     # degraded разбора.
-    OCR_FULL_MAX_PAGES: int = 50
+    # Разбор идёт в фоне, жёсткого лимита времени ТЗ не ставит; обрезка хвоста
+    # документа — прямая потеря данных. Пачки рендера держат память в границах.
+    OCR_FULL_MAX_PAGES: int = 300
     OCR_BATCH_PAGES: int = 5
     OCR_DPI: int = 200
     # Потолок длинной стороны страницы перед распознаванием. Сканы A3 с

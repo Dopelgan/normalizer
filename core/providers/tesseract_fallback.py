@@ -69,6 +69,8 @@ class TesseractFallbackProvider:
         # (сколько распознали, сколько всего) последнего полного прохода;
         # None — усечения не было.
         self.truncated_at: Optional[tuple] = None
+        # Страницы последнего прохода, которые не удалось отрендерить.
+        self.failed_pages: List[int] = []
 
     # ------------------------------------------------------------- публичное
     def parse_pages(
@@ -130,6 +132,7 @@ class TesseractFallbackProvider:
         разбора, его читает вызывающий и пишет в degraded.
         """
         self.truncated_at = None
+        self.failed_pages = []
         local_path, cleanup = self._materialize(uri)
         if not local_path:
             logger.error("Не удалось получить локальный путь для %s", uri)
@@ -158,13 +161,18 @@ class TesseractFallbackProvider:
                         dpi=settings.OCR_DPI,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    # Сбой одной пачки не повод бросать остаток документа:
+                    # раньше здесь был `break`, и всё после испорченной
+                    # страницы молча пропадало. Страницы пачки — неудачные.
                     logger.error(
                         "pdf2image не смог обработать страницы %d-%d файла %s: %s",
                         first, last, local_path, exc,
                     )
-                    break
+                    self.failed_pages.extend(range(first, last + 1))
+                    continue
                 if not images:
-                    break
+                    self.failed_pages.extend(range(first, last + 1))
+                    continue
                 for index, img in enumerate(images):
                     blocks.extend(self._blocks_from_image(img, first + index))
                     img.close()
@@ -193,6 +201,7 @@ class TesseractFallbackProvider:
         единственный способ прочитать русскую прозу, которую модель таблиц
         MinerU отдаёт побуквенной LaTeX-разметкой.
         """
+        self.failed_pages = []
         local_path, cleanup = self._materialize(uri)
         if not local_path:
             raise OcrUnavailable(f"Файл {uri} не удалось получить локально")
@@ -246,6 +255,7 @@ class TesseractFallbackProvider:
             )
             self.truncated_at = (limit, total)
         batch = max(1, settings.OCR_BATCH_PAGES)
+        yielded, error = 0, None
         for first in range(1, last_page + 1, batch):
             last = min(first + batch - 1, last_page)
             try:
@@ -253,14 +263,19 @@ class TesseractFallbackProvider:
                     local_path, first_page=first, last_page=last, dpi=settings.OCR_DPI
                 )
             except Exception as exc:  # noqa: BLE001
-                if first == 1:
-                    raise OcrUnavailable(str(exc)) from exc
                 logger.error("Страницы %d-%d не отрендерились: %s", first, last, exc)
-                return
+                self.failed_pages.extend(range(first, last + 1))
+                error = exc
+                continue
             if not images:
-                return
+                self.failed_pages.extend(range(first, last + 1))
+                continue
             for index, image in enumerate(images):
+                yielded += 1
                 yield first + index, image
+        if not yielded and error is not None:
+            # Не отрендерилось ничего — это сбой OCR, а не «в документе нет текста».
+            raise OcrUnavailable(str(error)) from error
 
     def _ocr_single_image(self, path: str, page: int) -> List[ParsedBlock]:
         try:
