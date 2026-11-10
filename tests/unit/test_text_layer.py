@@ -263,3 +263,19 @@ class TestHomoglyphs:
 @pytest.mark.skipif(PYMUPDF_AVAILABLE, reason="проверяем поведение без PyMuPDF")
 def test_missing_pymupdf_degrades_quietly():
     assert extract_text_layer(b"%PDF-1.4") is None
+
+
+def test_rotated_page_lines_use_displayed_coordinates():
+    """Лист с /Rotate 90: строки в координатах видимой страницы, как у растра."""
+    pymupdf = pytest.importorskip("pymupdf")
+    document = pymupdf.open()
+    page = document.new_page(width=600, height=800)
+    # Текст написан вдоль длинной стороны — на повёрнутом листе он горизонтален.
+    page.insert_text((100, 700), "Letter code", fontsize=14, rotate=90)
+    page.set_rotation(90)
+    layer = extract_text_layer(document.tobytes())
+
+    (only,) = layer.lines(1)
+    x0, y0, x1, y1 = only.bbox
+    assert 0.10 < x0 < x1 < 0.40 and 0.10 < y0 < y1 < 0.25
+    assert not only.is_rotated

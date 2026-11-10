@@ -8,6 +8,8 @@
 синтетические.
 """
 
+import pytest
+
 from core.models.parse_result import ParsedBlock
 from core.providers.text_layer import (
     METHOD_OCR_LAYER_RECOVERED,
@@ -17,6 +19,7 @@ from core.providers.text_layer import (
     layer_vocabulary,
     reconcile_with_text_layer,
     split_glued_text,
+    unify_script,
 )
 
 
@@ -48,9 +51,10 @@ class TestSplitGluedText:
         assert text == "АБВГ 123456.007-19"
 
     def test_split_after_punctuation_and_homoglyphs(self):
-        # «См.» распознано латиницей, следующее слово приклеено.
+        # «См.» распознано латиницей, следующее слово приклеено: токен со
+        # смешанным алфавитом берёт написание слоя.
         text, _ = split_glued_text("Cm.АБВГ 123456.007.01", VOCAB)
-        assert text == "Cm. АБВГ 123456.007.01"
+        assert text == "См. АБВГ 123456.007.01"
 
     def test_known_word_is_not_touched(self):
         assert split_glued_text("биозащиты", VOCAB) == ("биозащиты", 0)
@@ -143,8 +147,61 @@ class TestReconcileOcrTable:
         assert recovered == ["Количество деталей изделия"]
         assert stats.table_lines_kept == 1
 
-    def test_vector_layer_is_left_as_before(self):
+    def test_vector_layer_splits_cells_but_returns_no_lines(self):
+        # Модель таблиц склеивает ячейки и на векторном листе; строки слоя
+        # из рамки там не возвращаются — это не измерялось.
         blocks, stats = reconcile_with_text_layer([self._table()], self._layer())
         table = next(b for b in blocks if b.type == "table")
-        assert table.table_data["rows"][0][1] == "Креплениебиозащитына фильтрах"
+        assert table.table_data["rows"][0][1] == "Крепление биозащиты на фильтрах"
         assert [b for b in blocks if b.type == "text"] == []
+
+
+class TestMixedScript:
+    """Латиница и греческий внутри русских слов ячейки (синтетика)."""
+
+    @pytest.mark.parametrize("word, expected", [
+        ("HOCТЬ", "НОСТЬ"),            # есть буква, которой нет в латинице
+        ("Πoпроекту", "Попроекту"),    # греческая П
+        ("exрires", "expires"),        # латинское слово с кириллицей
+        ("OTK", "OTK"),                # один алфавит — не трогаем
+        ("priёmki", "priёmki"),        # каша из обоих — не угадываем
+    ])
+    def test_unify_script(self, word, expected):
+        assert unify_script(word) == expected
+
+    def test_transliterated_piece_takes_layer_spelling(self):
+        vocab = layer_vocabulary([line("На стадии приёмки изделий", 0.1)])
+        assert split_glued_text("Haстадииpriёmkiизделий", vocab)[0] == (
+            "На стадии приёмки изделий"
+        )
+
+    def test_vector_spelling_wins_single_script_word(self):
+        vocab = layer_vocabulary([line("СТО 05.18 СТП", 0.1)])
+        assert split_glued_text("CTO 05.18СТП", vocab, exact=True)[0] == "СТО 05.18 СТП"
+        # Слою распознавания в токене одного алфавита не верим.
+        assert split_glued_text("CTO", vocab)[0] == "CTO"
+
+    def test_vector_table_cells_are_split(self):
+        table = ParsedBlock(
+            type="table", page=1, bbox=[0.05, 0.05, 0.95, 0.60],
+            table_data={"headers": ["Буквенныйшифр", "Нoмepизменений"],
+                        "rows": [["АБВГ", "1"]], "total_row": None},
+        )
+        layer = layer_of(
+            line("Буквенный", 0.10, x=0.06, width=0.2), line("шифр", 0.13, x=0.06, width=0.1),
+            line("Номер", 0.10, x=0.50, width=0.2), line("изменений", 0.13, x=0.50, width=0.2),
+        )
+        blocks, _ = reconcile_with_text_layer([table], layer)
+        assert blocks[0].table_data["headers"] == ["Буквенный шифр", "Номер изменений"]
+
+    def test_latin_lookalike_piece_in_russian_token_becomes_cyrillic(self):
+        vocab = layer_vocabulary([line("Ha стадии приёмки", 0.1)])
+        # В токене есть и латиница без кириллической пары (r, i), поэтому
+        # алфавит целиком не выправить — решает кусок.
+        assert split_glued_text("Haстадииpriёmki", vocab)[0] == "На стадии приёмки"
+
+    def test_cut_after_comma_before_word_with_suffix_in_brackets(self):
+        vocab = layer_vocabulary([line("главный аудитор, аудитор(ы)", 0.1)], )
+        assert split_glued_text("главныйаудитор,аудитор(ы)", vocab, exact=True)[0] == (
+            "главный аудитор, аудитор(ы)"
+        )

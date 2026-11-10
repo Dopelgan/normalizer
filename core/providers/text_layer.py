@@ -284,6 +284,13 @@ def _lines_from_page(page: Any, page_no: int, width: float, height: float) -> Li
 
     raw = page.get_text("dict")
     lines: List[TextLine] = []
+    # У повёрнутой страницы (/Rotate, альбомный лист) слой отдаёт координаты
+    # неповёрнутой, а `page.rect`, растр и рамки MinerU — повёрнутой. Без
+    # пересчёта строки съезжали за край, прижимались к 1.0 и не попадали ни
+    # в одну рамку: таблица оставалась с текстом модели, а слой уходил
+    # плоским текстом мимо неё.
+    turn = int(getattr(page, "rotation", 0) or 0) % 360
+    matrix = page.rotation_matrix if turn else None
 
     for block in raw.get("blocks") or []:
         if block.get("type") != 0:      # 0 — текст, 1 — растровая картинка
@@ -295,6 +302,9 @@ def _lines_from_page(page: Any, page_no: int, width: float, height: float) -> Li
                 continue
 
             bbox = line.get("bbox") or [0, 0, 0, 0]
+            if matrix is not None:
+                turned = _pymupdf.Rect(bbox) * matrix
+                bbox = [turned.x0, turned.y0, turned.x1, turned.y1]
             sizes = [float(s.get("size", 0) or 0) for s in spans]
             fonts = " ".join(str(s.get("font", "")) for s in spans).lower()
             colors = [int(s.get("color", 0) or 0) for s in spans]
@@ -309,12 +319,19 @@ def _lines_from_page(page: Any, page_no: int, width: float, height: float) -> Li
                 ],
                 page=page_no,
                 size=max(sizes) if sizes else 0.0,
-                rotation=_direction_to_degrees(line.get("dir")),
+                rotation=_turn_back(_direction_to_degrees(line.get("dir")), turn),
                 color=statistics.mode(colors) if colors else 0,
                 mono=any(marker in fonts for marker in _MONO_MARKERS),
             ))
 
     return lines
+
+
+def _turn_back(angle: float, turn: int) -> float:
+    """Угол письма на странице в том виде, в каком её видно (с учётом /Rotate)."""
+    if not turn:
+        return angle
+    return round((angle - turn + 180.0) % 360.0 - 180.0, 1)
 
 
 def _direction_to_degrees(direction: Optional[Sequence[float]]) -> float:
@@ -519,9 +536,10 @@ def reconcile_with_text_layer(
             page_blocks = [b for b in page_blocks if b.type != "text"]
 
         assignments = _assign_lines(page_lines, page_blocks)
-        # Словарь страницы нужен только распознанному слою: склейку ячеек
-        # даёт OCR модели таблиц, у векторного PDF её не измеряли.
-        vocab = layer_vocabulary(page_lines) if not source.exact else None
+        # Словарь страницы: по нему режутся склейки в ячейках MinerU. Модель
+        # таблиц склеивает строки ячейки и на векторном листе — слой файла
+        # там точный, и словарь из него только надёжнее.
+        vocab = layer_vocabulary(page_lines)
 
         leftovers = list(assignments.get(None) or [])
 
@@ -544,7 +562,9 @@ def reconcile_with_text_layer(
                 # Структуру таблицы строит MinerU — слой про неё ничего не
                 # знает. Но текст ячеек всё равно распознан, поэтому его
                 # значения выправляются по слою.
-                replacements, kept = _fix_table(block, matched, stats, vocab)
+                replacements, kept = _fix_table(
+                    block, matched, stats, vocab, exact=source.exact
+                )
                 extra_blocks.extend(replacements)
                 leftovers.extend(kept)
             elif matched and not _carries_own_text(block):
@@ -756,7 +776,8 @@ def _fix_table(
     block: ParsedBlock,
     matched: Sequence[TextLine],
     stats: ReconcileStats,
-    vocab: Optional[set] = None,
+    vocab: Optional[Dict[str, str]] = None,
+    exact: bool = False,
 ) -> Tuple[List[ParsedBlock], List[TextLine]]:
     """
     Содержимое ячеек — по строкам слоя. Возвращает блоки, которыми таблицу
@@ -770,9 +791,11 @@ def _fix_table(
     Не сошлась геометрия — таблица разбирается на текст и формулы, потому
     что выдать разметку побуквенно в индекс хуже любой потери структуры.
 
-    `vocab` — словарь распознанного слоя страницы; есть только у OCR-слоя.
-    С ним склеенные строки ячеек режутся по словам, а строки слоя, слов
-    которых в таблице нет, возвращаются вторым значением — текстом.
+    `vocab` — словарь слоя страницы. С ним склеенные строки ячеек режутся
+    по словам, а буквы чужого алфавита внутри слова выправляются. Строки
+    слоя, слов которых в таблице нет, возвращаются вторым значением —
+    текстом; только у распознанного слоя (`exact=False`): у векторного это
+    не измерялось.
     """
     if latex_text.mangled_cells(block.table_data):
         stats.mangled_tables += 1
@@ -784,7 +807,9 @@ def _fix_table(
     unused = _repair_table_cells(block, matched, stats)
     if vocab is None:
         return [], []
-    _split_glued_cells(block, vocab, stats)
+    _split_glued_cells(block, vocab, stats, exact)
+    if exact:
+        return [], []
     kept = _lines_with_new_words(unused, block)
     stats.table_lines_kept += len(kept)
     return [], kept
@@ -836,9 +861,72 @@ def _repair_table_cells(
 # Склеенные строки ячеек
 # ===========================================================================
 
+# Буквы, которые распознавание подставляет в русское слово вместо
+# кириллицы, по виду («Ha», «Нoмep», «Πo»): латиница и греческий.
+_TO_CYRILLIC = dict(zip(
+    "aceopxykmACEHKMOPTXYBΠποΟαΑεΕρΡτΤκΚχΧΒΗΜΥ",
+    "асеорхукмАСЕНКМОРТХУВПпоОаАеЕрРтТкКхХВНМУ",
+))
+# Обратное — для латинского слова с кириллицей внутри («exрires»).
+_TO_LATIN = {cyr: lat for lat, cyr in _TO_CYRILLIC.items() if "a" <= lat.lower() <= "z"}
+_TO_LATIN.update(dict(zip("οΟαΑεΕρΡτΤκΚχΧΒΗΜ", "oOaAeEpPtTkKxXBHM")))
+# Транслитерация по звуку: модель MinerU иногда пишет русское слово
+# латиницей вперемешку («priёmki» — «приёмки»). Нужна только для сверки со
+# словарём слоя, и только у слова, где смешаны алфавиты.
+_TRANSLIT = dict(zip("abvgdezijklmnoprstufhcy", "абвгдезийклмнопрстуфхцы"))
+_LETTER_RUN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _script(ch: str) -> str:
+    if "\u0400" <= ch <= "\u04ff":
+        return "cyr"
+    if "\u0370" <= ch <= "\u03ff":
+        return "grk"
+    if ch.isascii() and ch.isalpha():
+        return "lat"
+    return "other" if ch.isalpha() else ""
+
+
+def _scripts(text: str) -> set:
+    return {_script(ch) for ch in text} - {""}
+
+
+def _single_script(text: str) -> bool:
+    return len(_scripts(text)) <= 1
+
+
+def unify_script(word: str) -> str:
+    """
+    Слово из одного алфавита, если смесь в нём объяснима подменой похожих
+    букв. Есть в слове буква, которой нет в латинице («НачальникOTK»,
+    «HOCТЬ»), — похожие латинские и греческие буквы становятся кириллицей.
+    Есть буква, которой нет в кириллице («exрires»), — наоборот. Есть и те и
+    другие («priёmki») — слово не трогается: это не подмена, а каша, и
+    угадывать её нельзя. Слово из одного алфавита не трогается никогда.
+    """
+    def fix(match: "re.Match[str]") -> str:
+        run = match.group(0)
+        if _single_script(run):
+            return run
+        cyr_only = any(_script(ch) == "cyr" and ch not in _TO_LATIN for ch in run)
+        lat_only = any(_script(ch) == "lat" and ch not in _TO_CYRILLIC for ch in run)
+        if cyr_only and lat_only:
+            return run
+        if not cyr_only and not lat_only:
+            cyr = sum(_script(ch) in ("cyr", "grk") for ch in run)
+            to_cyrillic = cyr * 2 >= len(run)
+        else:
+            to_cyrillic = cyr_only
+        table = _TO_CYRILLIC if to_cyrillic else _TO_LATIN
+        return "".join(table.get(ch, ch) for ch in run)
+
+    return _LETTER_RUN_RE.sub(fix, word)
+
+
 def _fold_char(ch: str) -> str:
     """Посимвольная свёртка: длина строки сохраняется, позиции совпадают."""
-    low = ch.lower()
+    low = _TO_CYRILLIC.get(ch, ch) if _script(ch) == "grk" else ch
+    low = low.lower()
     folded = _HOMOGLYPHS.get(low, low)
     return folded if len(folded) == 1 else ch
 
@@ -847,15 +935,49 @@ def _fold_word(word: str) -> str:
     return "".join(_fold_char(ch) for ch in word)
 
 
-def layer_vocabulary(lines: Sequence[TextLine]) -> set:
-    """Слова строк слоя, свёрнутые и без знаков по краям."""
-    vocab = set()
+def layer_vocabulary(lines: Sequence[TextLine]) -> Dict[str, str]:
+    """
+    Слова строк слоя: свёрнутое написание -> написание из слоя (без знаков
+    по краям). Из нескольких написаний берётся слово одного алфавита.
+    """
+    vocab: Dict[str, str] = {}
     for line in lines:
         for raw in (line.text or "").split():
             word = raw.strip(_WORD_EDGE)
-            if word:
-                vocab.add(_fold_word(word))
+            if not word:
+                continue
+            key = _fold_word(word)
+            if key not in vocab or (not _single_script(vocab[key]) and _single_script(word)):
+                vocab[key] = word
     return vocab
+
+
+def _lookup(piece: str, vocab: Dict[str, str]) -> Optional[str]:
+    """Написание куска по словарю слоя или None."""
+    found = vocab.get(_fold_word(piece))
+    if found is not None:
+        return found
+    scripts = _scripts(piece)
+    if "cyr" in scripts and "lat" in scripts:
+        spelled = "".join(_TRANSLIT.get(ch.lower(), ch) if _script(ch) == "lat" else ch
+                          for ch in piece)
+        return vocab.get(_fold_word(spelled))
+    return None
+
+
+def _respell(piece: str, spelling: str, trusted: bool) -> str:
+    """
+    Кусок в написании слоя, с регистром куска. Только если слой надёжен
+    (`trusted`: векторный слой или смешанный алфавит в самом токене) и
+    написание слоя из одного алфавита.
+    """
+    if not trusted or spelling == piece or len(spelling) != len(piece):
+        return piece
+    if not _single_script(spelling):
+        return piece
+    return "".join(
+        new.upper() if old.isupper() else new.lower() for old, new in zip(piece, spelling)
+    )
 
 
 def _letter_run(text: str, from_end: bool) -> int:
@@ -869,9 +991,11 @@ def _letter_run(text: str, from_end: bool) -> int:
     return run
 
 
-def _split_token(token: str, vocab: set) -> Optional[List[int]]:
+def _split_token(
+    token: str, vocab: Dict[str, str]
+) -> Optional[List[Tuple[int, int, str]]]:
     """
-    Позиции, перед которыми в склеенный токен вставляется пробел, или None.
+    Куски склеенного токена — (начало, конец, написание по слою) — или None.
 
     Токен должен целиком разложиться на слова словаря; из разложений берётся
     то, где кусков меньше. Кусок короче трёх букв допустим, только если это
@@ -890,6 +1014,7 @@ def _split_token(token: str, vocab: set) -> Optional[List[int]]:
     if folded.strip(_WORD_EDGE) in vocab:
         return None
     size = len(folded)
+    spellings: Dict[Tuple[int, int], str] = {}
     short_words = {_fold_word(w) for w in _SHORT_WORDS}
     # best[stop] — (кусков, начало последнего куска, конец предыдущего или
     # None) для лучшего разбора folded[:stop].
@@ -897,8 +1022,10 @@ def _split_token(token: str, vocab: set) -> Optional[List[int]]:
 
     def piece_ok(start: int, stop: int) -> bool:
         piece = folded[start:stop]
-        if piece not in vocab:
+        spelling = _lookup(token[start:stop], vocab)
+        if spelling is None:
             return False
+        spellings[(start, stop)] = spelling
         letters = sum(ch.isalpha() for ch in token[start:stop])
         # Сокращение с точкой («См.», «Рис.») — тоже слово.
         abbreviation = token[stop:stop + 1] == "."
@@ -909,7 +1036,7 @@ def _split_token(token: str, vocab: set) -> Optional[List[int]]:
         left, right = token[prev_end - 1], token[start]
         word = token[start:stop]
         if gap:
-            return all(ch in _CUT_AFTER for ch in gap) and word.isalpha() and len(word) >= 3
+            return all(ch in _CUT_AFTER for ch in gap) and _letter_run(word, from_end=False) >= 3
         if left.isdigit() and right.isdigit():
             return False
         if left.isalpha() and right.isdigit():
@@ -948,31 +1075,71 @@ def _split_token(token: str, vocab: set) -> Optional[List[int]]:
     end = min(finishes, key=lambda e: best[e][0])
     if best[end][0] < 2:
         return None
-    cuts: List[int] = []
-    while best[end][2] is not None:
-        cuts.append(best[end][1])
-        end = best[end][2]
-    return sorted(cuts)
+    pieces: List[Tuple[int, int, str]] = []
+    while True:
+        _, start, prev_end = best[end]
+        pieces.append((start, end, spellings[(start, end)]))
+        if prev_end is None:
+            break
+        end = prev_end
+    return pieces[::-1]
 
 
-def split_glued_text(text: str, vocab: set) -> Tuple[str, int]:
+def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
     """
-    Текст (или HTML таблицы) с разрезанными склейками и число разрезанных
-    токенов. Разметка не трогается: режется только текст между тегами.
+    Токен ячейки: алфавит выправлен, склейка разрезана по словам слоя, а
+    куски и целые слова взяты в написании слоя, если слою можно верить.
     """
-    if not text or not vocab:
+    token = unify_script(token)
+    trusted = exact or len(_scripts(token)) > 1
+    pieces = _split_token(token, vocab)
+    if pieces:
+        # Кусок из одних похожих латинских букв внутри русского токена
+        # («Haстадии») — русское слово, даже если слой его так не написал.
+        russian = "cyr" in _scripts(token)
+        out = [token[:pieces[0][0]]]
+        for index, (start, stop, spelling) in enumerate(pieces):
+            if index:
+                out.append(" ")
+            piece = _respell(token[start:stop], spelling, trusted)
+            if russian and all(ch in _TO_CYRILLIC for ch in piece if ch.isalpha()):
+                piece = "".join(_TO_CYRILLIC.get(ch, ch) for ch in piece)
+            out.append(piece)
+            following = pieces[index + 1][0] if index + 1 < len(pieces) else len(token)
+            out.append(token[stop:following])
+        return "".join(out)
+    core = token.strip(_WORD_EDGE)
+    if not core or not any(ch.isalpha() for ch in core):
+        return token
+    spelling = _lookup(core, vocab)
+    if spelling is None:
+        return token
+    start = token.index(core)
+    return token[:start] + _respell(core, spelling, trusted) + token[start + len(core):]
+
+
+def split_glued_text(
+    text: str, vocab: Dict[str, str], exact: bool = False
+) -> Tuple[str, int]:
+    """
+    Текст (или HTML таблицы) с разрезанными склейками и выправленным
+    алфавитом; второе значение — число изменённых токенов. Разметка не
+    трогается: правится только текст между тегами. `exact` — словарь из
+    векторного слоя: его написанию верим всегда, а написанию OCR — только
+    в токене, где алфавиты смешаны.
+    """
+    if not text:
         return text, 0
+    vocab = vocab or {}
     count = 0
 
     def fix(match: "re.Match[str]") -> str:
         nonlocal count
         token = match.group(0)
-        cuts = _split_token(token, vocab)
-        if not cuts:
-            return token
-        count += 1
-        bounds = [0] + cuts + [len(token)]
-        return " ".join(token[a:b] for a, b in zip(bounds, bounds[1:]))
+        fixed = _fix_token(token, vocab, exact)
+        if fixed != token:
+            count += 1
+        return fixed
 
     parts = _MARKUP_RE.split(text)
     for index in range(0, len(parts), 2):
@@ -980,14 +1147,16 @@ def split_glued_text(text: str, vocab: set) -> Tuple[str, int]:
     return "".join(parts), count
 
 
-def _split_glued_cells(block: ParsedBlock, vocab: set, stats: ReconcileStats) -> None:
+def _split_glued_cells(
+    block: ParsedBlock, vocab: Dict[str, str], stats: ReconcileStats, exact: bool = False
+) -> None:
     """Склейки режутся во всех видах таблицы: ячейки, HTML и текст блока."""
     table = block.table_data or {}
 
     def fix(value: Any) -> Any:
         if not isinstance(value, str):
             return value
-        fixed, count = split_glued_text(value, vocab)
+        fixed, count = split_glued_text(value, vocab, exact)
         stats.split_tokens += count
         return fixed
 
@@ -996,9 +1165,9 @@ def _split_glued_cells(block: ParsedBlock, vocab: set, stats: ReconcileStats) ->
         table["rows"] = [[fix(c) for c in row] for row in (table.get("rows") or [])]
         block.table_data = table
     if block.table_html:
-        block.table_html = split_glued_text(block.table_html, vocab)[0]
+        block.table_html = split_glued_text(block.table_html, vocab, exact)[0]
     if block.text:
-        block.text = split_glued_text(block.text, vocab)[0]
+        block.text = split_glued_text(block.text, vocab, exact)[0]
 
 
 def _looks_like_word(word: str) -> bool:
