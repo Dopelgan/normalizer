@@ -75,6 +75,14 @@ _IMAGE_CATEGORY_BY_KIND = {
 }
 
 
+def _has_name_conflict(signals: Dict[str, Any]) -> bool:
+    """Противоречие имени и содержимого: на G-3 оно лежит внутри `raster`."""
+    raster = signals.get("raster")
+    return "name_conflict" in signals or (
+        isinstance(raster, dict) and "name_conflict" in raster
+    )
+
+
 @dataclass
 class GatewayVerdict:
     """Решение по файлу и почему оно принято."""
@@ -342,12 +350,37 @@ class DataGateway:
         """
         Дорого и на малой доле файлов. Спорный случай уходит основной модели
         вместе с описанием деятельности организации из профиля. Модель не
-        настроена — документ отправляется в карантин, а не выбрасывается.
+        настроена: документ принимаемой категории принимается с пометкой
+        `needs_review` (если профиль не запрещает), остальное — в карантин,
+        а не выбрасывается.
         """
         resolved = self.classifier.resolve_ambiguous(
             path, sample, self.profile.company_profile
         )
         if resolved is None:
+            if (
+                previous.outcome == ACCEPT
+                and self.profile.accept_uncertain_without_review
+                # Противоречие (имя «личное», а на листе чертёж) — уже
+                # признак против приёма: такое решает человек.
+                and not _has_name_conflict(previous.signals)
+            ):
+                # Неуверенность — не признак мусора. Слой назвал файл
+                # принимаемой категорией, опровергнуть некому: принимаем и
+                # помечаем для проверки, а не прячем в карантин навсегда.
+                return GatewayVerdict(
+                    ACCEPT,
+                    f"Классификатор не уверен (уверенность {previous.confidence:.2f}), "
+                    "разбор спорных случаев не настроен; признаков мусора или "
+                    "личного нет — принимается с пометкой для проверки.",
+                    "G-4", category=previous.category,
+                    confidence=previous.confidence,
+                    signals={
+                        **previous.signals,
+                        "escalated_from": previous.layer,
+                        "needs_review": True,
+                    },
+                )
             return GatewayVerdict(
                 QUARANTINE,
                 f"Классификатор не уверен (уверенность {previous.confidence:.2f}), "

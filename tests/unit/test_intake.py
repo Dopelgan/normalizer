@@ -351,12 +351,62 @@ class TestImageLayer:
 
 
 class TestEscalation:
-    def test_unsure_without_model_goes_to_quarantine(self):
-        """Спорный случай не выбрасывается — его смотрит человек."""
+    def test_unsure_without_model_is_accepted_for_review(self):
+        """
+        Регрессия (прод, 11.2026): 20 сканов КД без текстового слоя («ТАДУ
+        687000.001 СБ.pdf») получали от правил «деловой документ, 0.50», а
+        G-4 без модели отправлял их в карантин — и в индекс они не попадали.
+        Признаков мусора или личного у такого файла нет, поэтому он
+        принимается с пометкой для проверки, а не теряется.
+        """
         previous = gateway().content_layer("documents/x.pdf", "ни о чём".encode(), 1.0)
+        assert previous.outcome == ACCEPT and previous.confidence < 0.6
         verdict = gateway().escalation_layer("documents/x.pdf", b"", previous)
-        assert verdict.outcome == QUARANTINE
+        assert verdict.outcome == ACCEPT
         assert verdict.layer == "G-4"
+        assert verdict.signals["needs_review"] is True
+        assert verdict.signals["escalated_from"] == "G-2"
+
+    def test_scan_without_text_layer_reaches_index_end_to_end(self):
+        """Тот же случай через evaluate: скан без текста и без маркеров в имени."""
+        pymupdf = pytest.importorskip("pymupdf")
+        document = pymupdf.open()
+        document.new_page(width=600, height=800).draw_rect(
+            pymupdf.Rect(20, 20, 580, 780), color=(0, 0, 0)
+        )
+        data = document.tobytes()
+        document.close()
+        uri = "imports/u/ТАДУ 687000.001 СБ (изм. 1).pdf"
+        verdict = gateway({uri: data}).evaluate(uri, uri, len(data))
+        assert verdict.outcome == ACCEPT
+        assert verdict.signals.get("needs_review") is True
+
+    def test_unsure_negative_without_model_still_goes_to_quarantine(self):
+        """Неуверенное «нераспознаваемое» или «личное» не принимается молча."""
+        from core.gateway.profile import CATEGORY_UNRECOGNIZABLE
+        from core.gateway.service import GatewayVerdict
+
+        for category, outcome in (
+            (CATEGORY_UNRECOGNIZABLE, QUARANTINE), (CATEGORY_PERSONAL, REJECT),
+        ):
+            previous = GatewayVerdict(
+                outcome, "x", "G-2", category=category, confidence=0.5,
+            )
+            verdict = gateway().escalation_layer("documents/x.pdf", b"", previous)
+            assert verdict.outcome == QUARANTINE
+
+        conflict = GatewayVerdict(
+            ACCEPT, "x", "G-3", category=IMAGE_DRAWING, confidence=0.5,
+            signals={"raster": {"name_conflict": "имя файла помечено как личное"}},
+        )
+        verdict = gateway().escalation_layer("личное_отпуск.png", b"", conflict)
+        assert verdict.outcome == QUARANTINE
+
+    def test_unsure_quarantine_can_be_restored_by_profile(self):
+        profile = GatewayProfile(accept_uncertain_without_review=False)
+        previous = gateway().content_layer("documents/x.pdf", "ни о чём".encode(), 1.0)
+        verdict = gateway(profile=profile).escalation_layer("x.pdf", b"", previous)
+        assert verdict.outcome == QUARANTINE
 
     def test_main_model_resolves_the_case(self):
         class Model(SilentClassifier):
