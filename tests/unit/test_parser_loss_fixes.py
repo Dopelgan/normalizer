@@ -232,7 +232,8 @@ def _context():
     classification = SimpleNamespace(source="raster", genre="text", raster_quality=0.5,
                                      as_dict=lambda: {})
     return SimpleNamespace(uri="documents/x.pdf", file_type="pdf", kind="pdf",
-                           classification=classification, source_page_count=1)
+                           classification=classification, source_page_count=1,
+                           text_layer=None)
 
 
 def test_router_does_not_swallow_celery_soft_time_limit():
@@ -264,3 +265,35 @@ def test_ocr_render_does_not_swallow_soft_time_limit(pdf_provider, monkeypatch):
     monkeypatch.setattr(tesseract_fallback, "convert_from_path", render)
     with pytest.raises(SoftTimeLimitExceeded):
         pdf_provider.parse_all_pages("documents/doc.pdf")
+
+
+def test_soft_limit_keeps_best_candidate_already_found():
+    """Мягкий лимит на дорогом уровне не теряет результат дешёвого (ревью f7e47ff)."""
+    from celery.exceptions import SoftTimeLimitExceeded
+    from core.ladder.router import LadderRouter
+    from core.models.parse_result import ParsedBlock, ParseResult
+
+    class _Ok(_Level):
+        def run(self, context):
+            return ParseResult(blocks=[ParsedBlock(type="text", text="текст " * 50, page=1,
+                                                   confidence=0.5)],
+                               is_fallback=True, parser_name="fake", source_kind="scanned_pdf")
+
+    cheap, costly = _Ok(None), _Level(SoftTimeLimitExceeded())
+    costly.level, costly.name = 5, "costly"
+    router = LadderRouter(strategies=[cheap, costly], enabled_levels=[4, 5])
+    result = router.parse(_context())
+    assert result.blocks and any("срок задачи истёк" in note for note in result.degraded)
+
+
+def test_restoration_stops_before_task_deadline():
+    import fitz
+    from core import deadline
+    from core.ladder.restoration import restore_pages
+
+    document = fitz.open()
+    for _ in range(3):
+        document.new_page(width=200, height=200)
+    with deadline.scope(10):
+        restored, applied, _ = restore_pages(document.tobytes(), max_pages=50)
+    assert restored is None and applied == []  # ни одной страницы не начато

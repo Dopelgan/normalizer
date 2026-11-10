@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from core import filetypes, telemetry
+from celery.exceptions import SoftTimeLimitExceeded
+
 from core.config import settings
 from core.gateway.profile import GatewayProfile, load_profile
 from core.gateway.service import ACCEPT, QUARANTINE, REJECT
@@ -516,6 +518,8 @@ class QualityGate:
         except OcrUnavailable as exc:
             logger.info("Быстрый OCR недоступен для %s: %s", context.uri, exc)
             return None
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 — OCR не обязан быть поднят
             logger.info("Быстрый OCR не отработал на %s: %s", context.uri, exc)
             return None
@@ -527,6 +531,8 @@ class QualityGate:
         """Байты документа, если они уже прочитаны. Читать заново незачем."""
         try:
             return context.data
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 — пусть решает провайдер
             logger.debug("Байты %s недоступны: %s", context.uri, exc)
             return None

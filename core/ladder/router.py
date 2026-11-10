@@ -204,8 +204,15 @@ class LadderRouter:
             try:
                 result = strategy.run(context)
             except SoftTimeLimitExceeded:
-                # Лимит задачи — не «неудача уровня»: его обрабатывает задача.
-                raise
+                # Лимит задачи — не «неудача уровня». Если кандидат уже есть,
+                # он сохраняется с пометкой; иначе лимит обрабатывает задача.
+                if best is None:
+                    raise
+                note = f"срок задачи истёк на уровне {strategy.level} ({strategy.name})"
+                best.degraded.append(note)
+                attempts.append(Attempt(strategy.level, strategy.name, error=note))
+                logger.warning("Разбор %s: %s — сохраняем лучший результат", context.uri, note)
+                break
             except Exception as exc:  # noqa: BLE001 — неудача уровня не фатальна
                 logger.warning(
                     "Уровень %d (%s) не справился: %s", strategy.level, strategy.name, exc

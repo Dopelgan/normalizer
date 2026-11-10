@@ -26,6 +26,9 @@ _MAX_UPSCALE_PIXELS = 40_000_000
 # Наклон меньше этого не выправляем: поворот сам по себе размывает растр.
 _MIN_SKEW = 0.6
 
+# Сколько секунд срока задачи оставить на разбор уже восстановленных страниц.
+_PAGE_RESERVE = 120
+
 
 def restore(data: bytes, pdf: bool = False) -> Tuple[Optional[bytes], List[str]]:
     """Выправленный PNG (изображение или первая страница PDF) и список шагов."""
@@ -64,9 +67,16 @@ def restore_pages(
     applied: List[str] = []
     first_png: Optional[bytes] = None
     try:
+        from core import deadline
+
         for index, page in enumerate(source):
             if index >= max_pages:
                 logger.warning("Восстановление усечено: %d страниц из %d", max_pages, source.page_count)
+                break
+            left = deadline.remaining()
+            if left is not None and left < _PAGE_RESERVE:
+                logger.warning("Восстановление остановлено по сроку задачи на странице %d", index + 1)
+                applied.append(f"усечено по времени: {index} из {source.page_count} стр.")
                 break
             pixmap = page.get_pixmap(dpi=dpi)
             image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)

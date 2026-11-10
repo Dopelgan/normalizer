@@ -38,6 +38,9 @@ import time
 from typing import Any, Dict, List, Optional
 
 from core import filetypes
+from celery.exceptions import SoftTimeLimitExceeded
+
+from core import deadline
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import drawing_text, drawing_vision, raster_drawing, vector_drawing
@@ -246,9 +249,19 @@ class DrawingProcessor:
             if fragment.type != "image" or not fragment.content.image_ref:
                 result.append(fragment)
                 continue
+            left = deadline.remaining()
+            if left is not None and left < settings.VLM_TIMEOUT:
+                # До срока задачи не уложится даже один вызов модели: лучше
+                # сохранить документ с пометкой, чем потерять его целиком.
+                fragment.review_required = True
+                fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_SKIPPED_NO_TIME"]))
+                result.append(fragment)
+                continue
             try:
                 drawing_result = self.process(fragment.content.image_ref, metadata)
                 enriched = self.build_fragment(drawing_result, fragment, metadata)
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
                 logger.error("Обработка чертежа %s не удалась: %s",
                              fragment.content.image_ref, exc)
@@ -281,8 +294,14 @@ class DrawingProcessor:
         if not source_uri:
             return None
 
+        left = deadline.remaining()
+        if left is not None and left < settings.VLM_TIMEOUT:
+            logger.warning("Разбор листа %s пропущен: до срока задачи %.0f с", source_uri, left)
+            return None
         try:
             drawing_result = self.process(source_uri, metadata)
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
             logger.error("Разбор листа %s не удался: %s", source_uri, exc)
             return None

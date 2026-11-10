@@ -180,6 +180,7 @@ class RestoreThenLayoutStrategy(Strategy):
             )
             if restored is None:
                 raise ValueError("Восстановление страниц PDF не удалось")
+            notes.extend(step for step in applied if step.startswith("усечено"))
             total = context.source_page_count or 0
             if total > settings.OCR_FULL_MAX_PAGES:
                 notes.append(
