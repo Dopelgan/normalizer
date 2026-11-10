@@ -350,9 +350,9 @@ class DataGateway:
         """
         Дорого и на малой доле файлов. Спорный случай уходит основной модели
         вместе с описанием деятельности организации из профиля. Модель не
-        настроена: документ принимаемой категории принимается с пометкой
-        `needs_review` (если профиль не запрещает), остальное — в карантин,
-        а не выбрасывается.
+        настроена: документ, у которого правила нашли маркер принимаемой
+        категории и ни одного против, принимается с пометкой `needs_review`
+        (если профиль не запрещает); остальное — в карантин, а не выбрасывается.
         """
         resolved = self.classifier.resolve_ambiguous(
             path, sample, self.profile.company_profile
@@ -364,6 +364,7 @@ class DataGateway:
                 # Противоречие (имя «личное», а на листе чертёж) — уже
                 # признак против приёма: такое решает человек.
                 and not _has_name_conflict(previous.signals)
+                and self._positively_matched(previous)
             ):
                 # Неуверенность — не признак мусора. Слой назвал файл
                 # принимаемой категорией, опровергнуть некому: принимаем и
@@ -401,6 +402,27 @@ class DataGateway:
         )
 
     # ------------------------------------------------------------ внутреннее
+    def _positively_matched(self, previous: GatewayVerdict) -> bool:
+        """
+        Неуверенный документ принимается без G-4, только если правила нашли
+        положительный маркер принимаемой категории и ни одного — против.
+
+        Голый запасной «деловой, 0.5» (ничего не нашлось) сюда не подходит:
+        так выглядит и скан паспорта «scan_001.pdf». Любой ненулевой счёт
+        непринимаемой категории (личное, переписка…) — тоже повод отдать
+        решение человеку.
+        """
+        signals = previous.signals or {}
+        if not signals.get("matched_in"):
+            return False
+        scores = signals.get("rule_scores") or {}
+        accepted = set(self.profile.accepted_categories)
+        return any(
+            category in accepted and score > 0 for category, score in scores.items()
+        ) and not any(
+            category not in accepted and score > 0 for category, score in scores.items()
+        )
+
     def _read_all(self, path: str) -> bytes:
         """Весь файл: нужен там, где решение принимается по содержимому целиком."""
         try:

@@ -351,27 +351,8 @@ class TestImageLayer:
 
 
 class TestEscalation:
-    def test_unsure_without_model_is_accepted_for_review(self):
-        """
-        Регрессия (прод, 11.2026): 20 сканов КД без текстового слоя («ТАДУ
-        687000.001 СБ.pdf») получали от правил «деловой документ, 0.50», а
-        G-4 без модели отправлял их в карантин — и в индекс они не попадали.
-        Признаков мусора или личного у такого файла нет, поэтому он
-        принимается с пометкой для проверки, а не теряется.
-        """
-        previous = gateway().content_layer("documents/x.pdf", "ни о чём".encode(), 1.0)
-        assert previous.outcome == ACCEPT and previous.confidence < 0.6
-        verdict = gateway().escalation_layer("documents/x.pdf", b"", previous)
-        assert verdict.outcome == ACCEPT
-        assert verdict.layer == "G-4"
-        assert verdict.signals["needs_review"] is True
-        assert verdict.signals["escalated_from"] == "G-2"
-
-    def test_scan_without_text_layer_reaches_index_end_to_end(self):
-        """
-        Тот же случай через evaluate: скан без текста и без маркеров в имени
-        (обозначение ЕСКД в имени теперь опознаётся правилами на G-2).
-        """
+    @staticmethod
+    def _scan() -> bytes:
         pymupdf = pytest.importorskip("pymupdf")
         document = pymupdf.open()
         document.new_page(width=600, height=800).draw_rect(
@@ -379,10 +360,68 @@ class TestEscalation:
         )
         data = document.tobytes()
         document.close()
-        uri = "imports/u/01.01.008 - Продольный усилитель укороченный с проушиной.pdf"
+        return data
+
+    @staticmethod
+    def _uncertain(scores, matched_in="путь"):
+        from core.gateway.service import GatewayVerdict
+
+        signals = {"decided_by": "правила", "rule_scores": scores}
+        if matched_in:
+            signals["matched_in"] = matched_in
+        return GatewayVerdict(
+            ACCEPT, "x", "G-2", category=CATEGORY_TECHNICAL, confidence=0.5,
+            signals=signals,
+        )
+
+    def test_unsure_positive_marker_is_accepted_for_review(self):
+        """
+        Регрессия (прод, 11.2026): неуверенный, но опознанный маркером
+        принимаемой категории документ без G-4 уходил в карантин и в индекс
+        не попадал. Признаков против нет — принимается с пометкой проверки.
+        """
+        previous = self._uncertain({CATEGORY_TECHNICAL: 1.0, CATEGORY_BUSINESS: 1.0})
+        verdict = gateway().escalation_layer("documents/x.pdf", b"", previous)
+        assert verdict.outcome == ACCEPT
+        assert verdict.layer == "G-4"
+        assert verdict.signals["needs_review"] is True
+        assert verdict.signals["escalated_from"] == "G-2"
+
+    def test_tied_accepted_categories_scan_end_to_end(self):
+        """Скан, где поровну признаков договора и чертежа: обе принимаемые."""
+        uri = "imports/u/Договор чертеж.pdf"
+        data = self._scan()
         verdict = gateway({uri: data}).evaluate(uri, uri, len(data))
+        assert verdict.layer == "G-4"
         assert verdict.outcome == ACCEPT
         assert verdict.signals.get("needs_review") is True
+
+    def test_bare_fallback_without_markers_stays_in_quarantine(self):
+        """
+        «Деловой, 0.5» без единого маркера — не основание принимать: так
+        выглядит и скан паспорта «scan_001.pdf».
+        """
+        for name in ("scan_001.pdf", "01.01.008 - Продольный усилитель.pdf"):
+            uri = f"imports/u/{name}"
+            data = self._scan()
+            verdict = gateway({uri: data}).evaluate(uri, uri, len(data))
+            assert verdict.outcome == QUARANTINE, name
+            assert verdict.layer == "G-4"
+
+    def test_negative_category_score_blocks_uncertain_accept(self):
+        """Хоть какой-то счёт личного или переписки — решает человек."""
+        for negative in (CATEGORY_PERSONAL, CATEGORY_CORRESPONDENCE):
+            previous = self._uncertain({CATEGORY_TECHNICAL: 1.2, negative: 1.0})
+            verdict = gateway().escalation_layer("documents/x.pdf", b"", previous)
+            assert verdict.outcome == QUARANTINE, negative
+
+    def test_personal_name_with_designation_is_not_accepted(self):
+        """«личное_ТАДУ 687000.001.pdf» раньше отклонялся — не должен стать КД."""
+        uri = "imports/u/личное_ТАДУ 687000.001.pdf"
+        data = self._scan()
+        verdict = gateway({uri: data}).evaluate(uri, uri, len(data))
+        assert verdict.category == CATEGORY_PERSONAL
+        assert verdict.outcome == REJECT
 
     def test_unsure_negative_without_model_still_goes_to_quarantine(self):
         """Неуверенное «нераспознаваемое» или «личное» не принимается молча."""
@@ -407,7 +446,7 @@ class TestEscalation:
 
     def test_unsure_quarantine_can_be_restored_by_profile(self):
         profile = GatewayProfile(accept_uncertain_without_review=False)
-        previous = gateway().content_layer("documents/x.pdf", "ни о чём".encode(), 1.0)
+        previous = self._uncertain({CATEGORY_TECHNICAL: 1.0, CATEGORY_BUSINESS: 1.0})
         verdict = gateway(profile=profile).escalation_layer("x.pdf", b"", previous)
         assert verdict.outcome == QUARANTINE
 
