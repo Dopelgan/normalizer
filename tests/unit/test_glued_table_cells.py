@@ -161,7 +161,8 @@ class TestMixedScript:
 
     @pytest.mark.parametrize("word, expected", [
         ("HOCТЬ", "НОСТЬ"),            # есть буква, которой нет в латинице
-        ("Πoпроекту", "Попроекту"),    # греческая П
+        ("Пοпроекту", "Попроекту"),    # греческая ο среди кириллицы
+        ("Πoпроекту", "Πoпроекту"),    # три алфавита — только по словарю слоя
         ("exрires", "expires"),        # латинское слово с кириллицей
         ("OTK", "OTK"),                # один алфавит — не трогаем
         ("priёmki", "priёmki"),        # каша из обоих — не угадываем
@@ -174,6 +175,10 @@ class TestMixedScript:
         assert split_glued_text("Haстадииpriёmkiизделий", vocab)[0] == (
             "На стадии приёмки изделий"
         )
+
+    def test_three_scripts_are_resolved_by_layer(self):
+        vocab = layer_vocabulary([line("По проекту", 0.1)])
+        assert split_glued_text("Πoпроекту", vocab)[0] == "По проекту"
 
     def test_vector_spelling_wins_single_script_word(self):
         vocab = layer_vocabulary([line("СТО 05.18 СТП", 0.1)])
@@ -205,3 +210,26 @@ class TestMixedScript:
         assert split_glued_text("главныйаудитор,аудитор(ы)", vocab, exact=True)[0] == (
             "главный аудитор, аудитор(ы)"
         )
+
+
+class TestLegitMixedTokens:
+    """Ревью bd7b651: законные смеси латиницы и греческого не трогаются."""
+
+    TOKENS = ["kΩ", "μm", "Δp", "τmax"]
+
+    @pytest.mark.parametrize("token", TOKENS)
+    def test_unify_script_leaves_greek_latin(self, token):
+        assert unify_script(token) == token
+
+    @pytest.mark.parametrize("exact", [True, False])
+    def test_tokens_from_layer_are_kept(self, exact):
+        text = "R = 10 kΩ, 5 μm, Δp, τmax"
+        vocab = layer_vocabulary([line(text, 0.1)])
+        assert split_glued_text(text, vocab, exact)[0] == text
+
+    @pytest.mark.parametrize("token, expected", [
+        ("кBт", "кВт"), ("MПa", "МПа"), ("exрires", "expires"),
+        ("IP65", "IP65"), ("M8", "M8"), ("Rev.1", "Rev.1"), ("Ø20", "Ø20"), ("SiO2", "SiO2"),
+    ])
+    def test_substitutions_still_fixed(self, token, expected):
+        assert split_glued_text(token, {})[0] == expected

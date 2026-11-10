@@ -898,22 +898,30 @@ def _single_script(text: str) -> bool:
 def unify_script(word: str) -> str:
     """
     Слово из одного алфавита, если смесь в нём объяснима подменой похожих
-    букв. Есть в слове буква, которой нет в латинице («НачальникOTK»,
-    «HOCТЬ»), — похожие латинские и греческие буквы становятся кириллицей.
-    Есть буква, которой нет в кириллице («exрires»), — наоборот. Есть и те и
-    другие («priёmki») — слово не трогается: это не подмена, а каша, и
-    угадывать её нельзя. Слово из одного алфавита не трогается никогда.
+    букв. Подмена — это всегда кириллица плюс ровно один чужой алфавит:
+    слово без кириллицы не трогается никогда — смесь латиницы с греческим
+    законна («kΩ», «μm», «Δp», «τmax»), как и смесь трёх алфавитов. Есть в
+    слове буква, которой нет в латинице («НачальникOTK», «HOCТЬ»), — похожие
+    латинские буквы становятся кириллицей; греческие — тоже, но только в
+    слове из кириллицы и греческого («Πoпроекту» сюда не относится: там
+    латинская o, и слово остаётся как есть до сверки со слоем). Есть буква,
+    которой нет в кириллице («exрires»), — наоборот. Есть и те и другие
+    («priёmki») — слово не трогается: это не подмена, а каша.
     """
     def fix(match: "re.Match[str]") -> str:
         run = match.group(0)
-        if _single_script(run):
+        scripts = _scripts(run)
+        if scripts not in ({"cyr", "lat"}, {"cyr", "grk"}):
             return run
+        if "grk" in scripts:
+            return "".join(_TO_CYRILLIC.get(ch, ch) if _script(ch) == "grk" else ch
+                           for ch in run)
         cyr_only = any(_script(ch) == "cyr" and ch not in _TO_LATIN for ch in run)
         lat_only = any(_script(ch) == "lat" and ch not in _TO_CYRILLIC for ch in run)
         if cyr_only and lat_only:
             return run
         if not cyr_only and not lat_only:
-            cyr = sum(_script(ch) in ("cyr", "grk") for ch in run)
+            cyr = sum(_script(ch) == "cyr" for ch in run)
             to_cyrillic = cyr * 2 >= len(run)
         else:
             to_cyrillic = cyr_only
@@ -935,17 +943,26 @@ def _fold_word(word: str) -> str:
     return "".join(_fold_char(ch) for ch in word)
 
 
+class _Vocabulary(dict):
+    """Свёрнутое написание -> написание слоя; `verbatim` — слова как в слое."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.verbatim: set = set()
+
+
 def layer_vocabulary(lines: Sequence[TextLine]) -> Dict[str, str]:
     """
     Слова строк слоя: свёрнутое написание -> написание из слоя (без знаков
     по краям). Из нескольких написаний берётся слово одного алфавита.
     """
-    vocab: Dict[str, str] = {}
+    vocab = _Vocabulary()
     for line in lines:
         for raw in (line.text or "").split():
             word = raw.strip(_WORD_EDGE)
             if not word:
                 continue
+            vocab.verbatim.add(word)
             key = _fold_word(word)
             if key not in vocab or (not _single_script(vocab[key]) and _single_script(word)):
                 vocab[key] = word
@@ -1090,6 +1107,13 @@ def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
     Токен ячейки: алфавит выправлен, склейка разрезана по словам слоя, а
     куски и целые слова взяты в написании слоя, если слою можно верить.
     """
+    core = token.strip(_WORD_EDGE)
+    # Слово, которое в слое стоит буква в букву, — уже правильное; токен без
+    # кириллицы с греческим («kΩ», «τmax») — законная запись, не подмена.
+    if core in getattr(vocab, "verbatim", ()):
+        return token
+    if "grk" in _scripts(token) and "cyr" not in _scripts(token):
+        return token
     token = unify_script(token)
     trusted = exact or len(_scripts(token)) > 1
     pieces = _split_token(token, vocab)
