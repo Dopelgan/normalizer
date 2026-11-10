@@ -50,7 +50,7 @@ class PlainOcrStrategy(Strategy):
         return context.kind in (filetypes.KIND_IMAGE, filetypes.KIND_PDF)
 
     def run(self, context: DocumentContext) -> ParseResult:
-        blocks = self.provider.parse_all_pages(context.uri)
+        blocks = self.provider.parse_all_pages(context.uri, context.file_type)
         if not blocks:
             raise ValueError("Распознавание не дало текста")
         return self.build_result(

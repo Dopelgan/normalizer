@@ -216,7 +216,7 @@ class MinerUParserProvider(DocumentParserProvider):
         # модель таблиц MinerU отдаёт русскую прозу побуквенной LaTeX-
         # разметкой, а Tesseract с `rus` читает её как текст.
         if self._has_content(result):
-            ocr_layer = self._ocr_layer(uri)
+            ocr_layer = self._ocr_layer(uri, file_type)
             if ocr_layer is not None:
                 blocks, stats = reconcile_with_text_layer(
                     result.blocks, ocr_layer, source=OCR_LAYER
@@ -298,7 +298,7 @@ class MinerUParserProvider(DocumentParserProvider):
         finally:
             document.close()
 
-    def _ocr_layer(self, uri: str) -> Optional[TextLayer]:
+    def _ocr_layer(self, uri: str, file_type: Optional[str] = None) -> Optional[TextLayer]:
         """
         Построчное распознавание растра как слой. Недоступность OCR здесь не
         фатальна: без слоя разбор останется как был, поэтому ошибка уходит в
@@ -307,7 +307,7 @@ class MinerUParserProvider(DocumentParserProvider):
         if not settings.OCR_LAYER_ENABLED:
             return None
         try:
-            layer = self.tesseract.text_layer(uri)
+            layer = self.tesseract.text_layer(uri, file_type)
         except SoftTimeLimitExceeded:
             raise
         except Exception as exc:  # noqa: BLE001 — слой не обязателен
@@ -726,7 +726,7 @@ class MinerUParserProvider(DocumentParserProvider):
 
     # ------------------------------------------------------------ фоллбэк
     def _full_tesseract_fallback(self, uri: str, file_type: str) -> ParseResult:
-        blocks = self.tesseract.parse_all_pages(uri)
+        blocks = self.tesseract.parse_all_pages(uri, file_type)
         for block in blocks:
             block.method = block.method or "tesseract"
         degraded: List[str] = []

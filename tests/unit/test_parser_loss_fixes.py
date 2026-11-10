@@ -69,7 +69,7 @@ def _fake_render(fail_batches):
 @pytest.fixture
 def pdf_provider(monkeypatch):
     provider = TesseractFallbackProvider(storage=object())
-    monkeypatch.setattr(provider, "_materialize", lambda uri: ("/tmp/doc.pdf", lambda: None))
+    monkeypatch.setattr(provider, "_materialize", lambda uri, data=None, file_type=None: ("/tmp/doc.pdf", lambda: None))
     monkeypatch.setattr(provider, "_is_image", staticmethod(lambda path: False))
     monkeypatch.setattr(provider, "_page_count", staticmethod(lambda path: 12))
     monkeypatch.setattr(settings, "OCR_BATCH_PAGES", 5)
@@ -369,3 +369,113 @@ def test_drawing_branch_renders_pdf_scan_pages(monkeypatch):
     image = processor._open("src/sheet.pdf", page=2)
     assert image is not None and image.size[0] > 1000
     assert processor._open("src/sheet.pdf", page=3) is None
+
+
+# ------------------------------------------- вложение чата: ключ без расширения
+
+_ATTACHMENT_URI = "s3://chat-attachments/0b9f3c2e-5d1a-4c6b-9e8f-1a2b3c4d5e6f"
+
+
+def _png_bytes() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("L", (40, 20), 255).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class _BytesStorage:
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def read_bytes(self, uri):
+        assert uri == _ATTACHMENT_URI
+        return self.data
+
+
+def _no_pdf_render(*args, **kwargs):
+    raise AssertionError("PNG ушёл в pdf2image")
+
+
+class TestExtensionlessAttachmentIsOcrAsImage:
+    """
+    Регрессия ревью 3c9374b: у вложения чата ключ — голый uuid, временный
+    файл получал суффикс `.pdf`, и PNG уходил в pdf2image ("Unable to get
+    page count"): слой распознавания и полный OCR-фоллбэк терялись.
+    """
+
+    def test_materialize_suffix_from_file_type(self):
+        provider = TesseractFallbackProvider(storage=_BytesStorage(_png_bytes()))
+        path, cleanup = provider._materialize(_ATTACHMENT_URI, file_type="png")
+        try:
+            assert path.endswith(".png")
+        finally:
+            cleanup()
+
+    def test_materialize_ignores_unknown_type(self):
+        provider = TesseractFallbackProvider(storage=_BytesStorage(b"x"))
+        path, cleanup = provider._materialize(_ATTACHMENT_URI, file_type="../evil")
+        try:
+            assert path.endswith(".pdf")
+        finally:
+            cleanup()
+
+    def test_parse_all_pages_reads_png_as_image(self, monkeypatch):
+        provider = TesseractFallbackProvider(storage=_BytesStorage(_png_bytes()))
+        monkeypatch.setattr(tesseract_fallback, "convert_from_path", _no_pdf_render)
+        seen = []
+
+        def single(path, page):
+            seen.append(Image.open(path).format)
+            return [tesseract_fallback.ParsedBlock(type="text", text="HELLO", page=page)]
+
+        monkeypatch.setattr(provider, "_ocr_single_image", single)
+        blocks = provider.parse_all_pages(_ATTACHMENT_URI, "png")
+        assert [b.text for b in blocks] == ["HELLO"]
+        assert seen == ["PNG"]
+
+    def test_text_layer_reads_png_as_image(self, monkeypatch):
+        provider = TesseractFallbackProvider(storage=_BytesStorage(_png_bytes()))
+        monkeypatch.setattr(tesseract_fallback, "convert_from_path", _no_pdf_render)
+        monkeypatch.setattr(
+            provider, "ocr_lines",
+            lambda image, psm=None: [tesseract_fallback.OcrLine(text="HELLO WORLD", confidence=90.0)],
+        )
+        layer = provider.text_layer(_ATTACHMENT_URI, "png")
+        assert layer is not None
+        assert [line.text for line in layer.pages[1]] == ["HELLO WORLD"]
+
+    def test_mineru_passes_file_type_to_ocr(self, mineru):
+        calls = []
+
+        class FakeTesseract:
+            truncated_at = None
+
+            def text_layer(self, uri, file_type=None):
+                calls.append(("layer", uri, file_type))
+                return None
+
+            def parse_all_pages(self, uri, file_type=None):
+                calls.append(("all", uri, file_type))
+                return []
+
+        mineru.tesseract = FakeTesseract()
+        mineru._ocr_layer(_ATTACHMENT_URI, "png")
+        mineru._full_tesseract_fallback(_ATTACHMENT_URI, "png")
+        assert calls == [("layer", _ATTACHMENT_URI, "png"), ("all", _ATTACHMENT_URI, "png")]
+
+    def test_plain_ocr_strategy_passes_file_type(self):
+        from types import SimpleNamespace
+
+        from core.ladder.strategies.recognition import PlainOcrStrategy
+
+        calls = []
+
+        class FakeProvider:
+            failed_pages = []
+
+            def parse_all_pages(self, uri, file_type=None):
+                calls.append((uri, file_type))
+                return [tesseract_fallback.ParsedBlock(type="text", text="HELLO", page=1)]
+
+        context = SimpleNamespace(uri=_ATTACHMENT_URI, file_type="png", kind="image")
+        PlainOcrStrategy(provider=FakeProvider()).run(context)
+        assert calls == [(_ATTACHMENT_URI, "png")]

@@ -96,7 +96,7 @@ class TesseractFallbackProvider:
         if not pages:
             return []
 
-        local_path, cleanup = self._materialize(uri, data)
+        local_path, cleanup = self._materialize(uri, data, file_type)
         if not local_path:
             raise OcrUnavailable(f"Файл {uri} не удалось получить локально")
 
@@ -125,9 +125,13 @@ class TesseractFallbackProvider:
         finally:
             cleanup()
 
-    def parse_all_pages(self, uri: str) -> List[ParsedBlock]:
+    def parse_all_pages(self, uri: str, file_type: Optional[str] = None) -> List[ParsedBlock]:
         """
         Распознаёт документ целиком (или всё изображение).
+
+        `file_type` — тип, определённый при поиске файла. Без него тип
+        угадывается по расширению URI, а у вложений чата (`s3://…/<uuid>`)
+        расширения нет: картинка уезжала в pdf2image и не читалась.
 
         Страницы рендерятся пачками и не больше, чем `OCR_FULL_MAX_PAGES`.
         Прежний код звал `convert_from_path` без границ: на техническом
@@ -137,13 +141,13 @@ class TesseractFallbackProvider:
         """
         self.truncated_at = None
         self.failed_pages = []
-        local_path, cleanup = self._materialize(uri)
+        local_path, cleanup = self._materialize(uri, file_type=file_type)
         if not local_path:
             logger.error("Не удалось получить локальный путь для %s", uri)
             return []
 
         try:
-            if self._is_image(local_path):
+            if self._treat_as_image(local_path, file_type):
                 return self._ocr_single_image(local_path, page=1)
 
             blocks: List[ParsedBlock] = []
@@ -169,7 +173,7 @@ class TesseractFallbackProvider:
             return 0
 
     # ------------------------------------------------------------ внутреннее
-    def text_layer(self, uri: str) -> Optional[TextLayer]:
+    def text_layer(self, uri: str, file_type: Optional[str] = None) -> Optional[TextLayer]:
         """
         Построчное распознавание всего документа как текстовый слой.
 
@@ -179,12 +183,12 @@ class TesseractFallbackProvider:
         MinerU отдаёт побуквенной LaTeX-разметкой.
         """
         self.failed_pages = []
-        local_path, cleanup = self._materialize(uri)
+        local_path, cleanup = self._materialize(uri, file_type=file_type)
         if not local_path:
             raise OcrUnavailable(f"Файл {uri} не удалось получить локально")
 
         try:
-            images = self._images_of(local_path)
+            images = self._images_of(local_path, file_type)
             pages: Dict[int, List[TextLine]] = {}
             for page_num, image in images:
                 lines = [
@@ -203,7 +207,7 @@ class TesseractFallbackProvider:
         finally:
             cleanup()
 
-    def _images_of(self, local_path: str):
+    def _images_of(self, local_path: str, file_type: Optional[str] = None):
         """
         Страницы документа по одной: (номер, картинка).
 
@@ -212,7 +216,7 @@ class TesseractFallbackProvider:
         сканированном приложении это съедало память воркера целиком, ещё до
         первой строки распознавания.
         """
-        if self._is_image(local_path):
+        if self._treat_as_image(local_path, file_type):
             try:
                 image = Image.open(local_path)
                 image.load()
@@ -481,18 +485,28 @@ class TesseractFallbackProvider:
             logger.error("Ошибка OCR: %s", exc)
             return ""
 
-    def _materialize(self, uri: str, data: Optional[bytes] = None):
+    def _materialize(
+        self, uri: str, data: Optional[bytes] = None, file_type: Optional[str] = None,
+    ):
         """
         Возвращает (локальный путь, функция очистки).
         Для S3 файл выкачивается во временный, для локального — резолвится
         через StorageProvider (с проверкой path traversal). Переданные байты
         избавляют от повторной выкачки.
+
+        Расширение временного файла — от известного `file_type`, иначе от
+        URI: ключ вложения чата — голый uuid, и PNG под ним становился
+        `tmpXXXX.pdf`.
         """
         noop = lambda: None  # noqa: E731
 
         if uri.startswith("s3://"):
             try:
-                ext = os.path.splitext(uri.split("/")[-1])[1] or ".pdf"
+                known = filetypes.normalize(file_type or "")
+                ext = (
+                    f".{known}" if known and filetypes.is_known(known)
+                    else os.path.splitext(uri.split("/")[-1])[1] or ".pdf"
+                )
                 content = data if data is not None else self.storage.read_bytes(uri)
                 # dir= задаётся явно: даже если TMPDIR кто-то перебил,
                 # выкачанный из S3 исходник остаётся в томе сервиса.
