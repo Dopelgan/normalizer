@@ -19,6 +19,7 @@ from core.providers.text_layer import (
     layer_vocabulary,
     reconcile_with_text_layer,
     split_glued_text,
+    steel_grade,
     unify_script,
 )
 
@@ -251,3 +252,75 @@ class TestGostSymbols:
         # OCR прочитал «3» как «з»; свёртка их не различает.
         vocab = layer_vocabulary([line("АБВГ 681821.001ПМз", 0.1)])
         assert split_glued_text("681821.001ПM3", vocab)[0] == "681821.001ПM3"
+
+
+class TestDrawingStamp:
+    """Основная надпись чертежа, прочитанная с курсивными подменами (синтетика)."""
+
+    def _stamp(self, *rows):
+        return ParsedBlock(
+            type="table", page=1, bbox=[0.05, 0.80, 0.95, 0.99],
+            table_data={"headers": ["Изм.", "Лист", "№ докум.", "Подп.", "Дата"],
+                        "rows": [list(r) for r in rows], "total_row": None},
+        )
+
+    def _reconcile(self, block, *texts):
+        lines = [line(t, 0.82 + 0.02 * i, x=0.06, width=0.85) for i, t in enumerate(texts)]
+        blocks, _ = reconcile_with_text_layer([block], layer_of(*lines), source=OCR_LAYER)
+        return next(b for b in blocks if b.type == "table").table_data["rows"]
+
+    def test_cursive_labels_are_fixed_in_stamp(self):
+        rows = self._reconcile(
+            self._stamp(["Разрад.", "Иванов", "Macca", "Macwmad", "Лum."],
+                        ["Проб.", "Петров", "Дама", "FOCT", "Лустов 1"],
+                        ["Ра3pаб.", "И3м.", "", "", ""]),
+            # Слой прочитал подпись той же латиницей — штамп всё равно прав.
+            "Иванов Петров Macca",
+        )
+        assert rows[0] == ["Разраб.", "Иванов", "Масса", "Масштаб", "Лит."]
+        assert rows[2][:2] == ["Разраб.", "Изм."]
+        assert rows[1] == ["Пров.", "Петров", "Дата", "ГОСТ", "Листов 1"]
+
+    def test_material_with_steel_grade(self):
+        rows = self._reconcile(
+            self._stamp(["Луcт12X18H10T ГОСТ 5582-75", "", "", "", ""]), "ГОСТ 5582-75",
+        )
+        assert rows[0][0] == "Лист 12Х18Н10Т ГОСТ 5582-75"
+
+    def test_part_name_glued_to_digit_and_known_word(self):
+        rows = self._reconcile(
+            self._stamp(["Крышка2", "Продольный усилителькороткий", "", "", ""]),
+            "Продольный усилитель",
+        )
+        assert rows[0][:2] == ["Крышка 2", "Продольный усилитель короткий"]
+
+    def test_labels_are_not_guessed_outside_stamp(self):
+        # «отбор проб» — не «Пров.»: без штампа закрытый словарь не действует.
+        block = ParsedBlock(
+            type="table", page=1, bbox=[0.05, 0.05, 0.95, 0.40],
+            table_data={"headers": ["Операция", "Объём"],
+                        "rows": [["Отбор проб.", "Дама"]], "total_row": None},
+        )
+        layer = layer_of(line("Операция Объём", 0.1))
+        blocks, _ = reconcile_with_text_layer([block], layer, source=OCR_LAYER)
+        assert blocks[0].table_data["rows"][0] == ["Отбор проб.", "Дама"]
+
+    @pytest.mark.parametrize("token, expected", [
+        ("12X18H10T", "12Х18Н10Т"), ("08X18H10T", "08Х18Н10Т"),
+        ("770X520X320", None), ("10X20", None), ("IP65", None), ("M8", None),
+    ])
+    def test_steel_grade(self, token, expected):
+        assert steel_grade(token) == expected
+
+    def test_compound_with_short_known_stem_is_not_cut(self):
+        vocab = layer_vocabulary([line("тепло", 0.1)])
+        assert split_glued_text("теплообменник", vocab)[0] == "теплообменник"
+
+
+class TestOcrTextBlocks:
+    def test_mixed_script_fixed_in_parser_text_block(self):
+        block = ParsedBlock(type="text", page=1, bbox=[0.05, 0.05, 0.95, 0.10],
+                            text="HOCТЬ размеры УхХхZ, мм")
+        layer = layer_of(line("Прочий текст", 0.5))
+        blocks, _ = reconcile_with_text_layer([block], layer, source=OCR_LAYER)
+        assert blocks[0].text == "НОСТЬ размеры YxXxZ, мм"
