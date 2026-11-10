@@ -315,3 +315,61 @@ def _ods_bytes(value: str) -> bytes:
         )
         archive.writestr("content.xml", content)
     return buffer.getvalue()
+
+
+# ===========================================================================
+# Обозначения ЕСКД
+# ===========================================================================
+
+class TestEskdDesignation:
+    """
+    Регрессия (прод, 11.2026): сканы КД без текстового слоя приходят только
+    с обозначением в имени — «ТАДУ 687000.001 СБ (изм. 1).pdf». Маркеров в
+    словарях для них не было, правила давали «деловой, 0.50», и файлы
+    уходили в карантин. Обозначение по ГОСТ 2.201 — признак КД само по себе.
+    """
+
+    @pytest.mark.parametrize("name", [
+        "ТАДУ 687000.001.004.pdf",
+        "ТАДУ 687000.001 СБ (изм. 1) (анг Эль-Дабаа).pdf",
+        "ТАДУ 405220.152.00 СБ (изм. 6).pdf",
+        "ТАДУ 305179.001.01.01.011 - Основание под скобу.pdf",
+        "АЕГН.01.00017.111.0015СБ.pdf",
+        "ТАДУ 687000.001 (изм. 2).pdf",
+    ])
+    def test_scan_named_by_designation_is_technical(self, name):
+        data = blank_pdf()
+        uri = f"imports/a1704372-a9c9-4fb3-98d7-616d69fdc767/{name}"
+        verdict = gateway({uri: data}).evaluate(uri, uri, len(data))
+        assert verdict.category == CATEGORY_TECHNICAL
+        assert verdict.outcome == ACCEPT
+        assert verdict.layer == "G-2"
+        assert verdict.confidence >= GatewayProfile().min_confidence
+        assert verdict.signals["matched_in"] == "путь"
+
+    def test_designation_in_document_text(self):
+        # DOCX, а не PDF: штатный шрифт pymupdf кириллицу не рисует.
+        data = docx_bytes("ТАДУ 687000.001 ПЭ3", "Перечень элементов")
+        uri = "documents/без имени.docx"
+        verdict = gateway({uri: data}).evaluate(uri, uri, len(data))
+        assert verdict.category == CATEGORY_TECHNICAL
+        assert verdict.outcome == ACCEPT
+
+    @pytest.mark.parametrize("value", [
+        "12345.pdf",
+        "imports/a1704372-a9c9-4fb3-98d7-616d69fdc767/12345.pdf",
+        "Заявка от 12.05.2024 №3",
+        "ОТ 12.05.2024",
+        "ГОСТ 2.307",
+    ])
+    def test_not_a_designation(self, value):
+        assert not rules.ESKD_DESIGNATION.pattern.search(rules.prepare(value))
+
+    def test_personal_name_is_not_technical(self):
+        match = rules.classify("личное_отпуск 2023.pdf")
+        assert match.category != CATEGORY_TECHNICAL
+
+    def test_bare_document_code_does_not_declare_technical(self):
+        """«ПС» или «изм. 1» без обозначения — подтверждение, а не решение."""
+        match = rules.classify("Отчёт ПС (изм. 1).pdf")
+        assert match.category == CATEGORY_BUSINESS

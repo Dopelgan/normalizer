@@ -368,7 +368,10 @@ class TestEscalation:
         assert verdict.signals["escalated_from"] == "G-2"
 
     def test_scan_without_text_layer_reaches_index_end_to_end(self):
-        """Тот же случай через evaluate: скан без текста и без маркеров в имени."""
+        """
+        Тот же случай через evaluate: скан без текста и без маркеров в имени
+        (обозначение ЕСКД в имени теперь опознаётся правилами на G-2).
+        """
         pymupdf = pytest.importorskip("pymupdf")
         document = pymupdf.open()
         document.new_page(width=600, height=800).draw_rect(
@@ -376,7 +379,7 @@ class TestEscalation:
         )
         data = document.tobytes()
         document.close()
-        uri = "imports/u/ТАДУ 687000.001 СБ (изм. 1).pdf"
+        uri = "imports/u/01.01.008 - Продольный усилитель укороченный с проушиной.pdf"
         verdict = gateway({uri: data}).evaluate(uri, uri, len(data))
         assert verdict.outcome == ACCEPT
         assert verdict.signals.get("needs_review") is True
