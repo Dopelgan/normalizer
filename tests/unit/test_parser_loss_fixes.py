@@ -302,7 +302,7 @@ def test_restoration_stops_before_task_deadline():
 # ------------------------------------------------- сканы чертежей в PDF (10.11)
 
 def _scanned_drawing_pdf(pages: int = 1) -> bytes:
-    """Скан чертежа: рамка ГОСТ с полем подшивки 20 мм, лёгкий перекос, без текстового слоя."""
+    """Скан чертежа: рамка ГОСТ с полем подшивки 20 мм (9,5 % ширины), без текстового слоя."""
     import fitz
     from PIL import ImageDraw
 
@@ -318,7 +318,6 @@ def _scanned_drawing_pdf(pages: int = 1) -> bytes:
         for y in (300, 1500, 1700):
             draw.line([(250, y), (1500, y)], fill=0, width=2)  # размерные и выносные линии
         draw.line([(1450, 200), (1450, 1900)], fill=0, width=2)
-        sheet = sheet.rotate(0.4, expand=False, fillcolor=255)
         buffer = io.BytesIO()
         sheet.save(buffer, format="PNG")
         page = document.new_page(width=595, height=842)
@@ -326,11 +325,35 @@ def _scanned_drawing_pdf(pages: int = 1) -> bytes:
     return document.tobytes()
 
 
-def test_scanned_pdf_drawing_is_classified_as_drawing():
+def test_scanned_pdf_drawing_is_classified_as_drawing(monkeypatch):
+    """Скан PDF без векторных линий проверяется растровым детектором (раньше — нет)."""
     from core.ladder.context import GENRE_DRAWING, DocumentContext
+    from core.providers import raster_drawing
 
-    context = DocumentContext(uri="x", file_type="pdf", data=_scanned_drawing_pdf())
+    calls = []
+
+    def verdict(data):
+        calls.append(len(data))
+        return raster_drawing.RasterVerdict(raster_drawing.KIND_DRAWING, 0.85, "тест", {})
+
+    monkeypatch.setattr(raster_drawing, "analyse", verdict)
+    context = DocumentContext(uri="x", file_type="pdf", data=_scanned_drawing_pdf(pages=2))
     assert context.classification.genre == GENRE_DRAWING
+    assert context.classification.signals["raster_drawing_pages"] == [1, 2]
+    assert len(calls) == 2
+
+
+def test_single_false_drawing_page_does_not_relabel_text_scan(monkeypatch):
+    """Одна «чертёжная» страница из многих не делает скан смешанным (гриф!)."""
+    from core.ladder.context import GENRE_MIXED, GENRE_DRAWING, DocumentContext
+    from core.providers import raster_drawing
+
+    kinds = iter([raster_drawing.KIND_DRAWING] + [raster_drawing.KIND_TEXT_SCAN] * 7)
+    monkeypatch.setattr(raster_drawing, "analyse",
+                        lambda data: raster_drawing.RasterVerdict(next(kinds), 0.8, "тест", {}))
+    context = DocumentContext(uri="x", file_type="pdf", data=_scanned_drawing_pdf(pages=8))
+    assert context.classification.genre not in (GENRE_MIXED, GENRE_DRAWING)
+    assert context.classification.signals.get("drawing_share", 0) == 0
 
 
 def test_drawing_branch_renders_pdf_scan_pages(monkeypatch):

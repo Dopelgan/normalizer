@@ -303,13 +303,15 @@ class DrawingProcessor:
             return []
 
         signals = (metadata.get("classification") or {}).get("signals") or {}
-        pages = signals.get("raster_drawing_pages") or signals.get("drawing_pages") or [1]
+        pages = list(signals.get("raster_drawing_pages") or signals.get("drawing_pages") or [1])
         sheets: List[Fragment] = []
-        for page in list(pages)[: settings.DRAWING_MAX_SHEETS]:
+        skipped = pages[settings.DRAWING_MAX_SHEETS:]
+        for index, page in enumerate(pages[: settings.DRAWING_MAX_SHEETS]):
             left = deadline.remaining()
             if left is not None and left < settings.VLM_TIMEOUT:
                 logger.warning("Разбор листа %s стр. %d пропущен: до срока задачи %.0f с",
                                source_uri, page, left)
+                skipped = pages[index:]
                 break
             try:
                 drawing_result = self.process(source_uri, metadata, page)
@@ -332,6 +334,11 @@ class DrawingProcessor:
             sheet = self.build_fragment(drawing_result, anchor, metadata)
             if sheet is not None:
                 sheets.append(sheet)
+        if skipped and sheets:
+            # Неразобранные листы не пропадают молча: пометка ведёт на проверку.
+            note = "DRAWING_SHEETS_SKIPPED:" + ",".join(str(page) for page in skipped)
+            sheets[0].review_required = True
+            sheets[0].warnings = list(dict.fromkeys(sheets[0].warnings + [note]))
         return sheets
 
     def _source_is_raster_drawing(self, metadata: Dict[str, Any]) -> bool:

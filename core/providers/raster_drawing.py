@@ -56,8 +56,10 @@ _INK_DRAWING = 0.25         # чертёж — редкая графика на 
 _INK_BLANK = 0.002          # ниже — лист пустой
 _RULE_COVERAGE = 0.5        # линия считается длинной с этой доли стороны
 _FRAME_COVERAGE = 0.7       # сторона рамки формата почти во всю сторону листа
-_FRAME_MARGIN = 0.12        # рамка ищется в этой полосе у края (поле подшивки 9,5 % A4)
-_FRAME_BAND = 0.012         # толщина полосы, в которой ищется перекошенная линия рамки
+_FRAME_MARGIN = 0.12        # рамка ищется в этой полосе у края (поле подшивки 20 мм = 9,5 % A4)
+_FRAME_WEAK_SIDE = 0.3      # бледная вертикаль рамки на скане
+_FRAME_BAND_PX = 3          # окно поиска линии рамки, пиксели рабочего размера
+_SKEW_LIMIT = 2.0           # наибольший выпрямляемый перекос маски, градусы
 _TEXT_ROW_MIN = 0.005       # плотность строки текста: от
 _TEXT_ROW_MAX = 0.60        #                          до
 _TEXT_BANDS_PAGE = 6        # столько полос строк — это уже страница текста
@@ -129,13 +131,19 @@ def analyse_image(image) -> RasterVerdict:
     colourfulness = float(rgb.std(axis=2).mean() / 128.0)
     whiteness = float((grey > 200).mean())
     ink_mask = grey < _threshold(grey, numpy)
+    # Скан почти всегда слегка перекошен: линия в 0,3–1° расползается по
+    # нескольким строкам пикселей, и ни рамка, ни длинные линии не набирали
+    # порога — чертёж шёл как «страница текста». Маска выпрямляется до
+    # подсчёта признаков, сами признаки не меняются.
+    skew = _mask_skew(ink_mask, numpy)
+    if skew:
+        ink_mask = _rotate_mask(ink_mask, skew, numpy)
     ink = float(ink_mask.mean())
 
     rows = ink_mask.sum(axis=1)
     columns = ink_mask.sum(axis=0)
-    band = _band(ink_mask)
-    horizontal = _rule_bands(_banded_coverage(ink_mask, band, numpy), ink_mask.shape[1])
-    vertical = _rule_bands(_banded_coverage(ink_mask.T, band, numpy), ink_mask.shape[0])
+    horizontal = _rule_bands(rows, ink_mask.shape[1])
+    vertical = _rule_bands(columns, ink_mask.shape[0])
     rules = horizontal + vertical
     frame = _has_frame(ink_mask)
 
@@ -145,11 +153,6 @@ def analyse_image(image) -> RasterVerdict:
     long_columns = columns >= _RULE_COVERAGE * ink_mask.shape[0]
     body = ink_mask[:, ~long_columns]
     text_bands = _text_bands(body.sum(axis=1), body.shape[1])
-    # Лист, отсканированный боком (паспорт, альбомная страница), несёт строки
-    # вертикально — по рядам их не видно, и лист текста шёл как чертёж.
-    long_rows = rows >= _RULE_COVERAGE * ink_mask.shape[1]
-    turned = ink_mask[~long_rows, :]
-    text_bands = max(text_bands, _text_bands(turned.sum(axis=0), turned.shape[0]))
 
     signals.update({
         "colourfulness": round(colourfulness, 3),
@@ -307,48 +310,64 @@ def _text_bands(rows, width: int) -> int:
     ])
 
 
-def _band(ink_mask) -> int:
-    """Толщина полосы, в которой ищется слегка перекошенная линия."""
-    return max(1, int(min(ink_mask.shape) * _FRAME_BAND))
-
-
-def _banded_coverage(ink_mask, band: int, numpy):
-    """
-    Покрытие строки с учётом соседних: сколько столбцов тёмные хотя бы в
-    одной из `band` строк подряд. На скане длинная линия перекошена и
-    размазана по нескольким строкам, и покрытие одной строки её не видело:
-    рамка и линии чертежа не находились, чертёж шёл как «страница текста».
-    """
-    rows = ink_mask.shape[0]
-    if band <= 1 or rows <= band:
-        return ink_mask.sum(axis=1)
-    window = numpy.zeros((rows - band + 1, ink_mask.shape[1]), dtype=bool)
-    for shift in range(band):
-        window |= ink_mask[shift:rows - band + 1 + shift]
-    coverage = window.sum(axis=1)
-    # Длина профиля сохраняется: хвост дополняется последним значением.
-    return numpy.concatenate([coverage, numpy.repeat(coverage[-1:], band - 1)])
-
-
 def _has_frame(ink_mask) -> bool:
     """
     Рамка формата: тёмная линия почти во всю сторону в полосе у края.
     Хватает трёх сторон из четырёх — сканы часто обрезаны с одного края.
-    Полоса у края — до 12 %: поле подшивки по ГОСТ 2.104 — 20 мм, это 9,5 %
-    ширины A4.
+
+    Тонкая линия рамки на скане бледнеет и смещается на пиксель-другой,
+    поэтому сторона ищется в полосе из `_FRAME_BAND_PX` соседних строк
+    (столбцов), а не в одной: вертикали рамки иначе набирали 20–30 %.
     """
     import numpy
 
     height, width = ink_mask.shape
     margin_y = max(1, int(height * _FRAME_MARGIN))
     margin_x = max(1, int(width * _FRAME_MARGIN))
-    band = _band(ink_mask)
-    rows = _banded_coverage(ink_mask, band, numpy)
-    columns = _banded_coverage(ink_mask.T, band, numpy)
-    sides = [
-        bool((rows[:margin_y] >= _FRAME_COVERAGE * width).any()),
-        bool((rows[height - margin_y:] >= _FRAME_COVERAGE * width).any()),
-        bool((columns[:margin_x] >= _FRAME_COVERAGE * height).any()),
-        bool((columns[width - margin_x:] >= _FRAME_COVERAGE * height).any()),
-    ]
-    return sum(sides) >= 3
+
+    def coverage(strip):
+        # Покрытие стороны в окне из нескольких соседних линий пикселей.
+        best = 0
+        for start in range(0, max(1, strip.shape[0] - _FRAME_BAND_PX + 1)):
+            best = max(best, int(numpy.any(strip[start:start + _FRAME_BAND_PX], axis=0).sum()))
+        return best
+
+    top = coverage(ink_mask[:margin_y]) / width
+    bottom = coverage(ink_mask[height - margin_y:]) / width
+    left = coverage(ink_mask[:, :margin_x].T) / height
+    right = coverage(ink_mask[:, width - margin_x:].T) / height
+    if sum(side >= _FRAME_COVERAGE for side in (top, bottom, left, right)) >= 3:
+        return True
+    # Вертикали рамки на скане часто бледные и прерывистые (30–45 % стороны),
+    # горизонтали держатся. Обе чёткие горизонтали и видимая вертикаль — рамка.
+    return (top >= _FRAME_COVERAGE and bottom >= _FRAME_COVERAGE
+            and max(left, right) >= _FRAME_WEAK_SIDE)
+
+
+def _rotate_mask(ink_mask, angle: float, numpy):
+    from PIL import Image
+
+    image = Image.fromarray(ink_mask.astype(numpy.uint8) * 255)
+    return numpy.asarray(image.rotate(angle, fillcolor=0)) > 127
+
+
+def _mask_skew(ink_mask, numpy) -> float:
+    """
+    Перекос по методу проекций: при верном угле строки и линии дают резкие
+    пики в сумме по рядам. Поворачивается только при заметном выигрыше —
+    иначе «лучший» угол на пустом или однородном листе случаен.
+    """
+    from PIL import Image
+
+    image = Image.fromarray(ink_mask.astype(numpy.uint8) * 255)
+
+    def score(angle: float) -> float:
+        rotated = numpy.asarray(image.rotate(angle, fillcolor=0)) > 127
+        return float(numpy.var(rotated.sum(axis=1)))
+
+    base = score(0.0)
+    if base <= 0:
+        return 0.0
+    angles = numpy.arange(-_SKEW_LIMIT, _SKEW_LIMIT + 1e-9, 0.25)
+    best = max(angles, key=score)
+    return float(best) if abs(best) >= 0.25 and score(best) > base * 1.05 else 0.0

@@ -311,12 +311,16 @@ def _classify_pdf(context: DocumentContext) -> Classification:
             # Векторный детектор на скане не видит ничего: линии там —
             # пиксели. Без растровой проверки скан чертежа получал жанр
             # unknown, и ветка чертежей (Qwen-VL) на него не включалась.
-            drawing_pages, checked = _raster_drawing_pages(context.data)
-            signals["raster_drawing_pages"] = drawing_pages
-            if checked:
-                share = len(drawing_pages) / checked
-                signals["drawing_share"] = round(share, 3)
-                mostly_drawings = share >= _DRAWING_GENRE_SHARE
+            raster_pages, checked = _raster_drawing_pages(context.data)
+            signals["raster_drawing_pages"] = raster_pages
+            # Растровый детектор ошибается чаще векторного (~13 % ложных на
+            # листах заказчика), а жанр правит грифом доступа. Поэтому скан
+            # становится чертёжным только при большинстве чертёжных листов;
+            # одиночные листы не делают его «смешанным» и не поднимают гриф.
+            if checked and len(raster_pages) / checked >= _DRAWING_GENRE_SHARE:
+                drawing_pages = raster_pages
+                signals["drawing_share"] = round(len(raster_pages) / checked, 3)
+                mostly_drawings = True
         if mostly_drawings:
             genre = GENRE_DRAWING
         elif drawing_pages:
