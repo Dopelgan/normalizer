@@ -16,6 +16,7 @@ URI резолвятся относительно STORAGE_LOCAL_MOUNT, а не �
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -142,40 +143,13 @@ class TesseractFallbackProvider:
             if self._is_image(local_path):
                 return self._ocr_single_image(local_path, page=1)
 
-            total = self._page_count(local_path)
-            limit = max(1, settings.OCR_FULL_MAX_PAGES)
-            last_page = min(total, limit) if total else limit
-            if total and total > limit:
-                logger.warning(
-                    "OCR %s усечён: %d страниц из %d", uri, limit, total
-                )
-                self.truncated_at = (limit, total)
-
             blocks: List[ParsedBlock] = []
-            batch = max(1, settings.OCR_BATCH_PAGES)
-            for first in range(1, last_page + 1, batch):
-                last = min(first + batch - 1, last_page)
-                try:
-                    images = convert_from_path(
-                        local_path, first_page=first, last_page=last,
-                        dpi=settings.OCR_DPI,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # Сбой одной пачки не повод бросать остаток документа:
-                    # раньше здесь был `break`, и всё после испорченной
-                    # страницы молча пропадало. Страницы пачки — неудачные.
-                    logger.error(
-                        "pdf2image не смог обработать страницы %d-%d файла %s: %s",
-                        first, last, local_path, exc,
-                    )
-                    self.failed_pages.extend(range(first, last + 1))
-                    continue
-                if not images:
-                    self.failed_pages.extend(range(first, last + 1))
-                    continue
-                for index, img in enumerate(images):
-                    blocks.extend(self._blocks_from_image(img, first + index))
+            try:
+                for page_num, img in self._pdf_pages(local_path):
+                    blocks.extend(self._blocks_from_image(img, page_num))
                     img.close()
+            except OcrUnavailable as exc:
+                logger.error("OCR %s: ни одна страница не отрендерилась: %s", uri, exc)
             return blocks
         finally:
             cleanup()
@@ -245,34 +219,52 @@ class TesseractFallbackProvider:
         return self._pdf_pages(local_path)
 
     def _pdf_pages(self, local_path: str):
-        """Генератор страниц PDF: рендерим пачками, лишнего в памяти не держим."""
+        """
+        Генератор страниц PDF: рендерим пачками, лишнего в памяти не держим.
+
+        Сбой одной пачки не обрывает документ: её страницы уходят в
+        `failed_pages`, остальные читаются. Если число страниц неизвестно,
+        сбой или пустая пачка считаются концом документа — иначе пачки за
+        концом записывались бы ложными неудачами. Время ограничено
+        `OCR_TIME_BUDGET`: дальше — честная пометка об усечении, а не обрыв
+        задачи по таймауту Celery.
+        """
         total = self._page_count(local_path)
         limit = max(1, settings.OCR_FULL_MAX_PAGES)
         last_page = min(total, limit) if total else limit
         if total and total > limit:
-            logger.warning(
-                "Слой OCR %s усечён: %d страниц из %d", local_path, limit, total
-            )
+            logger.warning("OCR %s усечён: %d страниц из %d", local_path, limit, total)
             self.truncated_at = (limit, total)
         batch = max(1, settings.OCR_BATCH_PAGES)
+        deadline = time.monotonic() + settings.OCR_TIME_BUDGET
         yielded, error = 0, None
         for first in range(1, last_page + 1, batch):
             last = min(first + batch - 1, last_page)
+            if time.monotonic() > deadline:
+                logger.warning("OCR %s остановлен по бюджету времени на странице %d", local_path, first)
+                self.truncated_at = (first - 1, total)
+                break
             try:
                 images = convert_from_path(
                     local_path, first_page=first, last_page=last, dpi=settings.OCR_DPI
                 )
             except Exception as exc:  # noqa: BLE001
+                error = exc
+                if not total:
+                    break
                 logger.error("Страницы %d-%d не отрендерились: %s", first, last, exc)
                 self.failed_pages.extend(range(first, last + 1))
-                error = exc
                 continue
             if not images:
+                if not total:
+                    break
                 self.failed_pages.extend(range(first, last + 1))
                 continue
             for index, image in enumerate(images):
                 yielded += 1
                 yield first + index, image
+            if not total and len(images) < last - first + 1:
+                break
         if not yielded and error is not None:
             # Не отрендерилось ничего — это сбой OCR, а не «в документе нет текста».
             raise OcrUnavailable(str(error)) from error

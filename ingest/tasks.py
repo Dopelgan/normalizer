@@ -283,6 +283,8 @@ def _batch_error(documents: List[DocumentResult]) -> Optional[ParserError]:
     max_retries=settings.CELERY_TASK_MAX_RETRIES,
     default_retry_delay=60,
     acks_late=True,
+    soft_time_limit=settings.PARSE_TASK_SOFT_TIME_LIMIT,
+    time_limit=settings.PARSE_TASK_TIME_LIMIT,
 )
 def process_document(
     self,

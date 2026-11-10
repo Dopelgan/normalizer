@@ -71,7 +71,8 @@ class Settings(BaseSettings):
     MINERU_ENDPOINT: str = "http://mineru-api:8000"
     MINERU_TIMEOUT: int = 300
     # Бюджет на страницу: большой скан получает таймаут pages × это значение,
-    # если он больше MINERU_TIMEOUT.
+    # если он больше MINERU_TIMEOUT, но не больше 40 % бюджета задачи разбора
+    # (остальное — на OCR-фоллбэк и сохранение).
     MINERU_TIMEOUT_PER_PAGE: int = 15
     MINERU_MODEL_CACHE: str = "/models/pdf-extract-kit"
     MINERU_BACKEND: str = "pipeline"
@@ -249,6 +250,13 @@ class Settings(BaseSettings):
     # ----------------------------------------------------------------- Celery
     CELERY_TASK_TIME_LIMIT: int = 600
     CELERY_TASK_SOFT_TIME_LIMIT: int = 540
+    # Разбор документа — отдельный бюджет: большой скан (MinerU + OCR-слой)
+    # в общие 540 с не укладывается, и при превышении терялся весь документ.
+    PARSE_TASK_SOFT_TIME_LIMIT: int = 3600
+    PARSE_TASK_TIME_LIMIT: int = 3900
+    # Бюджет OCR на документ: дальше разбор останавливается с честной
+    # пометкой об усечении, а не обрывается таймаутом задачи.
+    OCR_TIME_BUDGET: int = 1200
     CELERY_ML_QUEUE: str = "ml_gpu"
     CELERY_TASK_MAX_RETRIES: int = 3
 

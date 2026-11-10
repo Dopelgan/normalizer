@@ -94,6 +94,28 @@ def test_text_layer_continues_after_failed_batch(pdf_provider, monkeypatch):
     assert pdf_provider.failed_pages == [1, 2, 3, 4, 5]
 
 
+def test_unknown_page_count_does_not_invent_failed_pages(pdf_provider, monkeypatch):
+    """Число страниц неизвестно: пачки за концом документа — не неудачи (ревью 2b0d2e1)."""
+    monkeypatch.setattr(pdf_provider, "_page_count", staticmethod(lambda path: 0))
+
+    def render(path, first_page, last_page, dpi):
+        if first_page > 3:
+            raise RuntimeError("за концом документа")
+        return [Image.new("L", (10, 10), 255) for _ in range(first_page, min(last_page, 3) + 1)]
+
+    monkeypatch.setattr(tesseract_fallback, "convert_from_path", render)
+    blocks = pdf_provider.parse_all_pages("documents/doc.pdf")
+    assert sorted({b.page for b in blocks}) == [1, 2, 3]
+    assert pdf_provider.failed_pages == []
+
+
+def test_time_budget_truncates_honestly(pdf_provider, monkeypatch):
+    monkeypatch.setattr(tesseract_fallback, "convert_from_path", _fake_render(set()))
+    monkeypatch.setattr(settings, "OCR_TIME_BUDGET", -1)
+    assert pdf_provider.parse_all_pages("documents/doc.pdf") == []
+    assert pdf_provider.truncated_at == (0, 12)
+
+
 def test_nothing_rendered_is_ocr_failure_not_empty_document(pdf_provider, monkeypatch):
     monkeypatch.setattr(tesseract_fallback, "convert_from_path", _fake_render({1, 6, 11}))
     with pytest.raises(OcrUnavailable):
@@ -135,6 +157,38 @@ def test_timeout_grows_with_page_count(mineru, monkeypatch):
         document.new_page()
     _, _, pages = MinerUParserProvider._read_pdf(document.tobytes(), "pdf")
     monkeypatch.setattr(settings, "MINERU_TIMEOUT_PER_PAGE", 15)
+    monkeypatch.setattr(settings, "PARSE_TASK_SOFT_TIME_LIMIT", 3600)
     assert pages == 100
-    assert mineru._timeout_for(pages) == 1500
+    assert mineru._timeout_for(pages) == 1440  # не больше 40 % бюджета задачи
+    assert mineru._timeout_for(30) == 450
     assert mineru._timeout_for(1) == mineru.timeout
+
+
+def test_parse_task_has_its_own_time_budget():
+    from ingest.tasks import process_document
+
+    assert process_document.soft_time_limit == settings.PARSE_TASK_SOFT_TIME_LIMIT
+    assert settings.MINERU_TIMEOUT_PER_PAGE * 30 < settings.PARSE_TASK_SOFT_TIME_LIMIT
+
+
+def test_timeout_is_reported_as_timeout_not_outage(mineru, mocker):
+    mocker.patch.object(mineru.tesseract, "parse_all_pages", return_value=[])
+    with requests_mock.Mocker() as m:
+        m.post(PARSE_URL, exc=requests.exceptions.ReadTimeout("долго"))
+        result = mineru.parse("documents/test.pdf", "pdf")
+    assert any(note.startswith("mineru_timeout") for note in result.degraded)
+
+
+# ----------------------------------------------- многостраничное восстановление
+
+def test_restoration_keeps_every_page_of_a_scan():
+    import fitz
+    from core.ladder.restoration import restore_pages
+
+    document = fitz.open()
+    for index in range(3):
+        page = document.new_page(width=300, height=400)
+        page.insert_text((50, 100), f"page {index + 1}")
+    restored, applied, sample = restore_pages(document.tobytes(), max_pages=50)
+    assert fitz.open(stream=restored, filetype="pdf").page_count == 3
+    assert sample and applied

@@ -58,7 +58,16 @@ class PlainOcrStrategy(Strategy):
             source_kind="image" if context.kind == filetypes.KIND_IMAGE else "scanned_pdf",
             is_fallback=True,
             failed_pages=list(getattr(self.provider, "failed_pages", []) or []),
+            degraded=_truncation_note(getattr(self.provider, "truncated_at", None)),
         )
+
+
+def _truncation_note(truncated) -> list:
+    if not truncated:
+        return []
+    done, total = truncated
+    return [f"OCR выполнен для первых {done} страниц из {total or 'неизвестного числа'}: "
+            "предел OCR_FULL_MAX_PAGES или OCR_TIME_BUDGET."]
 
 
 class LayoutStrategy(Strategy):
@@ -143,13 +152,20 @@ class RestoreThenLayoutStrategy(Strategy):
         )
 
     def run(self, context: DocumentContext) -> ParseResult:
-        from core.ladder.restoration import restore
+        from core.ladder.restoration import restore, restore_pages
 
-        restored, applied = restore(context.data, pdf=context.kind == filetypes.KIND_PDF)
+        is_pdf = context.kind == filetypes.KIND_PDF
+        if is_pdf:
+            restored, applied, sample = restore_pages(
+                context.data, max_pages=settings.OCR_FULL_MAX_PAGES
+            )
+        else:
+            restored, applied = restore(context.data)
+            sample = restored
         if restored is None:
             raise ValueError("Восстановление изображения недоступно")
 
-        quality = self._quality_after(restored, context.classification.signals)
+        quality = self._quality_after(sample, context.classification.signals)
         before = context.classification.raster_quality or 0.0
         logger.info(
             "Восстановление %s: качество %.2f -> %.2f, применено: %s",
@@ -161,9 +177,10 @@ class RestoreThenLayoutStrategy(Strategy):
                 "документ нечитаем в оригинале"
             )
 
-        uri = self._store(context, restored)
+        file_type = "pdf" if is_pdf else "png"
+        uri = self._store(context, restored, file_type)
         restored_context = DocumentContext(
-            uri=uri, file_type="png", metadata=context.metadata,
+            uri=uri, file_type=file_type, metadata=context.metadata,
             storage=context.storage, data=restored,
         )
         result = self.layout.run(restored_context)
@@ -210,14 +227,14 @@ class RestoreThenLayoutStrategy(Strategy):
         return quality
 
     @staticmethod
-    def _store(context: DocumentContext, data: bytes) -> str:
+    def _store(context: DocumentContext, data: bytes, file_type: str = "png") -> str:
         """
         Выправленный растр кладётся рядом с ассетами: парсер читает файл из
         хранилища по URI, а не принимает байты.
         """
         digest = hashlib.sha256(data).hexdigest()[:16]
         prefix = settings.ASSETS_PREFIX.rstrip("/")
-        uri = f"{prefix}/restored/{digest}.png"
+        uri = f"{prefix}/restored/{digest}.{file_type}"
         context.storage.write_file(uri, data)
         return uri
 

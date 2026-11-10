@@ -132,6 +132,10 @@ def parse_table_html(html: str) -> Optional[Dict[str, Any]]:
 # Парсер
 # ===========================================================================
 
+class ParserTimedOut(ParserUnavailable):
+    """MinerU доступен, но не уложился в таймаут: деградация документа, не сервиса."""
+
+
 class MinerUParserProvider(DocumentParserProvider):
     # Когда сервис не отвечает, об этом помнит весь процесс: иначе каждый
     # уровень лестницы заново ждёт таймаут соединения и заново прогоняет
@@ -174,16 +178,16 @@ class MinerUParserProvider(DocumentParserProvider):
         # листам — файл за проход открывается один раз.
         file_bytes = self._read_source(uri)
         layer, drawing_verdicts, pages = self._read_pdf(file_bytes, file_type)
-        self._source_pages = pages
 
         try:
-            result = self._parse_with_mineru(uri, file_type, metadata, file_bytes)
+            result = self._parse_with_mineru(uri, file_type, metadata, file_bytes, pages)
         except ParserUnavailable as exc:
             # Недоступность сервиса — это деградация системы, а не свойство
             # документа, и путать их нельзя: лежащий mineru-api иначе
             # неотличим от плохого скана, приём «работает», а качество падает
             # молча и на всём потоке сразу.
-            note = f"mineru_unavailable: {exc}"
+            note = (f"mineru_timeout: {exc}" if isinstance(exc, ParserTimedOut)
+                    else f"mineru_unavailable: {exc}")
             if layer is not None:
                 logger.error(
                     "MinerU недоступен (%s), но у %s есть текстовый слой — читаем его", exc, uri
@@ -355,6 +359,7 @@ class MinerUParserProvider(DocumentParserProvider):
         file_type: str,
         metadata: Dict[str, Any],
         file_bytes: Optional[bytes] = None,
+        pages: int = 1,
     ) -> ParseResult:
         if file_bytes is None:
             try:
@@ -376,7 +381,7 @@ class MinerUParserProvider(DocumentParserProvider):
         }
         files = [("files", (filename, file_bytes, filetypes.mime_for(file_type)))]
 
-        timeout = self._timeout_for(getattr(self, "_source_pages", 1))
+        timeout = self._timeout_for(pages)
         logger.info(
             "MinerU: %s file=%s size=%d B timeout=%ds", url, filename, len(file_bytes), timeout
         )
@@ -386,7 +391,7 @@ class MinerUParserProvider(DocumentParserProvider):
             # Долгий разбор большого скана — свойство документа, а не отказ
             # сервиса. Раньше таймаут помечал MinerU недоступным на минуту, и
             # все соседние документы уходили в плоский OCR без таблиц.
-            raise ParserUnavailable(f"MinerU не уложился в {timeout} с: {exc}") from exc
+            raise ParserTimedOut(f"MinerU не уложился в {timeout} с: {exc}") from exc
         except requests.RequestException as exc:
             self.mark_unavailable()
             raise ParserUnavailable(f"нет связи с MinerU: {exc}") from exc
@@ -418,8 +423,13 @@ class MinerUParserProvider(DocumentParserProvider):
         )
 
     def _timeout_for(self, pages: int) -> int:
-        """Таймаут разбора: не меньше общего и не меньше бюджета на страницу."""
-        return int(max(self.timeout, max(1, pages) * settings.MINERU_TIMEOUT_PER_PAGE))
+        """
+        Таймаут разбора: не меньше общего и бюджета на страницу, но не больше
+        40 % бюджета задачи — иначе задачу оборвёт Celery и документ
+        потеряется целиком вместо деградации до OCR.
+        """
+        wanted = max(self.timeout, max(1, pages) * settings.MINERU_TIMEOUT_PER_PAGE)
+        return int(min(wanted, settings.PARSE_TASK_SOFT_TIME_LIMIT * 0.4))
 
     # ------------------------------------------------------ разбор ответа
     def _extract(self, payload: Dict[str, Any], asset_prefix: str) -> Tuple[List[ParsedBlock], int]:
@@ -714,8 +724,8 @@ class MinerUParserProvider(DocumentParserProvider):
         if truncated:
             done, total = truncated
             degraded.append(
-                f"OCR выполнен для первых {done} страниц из {total}: "
-                f"предел OCR_FULL_MAX_PAGES."
+                f"OCR выполнен для первых {done} страниц из {total or 'неизвестного числа'}: "
+                f"предел OCR_FULL_MAX_PAGES или OCR_TIME_BUDGET."
             )
         return ParseResult(
             blocks=blocks,
