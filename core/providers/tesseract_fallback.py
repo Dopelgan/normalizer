@@ -27,6 +27,7 @@ from core import filetypes
 from core.config import settings
 from core.models.parse_result import ParsedBlock
 from core.providers.storage import StorageProvider, StorageProviderFactory
+from core.providers.ocr_prepare import PreparedPage, prepare_page
 from core.workspace import temp_dir
 from core.providers.text_layer import TextLayer, TextLine, group_lines, merge_line_bboxes
 
@@ -354,7 +355,11 @@ class TesseractFallbackProvider:
         Строки с координатами и уверенностью распознавания. Координаты в
         долях изображения — как и везде в конвейере.
         """
+        original_side = max(image.width, image.height)
         image = self._fit(image)
+        prepared = self._prepare(image, upscaled=max(image.width, image.height) > original_side)
+        if prepared is not None:
+            image = prepared.image
         try:
             data = pytesseract.image_to_data(
                 image, lang=self.lang, config=f"--psm {psm}",
@@ -410,19 +415,50 @@ class TesseractFallbackProvider:
         for key in sorted(grouped):
             entry = grouped[key]
             left, top, right, bottom = entry["box"]
+            bbox = [
+                max(0.0, min(1.0, left / width)),
+                max(0.0, min(1.0, top / height)),
+                max(0.0, min(1.0, right / width)),
+                max(0.0, min(1.0, bottom / height)),
+            ]
+            if prepared is not None:
+                # Координаты — в долях исходного листа, иначе строки
+                # повёрнутого скана не сошьются с рамками MinerU.
+                bbox = prepared.to_source(bbox)
             lines.append(OcrLine(
                 text=" ".join(entry["words"]),
-                bbox=[
-                    max(0.0, min(1.0, left / width)),
-                    max(0.0, min(1.0, top / height)),
-                    max(0.0, min(1.0, right / width)),
-                    max(0.0, min(1.0, bottom / height)),
-                ],
+                bbox=bbox,
                 confidence=round(entry["sum"] / entry["weight"], 3) if entry["weight"] else 0.0,
             ))
         return lines
 
+    @staticmethod
+    def _prepare(image: "Image.Image", upscaled: bool = False) -> Optional[PreparedPage]:
+        """
+        Поворот, выравнивание, очистка и снятие линий таблиц перед OCR.
+        Сбой подготовки не должен лишать страницу распознавания: тогда
+        читается исходный лист, как раньше.
+        """
+        if not settings.OCR_PREPROCESS_ENABLED:
+            return None
+        try:
+            prepared = prepare_page(image, upscaled=upscaled)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Подготовка листа к OCR не удалась, читаем как есть: %s", exc)
+            return None
+        if prepared.orientation or prepared.skew:
+            logger.info(
+                "Лист повёрнут на %d°, выровнен на %.2f°",
+                prepared.orientation, prepared.skew,
+            )
+        return prepared
+
     def _ocr_image(self, image: "Image.Image") -> str:
+        original_side = max(image.width, image.height)
+        image = self._fit(image)
+        prepared = self._prepare(image, upscaled=max(image.width, image.height) > original_side)
+        if prepared is not None:
+            image = prepared.image
         try:
             return pytesseract.image_to_string(image, lang=self.lang, config="--psm 6")
         except Exception as exc:  # noqa: BLE001
