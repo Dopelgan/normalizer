@@ -26,7 +26,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from core.providers.text_layer import PYMUPDF_AVAILABLE, TextLayer, TextLine, open_pdf
+from core.providers.text_layer import (
+    PYMUPDF_AVAILABLE,
+    TextLayer,
+    TextLine,
+    open_pdf,
+    page_turn,
+    upright_bbox,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -232,11 +239,15 @@ def extract_drawing_fields(layer: TextLayer, page: int) -> List[Dict[str, Any]]:
     `confidence` отражает уверенность в *категории*, а не в тексте.
     """
     fields: List[Dict[str, Any]] = []
-    for line in layer.lines(page):
+    lines = layer.lines(page)
+    # Лист, выведенный на страницу боком без /Rotate: штамп — в правом
+    # нижнем углу прямо стоящего листа, а не страницы.
+    turn = page_turn(lines)
+    for line in lines:
         text = " ".join(line.text.split())
         if not text:
             continue
-        category, category_confidence = classify(text, line)
+        category, category_confidence = classify(text, line, turn)
         fields.append({
             "category": category,
             "value": text,
@@ -251,9 +262,12 @@ def extract_drawing_fields(layer: TextLayer, page: int) -> List[Dict[str, Any]]:
     return fields
 
 
-def classify(text: str, line: Optional[TextLine] = None) -> Tuple[str, float]:
-    """Категория поля и уверенность в ней. Порядок проверок — от частного."""
-    if line is not None and _in_title_block(line):
+def classify(text: str, line: Optional[TextLine] = None, turn: int = 0) -> Tuple[str, float]:
+    """
+    Категория поля и уверенность в ней. Порядок проверок — от частного.
+    `turn` — поворот текста страницы (`page_turn`) для зоны штампа.
+    """
+    if line is not None and _in_title_block(line, turn):
         if any(word in text.lower() for word in _MATERIAL_WORDS):
             return "material", 0.9
         return "title_block", 0.9
@@ -279,9 +293,10 @@ def classify(text: str, line: Optional[TextLine] = None) -> Tuple[str, float]:
     return "note", 0.4
 
 
-def _in_title_block(line: TextLine) -> bool:
+def _in_title_block(line: TextLine, turn: int = 0) -> bool:
     x1, y1, x2, y2 = _TITLE_BLOCK_REGION
-    cx, cy = line.center
+    left, top, right, bottom = upright_bbox(line.bbox, turn)
+    cx, cy = (left + right) / 2, (top + bottom) / 2
     return x1 <= cx <= x2 and y1 <= cy <= y2
 
 
