@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import difflib
 import logging
 import math
@@ -129,6 +130,10 @@ _STAMP_LABELS = [label for group in _STAMP_GROUPS for label in group] + ["ГОС
 _STAMP_MIN_LABELS = 4
 _STAMP_MIN_GROUPS = 2
 _STAMP_MIN_BOTTOM = 0.75
+# Лист повёрнут боком, если так повёрнуто не меньше этой доли символов
+# страницы; строка считается повёрнутой кратно 90° с этим допуском, градусы.
+_PAGE_TURN_SHARE = 0.6
+_TURN_TOLERANCE = 10.0
 # Курсивные подмены поверх обычной свёртки: т/m, и/у/u, б/в/д/6, г/F, ш/w.
 # Пары а/о здесь нет: «прав.» не должно стать «Пров.». В открытом тексте
 # так сравнивать нельзя — только с закрытым словарём штампа.
@@ -403,21 +408,30 @@ def group_lines(lines: Sequence[TextLine]) -> List[List[TextLine]]:
     if not lines:
         return []
 
-    ordered = sorted(lines, key=_reading_key)
-    heights = [l.height for l in ordered if l.height > 0]
+    # На листе, повёрнутом боком, «сверху вниз» считается по прямо
+    # стоящему листу, иначе вертикальные строки слипаются в один абзац.
+    pairs = _reading_pairs(lines)
+    heights = [upright.height for upright, _ in pairs if upright.height > 0]
     typical = statistics.median(heights) if heights else 0.012
     gap_limit = max(typical * 0.85, 0.004)
 
-    groups: List[List[TextLine]] = [[ordered[0]]]
-    for line in ordered[1:]:
-        previous = groups[-1][-1]
-        gap = line.bbox[1] - previous.bbox[3]
+    groups: List[List[Tuple[TextLine, TextLine]]] = [[pairs[0]]]
+    for upright, line in pairs[1:]:
+        previous = groups[-1][-1][0]
+        gap = upright.bbox[1] - previous.bbox[3]
         same_style = (line.mono == previous.mono) and (abs(line.rotation - previous.rotation) < 5)
         if gap > gap_limit or not same_style:
-            groups.append([line])
+            groups.append([(upright, line)])
         else:
-            groups[-1].append(line)
-    return groups
+            groups[-1].append((upright, line))
+    return [[line for _, line in group] for group in groups]
+
+
+def _reading_pairs(lines: Sequence[TextLine]) -> List[Tuple[TextLine, TextLine]]:
+    """(строка с рамкой прямо стоящего листа, исходная строка) в порядке чтения."""
+    pairs = list(zip(_upright_lines(lines, page_turn(lines)), lines))
+    pairs.sort(key=lambda pair: _reading_key(pair[0]))
+    return pairs
 
 
 def lines_to_text(lines: Sequence[TextLine]) -> str:
@@ -425,7 +439,7 @@ def lines_to_text(lines: Sequence[TextLine]) -> str:
     Текст абзаца. Моноширинный блок — это код или таблица, там перевод
     строки несёт смысл, и склеивать строки пробелом нельзя.
     """
-    ordered = sorted(lines, key=_reading_key)
+    ordered = [line for _, line in _reading_pairs(lines)]
     if any(line.mono for line in ordered):
         return "\n".join(line.text.rstrip() for line in ordered).strip()
     return " ".join(" ".join(line.text.split()) for line in ordered).strip()
@@ -445,6 +459,59 @@ def merge_line_bboxes(lines: Sequence[TextLine]) -> List[float]:
 def _reading_key(line: TextLine) -> Tuple[float, float]:
     """Порядок чтения: сверху вниз, слева направо, с округлением строки."""
     return (round(line.bbox[1], 3), round(line.bbox[0], 3))
+
+
+# ===========================================================================
+# Лист, повёрнутый боком
+# ===========================================================================
+
+def page_turn(lines: Sequence[TextLine]) -> int:
+    """
+    Поворот текста страницы кратно 90° против часовой (0, 90, 180, 270),
+    если так повёрнута большая часть её текста; иначе 0.
+
+    Скан альбомной страницы без /Rotate Tesseract читает после поворота по
+    OSD, а рамки строк отдаёт в системе исходного листа — там строки
+    вертикальные. Подписи размеров чертежа повёрнуты поодиночке и лист
+    не поворачивают: решает доля символов.
+    """
+    weights: Dict[int, int] = {}
+    total = 0
+    for line in lines:
+        chars = line.char_count()
+        total += chars
+        quarter = round(line.rotation / 90.0)
+        if abs(line.rotation - quarter * 90.0) <= _TURN_TOLERANCE:
+            turn = (quarter * 90) % 360
+            weights[turn] = weights.get(turn, 0) + chars
+    if not total or not weights:
+        return 0
+    turn, chars = max(weights.items(), key=lambda item: item[1])
+    return turn if turn and chars >= total * _PAGE_TURN_SHARE else 0
+
+
+def upright_bbox(bbox: Sequence[float], turn: int) -> List[float]:
+    """
+    Рамка в долях исходного листа -> рамка на том же листе, повёрнутом так,
+    чтобы текст стоял прямо. `turn` — поворот текста против часовой
+    (`page_turn`): при 90° строки идут снизу вверх, и лист поворачивается
+    на 90° по часовой.
+    """
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    if turn == 90:
+        return [1 - y2, x1, 1 - y1, x2]
+    if turn == 180:
+        return [1 - x2, 1 - y2, 1 - x1, 1 - y1]
+    if turn == 270:
+        return [y1, 1 - x2, y2, 1 - x1]
+    return [x1, y1, x2, y2]
+
+
+def _upright_lines(lines: Sequence[TextLine], turn: int) -> List[TextLine]:
+    """Копии строк с рамками прямо стоящего листа — только для геометрии."""
+    if not turn:
+        return list(lines)
+    return [dataclasses.replace(line, bbox=upright_bbox(line.bbox, turn)) for line in lines]
 
 
 # ===========================================================================
@@ -578,6 +645,9 @@ def reconcile_with_text_layer(
             page_blocks = [b for b in page_blocks if b.type != "text"]
 
         assignments = _assign_lines(page_lines, page_blocks)
+        # Лист, повёрнутый боком: порядок блоков, место штампа и колонки
+        # таблиц считаются по прямо стоящему листу, рамки остаются как есть.
+        turn = page_turn(page_lines)
         # Словарь страницы: по нему режутся склейки в ячейках MinerU. Модель
         # таблиц склеивает строки ячейки и на векторном листе — слой файла
         # там точный, и словарь из него только надёжнее.
@@ -610,7 +680,7 @@ def reconcile_with_text_layer(
                 # знает. Но текст ячеек всё равно распознан, поэтому его
                 # значения выправляются по слою.
                 replacements, kept = _fix_table(
-                    block, matched, stats, vocab, exact=source.exact
+                    block, matched, stats, vocab, exact=source.exact, turn=turn
                 )
                 extra_blocks.extend(replacements)
                 leftovers.extend(kept)
@@ -651,7 +721,7 @@ def reconcile_with_text_layer(
                 method=source.recovered_method,
             ))
 
-        page_blocks.sort(key=_block_reading_key)
+        page_blocks.sort(key=lambda block: _block_reading_key(block, turn))
         result.extend(page_blocks)
 
     for order, block in enumerate(result):
@@ -825,6 +895,7 @@ def _fix_table(
     stats: ReconcileStats,
     vocab: Optional[Dict[str, str]] = None,
     exact: bool = False,
+    turn: int = 0,
 ) -> Tuple[List[ParsedBlock], List[TextLine]]:
     """
     Содержимое ячеек — по строкам слоя. Возвращает блоки, которыми таблицу
@@ -843,10 +914,13 @@ def _fix_table(
     слоя, слов которых в таблице нет, возвращаются вторым значением —
     текстом; только у распознанного слоя (`exact=False`): у векторного это
     не измерялось.
+
+    `turn` — поворот текста страницы (`page_turn`): колонки и строки
+    таблицы ищутся по прямо стоящему листу.
     """
     if latex_text.mangled_cells(block.table_data):
         stats.mangled_tables += 1
-        if not table_from_lines.repair_cells(block, matched):
+        if not table_from_lines.repair_cells(block, _upright_lines(matched, turn)):
             stats.degraded_tables += 1
             return table_from_lines.degrade(block, matched), []
         stats.repaired_tables += 1
@@ -854,7 +928,7 @@ def _fix_table(
     unused = _repair_table_cells(block, matched, stats)
     if vocab is None:
         return [], []
-    _split_glued_cells(block, vocab, stats, exact)
+    _split_glued_cells(block, vocab, stats, exact, turn)
     if exact:
         return [], []
     kept = _lines_with_new_words(unused, block)
@@ -1067,9 +1141,13 @@ def _with_stamp_lexicon(vocab: Dict[str, str]) -> Dict[str, str]:
     return merged
 
 
-def _looks_like_stamp(cells: Sequence[str], bbox: Sequence[float]) -> bool:
-    """Таблица — основная надпись чертежа (см. `_STAMP_MIN_LABELS`)."""
-    if not bbox or float(bbox[3]) < _STAMP_MIN_BOTTOM:
+def _looks_like_stamp(cells: Sequence[str], bbox: Sequence[float], turn: int = 0) -> bool:
+    """
+    Таблица — основная надпись чертежа (см. `_STAMP_MIN_LABELS`). «Внизу
+    листа» — на прямо стоящем листе: у альбомного листа, отсканированного
+    книжным, штамп лежит у края исходного листа сбоку или вверху.
+    """
+    if not bbox or upright_bbox(bbox, turn)[3] < _STAMP_MIN_BOTTOM:
         return False
     found = {}
     for cell in cells:
@@ -1383,12 +1461,13 @@ def split_glued_text(
 
 
 def _split_glued_cells(
-    block: ParsedBlock, vocab: Dict[str, str], stats: ReconcileStats, exact: bool = False
+    block: ParsedBlock, vocab: Dict[str, str], stats: ReconcileStats, exact: bool = False,
+    turn: int = 0,
 ) -> None:
     """Склейки режутся во всех видах таблицы: ячейки, HTML и текст блока."""
     table = block.table_data or {}
     cells = list(table.get("headers") or []) + [c for row in table.get("rows") or [] for c in row]
-    if not exact and _looks_like_stamp(cells, block.bbox):
+    if not exact and _looks_like_stamp(cells, block.bbox, turn):
         vocab = _with_stamp_lexicon(vocab)
 
     def fix(value: Any) -> Any:
@@ -1466,5 +1545,6 @@ def _carries_own_text(block: ParsedBlock) -> bool:
     return block.type == "image"
 
 
-def _block_reading_key(block: ParsedBlock) -> Tuple[float, float]:
-    return (round(block.bbox[1], 3), round(block.bbox[0], 3))
+def _block_reading_key(block: ParsedBlock, turn: int = 0) -> Tuple[float, float]:
+    x1, y1, _x2, _y2 = upright_bbox(block.bbox, turn)
+    return (round(y1, 3), round(x1, 3))

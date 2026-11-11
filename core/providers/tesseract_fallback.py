@@ -64,6 +64,9 @@ class OcrLine:
     text: str
     bbox: List[float] = field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])
     confidence: float = 0.0
+    # Угол письма на исходном листе, против часовой: лист, повёрнутый
+    # перед чтением по OSD на 90° по часовой, даёт 90 (строки снизу вверх).
+    rotation: float = 0.0
 
 
 class TesseractFallbackProvider:
@@ -194,7 +197,7 @@ class TesseractFallbackProvider:
                 lines = [
                     TextLine(
                         text=line.text, bbox=list(line.bbox), page=page_num,
-                        confidence=line.confidence,
+                        confidence=line.confidence, rotation=line.rotation,
                     )
                     for line in self.ocr_lines(image)
                     if line.text.strip()
@@ -334,7 +337,8 @@ class TesseractFallbackProvider:
         if lines:
             blocks: List[ParsedBlock] = []
             as_text_lines = [
-                TextLine(text=l.text, bbox=list(l.bbox), page=page, confidence=l.confidence)
+                TextLine(text=l.text, bbox=list(l.bbox), page=page, confidence=l.confidence,
+                         rotation=l.rotation)
                 for l in lines if l.text.strip()
             ]
             for group in group_lines(as_text_lines):
@@ -390,6 +394,11 @@ class TesseractFallbackProvider:
         width, height = image.size
         if not width or not height:
             return []
+        # Лист читался повёрнутым по OSD, а рамки строк уходят в систему
+        # исходного листа: там строки идут под этим углом. Без него
+        # порядок чтения и место штампа считались бы по вертикальным строкам.
+        orientation = prepared.orientation % 360 if prepared is not None else 0
+        rotation = float(orientation - 360 if orientation > 180 else orientation)
 
         grouped: Dict[tuple, Dict[str, Any]] = {}
         for index, raw in enumerate(data.get("text") or []):
@@ -447,6 +456,7 @@ class TesseractFallbackProvider:
                 text=" ".join(entry["words"]),
                 bbox=bbox,
                 confidence=round(entry["sum"] / entry["weight"], 3) if entry["weight"] else 0.0,
+                rotation=rotation,
             ))
         return lines
 
