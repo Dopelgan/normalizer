@@ -1,0 +1,102 @@
+# Отдельная очередь для синхронного разбора (вложения чата).
+#
+# Зачем. Вложение в чате RAG разбирает синхронно: POST /internal/v1/parse.
+# Без этого файла задача встаёт в общую очередь ml_gpu, которую слушает один
+# воркер с concurrency=1. Под пакетной переобработкой (десятки чертежей,
+# 14–250 с на задачу) вложение, которое само разбирается за полсекунды, ждёт
+# весь пакет, а RAG через ~30 с перестаёт его ждать.
+#
+# Что делает файл:
+#   - ingest_api ставит синхронный разбор в очередь `interactive`
+#     (фоновый /internal/v1/parse/background по-прежнему идёт в ml_gpu);
+#   - interactive_worker слушает только `interactive`, concurrency=1 —
+#     MinerU и модель чертежей получают не больше одного лишнего
+#     одновременного запроса.
+#
+# Основной docker-compose.yml и config/profile.yaml не меняются. Включение:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.interactive.yml \
+#     up -d --build interactive_worker ingest_api
+#
+# Порядок важен: сначала должен подняться воркер, потом ingest_api с новой
+# очередью — иначе синхронные задачи лягут в очередь без исполнителя.
+# Команда выше поднимает оба; при раздельном запуске — сначала воркер.
+# Все последующие `docker compose ...` для ingest_api вести с обоими -f
+# (или задать COMPOSE_FILE=docker-compose.yml:docker-compose.interactive.yml
+# в .env), иначе пересоздание ingest_api без этого файла молча вернёт
+# синхронный разбор в ml_gpu.
+#
+# Откат: пересоздать ingest_api без этого файла
+#   docker compose up -d ingest_api
+# дождаться, пока очередь interactive опустеет и у воркера не останется
+# отложенных повторов (retry с задержкой 60–180 с лежит в воркере, а не в
+# Redis; при остановке он вернётся в interactive, которую никто не слушает):
+#   docker compose -f docker-compose.yml -f docker-compose.interactive.yml \
+#     exec interactive_worker celery -A core.celery_app inspect scheduled
+#   (и inspect active) — оба пусты; затем остановить воркер:
+#   docker compose -f docker-compose.yml -f docker-compose.interactive.yml \
+#     stop interactive_worker
+#
+# Блок interactive_worker повторяет celery_worker из docker-compose.yml
+# (образ, тома, сети, зависимости). Если на установке celery_worker в
+# локальном docker-compose.yml отличается (сети до модели чертежей, лимиты
+# памяти, тома), перенести эти отличия и сюда.
+
+services:
+  ingest_api:
+    environment:
+      CELERY_INTERACTIVE_QUEUE: ${CELERY_INTERACTIVE_QUEUE_NAME:-interactive}
+    depends_on:
+      interactive_worker:
+        condition: service_started
+
+  interactive_worker:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "3"
+    env_file:
+      - .env
+    environment:
+      CELERY_INTERACTIVE_QUEUE: ${CELERY_INTERACTIVE_QUEUE_NAME:-interactive}
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    # Только очередь interactive и ровно одна задача за раз: вложения
+    # чата не копятся и не размножают нагрузку на MinerU и модель чертежей.
+    # Имя узла своё, чтобы в `celery inspect` воркеры различались.
+    command: >
+      celery -A core.celery_app worker
+      --loglevel=info
+      --concurrency=1
+      --prefetch-multiplier=1
+      -n interactive@%h
+      -Q ${CELERY_INTERACTIVE_QUEUE_NAME:-interactive}
+      --time-limit=${CELERY_TASK_TIME_LIMIT:-600}
+      --soft-time-limit=${CELERY_TASK_SOFT_TIME_LIMIT:-540}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mineru-api:
+        condition: service_healthy
+    # Метрики воркера: 9100 в контейнере, на хосте 9102 (9100 — разбор,
+    # 9101 — приём).
+    ports:
+      - "127.0.0.1:9102:9100"
+    volumes:
+      - shared_data:/data/shared
+      - ./core:/app/core:ro
+      - ./ingest:/app/ingest:ro
+      - ./config:/app/config:ro
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    networks:
+      - internal_net
+      # Как у celery_worker: выход к внешней модели чертежей (QWEN_ENDPOINT).
+      - public_net

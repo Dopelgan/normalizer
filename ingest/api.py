@@ -55,31 +55,53 @@ ACTIVE_STATUSES = ("queued", "processing")
 # Вспомогательное
 # ===========================================================================
 
+def parse_queue(interactive: bool) -> str:
+    """
+    Очередь Celery для разбора.
+
+    Синхронный разбор (вложение в чате, пользователь ждёт) идёт в
+    CELERY_INTERACTIVE_QUEUE, если она задана: её слушает отдельный воркер,
+    и пакетная переобработка его не занимает. Фоновый и пакетный разбор —
+    всегда в CELERY_ML_QUEUE.
+    """
+    if interactive and settings.CELERY_INTERACTIVE_QUEUE:
+        return settings.CELERY_INTERACTIVE_QUEUE
+    return settings.CELERY_ML_QUEUE
+
+
 def _dispatch(
     request_id: str,
     items: List[IntakeFile],
     dialog_id: str = "",
     event_id: str = "",
+    *,
+    queue: str,
 ) -> None:
     """
     Ставит по задаче на каждый файл пакета — со своей операцией.
 
     В фоне задача несёт `event_id` события жизненного цикла, в синхронном
     разборе — `dialog_id`. Технического `dialog_id=event_id` больше нет.
+    Очередь задаётся явно (см. parse_queue): явная очередь при постановке
+    сильнее и `queue=` в декораторе задачи, и task_routes. Повтор задачи
+    (self.retry) остаётся в той же очереди.
     """
     from ingest.tasks import process_document
 
     for item in items:
-        task = process_document.delay(
-            request_id=request_id,
-            s3_fileid=item.s3_fileid,
-            operation=item.operation,
-            dialog_id=dialog_id,
-            event_id=event_id,
+        task = process_document.apply_async(
+            kwargs={
+                "request_id": request_id,
+                "s3_fileid": item.s3_fileid,
+                "operation": item.operation,
+                "dialog_id": dialog_id,
+                "event_id": event_id,
+            },
+            queue=queue,
         )
         logger.info(
-            "Задача %s поставлена для файла %s (%s)",
-            task.id, item.s3_fileid, item.operation,
+            "Задача %s поставлена для файла %s (%s) в очередь %s",
+            task.id, item.s3_fileid, item.operation, queue,
         )
 
 
@@ -124,7 +146,8 @@ async def parse_sync(request: ParseRequest):
         dialog_id=request.dialog_id,
     )
     await asyncio.to_thread(
-        _dispatch, request.request_id, items, request.dialog_id, ""
+        _dispatch, request.request_id, items, request.dialog_id, "",
+        queue=parse_queue(interactive=True),
     )
 
     deadline = asyncio.get_event_loop().time() + settings.PROCESSING_TIMEOUT_SECONDS
@@ -172,7 +195,8 @@ async def parse_background(request: BackgroundParseRequest):
         operations=operations, event_id=request.event_id,
     )
     await asyncio.to_thread(
-        _dispatch, request.request_id, items, "", request.event_id
+        _dispatch, request.request_id, items, "", request.event_id,
+        queue=parse_queue(interactive=False),
     )
 
     return BackgroundAcceptedResponse(

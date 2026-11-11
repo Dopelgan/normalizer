@@ -176,7 +176,7 @@ class TestResults:
 
 class TestSync:
     def test_returns_documents_when_ready(self, client, mocker):
-        def fake_dispatch(request_id, items, dialog_id="", event_id=""):
+        def fake_dispatch(request_id, items, dialog_id="", event_id="", queue=""):
             for item in items:
                 put_document_result(request_id, item.s3_fileid, document(item.s3_fileid))
 

@@ -563,6 +563,50 @@ curl -X POST http://127.0.0.1:8000/internal/v1/parse \
 Если обработка не уложилась в `PROCESSING_TIMEOUT_SECONDS`, вернётся `504`,
 а результат останется доступен по `request_id`.
 
+#### Очередь синхронного разбора
+
+Синхронным разбором RAG читает вложения чата: пользователь ждёт ответа,
+RAG ждёт вложение около 30 с. По умолчанию задача идёт в ту же очередь
+`ml_gpu`, что и фоновый разбор, а её воркер берёт по одной задаче. Под
+пакетной переобработкой (чертежи, 14–250 с на задачу) вложение, которое
+само разбирается за полсекунды, стоит за всем пакетом, и RAG сдаётся.
+
+Поэтому синхронный разбор можно вынести в свою очередь
+`CELERY_INTERACTIVE_QUEUE` (обычно `interactive`) с отдельным воркером
+`interactive_worker`, `concurrency=1`:
+
+| Ручка | Очередь | Воркер |
+|---|---|---|
+| `POST /internal/v1/parse` (вложения чата) | `CELERY_INTERACTIVE_QUEUE`, если задана; иначе `ml_gpu` | `interactive_worker` |
+| `POST /internal/v1/parse/background` (lifecycle, пакеты, приём) | всегда `ml_gpu` | `celery_worker` |
+
+Воркер и переменная описаны отдельным файлом `docker-compose.interactive.yml`;
+основной `docker-compose.yml` не меняется. Включение:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.interactive.yml \
+  up -d --build interactive_worker ingest_api
+```
+
+Переменную задаёт этот файл, и только для `ingest_api` и нового воркера.
+Ставить `CELERY_INTERACTIVE_QUEUE` в `.env` без воркера нельзя: задачи
+синхронного разбора лягут в очередь, которую никто не слушает, и каждый
+запрос закончится `504`. Пересоздание `ingest_api` без второго `-f`
+возвращает синхронный разбор в `ml_gpu` (откат — ровно это). Чтобы не
+забывать второй `-f`, в `.env` можно задать
+`COMPOSE_FILE=docker-compose.yml:docker-compose.interactive.yml`
+(на Windows разделитель — `;`).
+
+`interactive_worker` при откате останавливать последним: когда очередь
+`interactive` пуста и `celery inspect scheduled` / `inspect active` у него
+пусты. Отложенный повтор (`retry` через 60–180 с) держит сам воркер, а не
+Redis; остановленный раньше времени, он вернётся в `interactive` без
+исполнителя.
+
+Повтор задачи (`retry`) остаётся в той очереди, куда задача была поставлена.
+MinerU и модель чертежей при этом получают не больше одного лишнего
+одновременного запроса — от `interactive_worker`.
+
 ### Фоновая обработка
 
 ```bash
@@ -857,7 +901,8 @@ docker compose logs intake_worker \
 **В метрики.** Гистограмма `normalizer_stage_duration_seconds` с метками
 `service`, `stage`, `outcome` и счётчик `normalizer_stage_failures_total`.
 У сервисов FastAPI их отдаёт ручка `/metrics`, у воркеров — отдельный порт
-`METRICS_WORKER_PORT` (в compose проброшены: разбор — 9100, приём — 9101).
+`METRICS_WORKER_PORT` (в compose проброшены: разбор — 9100, приём — 9101,
+синхронный разбор из `docker-compose.interactive.yml` — 9102).
 
 Без `prometheus-client` сервис работает: тайминги остаются в логах и в
 ответе, пропадают только метрики. Замер не имеет права ронять обработку —
@@ -878,7 +923,7 @@ docker compose logs intake_worker \
 ```
 core/
   config.py                 настройки (pydantic-settings)
-  celery_app.py             приложение Celery, очереди ml_gpu и intake
+  celery_app.py             приложение Celery, очереди ml_gpu, intake и interactive
   telemetry.py              замер времени этапов: логи, тайминги, метрики
   logging_setup.py          структурные логи, одна настройка на все сервисы
   mappers.py                фрагмент контракта <-> строка БД
@@ -1247,6 +1292,8 @@ docker compose run --rm --user root celery_worker chown -R 1000:1000 /data/share
 | Модель не найдена | `docker compose logs model-downloader`, содержимое `./models` |
 | GPU недоступна | `nvidia-smi`, секция `deploy.resources` в compose |
 | Задачи не выполняются | `docker compose logs celery_worker`; очередь должна быть `ml_gpu` |
+| Синхронный разбор (вложение чата) ждёт пакет | включена ли очередь `interactive`: `docker compose exec ingest_api env \| grep CELERY_INTERACTIVE_QUEUE`; см. «Очередь синхронного разбора» |
+| Синхронный разбор всегда `504`, фоновый идёт | `CELERY_INTERACTIVE_QUEUE` задана, а `interactive_worker` не поднят: `docker compose -f docker-compose.yml -f docker-compose.interactive.yml logs interactive_worker` |
 | `status: error` в результатах | `error.reason_code` в документе и логи воркера; `retryable` говорит, есть ли смысл повторять |
 | `status: partial` в результатах | `failed_pages` и `warnings` документа: там видно, какие страницы не прочитались |
 | Пустые фрагменты у скана | установлен ли `tesseract-ocr-rus` в образе |

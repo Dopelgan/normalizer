@@ -48,6 +48,17 @@ app.conf.task_queues = (
     Queue(settings.CELERY_ML_QUEUE, routing_key=settings.CELERY_ML_QUEUE),
     Queue(settings.CELERY_INTAKE_QUEUE, routing_key=settings.CELERY_INTAKE_QUEUE),
 )
+# Синхронный разбор (вложения чата) — своя очередь и свой воркер. Иначе
+# вложение, которое без нагрузки разбирается за полсекунды, встаёт в
+# ml_gpu за пакетной переобработкой чертежей (минуты на задачу), и RAG
+# перестаёт его ждать. Маршрут задаётся не здесь, а явной очередью при
+# постановке (ingest.api._dispatch): задача одна и та же, различается
+# только вызвавшая её ручка.
+if settings.CELERY_INTERACTIVE_QUEUE:
+    app.conf.task_queues += (
+        Queue(settings.CELERY_INTERACTIVE_QUEUE,
+              routing_key=settings.CELERY_INTERACTIVE_QUEUE),
+    )
 app.conf.task_routes = {
     "ingest.tasks.process_document": {"queue": settings.CELERY_ML_QUEUE},
     "core.intake.tasks.process_intake_file": {"queue": settings.CELERY_INTAKE_QUEUE},
