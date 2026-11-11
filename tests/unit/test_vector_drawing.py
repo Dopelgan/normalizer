@@ -56,6 +56,32 @@ class TestPageDetection:
     def test_broken_file_does_not_raise(self):
         assert detect_drawing_pages(b"not a pdf") == {}
 
+    def test_rotated_page_finds_title_block_in_visible_corner(self):
+        # Альбомный лист, сохранённый книжным с /Rotate 90: пути
+        # get_drawings() лежат в неповёрнутой системе, а угол штампа —
+        # в видимой. Без пересчёта сетка штампа не находилась.
+        pymupdf = pytest.importorskip("pymupdf")
+        document = pymupdf.open()
+        sheet = document.new_page(width=842, height=1190)
+        sheet.set_rotation(90)
+        to_file = sheet.derotation_matrix
+
+        def line_at(a, b):
+            sheet.draw_line(pymupdf.Point(*a) * to_file, pymupdf.Point(*b) * to_file)
+
+        sheet.draw_rect(pymupdf.Rect(20, 20, 1170, 822) * to_file)
+        for i in range(160):
+            line_at((100 + i, 200), (140 + i, 320))
+        for row in range(9):
+            line_at((820, 700 + row * 14), (1170, 700 + row * 14))
+        data = document.tobytes()
+        document.close()
+
+        verdict = detect_drawing_pages(data)[1]
+        assert verdict.signals["landscape"] is True
+        assert verdict.signals["title_block_lines"] >= 6
+        assert verdict.is_drawing is True
+
 
 class TestClassification:
     @pytest.mark.parametrize("text,category", [

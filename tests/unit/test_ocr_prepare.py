@@ -247,3 +247,30 @@ def test_rotated_scan_lines_are_in_source_coordinates():
     title = next(line for line in lines if "ПРОТОКОЛ" in line.text.upper())
     assert title.bbox[2] < 0.35  # в исходном (повёрнутом) файле — слева
     assert title.bbox[3] - title.bbox[1] > title.bbox[2] - title.bbox[0]  # вытянут по вертикали
+
+
+class TestOsdRotation:
+    """Ответ OSD разбирается в (угол, уверенность); нет ответа — `None`, а не 0."""
+
+    def test_answer_is_parsed(self, monkeypatch):
+        import pytesseract
+
+        from core.providers.ocr_prepare import osd_rotation
+
+        monkeypatch.setattr(
+            pytesseract, "image_to_osd",
+            lambda *a, **k: "Page number: 0\nRotate: 270\nOrientation confidence: 7.31\n",
+        )
+        assert osd_rotation(Image.new("L", (10, 10), 255)) == (270, 7.31)
+
+    def test_failure_is_unknown_not_zero(self, monkeypatch):
+        import pytesseract
+
+        from core.providers.ocr_prepare import _orientation, osd_rotation
+
+        def broken(*a, **k):
+            raise RuntimeError("tesseract не установлен")
+
+        monkeypatch.setattr(pytesseract, "image_to_osd", broken)
+        assert osd_rotation(Image.new("L", (10, 10), 255)) is None
+        assert _orientation(Image.new("L", (10, 10), 255)) == 0

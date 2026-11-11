@@ -140,7 +140,13 @@ def _score_page(page: Any, page_no: int) -> DrawingPage:
 
     path_count = len(drawings)
     frame = _has_format_frame(drawings, area)
-    title_block = _title_block_lines(drawings, width, height)
+    # Пути `get_drawings()` у страницы с /Rotate (альбомный лист, сохранённый
+    # книжным) — в неповёрнутой системе, а `page.rect` — в видимой. Без
+    # пересчёта сетка штампа искалась не в том углу, и повёрнутый лист
+    # недобирал признаков чертежа.
+    turn = int(getattr(page, "rotation", 0) or 0) % 360
+    matrix = page.rotation_matrix if turn else None
+    title_block = _title_block_lines(drawings, width, height, matrix)
     text = page.get_text("text") or ""
     chars = len("".join(text.split()))
 
@@ -186,8 +192,14 @@ def _has_format_frame(drawings: Sequence[Dict[str, Any]], page_area: float) -> b
     return False
 
 
-def _title_block_lines(drawings: Sequence[Dict[str, Any]], width: float, height: float) -> int:
-    """Число отрезков в зоне штампа: его сетка граф даёт характерный пучок."""
+def _title_block_lines(
+    drawings: Sequence[Dict[str, Any]], width: float, height: float, matrix: Any = None
+) -> int:
+    """
+    Число отрезков в зоне штампа: его сетка граф даёт характерный пучок.
+    `matrix` — матрица поворота страницы (`page.rotation_matrix`): переводит
+    пути в видимую систему, в которой заданы `width` и `height`.
+    """
     if width <= 0 or height <= 0:
         return 0
     x1, y1, x2, y2 = _TITLE_BLOCK_REGION
@@ -197,6 +209,8 @@ def _title_block_lines(drawings: Sequence[Dict[str, Any]], width: float, height:
         if rect is None:
             continue
         try:
+            if matrix is not None:
+                rect = rect * matrix
             cx = (float(rect.x0) + float(rect.x1)) / 2 / width
             cy = (float(rect.y0) + float(rect.y1)) / 2 / height
         except Exception:  # noqa: BLE001

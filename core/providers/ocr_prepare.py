@@ -24,7 +24,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps
@@ -136,23 +136,35 @@ def _orientation(gray: Image.Image) -> int:
     сразу, а неуверенный — только если повёрнутый лист читается заметно
     лучше исходного. Ошибка OSD — «не поворачивать».
     """
+    found = osd_rotation(gray)
+    if found is None:
+        return 0
+    angle, confidence = found
+    if not angle:
+        return 0
+    if confidence >= settings.OCR_OSD_MIN_CONFIDENCE:
+        return angle
+    return angle if _reads_better(gray, angle) else 0
+
+
+def osd_rotation(gray: Image.Image) -> Optional[Tuple[int, float]]:
+    """
+    Ответ Tesseract OSD: на сколько градусов по часовой повернуть лист, чтобы
+    текст встал прямо, и уверенность в этом. `None` — OSD недоступен или
+    ответа нет; это не то же самое, что «поворачивать не нужно».
+    """
     try:
         import pytesseract
 
         osd = pytesseract.image_to_osd(gray, config="--psm 0 -c min_characters_to_try=5")
     except Exception as exc:  # noqa: BLE001 — OSD не обязателен
         logger.debug("Ориентация листа не определена: %s", exc)
-        return 0
+        return None
     rotate = re.search(r"Rotate:\s*(\d+)", osd)
     confidence = re.search(r"Orientation confidence:\s*([\d.]+)", osd)
     if not rotate or not confidence:
-        return 0
-    angle = int(rotate.group(1)) % 360
-    if not angle:
-        return 0
-    if float(confidence.group(1)) >= settings.OCR_OSD_MIN_CONFIDENCE:
-        return angle
-    return angle if _reads_better(gray, angle) else 0
+        return None
+    return int(rotate.group(1)) % 360, float(confidence.group(1))
 
 
 def _reads_better(gray: Image.Image, angle: int) -> bool:

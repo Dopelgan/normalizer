@@ -53,6 +53,13 @@ _TITLE_BLOCK_CORNER = (0.45, 0.55)
 _MIN_TABLE_AREA = 0.004
 # Линия длиннее этой доли стороны принадлежит рамке формата, а не таблице.
 _FRAME_LINE = 0.7
+# Поворот листа по штампу: штамп не дальше этого от правого и нижнего края
+# рамки, длинная сторона не короче полутора коротких, а без подтверждения
+# OSD — короткая не меньше 0,2 длинной (55 из 185 мм у формы 1, 40 у формы 2).
+_TURN_CORNER_GAP = 0.08
+_TURN_MIN_ASPECT = 1.5
+_TURN_STRICT_RATIO = 0.2
+_OSD_SIDE = 2400
 # Перебор угла при выравнивании.
 _DESKEW_STEP = 0.2
 _DESKEW_GAIN = 1.03
@@ -88,6 +95,9 @@ class SheetLayout:
 
     image: Any
     angle: float = 0.0
+    # Поворот кратно 90° против часовой (как у PIL.rotate), которым штамп
+    # приведён в правый нижний угол; координаты областей — после него.
+    turn: int = 0
     frame: Optional[List[float]] = None
     regions: List[Region] = field(default_factory=list)
     signals: Dict[str, Any] = field(default_factory=dict)
@@ -109,6 +119,8 @@ class SheetLayout:
         tables = sum(1 for r in self.regions if r.kind == KIND_TABLE)
         if tables:
             parts.append(f"таблиц на листе: {tables}")
+        if self.turn:
+            parts.append(f"лист повёрнут на {self.turn}° против часовой, штамп внизу справа")
         if abs(self.angle) >= 0.1:
             parts.append(f"лист выправлен на {self.angle:+.1f}°")
         return "; ".join(parts)
@@ -116,6 +128,7 @@ class SheetLayout:
     def as_dict(self) -> Dict[str, Any]:
         return {
             "angle": round(self.angle, 2),
+            "turn": self.turn,
             "frame": [round(c, 4) for c in self.frame] if self.frame else None,
             "regions": [r.as_dict() for r in self.regions],
             **self.signals,
@@ -135,10 +148,51 @@ def analyse(image, deskew_limit: Optional[float] = None) -> SheetLayout:
     limit = settings.DRAWING_DESKEW_LIMIT if deskew_limit is None else deskew_limit
     straight, angle = deskew(image, limit)
 
-    mask = ink_mask(straight)
-    if mask is None:
+    found = _find_regions(straight)
+    if found is None:
         return SheetLayout(image=straight, angle=angle, signals={"vision": "маска не построилась"})
+    frame, regions, signals = found
 
+    # Лист, повёрнутый на 90° (альбомный A3, отсканированный книжным) или
+    # вверх ногами, без поворота теряет штамп: в правом нижнем углу его нет,
+    # и модель читает надписи боком. Поворот выбирается по штампу и
+    # проверяется: если на повёрнутом листе штамп не нашёлся, лист остаётся
+    # как был.
+    turn, source = _orientation_turn(straight, frame, regions)
+    if turn:
+        turned = straight.rotate(turn, expand=True, fillcolor="white")
+        refound = _find_regions(turned)
+        marked = _mark_title_block(refound[1], refound[0]) if refound else []
+        if any(r.kind == KIND_TITLE_BLOCK for r in marked):
+            straight = turned
+            frame, regions, signals = refound
+            signals["turn_source"] = source
+        else:
+            signals["turn_rejected"] = source
+            turn = 0
+    regions = _mark_title_block(regions, frame)
+
+    layout = SheetLayout(
+        image=straight,
+        angle=angle,
+        turn=turn,
+        frame=frame,
+        regions=regions[: max(1, settings.DRAWING_MAX_REGIONS)],
+        signals=signals,
+    )
+    logger.info(
+        "Разметка листа: поворот %d°, наклон %.1f°, рамка %s, таблиц %d (штамп %s)",
+        turn, angle, "есть" if frame else "нет", len(regions),
+        "найден" if layout.title_block else "не найден",
+    )
+    return layout
+
+
+def _find_regions(image) -> Optional[Tuple[Optional[List[float]], List[Region], Dict[str, Any]]]:
+    """Рамка формата и таблицы листа, штамп ещё не отмечен. `None` — нет маски."""
+    mask = ink_mask(image)
+    if mask is None:
+        return None
     height, width = mask.shape
     horizontals = _lines(mask, axis=0)
     verticals = _lines(mask, axis=1)
@@ -148,25 +202,12 @@ def analyse(image, deskew_limit: Optional[float] = None) -> SheetLayout:
     inner_h = [h for h in horizontals if h[2] - h[1] < _FRAME_LINE * width]
     inner_v = [v for v in verticals if v[2] - v[1] < _FRAME_LINE * height]
     regions = _tables(inner_h, inner_v, width, height)
-    regions = _mark_title_block(regions, frame)
-
-    layout = SheetLayout(
-        image=straight,
-        angle=angle,
-        frame=frame,
-        regions=regions[: max(1, settings.DRAWING_MAX_REGIONS)],
-        signals={
-            "horizontal_lines": len(horizontals),
-            "vertical_lines": len(verticals),
-            "tables": len(regions),
-        },
-    )
-    logger.info(
-        "Разметка листа: наклон %.1f°, рамка %s, таблиц %d (штамп %s)",
-        angle, "есть" if frame else "нет", len(regions),
-        "найден" if layout.title_block else "не найден",
-    )
-    return layout
+    signals: Dict[str, Any] = {
+        "horizontal_lines": len(horizontals),
+        "vertical_lines": len(verticals),
+        "tables": len(regions),
+    }
+    return frame, regions, signals
 
 
 def plain(image) -> SheetLayout:
@@ -421,6 +462,113 @@ def _mark_title_block(regions: List[Region], frame: Optional[List[float]]) -> Li
         if 0 < frame[3] - best.bbox[3] < 0.1:
             best.bbox[3] = frame[3]
     return regions
+
+
+# ===========================================================================
+# Ориентация листа
+# ===========================================================================
+
+def _turn_bbox(bbox: Sequence[float], turn: int) -> List[float]:
+    """
+    Рамка в долях листа после `PIL.rotate(turn, expand=True)` (против
+    часовой). При 90° верхний правый угол уходит в верхний левый.
+    """
+    x1, y1, x2, y2 = (float(c) for c in bbox)
+    if turn == 90:
+        return [y1, 1 - x2, y2, 1 - x1]
+    if turn == 180:
+        return [1 - x2, 1 - y2, 1 - x1, 1 - y1]
+    if turn == 270:
+        return [1 - y2, x1, 1 - y1, x2]
+    return [x1, y1, x2, y2]
+
+
+def _stamp_like(
+    region: Region,
+    frame: Optional[List[float]],
+    size: Tuple[int, int],
+    turn: int,
+    strict: bool,
+) -> bool:
+    """
+    Похожа ли таблица на штамп, если лист повернуть на `turn`: лежит в
+    правом нижнем углу у рамки и вытянута вдоль нижнего края (185×55 мм по
+    ГОСТ 2.104, у последующих листов 185×15 мм).
+
+    `strict` — для поворота без подтверждения OSD: штамп формы 1/2 (короткая
+    сторона не меньше 0,2 длинной) и не меньше трёх граф вдоль длинной
+    стороны. Узкая колонка дополнительных граф у левого поля (12×145 мм)
+    так за штамп не сойдёт.
+    """
+    width, height = size
+    if turn in (90, 270):
+        width, height = height, width
+    box = _turn_bbox(region.bbox, turn)
+    edge = _turn_bbox(frame, turn) if frame else [0.0, 0.0, 1.0, 1.0]
+    corner_x, corner_y = _TITLE_BLOCK_CORNER
+    if (box[0] + box[2]) / 2 < corner_x or (box[1] + box[3]) / 2 < corner_y:
+        return False
+    if edge[2] - box[2] > _TURN_CORNER_GAP or edge[3] - box[3] > _TURN_CORNER_GAP:
+        return False
+    long_side = (box[2] - box[0]) * width
+    short_side = (box[3] - box[1]) * height
+    if long_side < _TURN_MIN_ASPECT * short_side:
+        return False
+    if not strict:
+        return True
+    # Графы вдоль длинной стороны: при повороте на 90° строки и столбцы
+    # сетки меняются местами.
+    columns = region.rows if turn in (90, 270) else region.cols
+    return short_side >= _TURN_STRICT_RATIO * long_side and columns >= 3
+
+
+def _orientation_turn(
+    image, frame: Optional[List[float]], regions: Sequence[Region]
+) -> Tuple[int, str]:
+    """
+    Поворот кратно 90° против часовой, после которого штамп окажется в
+    правом нижнем углу, и чем он подтверждён ("osd" или "geometry").
+
+    Лист, на котором штамп уже стоит где положено, не поворачивается никогда,
+    и OSD для него не спрашивается: ошибка OSD на разреженном тексте листа
+    не должна переворачивать верный лист. Иначе спрашивается OSD; уверенный
+    ответ принимается, только если после такого поворота штамп встаёт на
+    место. Без уверенного OSD лист поворачивается, только если штампу
+    отвечает ровно один поворот по строгим признакам.
+    """
+    if not settings.DRAWING_AUTO_ROTATE or not regions:
+        return 0, ""
+    size = image.size
+    if any(_stamp_like(r, frame, size, 0, strict=False) for r in regions):
+        return 0, ""
+    candidates = [
+        turn for turn in (90, 180, 270)
+        if any(_stamp_like(r, frame, size, turn, strict=False) for r in regions)
+    ]
+    if not candidates:
+        return 0, ""
+
+    from core.providers.ocr_prepare import osd_rotation
+
+    try:
+        gray = image.convert("L")
+        # Лист A1 в 200 dpi OSD читает долго, а ориентацию текста видно и так.
+        gray.thumbnail((_OSD_SIDE, _OSD_SIDE))
+    except Exception:  # noqa: BLE001
+        gray = image
+    answer = osd_rotation(gray)
+    if answer is not None and answer[1] >= settings.OCR_OSD_MIN_CONFIDENCE:
+        # OSD говорит, на сколько повернуть по часовой; PIL крутит против.
+        turn = (-answer[0]) % 360
+        return (turn, "osd") if turn in candidates else (0, "")
+
+    strict = [
+        turn for turn in candidates
+        if any(_stamp_like(r, frame, size, turn, strict=True) for r in regions)
+    ]
+    if len(strict) == 1:
+        return strict[0], "geometry"
+    return 0, ""
 
 
 # ===========================================================================
