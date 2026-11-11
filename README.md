@@ -588,6 +588,30 @@ docker compose -f docker-compose.yml -f docker-compose.interactive.yml \
   up -d --build interactive_worker ingest_api
 ```
 
+На боевой установке вместо него — `docker-compose.interactive.prod.yml`:
+воркер собирается из `Dockerfile.prod`, сети `internal_net` + внешняя `rag`
+(через неё воркер ходит к vLLM/Qwen, как `celery_worker`; сеть объявлена в
+самом файле). Тома повторяют боевой `celery_worker` (`./core`, `./ingest`,
+`./config` только на чтение поверх кода образа) — если там их нет, убрать
+и здесь. Перед включением сверить блок `interactive_worker` с боевым
+`celery_worker`.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.interactive.prod.yml \
+  up -d --build interactive_worker ingest_api
+# проверка
+docker compose -f docker-compose.yml -f docker-compose.interactive.prod.yml \
+  exec ingest_api env | grep CELERY_INTERACTIVE_QUEUE    # interactive
+docker compose -f docker-compose.yml -f docker-compose.interactive.prod.yml \
+  logs --tail=50 interactive_worker                      # очередь interactive
+```
+
+Пересобираются и перезапускаются только `interactive_worker` и
+`ingest_api`; `celery_worker`, `intake_worker`, `data_gateway` и
+`quality_gate` не трогаются. Во всех последующих командах — оба `-f`
+(или `COMPOSE_FILE=docker-compose.yml:docker-compose.interactive.prod.yml`
+в `.env`).
+
 Переменную задаёт этот файл, и только для `ingest_api` и нового воркера.
 Ставить `CELERY_INTERACTIVE_QUEUE` в `.env` без воркера нельзя: задачи
 синхронного разбора лягут в очередь, которую никто не слушает, и каждый

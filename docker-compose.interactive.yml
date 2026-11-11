@@ -37,6 +37,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.interactive.yml \
 #     stop interactive_worker
 #
+# Для боевой установки (Dockerfile.prod, сеть rag) — docker-compose.interactive.prod.yml.
 # Блок interactive_worker повторяет celery_worker из docker-compose.yml
 # (образ, тома, сети, зависимости). Если на установке celery_worker в
 # локальном docker-compose.yml отличается (сети до модели чертежей, лимиты

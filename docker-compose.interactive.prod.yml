@@ -1,0 +1,88 @@
+# Отдельная очередь синхронного разбора — вариант для боевой установки.
+#
+# То же, что docker-compose.interactive.yml (зачем, порядок, откат — см. там
+# и README, «Очередь синхронного разбора»), но под боевой docker-compose.yml:
+#   - образ собирается из Dockerfile.prod, как у всех ролей на сервере;
+#   - сети internal_net + rag: внешняя сеть rag заменяет public_net, через
+#     неё celery_worker ходит к vLLM/Qwen — interactive_worker так же.
+# Сеть rag объявлена и здесь (external, name: rag), чтобы файл не зависел
+# от того, объявлена ли она в локальном docker-compose.yml.
+#
+# Тома повторяют celery_worker боевого docker-compose.yml: исходники с хоста
+# монтируются только на чтение поверх кода в образе. Так оба воркера
+# исполняют один и тот же код из рабочей копии. Если на сервере у
+# celery_worker этих томов нет, убрать ./core, ./ingest, ./config и здесь.
+#
+# Включение (на сервере, из каталога с боевым docker-compose.yml):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.interactive.prod.yml \
+#     up -d --build interactive_worker ingest_api
+#
+# Все последующие команды для ingest_api — с обоими -f, либо в .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.interactive.prod.yml
+#
+# Откат: `docker compose up -d ingest_api` без этого файла; дождаться пустой
+# очереди interactive и пустых `celery -A core.celery_app inspect scheduled`
+# / `inspect active` у воркера; затем
+#   docker compose -f docker-compose.yml -f docker-compose.interactive.prod.yml \
+#     stop interactive_worker
+
+networks:
+  rag:
+    external: true
+    name: rag
+
+services:
+  ingest_api:
+    environment:
+      CELERY_INTERACTIVE_QUEUE: ${CELERY_INTERACTIVE_QUEUE_NAME:-interactive}
+    depends_on:
+      interactive_worker:
+        condition: service_started
+
+  interactive_worker:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "3"
+    env_file:
+      - .env
+    environment:
+      CELERY_INTERACTIVE_QUEUE: ${CELERY_INTERACTIVE_QUEUE_NAME:-interactive}
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    # Только очередь interactive и ровно одна задача за раз.
+    command: >
+      celery -A core.celery_app worker
+      --loglevel=info
+      --concurrency=1
+      --prefetch-multiplier=1
+      -n interactive@%h
+      -Q ${CELERY_INTERACTIVE_QUEUE_NAME:-interactive}
+      --time-limit=${CELERY_TASK_TIME_LIMIT:-600}
+      --soft-time-limit=${CELERY_TASK_SOFT_TIME_LIMIT:-540}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mineru-api:
+        condition: service_healthy
+    # Метрики: 9100 в контейнере, на хосте 9102 (9100 — разбор, 9101 — приём).
+    ports:
+      - "127.0.0.1:9102:9100"
+    volumes:
+      - shared_data:/data/shared
+      - ./core:/app/core:ro
+      - ./ingest:/app/ingest:ro
+      - ./config:/app/config:ro
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    networks:
+      - internal_net
+      - rag
