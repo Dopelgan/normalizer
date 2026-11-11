@@ -245,3 +245,45 @@ class TestOcrLinesCarryOrientation:
         ])
         blocks = provider._blocks_from_image(Image.new("L", (10, 10), 255), page=1)
         assert [b.text.replace("\n", " ") for b in blocks] == EXPECTED
+
+
+class TestUprightPagesUnchanged:
+    """Ревью: повёрнутое меньшинство не поворачивает лист и не путает строки."""
+
+    def test_dimension_labels_do_not_turn_sparse_drawing(self):
+        # Разреженный прямой чертёж: цифр в повёрнутых подписях размеров
+        # больше, чем букв в штампе, но букв в них нет.
+        labels = [TextLine(text="100±0,2", page=1, bbox=[0.1 + 0.05 * i, 0.3, 0.12 + 0.05 * i, 0.4],
+                           rotation=90.0) for i in range(6)]
+        stamp = TextLine(text="АБВГ.301261.005", page=1, bbox=[0.80, 0.90, 0.88, 0.92])
+        assert page_turn(labels + [stamp]) == 0
+
+        from core.providers.vector_drawing import extract_drawing_fields
+        fields = extract_drawing_fields(TextLayer(pages={1: labels + [stamp]}, page_count=1), 1)
+        assert {f["value"]: f["category"] for f in fields}["АБВГ.301261.005"] == "title_block"
+
+    def test_horizontal_notes_on_turned_page_are_not_glued(self):
+        notes = [
+            TextLine(text="Note top", page=1, bbox=[0.40, 0.05, 0.60, 0.07]),
+            TextLine(text="Note bottom", page=1, bbox=[0.42, 0.90, 0.62, 0.92]),
+        ]
+        groups = group_lines(turned_lines(90) + notes)
+        texts = [lines_to_text(g) for g in groups]
+        assert "Note top" in texts and "Note bottom" in texts
+
+    def test_rotated_leftovers_on_upright_page_keep_page_order(self):
+        # Лист стоит прямо; среди строк, не попавших в рамки, большинство
+        # повёрнуто. Поворот решается по странице, а не по остатку.
+        body = [TextLine(text=f"Обычный горизонтальный текст абзаца номер {i}", page=1,
+                         bbox=[0.2, 0.1 + 0.03 * i, 0.8, 0.12 + 0.03 * i]) for i in range(8)]
+        block = ParsedBlock(type="text", page=1, bbox=[0.15, 0.08, 0.85, 0.40], text="x")
+        side = [
+            TextLine(text="Вертикальная подпись первая", page=1, bbox=[0.05, 0.5, 0.07, 0.9],
+                     rotation=90.0),
+            TextLine(text="Вертикальная подпись вторая", page=1, bbox=[0.08, 0.3, 0.10, 0.9],
+                     rotation=90.0),
+        ]
+        blocks, _ = reconcile_with_text_layer(
+            [block], TextLayer(pages={1: body + side}, page_count=1), source=OCR_LAYER)
+        recovered = [b.text for b in blocks if b is not block]
+        assert recovered == ["Вертикальная подпись вторая Вертикальная подпись первая"]

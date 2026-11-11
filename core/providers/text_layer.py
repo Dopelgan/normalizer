@@ -134,6 +134,8 @@ _STAMP_MIN_BOTTOM = 0.75
 # страницы; строка считается повёрнутой кратно 90° с этим допуском, градусы.
 _PAGE_TURN_SHARE = 0.6
 _TURN_TOLERANCE = 10.0
+# Строка участвует в решении о повороте листа, если в ней столько букв.
+_TURN_MIN_LETTERS = 3
 # Курсивные подмены поверх обычной свёртки: т/m, и/у/u, б/в/д/6, г/F, ш/w.
 # Пары а/о здесь нет: «прав.» не должно стать «Пров.». В открытом тексте
 # так сравнивать нельзя — только с закрытым словарём штампа.
@@ -399,18 +401,21 @@ def _direction_to_degrees(direction: Optional[Sequence[float]]) -> float:
 # Группировка строк в абзацы
 # ===========================================================================
 
-def group_lines(lines: Sequence[TextLine]) -> List[List[TextLine]]:
+def group_lines(lines: Sequence[TextLine], turn: Optional[int] = None) -> List[List[TextLine]]:
     """
     Соседние строки -> абзацы. Разрыв — там, где вертикальный зазор заметно
     больше обычного межстрочного, меняется угол поворота или меняется
     моноширинность (граница «проза / код»).
+
+    `turn` — поворот текста страницы (`page_turn`); по умолчанию считается
+    по самим строкам, поэтому передавать сюда надо строки всей страницы.
     """
     if not lines:
         return []
 
     # На листе, повёрнутом боком, «сверху вниз» считается по прямо
     # стоящему листу, иначе вертикальные строки слипаются в один абзац.
-    pairs = _reading_pairs(lines)
+    pairs = _reading_pairs(lines, page_turn(lines) if turn is None else turn)
     heights = [upright.height for upright, _ in pairs if upright.height > 0]
     typical = statistics.median(heights) if heights else 0.012
     gap_limit = max(typical * 0.85, 0.004)
@@ -427,19 +432,20 @@ def group_lines(lines: Sequence[TextLine]) -> List[List[TextLine]]:
     return [[line for _, line in group] for group in groups]
 
 
-def _reading_pairs(lines: Sequence[TextLine]) -> List[Tuple[TextLine, TextLine]]:
+def _reading_pairs(lines: Sequence[TextLine], turn: int) -> List[Tuple[TextLine, TextLine]]:
     """(строка с рамкой прямо стоящего листа, исходная строка) в порядке чтения."""
-    pairs = list(zip(_upright_lines(lines, page_turn(lines)), lines))
+    pairs = list(zip(_upright_lines(lines, turn), lines))
     pairs.sort(key=lambda pair: _reading_key(pair[0]))
     return pairs
 
 
-def lines_to_text(lines: Sequence[TextLine]) -> str:
+def lines_to_text(lines: Sequence[TextLine], turn: Optional[int] = None) -> str:
     """
     Текст абзаца. Моноширинный блок — это код или таблица, там перевод
-    строки несёт смысл, и склеивать строки пробелом нельзя.
+    строки несёт смысл, и склеивать строки пробелом нельзя. `turn` — как у
+    `group_lines`: поворот всей страницы, а не только этих строк.
     """
-    ordered = [line for _, line in _reading_pairs(lines)]
+    ordered = [line for _, line in _reading_pairs(lines, page_turn(lines) if turn is None else turn)]
     if any(line.mono for line in ordered):
         return "\n".join(line.text.rstrip() for line in ordered).strip()
     return " ".join(" ".join(line.text.split()) for line in ordered).strip()
@@ -472,22 +478,36 @@ def page_turn(lines: Sequence[TextLine]) -> int:
 
     Скан альбомной страницы без /Rotate Tesseract читает после поворота по
     OSD, а рамки строк отдаёт в системе исходного листа — там строки
-    вертикальные. Подписи размеров чертежа повёрнуты поодиночке и лист
-    не поворачивают: решает доля символов.
+    вертикальные. Решает доля букв, а не всех символов: подписи размеров
+    чертежа («100±0,2») повёрнуты поодиночке и почти без букв, и на
+    разреженном листе их цифры перевешивали бы штамп и требования. Лист
+    без букв считается по всем символам.
     """
+    lettered = [line for line in lines if _letters(line.text) >= _TURN_MIN_LETTERS]
     weights: Dict[int, int] = {}
     total = 0
-    for line in lines:
-        chars = line.char_count()
+    for line in lettered or lines:
+        chars = _letters(line.text) if lettered else line.char_count()
         total += chars
-        quarter = round(line.rotation / 90.0)
-        if abs(line.rotation - quarter * 90.0) <= _TURN_TOLERANCE:
-            turn = (quarter * 90) % 360
+        turn = _quarter(line.rotation)
+        if turn is not None:
             weights[turn] = weights.get(turn, 0) + chars
     if not total or not weights:
         return 0
     turn, chars = max(weights.items(), key=lambda item: item[1])
     return turn if turn and chars >= total * _PAGE_TURN_SHARE else 0
+
+
+def _letters(text: str) -> int:
+    return sum(1 for ch in text if ch.isalpha())
+
+
+def _quarter(rotation: float) -> Optional[int]:
+    """Угол письма -> 0/90/180/270, если он кратен 90° с допуском; иначе None."""
+    quarter = round(rotation / 90.0)
+    if abs(rotation - quarter * 90.0) > _TURN_TOLERANCE:
+        return None
+    return (quarter * 90) % 360
 
 
 def upright_bbox(bbox: Sequence[float], turn: int) -> List[float]:
@@ -508,10 +528,20 @@ def upright_bbox(bbox: Sequence[float], turn: int) -> List[float]:
 
 
 def _upright_lines(lines: Sequence[TextLine], turn: int) -> List[TextLine]:
-    """Копии строк с рамками прямо стоящего листа — только для геометрии."""
+    """
+    Копии строк с рамками прямо стоящего листа — только для геометрии.
+    Переводятся строки, написанные в направлении страницы; строки другого
+    направления (горизонтальная подпись на листе, повёрнутом боком)
+    остаются в системе страницы — как до поворота, иначе их «сверху вниз»
+    становилось бы «слева направо» и далёкие строки слипались бы в абзац.
+    """
     if not turn:
         return list(lines)
-    return [dataclasses.replace(line, bbox=upright_bbox(line.bbox, turn)) for line in lines]
+    return [
+        dataclasses.replace(line, bbox=upright_bbox(line.bbox, turn))
+        if _quarter(line.rotation) == turn else line
+        for line in lines
+    ]
 
 
 # ===========================================================================
@@ -661,7 +691,7 @@ def reconcile_with_text_layer(
             matched = assignments.get(id(block)) or []
             if block.type == "text":
                 if matched:
-                    _rebuild_text_block(block, matched, stats, source)
+                    _rebuild_text_block(block, matched, stats, source, turn)
                 else:
                     block.method = block.method or METHOD_PARSER_OCR
                 if not source.exact and block.text:
@@ -674,7 +704,7 @@ def reconcile_with_text_layer(
                 # которую сочла формулой, — на скане так уезжают заголовки
                 # и подписи целиком. Строки слоя внутри такой рамки раньше
                 # просто отбрасывались вместе с их текстом.
-                _fix_formula(block, matched, stats, source)
+                _fix_formula(block, matched, stats, source, turn)
             elif block.type == "table" and matched and _carries_own_text(block):
                 # Структуру таблицы строит MinerU — слой про неё ничего не
                 # знает. Но текст ячеек всё равно распознан, поэтому его
@@ -706,8 +736,8 @@ def reconcile_with_text_layer(
             page_blocks = [b for b in page_blocks if not any(b is d for d in dropped)]
         page_blocks.extend(extra_blocks)
 
-        for group in group_lines(leftovers):
-            text = lines_to_text(group)
+        for group in group_lines(leftovers, turn):
+            text = lines_to_text(group, turn)
             if not text:
                 continue
             stats.recovered_blocks += 1
@@ -772,13 +802,14 @@ def _rebuild_text_block(
     matched: Sequence[TextLine],
     stats: ReconcileStats,
     source: LayerSource = VECTOR_LAYER,
+    turn: int = 0,
 ) -> None:
     """
     Текст блока — из слоя. Если из слоя вышло заметно меньше, чем распознал
     парсер, сшивка сработала неверно (например, рамка съехала) — тогда
     оставляем распознанное и честно помечаем это как OCR.
     """
-    rebuilt = lines_to_text(matched)
+    rebuilt = lines_to_text(matched, turn)
     if not rebuilt:
         block.method = block.method or METHOD_PARSER_OCR
         return
@@ -805,6 +836,7 @@ def _fix_formula(
     matched: Sequence[TextLine],
     stats: "ReconcileStats",
     source: LayerSource = VECTOR_LAYER,
+    turn: int = 0,
 ) -> None:
     """
     Формульный блок, в котором лежит не формула, а проза под разметкой.
@@ -821,7 +853,7 @@ def _fix_formula(
     проверку человеку. Отдавать побуквенную разметку в индекс хуже.
     """
     stats.mangled_formulas += 1
-    rebuilt = lines_to_text(matched)
+    rebuilt = lines_to_text(matched, turn)
     if rebuilt:
         block.type = "text"
         block.text = rebuilt

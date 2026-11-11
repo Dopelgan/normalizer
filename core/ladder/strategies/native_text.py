@@ -22,7 +22,7 @@ from core import filetypes
 from core.ladder.base import Strategy
 from core.ladder.context import DocumentContext
 from core.models.parse_result import ParsedBlock, ParseResult
-from core.providers.text_layer import group_lines, lines_to_text, merge_line_bboxes
+from core.providers.text_layer import group_lines, lines_to_text, merge_line_bboxes, page_turn
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +58,9 @@ class PdfTextLayerStrategy(Strategy):
             if layer.overlay_only(page):
                 continue
             lines = [line for line in layer.lines(page) if line.char_count()]
-            for group in group_lines(lines):
-                text = lines_to_text(group)
+            turn = page_turn(lines)
+            for group in group_lines(lines, turn):
+                text = lines_to_text(group, turn)
                 if not text:
                     continue
                 blocks.append(ParsedBlock(
