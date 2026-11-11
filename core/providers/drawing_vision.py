@@ -60,6 +60,10 @@ _TURN_CORNER_GAP = 0.08
 _TURN_MIN_ASPECT = 1.5
 _TURN_STRICT_RATIO = 0.2
 _OSD_SIDE = 2400
+# Допуск «внутри рамки» для кандидатов в штамп, доли листа.
+_FRAME_SLACK = 0.01
+# Полоса у края листа, где ищутся линии внутренней рамки.
+_EDGE_BAND = 0.15
 # Перебор угла при выравнивании.
 _DESKEW_STEP = 0.2
 _DESKEW_GAIN = 1.03
@@ -158,12 +162,15 @@ def analyse(image, deskew_limit: Optional[float] = None) -> SheetLayout:
     # и модель читает надписи боком. Поворот выбирается по штампу и
     # проверяется: если на повёрнутом листе штамп не нашёлся, лист остаётся
     # как был.
-    turn, source = _orientation_turn(straight, frame, regions)
+    turn, source = _orientation_turn(straight, frame, regions, signals.get("inner_frame"))
     if turn:
         turned = straight.rotate(turn, expand=True, fillcolor="white")
         refound = _find_regions(turned)
-        marked = _mark_title_block(refound[1], refound[0]) if refound else []
-        if any(r.kind == KIND_TITLE_BLOCK for r in marked):
+        # Проверка независимая от выбора: на повёрнутом листе заново
+        # найденная сетка должна дать штамп на месте.
+        if refound and any(
+            _stamp_like(r, refound[0], turned.size, 0, strict=False) for r in refound[1]
+        ):
             straight = turned
             frame, regions, signals = refound
             signals["turn_source"] = source
@@ -197,6 +204,7 @@ def _find_regions(image) -> Optional[Tuple[Optional[List[float]], List[Region], 
     horizontals = _lines(mask, axis=0)
     verticals = _lines(mask, axis=1)
     frame = _frame(horizontals, verticals, width, height)
+    inner = _inner_frame(horizontals, verticals, width, height) if frame else None
     # Линии рамки формата в сетку таблиц не входят: штамп примыкает к рамке,
     # и без этого он склеивается с ней в одну группу во весь лист.
     inner_h = [h for h in horizontals if h[2] - h[1] < _FRAME_LINE * width]
@@ -207,6 +215,8 @@ def _find_regions(image) -> Optional[Tuple[Optional[List[float]], List[Region], 
         "vertical_lines": len(verticals),
         "tables": len(regions),
     }
+    if inner:
+        signals["inner_frame"] = inner
     return frame, regions, signals
 
 
@@ -363,6 +373,24 @@ def _frame(horizontals, verticals, width: int, height: int) -> Optional[List[flo
     if bottom - top < 0.5 or right - left < 0.5:
         return None
     return [round(left, 4), round(top, 4), round(right, 4), round(bottom, 4)]
+
+
+def _inner_frame(horizontals, verticals, width: int, height: int) -> Optional[List[float]]:
+    """
+    Внутренняя рамка: ближайшие к середине длинные линии с каждой стороны.
+    `_frame` берёт крайние — у скана это часто обрез листа, а между ним и
+    рамкой лежит поле подшивки с колонкой дополнительных граф.
+    """
+    long_h = [h[0] / height for h in horizontals if h[2] - h[1] >= 0.7 * width]
+    long_v = [v[0] / width for v in verticals if v[2] - v[1] >= 0.7 * height]
+    # Только у края: верхняя линия штампа A4 во всю ширину рамки тоже длинная.
+    top = [y for y in long_h if y <= _EDGE_BAND]
+    bottom = [y for y in long_h if y >= 1 - _EDGE_BAND]
+    left = [x for x in long_v if x <= _EDGE_BAND]
+    right = [x for x in long_v if x >= 1 - _EDGE_BAND]
+    if not (top and bottom and left and right):
+        return None
+    return [round(max(left), 4), round(max(top), 4), round(min(right), 4), round(min(bottom), 4)]
 
 
 def _tables(horizontals, verticals, width: int, height: int) -> List[Region]:
@@ -522,8 +550,18 @@ def _stamp_like(
     return short_side >= _TURN_STRICT_RATIO * long_side and columns >= 3
 
 
+def _within(bbox: Sequence[float], frame: Sequence[float]) -> bool:
+    return (
+        bbox[0] >= frame[0] - _FRAME_SLACK and bbox[1] >= frame[1] - _FRAME_SLACK
+        and bbox[2] <= frame[2] + _FRAME_SLACK and bbox[3] <= frame[3] + _FRAME_SLACK
+    )
+
+
 def _orientation_turn(
-    image, frame: Optional[List[float]], regions: Sequence[Region]
+    image,
+    frame: Optional[List[float]],
+    regions: Sequence[Region],
+    inner: Optional[List[float]] = None,
 ) -> Tuple[int, str]:
     """
     Поворот кратно 90° против часовой, после которого штамп окажется в
@@ -538,12 +576,26 @@ def _orientation_turn(
     """
     if not settings.DRAWING_AUTO_ROTATE or not regions:
         return 0, ""
-    size = image.size
-    if any(_stamp_like(r, frame, size, 0, strict=False) for r in regions):
+    # Лист считается стоящим верно, если в правом нижнем углу есть хоть
+    # какая-то таблица — тот же признак, по которому _mark_title_block
+    # отмечает штамп. Строже нельзя: штамп во всю ширину рамки A4 теряет
+    # длинные линии (они уходят в рамку) и распадается на куски, ни один
+    # из которых не вытянут, и тогда верный лист поворачивался бы.
+    corner_x, corner_y = _TITLE_BLOCK_CORNER
+    if any(
+        (r.bbox[0] + r.bbox[2]) / 2 >= corner_x and (r.bbox[1] + r.bbox[3]) / 2 >= corner_y
+        for r in regions
+    ):
         return 0, ""
+    # Таблица, выходящая за рамку, — колонка дополнительных граф на поле
+    # подшивки (или что-то, слитое с ней), а не штамп. Поле подшивки на
+    # повёрнутом листе может оказаться с любой стороны.
+    bounds = inner or frame
+    inside = [r for r in regions if not bounds or _within(r.bbox, bounds)]
+    size = image.size
     candidates = [
         turn for turn in (90, 180, 270)
-        if any(_stamp_like(r, frame, size, turn, strict=False) for r in regions)
+        if any(_stamp_like(r, frame, size, turn, strict=False) for r in inside)
     ]
     if not candidates:
         return 0, ""
@@ -564,7 +616,7 @@ def _orientation_turn(
 
     strict = [
         turn for turn in candidates
-        if any(_stamp_like(r, frame, size, turn, strict=True) for r in regions)
+        if any(_stamp_like(r, frame, size, turn, strict=True) for r in inside)
     ]
     if len(strict) == 1:
         return strict[0], "geometry"

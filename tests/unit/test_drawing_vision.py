@@ -205,3 +205,31 @@ class TestOrientation:
         box = vision._turn_bbox([0.75, 0.2, 0.75, 0.2], turn)
         assert box[0] == pytest.approx(x / turned.width, abs=0.02)
         assert box[1] == pytest.approx(y / turned.height, abs=0.02)
+
+
+class TestOrientationA4:
+    """
+    Регрессия ревью: штамп A4 во всю ширину рамки распадается на куски, а
+    его левая часть слипается с колонкой граф на поле подшивки в высокую
+    таблицу, которая при повороте на 90° выглядит штампом.
+    """
+
+    @pytest.mark.parametrize("osd", [None, (270, 9.0), (90, 9.0)])
+    def test_upright_a4_is_never_turned(self, monkeypatch, osd):
+        monkeypatch.setattr("core.providers.ocr_prepare.osd_rotation", lambda _: osd)
+        image = sheet.build_a4_portrait()
+        layout = vision.analyse(image)
+        assert layout.turn == 0 and layout.image is image
+        assert layout.title_block is not None
+
+    @pytest.mark.parametrize("scanned", [90, 180, 270])
+    def test_sideways_a4_is_not_turned_the_wrong_way(self, monkeypatch, scanned):
+        monkeypatch.setattr("core.providers.ocr_prepare.osd_rotation", lambda _: None)
+        layout = vision.analyse(sheet.build_a4_portrait().rotate(scanned, expand=True, fillcolor=255))
+        assert layout.turn in (0, (-scanned) % 360)
+
+    def test_inner_frame_skips_the_binding_margin(self):
+        found = vision._find_regions(sheet.build_a4_portrait())
+        inner = found[2]["inner_frame"]
+        assert inner[0] == pytest.approx(20 / 210, abs=0.01)   # рамка, а не обрез листа
+        assert inner[3] > 0.95                                  # линия штампа — не рамка
