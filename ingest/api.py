@@ -12,7 +12,7 @@ HTTP-интерфейс Parser по контракту RAG <-> Parser.
 
 import asyncio
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -31,7 +31,7 @@ from core.models.contract import (
     ResultsResponse,
     SyncPendingResponse,
 )
-from core.result_aggregator import get_request_state, init_request_state
+from core.result_aggregator import get_meta, get_request_state, init_request_state
 from core.workspace import configure_process_tempdir
 
 # Временные файлы процесса — в том сервиса, а не на слой контейнера.
@@ -105,14 +105,48 @@ def _dispatch(
         )
 
 
-def _reject_if_active(request_id: str) -> None:
-    """Повторное использование request_id незавершённого запроса — конфликт."""
+def _existing_request(
+    request_id: str, s3_fileids: List[str], event_id: str = "", dialog_id: str = ""
+) -> Optional[Dict[str, Any]]:
+    """
+    Состояние уже известного запроса, если повтор POST относится к нему же.
+
+    Повтор POST с request_id уже готового запроса раньше заново
+    инициализировал состояние: результат стирался, и файл разбирался ещё
+    раз (на GPU — повторный OCR). Теперь:
+
+    - запроса нет или он закончился ошибкой — None, запуск заново
+      (повтор после ошибки — это и есть ретрай RAG с тем же request_id);
+    - запрос ещё идёт — 409, как и раньше по контракту;
+    - запрос готов (completed/partial), тот же набор файлов и те же
+      event_id/dialog_id — возвращается его состояние, разбор не ставится;
+    - готовый запрос с другим содержимым — 409: это чужой запрос.
+    """
     state = get_request_state(request_id)
-    if state and state["status"] in ACTIVE_STATUSES:
+    if state is None or state["status"] == "error":
+        return None
+    if state["status"] in ACTIVE_STATUSES:
         raise HTTPException(
             status_code=409,
             detail=f"Запрос {request_id} уже выполняется. Используйте новый request_id.",
         )
+    meta_files = list((get_meta(request_id) or {}).get("s3_fileids") or [])
+    same = (
+        sorted(meta_files) == sorted(s3_fileids)
+        and (state.get("event_id") or "") == (event_id or "")
+        and (state.get("dialog_id") or "") == (dialog_id or "")
+    )
+    if not same:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Запрос {request_id} уже существует с другим содержимым. "
+                   "Используйте новый request_id.",
+        )
+    logger.info(
+        "Повтор запроса %s (статус %s) — отдаём текущее состояние без нового разбора",
+        request_id, state["status"],
+    )
+    return state
 
 
 def _documents(state: Dict[str, Any]) -> List[DocumentResult]:
@@ -137,18 +171,21 @@ async def parse_sync(request: ParseRequest):
     504 с текущим состоянием — результат при этом никуда не пропадает и
     остаётся доступен через /internal/v1/parse/results/{request_id}.
     """
-    _reject_if_active(request.request_id)
-
-    items = [IntakeFile(s3_fileid=fileid) for fileid in request.s3_fileid]
-    await asyncio.to_thread(
-        init_request_state,
-        request.request_id, request.s3_fileid, "create",
+    existing = await asyncio.to_thread(
+        _existing_request, request.request_id, list(request.s3_fileid),
         dialog_id=request.dialog_id,
     )
-    await asyncio.to_thread(
-        _dispatch, request.request_id, items, request.dialog_id, "",
-        queue=parse_queue(interactive=True),
-    )
+    if existing is None:
+        items = [IntakeFile(s3_fileid=fileid) for fileid in request.s3_fileid]
+        await asyncio.to_thread(
+            init_request_state,
+            request.request_id, request.s3_fileid, "create",
+            dialog_id=request.dialog_id,
+        )
+        await asyncio.to_thread(
+            _dispatch, request.request_id, items, request.dialog_id, "",
+            queue=parse_queue(interactive=True),
+        )
 
     deadline = asyncio.get_event_loop().time() + settings.PROCESSING_TIMEOUT_SECONDS
     while True:
@@ -181,23 +218,29 @@ async def parse_sync(request: ParseRequest):
 @app.post("/internal/v1/parse/background", response_model=BackgroundAcceptedResponse, status_code=202)
 async def parse_background(request: BackgroundParseRequest):
     """Фоновая обработка: сразу 202, результат забирается поллингом."""
-    _reject_if_active(request.request_id)
-
     items = request.items
     operations = {item.s3_fileid: item.operation for item in items}
     # Операция пакета осталась в контракте одним полем: когда файлы просят
     # разное, общей операции у пакета нет, и выдумывать её нельзя.
     common = next(iter(set(operations.values()))) if len(set(operations.values())) == 1 else None
 
-    await asyncio.to_thread(
-        init_request_state,
-        request.request_id, [item.s3_fileid for item in items], common,
-        operations=operations, event_id=request.event_id,
+    existing = await asyncio.to_thread(
+        _existing_request, request.request_id, [item.s3_fileid for item in items],
+        event_id=request.event_id,
     )
-    await asyncio.to_thread(
-        _dispatch, request.request_id, items, "", request.event_id,
-        queue=parse_queue(interactive=False),
-    )
+    # Повтор готового запроса — тот же 202 без нового разбора. Статус в
+    # подтверждении остаётся "queued": клиент RAG принимает в нём только
+    # это значение, а настоящее состояние отдаёт GET results.
+    if existing is None:
+        await asyncio.to_thread(
+            init_request_state,
+            request.request_id, [item.s3_fileid for item in items], common,
+            operations=operations, event_id=request.event_id,
+        )
+        await asyncio.to_thread(
+            _dispatch, request.request_id, items, "", request.event_id,
+            queue=parse_queue(interactive=False),
+        )
 
     return BackgroundAcceptedResponse(
         request_id=request.request_id,

@@ -49,11 +49,15 @@ from core.result_aggregator import (
     claim_publication,
     get_request_state,
     mark_started,
+    parse_stale_after_seconds,
     put_document_result,
 )
 from core.result_publisher import publish_result
 
 logger = logging.getLogger(__name__)
+
+# Пауза между проверками, пока тот же файл разбирает другая задача.
+PEER_WAIT_SECONDS = 60
 PAGE_COVERAGE_VERSION = 1
 
 
@@ -294,6 +298,7 @@ def process_document(
     operation: str = "create",
     dialog_id: str = "",
     event_id: str = "",
+    waited_for_peer: bool = False,
 ) -> Dict[str, Any]:
     """
     Обрабатывает один файл пакета. Возвращает краткий статус для логов.
@@ -302,7 +307,7 @@ def process_document(
     сопоставляется с исходным событием; в синхронном разборе его нет, там
     есть `dialog_id`. Один вместо другого не подставляется.
     """
-    mark_started(request_id)
+    mark_started(request_id, s3_fileid)
     doc_id = generate_doc_id(s3_fileid)
     storage = StorageProviderFactory.default()
     session = SessionLocal()
@@ -338,7 +343,10 @@ def process_document(
             doc_repo = DocumentRepository(session)
             document = doc_repo.get(doc_id, for_update=True)
 
-            if (document is not None and document.status == "indexed" and operation != "update"
+            # После ожидания чужого разбора того же файла его результат
+            # годится и для update: файл читался тот же, и свежее не будет.
+            if (document is not None and document.status == "indexed"
+                    and (operation != "update" or waited_for_peer)
                     and (document.extra_data or {}).get("processing_profile_version") == PROCESSING_PROFILE_VERSION
                     and (document.extra_data or {}).get("page_coverage_version") == PAGE_COVERAGE_VERSION):
                 logger.info("Документ %s уже проиндексирован, отдаём из БД", doc_id)
@@ -350,13 +358,33 @@ def process_document(
                 return {"status": "already_processed", "doc_id": doc_id}
 
             if document is not None and document.status == "pending":
-                if doc_repo.is_stale(document, settings.PROCESSING_TIMEOUT_SECONDS):
+                # Порог — жёсткий лимит разбора с запасом, а не таймаут
+                # синхронного ответа (900 с): раньше живой часовой разбор
+                # считался зависшим и запускался второй раз.
+                if doc_repo.is_stale(document, parse_stale_after_seconds()):
                     logger.warning("Документ %s завис в pending, перезапускаем", doc_id)
                 else:
+                    # Файл сейчас разбирает другая задача (повторная доставка
+                    # брокером или другой запрос с тем же файлом). Второй
+                    # разбор — двойной OCR на общем GPU. Ждём первый и отдаём
+                    # его результат из БД; если он умрёт, документ станет
+                    # «зависшим», и следующая попытка начнёт заново.
                     logger.warning(
-                        "Документ %s уже обрабатывается другим запросом — "
-                        "обрабатываем повторно, чтобы ответить на свой request_id", doc_id
+                        "Документ %s уже разбирается другой задачей — ждём %d с",
+                        doc_id, PEER_WAIT_SECONDS,
                     )
+                    # Новая задача, а не self.retry: ожидание не должно
+                    # тратить бюджет повторов на настоящие ошибки.
+                    process_document.apply_async(
+                        kwargs={
+                            "request_id": request_id, "s3_fileid": s3_fileid,
+                            "operation": operation, "dialog_id": dialog_id,
+                            "event_id": event_id, "waited_for_peer": True,
+                        },
+                        countdown=PEER_WAIT_SECONDS,
+                        queue=(self.request.delivery_info or {}).get("routing_key"),
+                    )
+                    return {"status": "waiting_for_peer", "doc_id": doc_id}
 
             if document is None:
                 doc_repo.create({

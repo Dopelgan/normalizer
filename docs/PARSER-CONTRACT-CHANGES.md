@@ -387,3 +387,10 @@ deskewed_page`); при `turn != 0` они не совпадают с исход
 векторного чертежа — категории `title_block`/`material`). Поля и схема не
 меняются; `position.bbox` по-прежнему в долях страницы, как её видно
 (с учётом `/Rotate`), без поворота.
+
+## Повтор `request_id` и пропавшая задача (12.11.2026)
+
+- Повтор `POST /internal/v1/parse/background` или `POST /internal/v1/parse` с `request_id` **готового** запроса (`completed`/`partial`) и тем же набором `s3_fileid` и `event_id`/`dialog_id` не запускает разбор заново: фоновая ручка отвечает тем же `202` (`status: "queued"`, как и раньше), синхронная — готовым результатом. Результат берётся `GET /internal/v1/parse/results/{request_id}`.
+- Повтор с `request_id` запроса, закончившегося `error`, запускает разбор заново (ретрай с тем же `request_id`).
+- Повтор незавершённого запроса — `409`, как и раньше; повтор готового запроса с другим набором файлов или другим `event_id`/`dialog_id` — тоже `409`.
+- Если задача файла стартовала дольше `PARSE_TASK_TIME_LIMIT + PARSE_STALE_MARGIN_SECONDS` назад и результата не оставила (жёсткий лимит, OOM, SIGKILL), файл получает документ со `status: "error"` и ошибкой `PARSER_TIMEOUT` (`retryable: true`), и запрос перестаёт быть `processing`.

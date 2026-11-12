@@ -13,6 +13,17 @@ from core.workspace import configure_process_tempdir
 # исходники, растры страниц), поэтому каталог задаётся до старта задач.
 configure_process_tempdir()
 
+
+def broker_visibility_timeout() -> int:
+    """Срок возврата неподтверждённой задачи брокером, с.
+
+    Не меньше 2 × PARSE_TASK_TIME_LIMIT: задача с запасом успевает
+    завершиться (или быть убитой по лимиту) раньше, чем брокер отдаст её
+    второму воркеру, а повторная доставка видит документ уже зависшим.
+    """
+    floor = 2 * settings.PARSE_TASK_TIME_LIMIT
+    return max(settings.CELERY_VISIBILITY_TIMEOUT or floor, floor)
+
 app = Celery(
     "normalizer",
     broker=settings.CELERY_BROKER_URL,
@@ -31,6 +42,11 @@ app.conf.update(
     task_time_limit=settings.CELERY_TASK_TIME_LIMIT,
     task_soft_time_limit=settings.CELERY_TASK_SOFT_TIME_LIMIT,
     result_expires=settings.RESULT_TTL_SECONDS,
+    # С acks_late Redis возвращает неподтверждённую задачу в очередь через
+    # visibility_timeout (по умолчанию 3600 с). Разбор живёт до
+    # PARSE_TASK_TIME_LIMIT (3900 с), и долгий скан получал второго
+    # исполнителя — двойной OCR на занятом GPU. Срок берётся с запасом.
+    broker_transport_options={"visibility_timeout": broker_visibility_timeout()},
 )
 
 # Очереди объявляются здесь, иначе `celery worker -Q ml_gpu` слушает
