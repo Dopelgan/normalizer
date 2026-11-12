@@ -352,3 +352,80 @@ class TestSidewaysScan:
         assert "title_block" in [what for what, _, _ in processor.qwen.asked]
         assert result["payload"]["layout"]["turn"] == 270
         assert result["payload"]["title_block"]["Наименование"] == "Вилка"
+
+
+class TestTextDocumentPictures:
+    """Классификатор «чертёж или текст»: логотип и печать в договоре — не чертёж."""
+
+    LOGO = [0.13, 0.13, 0.31, 0.23]       # ~2 % листа: логотип, печать, гриф
+    FIGURE = [0.15, 0.10, 0.90, 0.60]     # рисунок в приложении ТЗ
+
+    @staticmethod
+    def text(page, chars=900):
+        return Fragment(
+            fragment_id=f"doc-1-frag-t{page}", type="text",
+            content=Content(text="Текст договора поставки. " * (chars // 25)),
+            position=Position(page=page, bbox=[0.1, 0.1, 0.9, 0.9], order=0),
+            confidence=1.0, completeness=1.0,
+            provenance=Provenance(method="text_layer_extraction", strategy_level=2,
+                                  source="vector_pdf"),
+        )
+
+    @staticmethod
+    def picture(bbox, page=1):
+        fragment = image_fragment()
+        fragment.position.bbox = list(bbox)
+        fragment.position.page = page
+        return fragment
+
+    @pytest.fixture
+    def classifier(self, monkeypatch):
+        from core.config import settings
+        monkeypatch.setattr(settings, "DRAWING_PAGE_CLASSIFIER_ENABLED", True)
+
+    def model(self, storage):
+        qwen = FakeQwen(reading=reading(annotation("title_block", "НТА-Проект")))
+        return DrawingProcessor(storage, qwen=qwen), qwen
+
+    def test_flag_off_logo_goes_to_model(self, storage):
+        processor, qwen = self.model(storage)
+        out = processor.enrich_fragments([self.text(1), self.picture(self.LOGO)],
+                                         {"classification": {"genre": "text"}})
+        assert qwen.asked
+        assert out[1].type == "drawing"
+
+    def test_logo_in_text_document_stays_picture(self, storage, classifier):
+        processor, qwen = self.model(storage)
+        out = processor.enrich_fragments([self.text(1), self.picture(self.LOGO)],
+                                         {"classification": {"genre": "mixed"}})
+        assert not qwen.asked
+        assert out[1].type == "image"
+        assert not out[1].review_required
+
+    def test_figure_in_text_document_still_read(self, storage, classifier):
+        processor, qwen = self.model(storage)
+        out = processor.enrich_fragments([self.text(1), self.picture(self.FIGURE)],
+                                         {"classification": {"genre": "text"}})
+        assert qwen.asked
+        assert out[1].type == "drawing"
+
+    def test_drawing_document_keeps_small_views(self, storage, classifier):
+        processor, qwen = self.model(storage)
+        out = processor.enrich_fragments([self.text(1), self.picture(self.LOGO)],
+                                         {"classification": {"genre": "drawing"}})
+        assert qwen.asked
+        assert out[1].type == "drawing"
+
+    def test_scan_with_little_text_keeps_small_views(self, storage, classifier):
+        # Скан СБ, не узнанный растровым детектором: штамп и пара подписей.
+        processor, qwen = self.model(storage)
+        out = processor.enrich_fragments([self.text(1, chars=100), self.picture(self.LOGO)],
+                                         {"classification": {"genre": "unknown"}})
+        assert qwen.asked
+        assert out[1].type == "drawing"
+
+    def test_bbox_not_in_page_shares_is_not_judged(self, storage, classifier):
+        processor, qwen = self.model(storage)
+        out = processor.enrich_fragments([self.text(1), self.picture([10, 10, 60, 40])],
+                                         {"classification": {"genre": "text"}})
+        assert qwen.asked

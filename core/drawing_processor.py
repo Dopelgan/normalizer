@@ -91,6 +91,17 @@ _MODEL_ONLY = 0.75       # правило не знает такой катег�
 _DISAGREED = 0.6         # разошлись: поле остаётся, но доверия меньше
 _FROM_REGION = 0.85      # прочитано в области, найденной геометрией
 
+# Классификатор «чертёж или текст» (DRAWING_PAGE_CLASSIFIER_ENABLED). В
+# текстовом документе картинка меньше этой доли листа — логотип, печать,
+# подпись, гриф «Утверждаю», QR-код. Qwen-VL делал из них «основную надпись»
+# чертежа («Ген», «202д», «НТА-прибор»). Вид или схема в ТЗ и ПМ занимают
+# десятую часть листа и больше и по-прежнему разбираются как чертёж.
+_TEXT_DOC_MIN_FIGURE_AREA = 0.06
+# Документ текстовый, если в среднем на страницу у него столько символов
+# текста и таблиц. Скан сборочного чертежа, который растровый детектор не
+# узнал, — это штамп и пара подписей: до порога он не дотягивает.
+_TEXT_DOC_MIN_CHARS_PER_PAGE = 300
+
 
 class DrawingProcessor:
     """Изображение чертежа -> структурированные поля -> фрагмент `drawing`."""
@@ -260,6 +271,7 @@ class DrawingProcessor:
         чертежей: фрагмента `image` в таком документе нет.
         """
         result: List[Fragment] = []
+        text_document = settings.DRAWING_PAGE_CLASSIFIER_ENABLED and _is_text_document(fragments, metadata)
         for fragment in fragments:
             # Векторный чертёж уже разобран парсером по текстовому слою —
             # там точные значения и углы, читать нечего.
@@ -267,6 +279,11 @@ class DrawingProcessor:
                 result.append(fragment)
                 continue
             if fragment.type != "image" or not fragment.content.image_ref:
+                result.append(fragment)
+                continue
+            if text_document and _is_small_picture(fragment):
+                # Логотип или печать в тексте: чертежом не становится и
+                # вызова модели не стоит. Фрагмент остаётся картинкой.
                 result.append(fragment)
                 continue
             left = deadline.remaining()
@@ -482,6 +499,34 @@ class DrawingProcessor:
 # ===========================================================================
 # Поля
 # ===========================================================================
+
+def _is_text_document(fragments: List[Fragment], metadata: Dict[str, Any]) -> bool:
+    """
+    Текстовый документ (договор, ТЗ, ТУ, письмо, протокол), а не чертёж:
+    лестница не назвала его чертежом, и текста в нём в среднем не меньше
+    `_TEXT_DOC_MIN_CHARS_PER_PAGE` символов на страницу.
+    """
+    if (metadata.get("classification") or {}).get("genre") == GENRE_DRAWING:
+        return False
+    chars, pages = 0, set()
+    for fragment in fragments:
+        if fragment.position is not None:
+            pages.add(fragment.position.page)
+        if fragment.type in ("text", "table"):
+            chars += len("".join((fragment.content.text or "").split()))
+    return bool(pages) and chars / len(pages) >= _TEXT_DOC_MIN_CHARS_PER_PAGE
+
+
+def _is_small_picture(fragment: Fragment) -> bool:
+    """Картинка меньше `_TEXT_DOC_MIN_FIGURE_AREA` листа (bbox в долях листа)."""
+    bbox = fragment.position.bbox if fragment.position is not None else None
+    if not bbox or len(bbox) != 4:
+        return False
+    x0, y0, x1, y1 = (float(v) for v in bbox)
+    if max(x0, y0, x1, y1) > 1.0 or min(x0, y0, x1, y1) < 0.0:
+        return False      # не в долях листа — размер неизвестен
+    return (x1 - x0) * (y1 - y0) < _TEXT_DOC_MIN_FIGURE_AREA
+
 
 def _render_pdf_page(data: bytes, page: int):
     """Страница PDF как растр в рабочем разрешении чертежей."""

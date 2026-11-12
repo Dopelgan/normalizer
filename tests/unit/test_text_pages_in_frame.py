@@ -381,3 +381,68 @@ class TestGridOnlyPage:
         verdict = _score_page(_Broken(TABLE_CELLS, grid=200), 66)
         assert "geometry" not in verdict.signals
         assert verdict.is_drawing  # ячейки — не проза, прежний вердикт
+
+
+# ------------------------------------------- классификатор листа (флаг 2)
+FIGURE_PAGE = [
+    "Приложение Б (справочное)",
+    "Общий вид, габаритные размеры установки подготовки проб",
+    "Поз.", "Наименование патрубка", "Материал", "Тип сварного соединения",
+    "I", "Вход пробы", "12Х18Н10Т", "С-22",
+    "II", "Выход охлаждающей воды", "20", "С-17",
+    "Изм.", "Лист", "№ докум.", "Подп.", "Дата", "ТАДУ 421451.003 ТЗ", "Лист", "87",
+]
+
+DRAWING_FORM_STAMP = [
+    "Корпус", "Лит.", "Масса", "Масштаб", "1:2",
+    "Изм.", "Лист", "№ докум.", "Подп.", "Дата", "ТАДУ 305179.001", "Лист", "1",
+]
+
+
+@pytest.fixture
+def page_classifier(text_in_frame, monkeypatch):
+    monkeypatch.setattr(settings, "DRAWING_PAGE_CLASSIFIER_ENABLED", True)
+
+
+class TestPageClassifier:
+    """Лист ТЗ/ПМ/ТУ с рисунком-картинкой: текст, а не чертёж (флаг 2)."""
+
+    IMAGE = (60, 160, 560, 560)   # треть листа: рисунок в приложении ТЗ
+
+    def test_flag_off_figure_page_stays_drawing(self, text_in_frame):
+        verdict = _score_page(_GeometryPage(FIGURE_PAGE, image_bbox=self.IMAGE), 87)
+        assert verdict.is_drawing
+        assert verdict.signals["geometry"]["lines_only"] is True
+
+    def test_figure_in_text_page_is_text(self, page_classifier):
+        verdict = _score_page(_GeometryPage(FIGURE_PAGE, image_bbox=self.IMAGE), 87)
+        assert not verdict.is_drawing
+        assert verdict.signals["text_in_frame"] is True
+        assert verdict.signals["figure_in_text_page"] is True
+
+    def test_drawing_form_stamp_stays_drawing(self, page_classifier):
+        # Штамп формы 1 (графы «Масса», «Масштаб») — чертёж, хоть вид и картинкой.
+        verdict = _score_page(
+            _GeometryPage(FIGURE_PAGE + DRAWING_FORM_STAMP, image_bbox=self.IMAGE), 1)
+        assert verdict.is_drawing
+
+    def test_mass_in_prose_is_not_a_stamp(self, page_classifier):
+        lines = FIGURE_PAGE + ["Масса установки не более 350 кг, масштаб рисунка условный."]
+        assert not _score_page(_GeometryPage(lines, image_bbox=self.IMAGE), 87).is_drawing
+
+    def test_dimensions_over_picture_stay_drawing(self, page_classifier):
+        # Вид картинкой, а размеры Ø/R/резьба — текстом: это чертёж.
+        verdict = _score_page(_GeometryPage(DRAWING_PAGE, image_bbox=self.IMAGE), 29)
+        assert verdict.is_drawing
+
+    def test_page_mostly_picture_stays_drawing(self, page_classifier):
+        verdict = _score_page(_GeometryPage(FIGURE_PAGE, image_bbox=(20, 14, 580, 828)), 87)
+        assert verdict.is_drawing
+
+    def test_curves_stay_drawing(self, page_classifier):
+        verdict = _score_page(
+            _GeometryPage(FIGURE_PAGE, grid=150, curves=60, image_bbox=self.IMAGE), 87)
+        assert verdict.is_drawing
+
+    def test_flag_default_off(self):
+        assert settings.model_fields["DRAWING_PAGE_CLASSIFIER_ENABLED"].default is False

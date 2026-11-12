@@ -69,6 +69,21 @@ _GRID_MAX_IMAGE_COVERAGE = 0.15
 # Доли на листе с тысячами отрезков пропустят десятки кривых и наклонных —
 # а это уже контакты и клеммы схемы Э3. Поэтому и абсолютный предел.
 _GRID_MAX_NON_ORTHOGONAL = 40
+# Классификатор листа (флаг DRAWING_PAGE_CLASSIFIER_ENABLED, поверх
+# DRAWING_TEXT_IN_FRAME_ENABLED). Лист ТЗ, ПМ, ТУ со вставленным рисунком:
+# вся векторная графика — та же сетка рамки, штампа и таблиц, а рисунок
+# лежит картинкой на трети-половине листа. Порог картинок 15 % отправлял такой
+# лист в чертежи целиком, и весь его текст становился полями чертежа. Сам
+# рисунок от этого не теряется: MinerU выделит его картинкой, и он пойдёт
+# в Qwen-VL отдельным фрагментом.
+_FIGURE_MAX_IMAGE_COVERAGE = 0.6
+_FIGURE_MAX_DRAWING_MARKS = 5
+# Штамп чертежа (ГОСТ 2.104, форма 1) отличается от штампа текстового
+# документа (формы 2 и 2а) графами «Масса» и «Масштаб». Подпись графы —
+# отдельная короткая строка; в прозе эти слова стоят внутри предложения.
+_DRAWING_FORM_LABEL = re.compile(
+    r"^\s*(?:Масса|Масштаб|Mass|Weight|Scale)\s*$", re.IGNORECASE | re.MULTILINE
+)
 
 # Штамп по ГОСТ 2.104 — в правом нижнем углу листа.
 _TITLE_BLOCK_REGION = (0.55, 0.78, 1.0, 1.0)
@@ -210,6 +225,10 @@ def _score_page(page: Any, page_no: int) -> DrawingPage:
         if grid is not None and grid["grid_only"]:
             signals["text_in_frame"] = True
             score = min(score, _TEXT_IN_FRAME_SCORE)
+        elif grid is not None and _page_classifier_enabled() and _text_page_with_figure(grid, text):
+            signals["text_in_frame"] = True
+            signals["figure_in_text_page"] = True
+            score = min(score, _TEXT_IN_FRAME_SCORE)
         elif path_count < _TEXT_IN_FRAME_MAX_PATHS:
             verdict = page_prose.assess(text.splitlines())
             signals["prose"] = verdict.signals
@@ -256,21 +275,49 @@ def _grid_geometry(page: Any, drawings: Sequence[Dict[str, Any]],
     curve_share = curves / total
     diagonal_share = diagonal / total
     image_coverage = covered / area
+    lines_only = (curves + diagonal <= _GRID_MAX_NON_ORTHOGONAL
+                  and curve_share <= _GRID_MAX_CURVE_SHARE
+                  and diagonal_share <= _GRID_MAX_DIAGONAL_SHARE)
     return {
         "curve_share": round(curve_share, 3),
         "diagonal_share": round(diagonal_share, 3),
         "image_coverage": round(image_coverage, 3),
-        "grid_only": (curves + diagonal <= _GRID_MAX_NON_ORTHOGONAL
-                      and curve_share <= _GRID_MAX_CURVE_SHARE
-                      and diagonal_share <= _GRID_MAX_DIAGONAL_SHARE
-                      and image_coverage <= _GRID_MAX_IMAGE_COVERAGE),
+        "lines_only": lines_only,
+        "grid_only": lines_only and image_coverage <= _GRID_MAX_IMAGE_COVERAGE,
     }
+
+
+def _text_page_with_figure(grid: Dict[str, Any], text: str) -> bool:
+    """
+    Лист текстового документа со вставленным рисунком: векторная графика —
+    одна сетка, картинки не больше `_FIGURE_MAX_IMAGE_COVERAGE` листа, штамп
+    не чертёжный. Чертёж, вставленный в ТЗ целиком со своим штампом формы 1,
+    и чертёж с видом-картинкой в рамке остаются чертежами.
+    """
+    if not (grid["lines_only"]
+            and grid["image_coverage"] <= _FIGURE_MAX_IMAGE_COVERAGE
+            and not _DRAWING_FORM_LABEL.search(text)):
+        return False
+    # Размеры текстом поверх вида-картинки (Ø, R, резьба, шероховатость) —
+    # это чертёж. Простые числа не в счёт: ими полны таблицы нагрузок в ТЗ.
+    marks = sum(
+        1 for line in text.splitlines()
+        if _DIAMETER.search(line) or _RADIUS.search(line.strip())
+        or _THREAD.search(line) or _ROUGHNESS.search(line)
+    )
+    return marks < _FIGURE_MAX_DRAWING_MARKS
 
 
 def _text_in_frame_enabled() -> bool:
     from core.config import settings
 
     return bool(getattr(settings, "DRAWING_TEXT_IN_FRAME_ENABLED", False))
+
+
+def _page_classifier_enabled() -> bool:
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_PAGE_CLASSIFIER_ENABLED", False))
 
 
 def _has_format_frame(drawings: Sequence[Dict[str, Any]], page_area: float) -> bool:
