@@ -293,3 +293,91 @@ class TestLowConfidenceOcr:
         assert settings.OCR_LAYER_DROP_LOW_CONFIDENCE is False
         assert settings.DRAWING_TEXT_IN_FRAME_ENABLED is False
         assert settings.FRAME_TABLE_GUARD_ENABLED is False
+
+
+# ------------------------------------------- сетка таблиц без чертежа
+@dataclass
+class _Point:
+    x: float
+    y: float
+
+
+TABLE_CELLS = [
+    "Наименование", "Кол.", "Примечание", "Клапан запорный Ду10", "28",
+    "Фильтр 400 мм", "1", "Расходомер", "2", "Манометр электронный", "1",
+    "Изм.", "Лист", "№ докум.", "Подп.", "Дата", "ТАДУ 421451.003 ПМ1", "Лист", "66",
+]
+
+
+class _GeometryPage(_Page):
+    """Лист с известным составом путей (как у PyMuPDF `items`) и картинками."""
+
+    def __init__(self, lines, grid=200, curves=0, diagonals=0, image_bbox=None):
+        super().__init__(lines)
+        paths = [{"rect": _Rect(20, 14, 580, 828),
+                  "items": [("re", _Rect(20, 14, 580, 828), 1)]}]
+        for row in range(10):
+            y = 760 + row * 6
+            paths.append({"rect": _Rect(340, y, 580, y + 0.5),
+                          "items": [("l", _Point(340, y), _Point(580, y))]})
+        for i in range(grid):  # сетка таблицы: только горизонтали и вертикали
+            x = 40 + i % 500
+            paths.append({"rect": _Rect(x, 100, x + 0.5, 700),
+                          "items": [("l", _Point(x, 100), _Point(x, 700))]})
+        for i in range(curves):  # окружности и дуги вида
+            paths.append({"rect": _Rect(200, 200, 260, 260),
+                          "items": [("c", _Point(200, 230), _Point(200, 200),
+                                     _Point(260, 200), _Point(260, 230))]})
+        for i in range(diagonals):  # штриховка разреза
+            paths.append({"rect": _Rect(300, 300, 340, 340),
+                          "items": [("l", _Point(300 + i % 30, 300), _Point(340, 340 - i % 30))]})
+        self._paths = paths
+        self._images = [] if image_bbox is None else [{"bbox": image_bbox}]
+
+    def get_image_info(self):
+        return self._images
+
+
+class TestGridOnlyPage:
+    def test_flag_off_table_in_frame_stays_drawing(self):
+        assert _score_page(_GeometryPage(TABLE_CELLS), 66).is_drawing
+
+    def test_table_in_frame_is_text_page(self, text_in_frame):
+        # ПМ1 (изм. 4), ТЗ (анг), ПОК: таблица в рамке, строки ячеек короткие —
+        # прозой не считается, но вся графика — сетка.
+        assert not page_prose.assess(TABLE_CELLS).is_prose
+        verdict = _score_page(_GeometryPage(TABLE_CELLS, grid=900), 66)
+        assert not verdict.is_drawing
+        assert verdict.signals["text_in_frame"] is True
+        assert verdict.signals["geometry"]["grid_only"] is True
+
+    def test_vector_drawing_with_curves_stays_drawing(self, text_in_frame):
+        verdict = _score_page(_GeometryPage(DRAWING_PAGE, grid=150, curves=60), 1)
+        assert verdict.is_drawing
+        assert "text_in_frame" not in verdict.signals
+
+    def test_hatched_section_stays_drawing(self, text_in_frame):
+        verdict = _score_page(_GeometryPage(DRAWING_PAGE, grid=150, diagonals=40), 1)
+        assert verdict.is_drawing
+
+    def test_inserted_drawing_image_stays_drawing(self, text_in_frame):
+        # ТУ 681821.001, прил. А: габаритный чертёж вставлен картинкой в рамку.
+        verdict = _score_page(_GeometryPage(DRAWING_PAGE, grid=120,
+                                            image_bbox=(60, 60, 560, 520)), 29)
+        assert verdict.is_drawing
+        assert verdict.signals["geometry"]["image_coverage"] > 0.15
+
+    def test_large_orthogonal_scheme_with_terminals_stays_drawing(self, text_in_frame):
+        # Схема Э3: тысячи проводов, доли кривых < 2 %, но клемм-кружков десятки.
+        verdict = _score_page(_GeometryPage(DRAWING_PAGE, grid=3000, curves=50), 1)
+        assert verdict.signals["geometry"]["curve_share"] <= 0.02
+        assert verdict.is_drawing
+
+    def test_unreadable_images_fall_back_to_prose(self, text_in_frame):
+        class _Broken(_GeometryPage):
+            def get_image_info(self):
+                raise RuntimeError("broken xref")
+
+        verdict = _score_page(_Broken(TABLE_CELLS, grid=200), 66)
+        assert "geometry" not in verdict.signals
+        assert verdict.is_drawing  # ячейки — не проза, прежний вердикт

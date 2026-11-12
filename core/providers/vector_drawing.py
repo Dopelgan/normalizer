@@ -50,6 +50,18 @@ _TEXT_IN_FRAME_SCORE = 0.4  # проза в рамке ЕСКД: ниже пор
 # и пара таблиц — десятки-сотни. Сборочный чертёж с длинными техническими
 # требованиями остаётся чертежом, сколько бы прозы на нём ни было.
 _TEXT_IN_FRAME_MAX_PATHS = 400
+# Лист, где вся векторная графика — горизонтальные и вертикальные отрезки
+# (рамка, штамп, сетка таблиц), а картинок почти нет, — таблица или текст в
+# рамке. У чертежа есть окружности и дуги (кривые), штриховка и выноски
+# (наклонные отрезки) или вставленное изображение вида. На реальных PDF
+# заказчика (ТЗ, ПМ1, ТУ, ПОК, СТО) такие листы — 90 % ложных «чертежей»,
+# и prose-признак их не ловит: короткие строки ячеек — не предложения.
+_GRID_MAX_CURVE_SHARE = 0.02
+_GRID_MAX_DIAGONAL_SHARE = 0.02
+_GRID_MAX_IMAGE_COVERAGE = 0.15
+# Доли на листе с тысячами отрезков пропустят десятки кривых и наклонных —
+# а это уже контакты и клеммы схемы Э3. Поэтому и абсолютный предел.
+_GRID_MAX_NON_ORTHOGONAL = 40
 
 # Штамп по ГОСТ 2.104 — в правом нижнем углу листа.
 _TITLE_BLOCK_REGION = (0.55, 0.78, 1.0, 1.0)
@@ -175,17 +187,71 @@ def _score_page(page: Any, page_no: int) -> DrawingPage:
         score += 0.15
 
     score = min(1.0, score)
-    if (score >= _DRAWING_SCORE and path_count < _TEXT_IN_FRAME_MAX_PATHS
-            and _text_in_frame_enabled()):
-        # Рамка и штамп есть и у ПОК, ТУ, ТЗ, писем. Если на листе проза,
-        # это страница текста: её поля чертежа и Qwen-VL только портят.
-        verdict = page_prose.assess(text.splitlines())
-        signals["prose"] = verdict.signals
-        if verdict.is_prose:
+    if score >= _DRAWING_SCORE and _text_in_frame_enabled():
+        # Рамка и штамп есть и у ПОК, ТУ, ТЗ, писем. Если на листе проза или
+        # одна сетка таблиц, это страница текста: её поля чертежа и Qwen-VL
+        # только портят.
+        grid = _grid_geometry(page, drawings, area)
+        if grid is not None:
+            signals["geometry"] = grid
+        if grid is not None and grid["grid_only"]:
             signals["text_in_frame"] = True
             score = min(score, _TEXT_IN_FRAME_SCORE)
+        elif path_count < _TEXT_IN_FRAME_MAX_PATHS:
+            verdict = page_prose.assess(text.splitlines())
+            signals["prose"] = verdict.signals
+            if verdict.is_prose:
+                signals["text_in_frame"] = True
+                score = min(score, _TEXT_IN_FRAME_SCORE)
 
     return DrawingPage(page=page_no, score=round(score, 3), signals=signals)
+
+
+def _grid_geometry(page: Any, drawings: Sequence[Dict[str, Any]],
+                   area: float) -> Optional[Dict[str, Any]]:
+    """
+    Из чего состоит графика листа: доли кривых и наклонных отрезков, площадь
+    картинок. None, если состав путей неизвестен (нет `items`) — тогда
+    решать по геометрии нельзя.
+    """
+    total = curves = diagonal = 0
+    for item in drawings:
+        for part in item.get("items") or ():
+            total += 1
+            kind = part[0]
+            if kind == "c":
+                curves += 1
+            elif kind == "l":
+                a, b = part[1], part[2]
+                if abs(float(a.x) - float(b.x)) > 1 and abs(float(a.y) - float(b.y)) > 1:
+                    diagonal += 1
+    if not total:
+        return None
+    covered = 0.0
+    rect = page.rect
+    try:
+        for info in page.get_image_info():
+            x0, y0, x1, y1 = (float(v) for v in info["bbox"])
+            w = min(x1, float(rect.x1)) - max(x0, float(rect.x0))
+            h = min(y1, float(rect.y1)) - max(y0, float(rect.y0))
+            if w > 0 and h > 0:
+                covered += w * h
+    except Exception:  # noqa: BLE001
+        # Картинки не прочитались: вставленный вид мог остаться незамеченным,
+        # поэтому по геометрии не решаем.
+        return None
+    curve_share = curves / total
+    diagonal_share = diagonal / total
+    image_coverage = covered / area
+    return {
+        "curve_share": round(curve_share, 3),
+        "diagonal_share": round(diagonal_share, 3),
+        "image_coverage": round(image_coverage, 3),
+        "grid_only": (curves + diagonal <= _GRID_MAX_NON_ORTHOGONAL
+                      and curve_share <= _GRID_MAX_CURVE_SHARE
+                      and diagonal_share <= _GRID_MAX_DIAGONAL_SHARE
+                      and image_coverage <= _GRID_MAX_IMAGE_COVERAGE),
+    }
 
 
 def _text_in_frame_enabled() -> bool:
