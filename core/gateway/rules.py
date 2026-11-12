@@ -197,7 +197,8 @@ _TECHNICAL: Tuple[Marker, ...] = (
     _marker(CATEGORY_TECHNICAL, 1.0, r"\bпрограмм\w*\s+(?:и\s+методик\w*\s+)?(?:контрол|испытани)\w*", "программа контроля/испытаний"),
     # «ПК 3.18.22», «ПИ 3.10», «ПК РПР-ПК-НТЛ-6-2025» — шифры программы
     # контроля и программы испытаний. Регистр важен: «пк» строчными —
-    # компьютер; «ПК 12.05.24» — дата, а не шифр.
+    # компьютер; «ПК 12.05.24» — дата, а не шифр (поэтому и «ПК 3.10.22»,
+    # похожий на дату, остаётся администратору).
     Marker(
         category=CATEGORY_TECHNICAL,
         weight=1.0,
@@ -218,7 +219,7 @@ _TECHNICAL: Tuple[Marker, ...] = (
         weight=1.0,
         pattern=re.compile(
             r"(?<![А-ЯЁA-Zа-яёa-z])[Уу]достоверени\w*\s+"
-            r"(?:о\s+(?:ПИ|качеств\w*|приёмк\w*|приемк\w*)\b|[А-ЯЁ]{2,4}\s+П[КИ]\b)"
+            r"(?:о\s+(?:ПИ|качеств\w*|приёмк\w*|приемк\w*)\b|[А-ЯЁ]{2,4}\s+П[КИ]\s+[А-ЯЁ]{2,4}\s+\d)"
         ),
         title="удостоверение о качестве/ПИ",
     ),
@@ -230,7 +231,7 @@ _TECHNICAL: Tuple[Marker, ...] = (
         title="СТП",
     ),
     _marker(CATEGORY_TECHNICAL, 1.0, r"\bquality\s+(?:assurance|control|management|plan|manual|program\w*)", "quality assurance"),
-    _marker(CATEGORY_TECHNICAL, 1.0, r"\b(?:test|inspection|verification|calibration)\s+(?:report|procedure|program\w*|plan|certificate|method\w*)", "test/verification document"),
+    _marker(CATEGORY_TECHNICAL, 1.0, r"\b(?:verification|calibration)\s+(?:certificate|procedure|report|method\w*)|\b(?:test|inspection)\s+(?:procedure|program\w*|certificate)", "test/verification document"),
 )
 
 _BUSINESS: Tuple[Marker, ...] = (
@@ -260,7 +261,8 @@ _BUSINESS: Tuple[Marker, ...] = (
     # организации: такой скан решает администратор.
     _marker(
         CATEGORY_BUSINESS, 0.9,
-        r"\bсвидетельств\w+(?!\s+о\s+(?:рождени|брак|расторжени|смерт|перемен\w*\s+имен))",
+        r"\bсвидетельств\w*\b(?!\s+об?\s+(?:рождени|заключени\w*\s+брак|брак|расторжени|смерт|"
+        r"перемен\w*\s+имен|установлени\w*\s+отцовств|усыновл))",
         "свидетельство",
     ),
     _marker(CATEGORY_BUSINESS, 0.8, r"\bразрешени\w+", "разрешение"),
@@ -310,12 +312,23 @@ _BUSINESS: Tuple[Marker, ...] = (
     Marker(
         category=CATEGORY_BUSINESS,
         weight=1.0,
-        pattern=re.compile(r"(?<![А-ЯЁA-Zа-яёa-z\d])ДС\s*\d{1,3}(?!\d)"),
+        # «Справка ДС 15», «Квитанция ДС 5» — детский сад; «ДС 12.05.2024» — дата.
+        pattern=re.compile(
+            r"(?<![А-ЯЁA-Zа-яёa-z\d])(?<!(?i:справка) )(?<!(?i:квитанция) )"
+            r"ДС\s*\d{1,3}(?!\d)(?!\.\d)"
+        ),
         title="ДС (доп. соглашение)",
     ),
     # «исх 1082-113 от 22.08.2022» — исходящий номер без знака «№».
     _marker(CATEGORY_BUSINESS, 1.0, r"\bисх\.?\s*\d[\d\s]*от\s+\d", "исх. номер от"),
-    _marker(CATEGORY_BUSINESS, 0.8, r"\bзаключени\w+\s+о\b", "заключение о"),
+    # Только заключения о проекте/работе: «заключение о состоянии здоровья» —
+    # документ человека.
+    _marker(
+        CATEGORY_BUSINESS, 0.8,
+        r"\bзаключени\w*\s+о\s+(?:бесперспек|нецелесообразн|целесообразн|соответстви|"
+        r"техническ|возможност|результат)\w*",
+        "заключение о",
+    ),
 )
 
 # Переписка — это почтовая ветка, а не любое письмо. Служебное письмо с
