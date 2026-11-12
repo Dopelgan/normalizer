@@ -89,14 +89,18 @@ class Settings(BaseSettings):
     OCR_LAYER_ENABLED: bool = True
     # Строки слоя распознавания ниже этой уверенности отбрасываются на тех
     # страницах, где MinerU дал свой текст: Tesseract-мусор («едприяувие = Fe»)
-    # иначе уезжает в индекс рядом с текстом MinerU. Выключено до A/B.
+    # иначе уезжает в индекс рядом с текстом MinerU. Только растр (скан,
+    # картинка); применяется в core/providers/mineru_parser.py. По умолчанию
+    # выключено, значения на проде — в README, раздел «Флаги разбора».
     OCR_LAYER_DROP_LOW_CONFIDENCE: bool = False
     OCR_LAYER_MIN_LINE_CONFIDENCE: float = 0.4
     # Страница с прозой в рамке ЕСКД (ПОК, СТО, ТУ, ТЗ, письма) — текст, а
-    # не чертёж (core/providers/page_prose.py). Выключено до A/B.
+    # не чертёж (core/providers/page_prose.py). Проверка в опознании листа
+    # векторного PDF (core/providers/vector_drawing.py). По умолчанию выключено.
     DRAWING_TEXT_IN_FRAME_ENABLED: bool = False
     # Таблица MinerU во весь лист с прозой внутри — это рамка формата, а не
-    # таблица: разбирается в текст по слою. Выключено до A/B.
+    # таблица: разбирается в текст по слою (core/providers/text_layer.py,
+    # сшивка и векторного слоя, и слоя распознавания). По умолчанию выключено.
     FRAME_TABLE_GUARD_ENABLED: bool = False
 
     # ------------------------- Чертежи: разметка зрением + внешняя модель

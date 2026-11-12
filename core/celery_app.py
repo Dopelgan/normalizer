@@ -1,4 +1,25 @@
-"""Приложение Celery: очереди, маршрутизация, таймауты."""
+"""
+Приложение Celery: очереди, маршрутизация, таймауты.
+
+Брокер и хранилище результатов — Redis (`CELERY_BROKER_URL`,
+`CELERY_RESULT_BACKEND`). Один модуль обслуживает три роли воркеров,
+различаются они очередью в `-Q`:
+
+* `celery_worker` — очередь `CELERY_ML_QUEUE` (ml_gpu), фоновый и пакетный
+  разбор `ingest.tasks.process_document`: MinerU, OCR, чертежи через Qwen-VL.
+  Одна задача за раз (`--concurrency=1`).
+* `interactive_worker` — очередь `CELERY_INTERACTIVE_QUEUE` (interactive),
+  та же задача разбора, но для синхронной ручки `/internal/v1/parse`
+  (вложения чата). Поднимается override-файлом
+  `docker-compose.interactive*.yml`; без него `CELERY_INTERACTIVE_QUEUE`
+  пуста и синхронный разбор идёт в ml_gpu.
+* `intake_worker` — очередь `CELERY_INTAKE_QUEUE` (intake), приём файла
+  `core.intake.tasks.process_intake_file`: Data Gateway и Quality Gate,
+  `INTAKE_WORKER_CONCURRENCY` задач параллельно.
+
+Задачи ставят HTTP-сервисы: `ingest_api` (`ingest.api._dispatch`) и
+`data_gateway` (`core.intake.tasks.dispatch`).
+"""
 
 import logging
 

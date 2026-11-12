@@ -1,7 +1,22 @@
 """
-OCR-фоллбэк на Tesseract.
+OCR на Tesseract (`rus+eng`): фоллбэк разбора, слой распознавания и быстрый OCR приёма.
 
-Используется, когда MinerU недоступен или не вернул текстового слоя.
+Кто вызывает:
+
+* `parse_all_pages` — полный OCR документа: уровень 4 лестницы
+  (`PlainOcrStrategy`) и фоллбэк `MinerUParserProvider`, когда MinerU
+  недоступен или не дал текста;
+* `text_layer` — построчный слой распознавания растра для сшивки с блоками
+  MinerU (`OCR_LAYER_ENABLED`); строки несут свою уверенность, по ней
+  `mineru_parser.drop_low_confidence_lines` отбрасывает мусор
+  (`OCR_LAYER_DROP_LOW_CONFIDENCE`, `OCR_LAYER_MIN_LINE_CONFIDENCE`);
+* `parse_pages` — быстрый OCR первых страниц на Quality Gate.
+
+Первые два пути читают страницы через `_map_pages`: при
+`TESSERACT_PAGE_WORKERS` > 1 — параллельно, по процессу tesseract на
+страницу. Рендер PDF идёт пачками `OCR_BATCH_PAGES`, не дальше
+`OCR_FULL_MAX_PAGES` страниц.
+
 Путь к файлу всегда получается через StorageProvider, поэтому относительные
 URI резолвятся относительно STORAGE_LOCAL_MOUNT, а не рабочего каталога.
 

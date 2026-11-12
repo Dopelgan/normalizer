@@ -13,6 +13,13 @@ Gateway: сюда файл приходит уже признанным знан
 Пять этапов: техническая валидация, дубликаты, дата и актуальность,
 качество распознавания, классификация и маршрутизация. Предложение
 размещения формирует система — утверждает человек.
+
+Вызывается из задачи приёма (`core.intake.pipeline`, штатный путь) и из
+прямого входа `quality/api.py`. Пороги: `QG_MAX_SIZE_BYTES` (размер),
+`QG_SIMILARITY_THRESHOLD` (дубль или обновление), `QG_MAX_AGE_DAYS`
+(актуальность), `QG_OCR_PAGES`, `QG_OCR_WARN_CONFIDENCE`,
+`QG_OCR_BLOCK_CONFIDENCE`, `QG_OCR_UNREADABLE_SHARE` (читаемость по быстрому
+OCR, `TesseractFallbackProvider.parse_pages`).
 """
 
 from __future__ import annotations

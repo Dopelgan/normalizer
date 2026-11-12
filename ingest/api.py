@@ -8,6 +8,20 @@ HTTP-интерфейс Parser по контракту RAG <-> Parser.
 
 Ручки рассчитаны на внутреннюю сеть контейнеров: авторизации в MVP-контракте
 нет. Наружу порты публиковать не следует.
+
+Сторона RAG. Фоновый разбор (события жизненного цикла, `event_id`) уходит в
+очередь `CELERY_ML_QUEUE`, синхронный (вложения чата, `dialog_id`) — в
+`CELERY_INTERACTIVE_QUEUE`, если она задана (`parse_queue`). По задаче на
+файл: `ingest.tasks.process_document`. Состояние запроса лежит в Redis
+(`core.result_aggregator`, срок `RESULT_TTL_SECONDS`), статусы запроса —
+`queued`, `processing`, `completed`, `partial`, `error`
+(`core.models.contract.RequestStatus`). Синхронная ручка ждёт итог не дольше
+`PROCESSING_TIMEOUT_SECONDS`, затем отвечает 504 с текущим состоянием.
+
+Штатно RAG забирает результат опросом GET results. Push-доставка
+(`RESULT_DELIVERY_TYPE`, для HTTP — `RESULT_CALLBACK_URL` на
+`POST /internal/v1/parser/results` RAG) выключена по умолчанию, см.
+`core.result_delivery`. Изменения контракта — `docs/PARSER-CONTRACT-CHANGES.md`.
 """
 
 import asyncio
