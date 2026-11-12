@@ -689,6 +689,7 @@ def _drop_frame_tables(
     from core.providers import page_prose
 
     kept: List[ParsedBlock] = []
+    dropped_lines: List[str] = []
     for block in blocks:
         if block.type == "table" and block.area() >= _FRAME_TABLE_AREA:
             x1, y1, x2, y2 = block.bbox
@@ -698,9 +699,37 @@ def _drop_frame_tables(
             ]
             if inside and page_prose.assess(inside).is_prose:
                 stats.frame_tables += 1
+                dropped_lines.extend(inside)
                 continue
         kept.append(block)
-    return kept
+
+    # Многостраничную таблицу MinerU отдаёт целиком в рамке первого листа,
+    # а продолжения — пустыми рамками. Если первый лист сам не проза
+    # (титул, «УТВЕРЖДАЮ»), его «таблица» осталась бы и несла весь текст
+    # книги, а строки продолжений вернулись бы текстом второй копией.
+    # Поэтому снимается и та рамка во весь лист, в которой лежат строки
+    # уже снятых рамок.
+    probes = [_squash(t) for t in dropped_lines if len(_squash(t)) >= 20]
+    if not probes:
+        return kept
+    result: List[ParsedBlock] = []
+    for block in kept:
+        if block.type == "table" and block.area() >= _FRAME_TABLE_AREA:
+            own = _squash(_table_text(block))
+            hits = sum(1 for p in probes if p in own)
+            if own and hits >= min(3, len(probes)):
+                stats.frame_tables += 1
+                continue
+        result.append(block)
+    return result
+
+
+def _squash(text: str) -> str:
+    return "".join(fold_homoglyphs(text or "").split()).lower()
+
+
+def _table_text(block: ParsedBlock) -> str:
+    return f"{block.text or ''} {_table_index([block])}"
 
 
 def _assign_lines(

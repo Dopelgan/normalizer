@@ -58,6 +58,10 @@ from core.providers.text_layer import (
 logger = logging.getLogger(__name__)
 
 
+# Столько символов текста MinerU на странице, чтобы считать его основным.
+_MINERU_PAGE_TEXT_CHARS = 200
+
+
 def drop_low_confidence_lines(
     layer: TextLayer, blocks: List[ParsedBlock], threshold: float
 ) -> TextLayer:
@@ -67,10 +71,13 @@ def drop_low_confidence_lines(
     дублирует MinerU и уходит в индекс отдельными блоками. На странице, где
     MinerU текста не дал, слой — единственный источник, и он не трогается.
     """
-    mineru_pages = {
-        b.page for b in blocks
-        if b.type in _TEXTISH and b.text and b.text.strip()
-    }
+    # Колонтитул «Лист 3» — ещё не текст страницы: тело могло уехать в
+    # формулу или таблицу, и тогда слой — единственный его источник.
+    mineru_chars: Dict[int, int] = {}
+    for b in blocks:
+        if b.type in _TEXTISH and b.text:
+            mineru_chars[b.page] = mineru_chars.get(b.page, 0) + len("".join(b.text.split()))
+    mineru_pages = {p for p, n in mineru_chars.items() if n >= _MINERU_PAGE_TEXT_CHARS}
     pages: Dict[int, List[Any]] = {}
     dropped = 0
     for page, lines in layer.pages.items():

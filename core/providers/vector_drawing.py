@@ -46,6 +46,10 @@ _MANY_PATHS = 120          # столько векторных путей на �
 _FRAME_COVERAGE = 0.65     # рамка формата занимает почти весь лист
 _DRAWING_SCORE = 0.5       # порог отнесения страницы к чертежам
 _TEXT_IN_FRAME_SCORE = 0.4  # проза в рамке ЕСКД: ниже порога, но видно в signals
+# Столько векторных путей у листа с текстом в рамке не бывает: рамка, штамп
+# и пара таблиц — десятки-сотни. Сборочный чертёж с длинными техническими
+# требованиями остаётся чертежом, сколько бы прозы на нём ни было.
+_TEXT_IN_FRAME_MAX_PATHS = 400
 
 # Штамп по ГОСТ 2.104 — в правом нижнем углу листа.
 _TITLE_BLOCK_REGION = (0.55, 0.78, 1.0, 1.0)
@@ -171,7 +175,8 @@ def _score_page(page: Any, page_no: int) -> DrawingPage:
         score += 0.15
 
     score = min(1.0, score)
-    if score >= _DRAWING_SCORE and _text_in_frame_enabled():
+    if (score >= _DRAWING_SCORE and path_count < _TEXT_IN_FRAME_MAX_PATHS
+            and _text_in_frame_enabled()):
         # Рамка и штамп есть и у ПОК, ТУ, ТЗ, писем. Если на листе проза,
         # это страница текста: её поля чертежа и Qwen-VL только портят.
         verdict = page_prose.assess(text.splitlines())

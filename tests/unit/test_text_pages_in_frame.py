@@ -150,6 +150,32 @@ class TestDrawingClassifier:
         assert "text_in_frame" not in verdict.signals
 
 
+    def test_assembly_drawing_with_long_requirements_stays_drawing(self, text_in_frame):
+        # Сборочный чертёж: длинные технические требования, мало размеров
+        # текстом, но геометрии на листе — сотни путей.
+        lines = ASSEMBLY_REQUIREMENTS + ["1", "2", "3", "4", "5", "Ø40", "120", "R5",
+                                         "Изм.", "Лист", "№ докум.", "Подп.", "Дата",
+                                         "ТАДУ 305179.001 СБ", "Лист", "1"]
+        assert page_prose.assess(lines).is_prose  # текст сам по себе похож на прозу
+        verdict = _score_page(_Page(lines, extra_paths=600), 1)
+        assert verdict.is_drawing
+        assert "text_in_frame" not in verdict.signals
+
+
+ASSEMBLY_REQUIREMENTS = [
+    "1 Сборку производить в соответствии с требованиями ОСТ 26-07-2033",
+    "и технологического процесса изготовителя на данное изделие в целом.",
+    "2 Перед сборкой все детали промыть, продуть сжатым воздухом и осмотреть",
+    "на отсутствие забоин, заусенцев, следов коррозии и прочих дефектов.",
+    "3 Резьбовые соединения затянуть с моментом согласно таблице на листе",
+    "и застопорить краской, нанесённой полосой по всей длине соединения.",
+    "4 Установку испытать на прочность и плотность пробным давлением воды",
+    "в течение не менее десяти минут без падения давления по манометру.",
+    "5 Маркировать шрифтом по ГОСТ 2.304 краской контрастного цвета на",
+    "табличке, закреплённой на раме установки в доступном для осмотра месте.",
+]
+
+
 # --------------------------------------------------- рамка ≠ таблица
 def _layer(lines_by_page, conf=1.0):
     pages = {}
@@ -183,6 +209,25 @@ class TestFrameTable:
         assert "1 Общие положения" in text
         assert {b.page for b in result} == {1, 2, 3}
 
+    def test_head_table_of_book_dropped_with_continuations(self):
+        # MinerU: вся книга в «таблице» титульного листа, дальше пустые рамки.
+        # Титул сам не проза, но его таблица держит текст продолжений —
+        # оставь её, и текст книги ушёл бы в индекс дважды.
+        title = ["УТВЕРЖДАЮ", "Генеральный директор", "ТАДУ 421451.003 ПМ1", "2026"]
+        layer = _layer({1: title, 2: TZ_PAGE, 3: TZ_PAGE})
+        head = ParsedBlock(type="table", text="", page=1, bbox=[0.03, 0.02, 0.97, 0.98],
+                           table_data={"rows": [[t] for t in title + TZ_PAGE + TZ_PAGE]})
+        empty = [ParsedBlock(type="table", text="", page=p, bbox=[0.03, 0.02, 0.97, 0.98])
+                 for p in (2, 3)]
+
+        result, stats = reconcile_with_text_layer([head] + empty, layer, frame_table_guard=True)
+
+        assert stats.frame_tables == 3
+        assert not [b for b in result if b.type == "table"]
+        text = " ".join(b.text for b in result if b.type == "text")
+        assert text.count("1 Общие положения") == 2  # по разу на стр. 2 и 3
+        assert "УТВЕРЖДАЮ" in text
+
     def test_guard_off_keeps_table(self):
         layer = _layer({1: TZ_PAGE})
         result, stats = reconcile_with_text_layer([_frame_table(1)], layer)
@@ -214,8 +259,17 @@ class TestLowConfidenceOcr:
         alone = TextLine(text="ыва прол", page=2, bbox=[0.1, 0.5, 0.6, 0.52], confidence=0.2)
         return TextLayer(pages={1: [good, junk], 2: [alone]}, page_count=2)
 
+    BODY = "Акт приёмки оборудования " * 10
+
+    def test_footer_only_page_keeps_layer(self):
+        # У MinerU на странице только колонтитул — тело ещё может быть
+        # только в слое, его строки не трогаем.
+        blocks = [ParsedBlock(type="text", text="Лист 3", page=1, bbox=[0.8, 0.95, 0.9, 0.97])]
+        layer = drop_low_confidence_lines(self._layer(), blocks, 0.4)
+        assert len(layer.lines(1)) == 2
+
     def test_junk_dropped_where_mineru_has_text(self):
-        blocks = [ParsedBlock(type="text", text="Акт приёмки оборудования", page=1,
+        blocks = [ParsedBlock(type="text", text=self.BODY, page=1,
                               bbox=[0.1, 0.1, 0.6, 0.12])]
         layer = drop_low_confidence_lines(self._layer(), blocks, 0.4)
         assert [l.text for l in layer.lines(1)] == ["Акт приёмки оборудования"]
@@ -223,7 +277,7 @@ class TestLowConfidenceOcr:
         assert [l.text for l in layer.lines(2)] == ["ыва прол"]
 
     def test_reconcile_no_longer_recovers_junk(self):
-        blocks = [ParsedBlock(type="text", text="Акт приёмки оборудования", page=1,
+        blocks = [ParsedBlock(type="text", text=self.BODY, page=1,
                               bbox=[0.1, 0.1, 0.6, 0.12])]
         from core.providers.text_layer import OCR_LAYER
 
