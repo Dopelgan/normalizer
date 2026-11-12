@@ -620,6 +620,9 @@ def _image_digest(image: "Image.Image") -> str:
     """
     digest = hashlib.blake2b(digest_size=20)
     digest.update(f"{image.mode}|{image.width}x{image.height}".encode("ascii"))
+    palette = image.getpalette() if image.mode in ("P", "PA") else None
+    if palette:
+        digest.update(bytes(palette))
     step = 256
     for top in range(0, image.height, step):
         digest.update(image.crop((0, top, image.width, min(image.height, top + step))).tobytes())

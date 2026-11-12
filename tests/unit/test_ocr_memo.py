@@ -155,3 +155,38 @@ def test_ladder_reads_scan_once_and_keeps_both_results(monkeypatch, temp_storage
     assert result.ladder["chosen_strategy"] == "layout"
     assert [line.text for line in layout.layer.lines(1)] == ["Лист 1"]
     assert tesseract_fallback._MEMO.get() is None
+
+
+def test_palette_is_part_of_the_page(monkeypatch):
+    fake = _Tesseract()
+    _patch(monkeypatch, fake)
+    provider = TesseractFallbackProvider(storage=object())
+    light = _page().convert("P")
+    dark = light.copy()
+    dark.putpalette([255 - v for v in light.getpalette()])
+    with ocr_memo():
+        provider.ocr_lines(light)
+        provider.ocr_lines(dark)
+    assert fake.calls == 2
+
+
+def test_memo_is_dropped_when_parse_fails(monkeypatch):
+    class Broken(Strategy):
+        level, name, method = 5, "broken", "broken"
+
+        def applicable(self, context):
+            return True
+
+        def run(self, context):
+            TesseractFallbackProvider(storage=object()).ocr_lines(_page())
+            raise RuntimeError("сбой")
+
+    _patch(monkeypatch, _Tesseract())
+    import pytest
+    from core.providers.document_parser import ParserFailed
+
+    with pytest.raises(ParserFailed):
+        LadderRouter([Broken()], threshold=0.75).parse(
+            DocumentContext(uri="documents/x.png", file_type="png", metadata={}, data=b"x")
+        )
+    assert tesseract_fallback._MEMO.get() is None
