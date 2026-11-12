@@ -59,6 +59,7 @@ from core.ladder.strategies.tabular import SpreadsheetStrategy
 from core.models.parse_result import ParseResult
 from core.providers.storage import StorageProvider
 from core.providers.document_parser import DocumentParserProvider, ParserFailed
+from core.providers.tesseract_fallback import ocr_memo
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,12 @@ class LadderRouter:
 
     # ------------------------------------------------------------- публичное
     def parse(self, context: DocumentContext) -> ParseResult:
+        # Уровни 4 и 5 читают одни и те же страницы скана: в пределах
+        # документа каждая распознаётся один раз (результат тот же).
+        with ocr_memo():
+            return self._parse(context)
+
+    def _parse(self, context: DocumentContext) -> ParseResult:
         applicable = self._applicable(context)
         if not applicable:
             raise ParserFailed(

@@ -13,11 +13,14 @@ URI резолвятся относительно STORAGE_LOCAL_MOUNT, а не �
 (`image_to_data`), и блок наследует её среднее, взвешенное по длине слов.
 """
 
+import contextlib
+import contextvars
+import hashlib
 import logging
 import os
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 import pytesseract
@@ -368,6 +371,27 @@ class TesseractFallbackProvider:
 
     def ocr_lines(self, image: "Image.Image", psm: int = PSM_BLOCK) -> List[OcrLine]:
         """
+        Строки страницы; внутри `ocr_memo()` одна и та же страница читается
+        один раз. Скан проходит лестницу дважды по одним и тем же страницам:
+        уровень 4 (plain_ocr) и слой распознавания уровня 5 рендерят их с тем
+        же DPI и читают тем же `_read_lines`, — второй проход давал тот же
+        результат за те же секунды Tesseract на страницу.
+        """
+        memo = _MEMO.get()
+        if memo is None:
+            return self._read_lines(image, psm)
+        key = (_image_digest(image), self.lang, psm)
+        cached = memo.get(key)
+        if cached is None:
+            cached = self._read_lines(image, psm)
+            # Пустой ответ не запоминается: так же выглядит и сбой Tesseract,
+            # а его повтор следующим проходом — прежнее поведение.
+            if cached:
+                memo[key] = cached
+        return [replace(line, bbox=list(line.bbox)) for line in cached]
+
+    def _read_lines(self, image: "Image.Image", psm: int = PSM_BLOCK) -> List[OcrLine]:
+        """
         Строки с координатами и уверенностью распознавания. Координаты в
         долях изображения — как и везде в конвейере.
         """
@@ -562,3 +586,41 @@ def _weighted_lines(lines: Sequence[Any]) -> float:
     return round(
         sum(line.confidence * weight for line, weight in zip(lines, weights)) / total, 3
     )
+
+
+# Память распознанных страниц на время разбора одного документа. Вне
+# `ocr_memo()` её нет, и каждый вызов читает страницу заново, как раньше.
+_MEMO: "contextvars.ContextVar[Optional[Dict[tuple, List[OcrLine]]]]" = (
+    contextvars.ContextVar("tesseract_page_memo", default=None)
+)
+
+
+@contextlib.contextmanager
+def ocr_memo():
+    """
+    Одна страница — одно распознавание в пределах блока. Ключ — содержимое
+    картинки, а не номер страницы: выправленный уровнем 6 лист или другой
+    документ дают другой ключ и читаются заново. Вложенный блок
+    пользуется памятью внешнего.
+    """
+    if _MEMO.get() is not None:
+        yield
+        return
+    token = _MEMO.set({})
+    try:
+        yield
+    finally:
+        _MEMO.reset(token)
+
+
+def _image_digest(image: "Image.Image") -> str:
+    """
+    Отпечаток пикселей страницы. Лист A1 в 200 dpi — около 100 МБ, поэтому
+    хешируется полосами, без второй полной копии в памяти.
+    """
+    digest = hashlib.blake2b(digest_size=20)
+    digest.update(f"{image.mode}|{image.width}x{image.height}".encode("ascii"))
+    step = 256
+    for top in range(0, image.height, step):
+        digest.update(image.crop((0, top, image.width, min(image.height, top + step))).tobytes())
+    return digest.hexdigest()
