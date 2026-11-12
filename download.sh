@@ -74,7 +74,7 @@ echo "Конфиг моделей записан: $PDF_DIR/mineru.json"
 
 echo "Модели скачаны."
 echo
-echo "ℹ️  Модель чертежей здесь НЕ скачивается: она живёт на отдельном хосте с"
+echo "Модель чертежей здесь НЕ скачивается: она живёт на отдельном хосте с"
 echo "   GPU и поднимается там через vLLM, например:"
 echo "     vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000 --limit-mm-per-prompt image=2"
 echo "   Проверка из воркера: curl \$QWEN_ENDPOINT/v1/models"
