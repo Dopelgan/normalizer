@@ -513,6 +513,8 @@ class ReconcileStats:
     split_tokens: int = 0
     #: Строк слоя из рамки таблицы, возвращённых текстом: их слов в ячейках нет.
     table_lines_kept: int = 0
+    #: «Таблиц» во весь лист с прозой внутри — рамок ЕСКД, разобранных в текст.
+    frame_tables: int = 0
     layer_chars_by_page: Dict[int, int] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -531,6 +533,7 @@ class ReconcileStats:
             "degraded_tables": self.degraded_tables,
             "split_tokens": self.split_tokens,
             "table_lines_kept": self.table_lines_kept,
+            "frame_tables": self.frame_tables,
         }
 
 
@@ -538,6 +541,7 @@ def reconcile_with_text_layer(
     blocks: Sequence[ParsedBlock],
     layer: TextLayer,
     source: LayerSource = VECTOR_LAYER,
+    frame_table_guard: bool = False,
 ) -> Tuple[List[ParsedBlock], ReconcileStats]:
     """
     Текст блоков берётся из слоя, а не из OCR; всё, что не попало ни в одну
@@ -549,6 +553,8 @@ def reconcile_with_text_layer(
     метода и уверенность: выдавать распознанное за текст из файла нельзя.
     """
     stats = ReconcileStats(layer_chars_by_page=layer.char_counts_by_page())
+    if frame_table_guard:
+        blocks = _drop_frame_tables(blocks, layer, stats)
     by_page: Dict[int, List[ParsedBlock]] = {}
     for block in blocks:
         by_page.setdefault(block.page, []).append(block)
@@ -664,6 +670,37 @@ def reconcile_with_text_layer(
         stats.repaired_cells,
     )
     return result, stats
+
+
+# «Таблица» MinerU, которая занимает столько листа, — рамка формата.
+_FRAME_TABLE_AREA = 0.5
+
+
+def _drop_frame_tables(
+    blocks: Sequence[ParsedBlock], layer: TextLayer, stats: ReconcileStats
+) -> List[ParsedBlock]:
+    """
+    Текст в рамке ЕСКД MinerU принимает за одну таблицу во весь лист, а
+    многостраничную — за одну таблицу на всю книгу (ПМ1: 3626 подчанков).
+    Такая рамка убирается до сшивки: строки слоя внутри неё возвращаются
+    обычным текстом, и в индекс таблицы этой книги она не попадает.
+    Настоящая таблица во весь лист остаётся: в её ячейках не проза.
+    """
+    from core.providers import page_prose
+
+    kept: List[ParsedBlock] = []
+    for block in blocks:
+        if block.type == "table" and block.area() >= _FRAME_TABLE_AREA:
+            x1, y1, x2, y2 = block.bbox
+            inside = [
+                line.text for line in layer.lines(block.page)
+                if x1 <= line.center[0] <= x2 and y1 <= line.center[1] <= y2
+            ]
+            if inside and page_prose.assess(inside).is_prose:
+                stats.frame_tables += 1
+                continue
+        kept.append(block)
+    return kept
 
 
 def _assign_lines(

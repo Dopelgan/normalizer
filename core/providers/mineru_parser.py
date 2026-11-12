@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import replace
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,6 +56,34 @@ from core.providers.text_layer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def drop_low_confidence_lines(
+    layer: TextLayer, blocks: List[ParsedBlock], threshold: float
+) -> TextLayer:
+    """
+    Слой распознавания без строк ниже `threshold` — но только на страницах,
+    где у MinerU есть свой текст. Там мусор Tesseract («едприяувие = Fe SES»)
+    дублирует MinerU и уходит в индекс отдельными блоками. На странице, где
+    MinerU текста не дал, слой — единственный источник, и он не трогается.
+    """
+    mineru_pages = {
+        b.page for b in blocks
+        if b.type in _TEXTISH and b.text and b.text.strip()
+    }
+    pages: Dict[int, List[Any]] = {}
+    dropped = 0
+    for page, lines in layer.pages.items():
+        if page in mineru_pages:
+            kept = [l for l in lines if l.confidence >= threshold]
+            dropped += len(lines) - len(kept)
+            pages[page] = kept
+        else:
+            pages[page] = list(lines)
+    if dropped:
+        logger.info("Слой распознавания: отброшено строк с уверенностью < %.2f: %d",
+                    threshold, dropped)
+    return replace(layer, pages=pages)
 
 # Типы блоков MinerU, которые сводятся к текстовому.
 _TEXTISH = {"text", "title", "paragraph", "list", "header", "footer", "index", "text_level"}
@@ -204,7 +233,10 @@ class MinerUParserProvider(DocumentParserProvider):
 
         if layer is not None:
             # Векторный PDF: текст берём из слоя, структуру оставляем за MinerU.
-            blocks, stats = reconcile_with_text_layer(result.blocks, layer)
+            blocks, stats = reconcile_with_text_layer(
+                result.blocks, layer,
+                frame_table_guard=settings.FRAME_TABLE_GUARD_ENABLED,
+            )
             blocks = self._apply_vector_drawings(blocks, layer, drawing_verdicts)
             result.blocks = blocks
             result.text_layer_chars = stats.layer_chars_by_page
@@ -217,9 +249,14 @@ class MinerUParserProvider(DocumentParserProvider):
         # разметкой, а Tesseract с `rus` читает её как текст.
         if self._has_content(result):
             ocr_layer = self._ocr_layer(uri, file_type)
+            if ocr_layer is not None and settings.OCR_LAYER_DROP_LOW_CONFIDENCE:
+                ocr_layer = drop_low_confidence_lines(
+                    ocr_layer, result.blocks, settings.OCR_LAYER_MIN_LINE_CONFIDENCE
+                )
             if ocr_layer is not None:
                 blocks, stats = reconcile_with_text_layer(
-                    result.blocks, ocr_layer, source=OCR_LAYER
+                    result.blocks, ocr_layer, source=OCR_LAYER,
+                    frame_table_guard=settings.FRAME_TABLE_GUARD_ENABLED,
                 )
                 result.blocks = blocks
                 result.text_layer_chars = stats.layer_chars_by_page
