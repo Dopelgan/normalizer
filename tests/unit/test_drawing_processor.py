@@ -387,7 +387,9 @@ class TestTextDocumentPictures:
         qwen = FakeQwen(reading=reading(annotation("title_block", "НТА-Проект")))
         return DrawingProcessor(storage, qwen=qwen), qwen
 
-    def test_flag_off_logo_goes_to_model(self, storage):
+    def test_flag_off_logo_goes_to_model(self, storage, monkeypatch):
+        from core.config import settings
+        monkeypatch.setattr(settings, "DRAWING_PAGE_CLASSIFIER_ENABLED", False)
         processor, qwen = self.model(storage)
         out = processor.enrich_fragments([self.text(1), self.picture(self.LOGO)],
                                          {"classification": {"genre": "text"}})
@@ -429,3 +431,22 @@ class TestTextDocumentPictures:
         out = processor.enrich_fragments([self.text(1), self.picture([10, 10, 60, 40])],
                                          {"classification": {"genre": "text"}})
         assert qwen.asked
+        assert out[1].type == "drawing"
+
+    def test_inverted_bbox_of_figure_is_still_large(self, storage, classifier):
+        processor, qwen = self.model(storage)
+        out = processor.enrich_fragments([self.text(1), self.picture([0.9, 0.6, 0.15, 0.1])],
+                                         {"classification": {"genre": "text"}})
+        assert out[1].type == "drawing"
+
+    def test_table_only_document_counts_cells(self, storage, classifier):
+        # ТЗ из таблиц: у табличного фрагмента нет текста, всё в ячейках.
+        table = self.text(1)
+        table.type = "table"
+        table.content = Content(table_data={"headers": ["Наименование", "Значение"],
+                                            "rows": [["Давление рабочее, МПа", "19,4"]] * 30})
+        processor, qwen = self.model(storage)
+        out = processor.enrich_fragments([table, self.picture(self.LOGO)],
+                                         {"classification": {"genre": "mixed"}})
+        assert not qwen.asked
+        assert out[1].type == "image"

@@ -513,8 +513,17 @@ def _is_text_document(fragments: List[Fragment], metadata: Dict[str, Any]) -> bo
         if fragment.position is not None:
             pages.add(fragment.position.page)
         if fragment.type in ("text", "table"):
-            chars += len("".join((fragment.content.text or "").split()))
+            chars += _visible_chars(fragment.content.text or "")
+            table = fragment.content.table_data
+            if table is not None:
+                # У табличного фрагмента текста нет — всё в ячейках.
+                cells = list(table.headers) + [cell for row in table.rows for cell in row]
+                chars += sum(_visible_chars(str(cell)) for cell in cells if cell is not None)
     return bool(pages) and chars / len(pages) >= _TEXT_DOC_MIN_CHARS_PER_PAGE
+
+
+def _visible_chars(text: str) -> int:
+    return len("".join(text.split()))
 
 
 def _is_small_picture(fragment: Fragment) -> bool:
@@ -525,7 +534,7 @@ def _is_small_picture(fragment: Fragment) -> bool:
     x0, y0, x1, y1 = (float(v) for v in bbox)
     if max(x0, y0, x1, y1) > 1.0 or min(x0, y0, x1, y1) < 0.0:
         return False      # не в долях листа — размер неизвестен
-    return (x1 - x0) * (y1 - y0) < _TEXT_DOC_MIN_FIGURE_AREA
+    return abs(x1 - x0) * abs(y1 - y0) < _TEXT_DOC_MIN_FIGURE_AREA
 
 
 def _render_pdf_page(data: bytes, page: int):

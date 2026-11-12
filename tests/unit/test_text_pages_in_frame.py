@@ -409,7 +409,8 @@ class TestPageClassifier:
 
     IMAGE = (60, 160, 560, 560)   # треть листа: рисунок в приложении ТЗ
 
-    def test_flag_off_figure_page_stays_drawing(self, text_in_frame):
+    def test_flag_off_figure_page_stays_drawing(self, text_in_frame, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_PAGE_CLASSIFIER_ENABLED", False)
         verdict = _score_page(_GeometryPage(FIGURE_PAGE, image_bbox=self.IMAGE), 87)
         assert verdict.is_drawing
         assert verdict.signals["geometry"]["lines_only"] is True
@@ -425,6 +426,10 @@ class TestPageClassifier:
         verdict = _score_page(
             _GeometryPage(FIGURE_PAGE + DRAWING_FORM_STAMP, image_bbox=self.IMAGE), 1)
         assert verdict.is_drawing
+
+    def test_glued_stamp_labels_stay_drawing(self, page_classifier):
+        lines = FIGURE_PAGE + ["Лит. Масса Масштаб", "1:2"]
+        assert _score_page(_GeometryPage(lines, image_bbox=self.IMAGE), 1).is_drawing
 
     def test_mass_in_prose_is_not_a_stamp(self, page_classifier):
         lines = FIGURE_PAGE + ["Масса установки не более 350 кг, масштаб рисунка условный."]
