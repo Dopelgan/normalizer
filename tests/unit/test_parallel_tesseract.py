@@ -160,6 +160,8 @@ def test_time_budget_stops_new_pages(provider, monkeypatch):
     pages = [b.page for b in blocks]
     assert pages == list(range(1, len(pages) + 1))
     assert provider.truncated_at == (len(pages), PAGES)
+    # Сколько именно страниц успеет — зависит от планировщика (5 или 10):
+    # проверяется сплошность начала и честная пометка, а не точное число.
     assert 5 <= len(pages) < PAGES
 
 
@@ -204,6 +206,7 @@ def test_unexpected_error_propagates_in_page_order(monkeypatch):
         for page, result in TesseractFallbackProvider._map_pages(pages, work):
             got.append(page)
     assert got == [1]
+    assert sum(1 for _ in pages) > 80  # генератор не дочитан до конца
     # Остальное отменено, а не дочитано до конца документа.
     time.sleep(0.05)
     assert len(started) < 10

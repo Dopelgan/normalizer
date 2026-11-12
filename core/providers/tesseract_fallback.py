@@ -239,7 +239,8 @@ class TesseractFallbackProvider:
         генератора рендера, только когда освободилось место. Бюджет времени
         проверяет сам генератор перед каждой пачкой — после срока новые
         страницы не начинаются, начатые дочитываются (как и раньше
-        дочитывалась текущая пачка). Контекст (память OCR, срок задачи)
+        дочитывалась текущая пачка). Генератор забегает вперёд на N
+        страниц, поэтому перерасход срока — до N страниц, а не до пачки. Контекст (память OCR, срок задачи)
         копируется в поток. Исключение страницы поднимается в порядке
         страниц, как при постраничном чтении; недочитанное отменяется.
         """
@@ -250,25 +251,30 @@ class TesseractFallbackProvider:
             return
 
         # N процессов tesseract по одному потоку OpenMP: иначе каждый
-        # займёт все ядра, и они будут мешать друг другу.
+        # займёт все ядра, и они будут мешать друг другу. Переменная
+        # остаётся процессу воркера до конца его жизни: дальше и одиночные
+        # вызовы tesseract идут в один поток (на страницу это 2–5 с).
         os.environ["OMP_THREAD_LIMIT"] = "1"
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tesseract-page")
         pending: "collections.deque" = collections.deque()
         try:
             for page_num, image in pages:
                 context = contextvars.copy_context()
-                pending.append((page_num, pool.submit(context.run, work, image, page_num)))
+                future = pool.submit(context.run, work, image, page_num)
+                pending.append((page_num, image, future))
                 if len(pending) >= workers:
-                    done_page, future = pending.popleft()
+                    done_page, _, future = pending.popleft()
                     yield done_page, future.result()
             while pending:
-                done_page, future = pending.popleft()
+                done_page, _, future = pending.popleft()
                 yield done_page, future.result()
         finally:
-            for _, future in pending:
-                future.cancel()
+            for _, image, future in pending:
+                if future.cancel() and hasattr(image, "close"):
+                    image.close()
             # Не ждём: при мягком лимите Celery задача должна успеть записать
-            # ошибку; начатые процессы tesseract закончатся сами за секунды.
+            # ошибку. Уже начатые страницы (до N-1) дочитываются в фоне —
+            # обычно секунды, на крупном листе дольше.
             pool.shutdown(wait=False, cancel_futures=True)
 
     def _images_of(self, local_path: str, file_type: Optional[str] = None):
