@@ -11,14 +11,14 @@ export HF_XET_HIGH_PERFORMANCE=1
 export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 
 if [ -n "${HF_TOKEN:-}" ]; then
-    echo "🔑 Авторизация Hugging Face включена."
+    echo "Авторизация Hugging Face включена."
 else
-    echo "⚠️ HF_TOKEN не найден, скачивание без авторизации."
+    echo "HF_TOKEN не найден, скачивание без авторизации."
 fi
 
 : "${MINERU_MODEL_CACHE:?Переменная MINERU_MODEL_CACHE не задана}"
 
-echo "🚀 Запуск загрузки моделей..."
+echo "Запуск загрузки моделей..."
 echo "   MINERU_MODEL_CACHE=$MINERU_MODEL_CACHE"
 
 # ----------------------------------------------------------------------
@@ -30,9 +30,9 @@ mkdir -p "$PDF_DIR"
 # MinerU 3.4.x. Прежняя проверка смотрела на models/Layout/YOLO — путь из
 # MinerU 2.x, который к работающей ветке разбора отношения не имеет.
 if [ -d "$PDF_DIR/models/Layout/PP-DocLayoutV2" ] && [ -f "$PDF_DIR/mineru.json" ]; then
-    echo "✅ PDF-Extract-Kit уже скачан, пропуск."
+    echo "PDF-Extract-Kit уже скачан, пропуск."
 else
-    echo "📥 Скачивание PDF-Extract-Kit (~15 ГБ)..."
+    echo "Скачивание PDF-Extract-Kit (~15 ГБ)..."
     # Путь передаётся через окружение, а не подстановкой в текст программы:
     # кавычка в значении переменной иначе выполняет произвольный Python.
     TARGET_DIR="$PDF_DIR" python3 -c '
@@ -70,9 +70,9 @@ with open(path, "w", encoding="utf-8") as f:
     json.dump(config, f, ensure_ascii=False, indent=2)
     f.write("\n")
 '
-echo "🧾 Конфиг моделей записан: $PDF_DIR/mineru.json"
+echo "Конфиг моделей записан: $PDF_DIR/mineru.json"
 
-echo "🎉 Модели скачаны."
+echo "Модели скачаны."
 echo
 echo "ℹ️  Модель чертежей здесь НЕ скачивается: она живёт на отдельном хосте с"
 echo "   GPU и поднимается там через vLLM, например:"
