@@ -13,15 +13,18 @@ URI резолвятся относительно STORAGE_LOCAL_MOUNT, а не �
 (`image_to_data`), и блок наследует её среднее, взвешенное по длине слов.
 """
 
+import collections
 import contextlib
 import contextvars
 import hashlib
 import logging
 import os
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import pytesseract
 from pdf2image import convert_from_path
@@ -157,10 +160,16 @@ class TesseractFallbackProvider:
                 return self._ocr_single_image(local_path, page=1)
 
             blocks: List[ParsedBlock] = []
-            try:
-                for page_num, img in self._pdf_pages(local_path):
-                    blocks.extend(self._blocks_from_image(img, page_num))
+
+            def read(img, page_num):
+                try:
+                    return self._blocks_from_image(img, page_num)
+                finally:
                     img.close()
+
+            try:
+                for _, page_blocks in self._map_pages(self._pdf_pages(local_path), read):
+                    blocks.extend(page_blocks)
             except OcrUnavailable as exc:
                 logger.error("OCR %s: ни одна страница не отрендерилась: %s", uri, exc)
             return blocks
@@ -196,13 +205,13 @@ class TesseractFallbackProvider:
         try:
             images = self._images_of(local_path, file_type)
             pages: Dict[int, List[TextLine]] = {}
-            for page_num, image in images:
+            for page_num, ocr_lines in self._map_pages(images, lambda image, _: self.ocr_lines(image)):
                 lines = [
                     TextLine(
                         text=line.text, bbox=list(line.bbox), page=page_num,
                         confidence=line.confidence, rotation=line.rotation,
                     )
-                    for line in self.ocr_lines(image)
+                    for line in ocr_lines
                     if line.text.strip()
                 ]
                 if lines:
@@ -212,6 +221,55 @@ class TesseractFallbackProvider:
             return TextLayer(pages=pages, page_count=max(pages))
         finally:
             cleanup()
+
+    @staticmethod
+    def _map_pages(
+        pages: Iterable[Tuple[int, Any]], work: Callable[[Any, int], Any],
+    ) -> Iterator[Tuple[int, Any]]:
+        """
+        `work(картинка, номер)` по каждой странице; результаты — в порядке
+        страниц, как при постраничном чтении.
+
+        При `TESSERACT_PAGE_WORKERS` > 1 страницы читаются одновременно:
+        каждый вызов tesseract — отдельный процесс, потоки здесь только ждут
+        его и готовят лист, так что GIL не мешает. Раньше на скане работало
+        одно ядро из 32, и Tesseract занимал половину времени воркера.
+
+        Память: в работе не больше N страниц; следующая берётся из
+        генератора рендера, только когда освободилось место. Бюджет времени
+        проверяет сам генератор перед каждой пачкой — после срока новые
+        страницы не начинаются, начатые дочитываются (как и раньше
+        дочитывалась текущая пачка). Контекст (память OCR, срок задачи)
+        копируется в поток. Исключение страницы поднимается в порядке
+        страниц, как при постраничном чтении; недочитанное отменяется.
+        """
+        workers = max(1, int(settings.TESSERACT_PAGE_WORKERS or 1))
+        if workers == 1:
+            for page_num, image in pages:
+                yield page_num, work(image, page_num)
+            return
+
+        # N процессов tesseract по одному потоку OpenMP: иначе каждый
+        # займёт все ядра, и они будут мешать друг другу.
+        os.environ["OMP_THREAD_LIMIT"] = "1"
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tesseract-page")
+        pending: "collections.deque" = collections.deque()
+        try:
+            for page_num, image in pages:
+                context = contextvars.copy_context()
+                pending.append((page_num, pool.submit(context.run, work, image, page_num)))
+                if len(pending) >= workers:
+                    done_page, future = pending.popleft()
+                    yield done_page, future.result()
+            while pending:
+                done_page, future = pending.popleft()
+                yield done_page, future.result()
+        finally:
+            for _, future in pending:
+                future.cancel()
+            # Не ждём: при мягком лимите Celery задача должна успеть записать
+            # ошибку; начатые процессы tesseract закончатся сами за секунды.
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def _images_of(self, local_path: str, file_type: Optional[str] = None):
         """
@@ -385,13 +443,18 @@ class TesseractFallbackProvider:
         if memo is None:
             return self._read_lines(image, psm)
         key = (_image_digest(image), self.lang, psm)
-        cached = memo.get(key)
+        with _MEMO_LOCK:
+            cached = memo.get(key)
         if cached is None:
+            # Читается вне замка: страницы идут параллельно. Одинаковые
+            # листы, попавшие в работу одновременно, прочитаются дважды —
+            # результат тот же, теряются только секунды.
             cached = self._read_lines(image, psm)
             # Пустой ответ не запоминается: так же выглядит и сбой Tesseract,
             # а его повтор следующим проходом — прежнее поведение.
             if cached:
-                memo[key] = cached
+                with _MEMO_LOCK:
+                    cached = memo.setdefault(key, cached)
         return [replace(line, bbox=list(line.bbox)) for line in cached]
 
     def _read_lines(self, image: "Image.Image", psm: int = PSM_BLOCK) -> List[OcrLine]:
@@ -603,6 +666,8 @@ def _weighted_lines(lines: Sequence[Any]) -> float:
 _MEMO: "contextvars.ContextVar[Optional[Dict[tuple, List[OcrLine]]]]" = (
     contextvars.ContextVar("tesseract_page_memo", default=None)
 )
+# Память общая для потоков параллельного чтения страниц (`_map_pages`).
+_MEMO_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
