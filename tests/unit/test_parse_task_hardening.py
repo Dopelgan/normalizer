@@ -82,8 +82,10 @@ class TestBusyDocument:
         assert result["status"] == "waiting_for_peer"
         assert pipeline.calls == []
         requeue.assert_called_once()
-        assert requeue.call_args.kwargs["kwargs"]["waited_for_peer"] is True
+        assert requeue.call_args.kwargs["kwargs"]["request_id"] == "req-busy"
         assert requeue.call_args.kwargs["countdown"] == tasks.PEER_WAIT_SECONDS
+        # Вызов напрямую, без брокера — очередь разбора по умолчанию.
+        assert requeue.call_args.kwargs["queue"] == settings.CELERY_ML_QUEUE
         # Документ остаётся у первой задачи, не помечается ошибкой.
         session = task_db()
         assert DocumentRepository(session).get(generate_doc_id("file-busy")).status == "pending"
@@ -103,19 +105,51 @@ class TestBusyDocument:
         assert len(pipeline.calls) == 1
         requeue.assert_not_called()
 
-    def test_waiter_takes_peer_result_even_for_update(self, pipeline, task_db):  # noqa: F811
-        init_request_state("req-first", ["file-w"])
-        process_document("req-first", "file-w")
-        assert len(pipeline.calls) == 1
+    def test_waiting_does_not_count_as_lost_task(  # noqa: F811
+        self, pipeline, task_db, fake_redis, mocker
+    ):
+        """Пока ожидающая задача стоит в очереди, файл не «пропавший»."""
+        mocker.patch.object(tasks.process_document, "apply_async")
+        _set_pending(task_db, "file-wait", age_seconds=10)
+        init_request_state("req-wait", ["file-wait"])
 
-        init_request_state("req-second", ["file-w"], "update")
-        result = process_document(
-            "req-second", "file-w", operation="update", waited_for_peer=True
+        process_document("req-wait", "file-wait")
+
+        assert not fake_redis.hexists("req:req-wait:since", "file-wait")
+
+    def test_requeue_failure_does_not_mark_peer_document_error(  # noqa: F811
+        self, pipeline, task_db, mocker
+    ):
+        """
+        Сбой постановки ожидания уходит в общий обработчик ошибок; документ,
+        который разбирает другая задача, при этом не помечается error —
+        иначе следующий повтор начал бы второй разбор.
+        """
+        mocker.patch.object(
+            tasks.process_document, "apply_async", side_effect=ConnectionError("broker")
         )
+        mocker.patch.object(tasks.process_document, "retry", side_effect=RuntimeError("retry"))
+        _set_pending(task_db, "file-peer", age_seconds=10)
+        init_request_state("req-peer", ["file-peer"])
 
-        assert result["status"] == "already_processed"
-        assert len(pipeline.calls) == 1
-        assert get_request_state("req-second")["status"] == "completed"
+        with pytest.raises(RuntimeError):
+            process_document("req-peer", "file-peer")
+
+        session = task_db()
+        assert DocumentRepository(session).get(generate_doc_id("file-peer")).status == "pending"
+        session.close()
+
+    def test_failed_attempt_handed_to_retry_is_not_lost(  # noqa: F811
+        self, pipeline, task_db, fake_redis, mocker
+    ):
+        mocker.patch.object(tasks.process_document, "retry", side_effect=RuntimeError("retry"))
+        pipeline.parse = mocker.Mock(side_effect=ValueError("boom"))
+        init_request_state("req-retry", ["file-retry"])
+
+        with pytest.raises(RuntimeError):
+            process_document("req-retry", "file-retry")
+
+        assert not fake_redis.hexists("req:req-retry:since", "file-retry")
 
 
 # ===========================================================================
@@ -180,6 +214,18 @@ class TestLostTask:
         assert get_request_state("req-late")["status"] == "completed"
 
 
+    def test_real_result_after_timeout_wins(self, fake_redis):
+        """Опоздавший настоящий результат заменяет синтетическую ошибку."""
+        init_request_state("req-after", ["f1"])
+        mark_started("req-after", "f1")
+        self._age_start(
+            fake_redis, "req-after", "f1", result_aggregator.parse_stale_after_seconds() + 1
+        )
+        assert get_request_state("req-after")["status"] == "error"
+        put_document_result("req-after", "f1", document("f1"))
+        assert get_request_state("req-after")["status"] == "completed"
+
+
 # ===========================================================================
 # 8. Повтор POST с request_id готового запроса
 # ===========================================================================
@@ -235,6 +281,19 @@ class TestRepost:
         assert client.post("/internal/v1/parse/background", json=payload).status_code == 202
         client.dispatched.assert_called_once()
         assert get_request_state("req-err")["status"] == "queued"
+
+    def test_repost_with_other_operation_conflicts(self, client):
+        client.post("/internal/v1/parse/background", json={
+            "request_id": "req-op", "event_id": "ev-1", "s3_fileid": ["f1"],
+            "operation": "create",
+        })
+        put_document_result("req-op", "f1", document("f1"))
+
+        response = client.post("/internal/v1/parse/background", json={
+            "request_id": "req-op", "event_id": "ev-1", "s3_fileid": ["f1"],
+            "operation": "update",
+        })
+        assert response.status_code == 409
 
     def test_repost_with_other_files_conflicts(self, client):
         client.post("/internal/v1/parse/background", json={

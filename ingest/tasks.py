@@ -48,6 +48,7 @@ from core.repositories import ChunkRepository, DocumentRepository
 from core.result_aggregator import (
     claim_publication,
     get_request_state,
+    mark_handed_off,
     mark_started,
     parse_stale_after_seconds,
     put_document_result,
@@ -298,7 +299,6 @@ def process_document(
     operation: str = "create",
     dialog_id: str = "",
     event_id: str = "",
-    waited_for_peer: bool = False,
 ) -> Dict[str, Any]:
     """
     Обрабатывает один файл пакета. Возвращает краткий статус для логов.
@@ -312,6 +312,9 @@ def process_document(
     storage = StorageProviderFactory.default()
     session = SessionLocal()
     located: Optional[LocatedFile] = None
+    # Документ в БД наш (мы перевели его в pending). Чужой документ —
+    # его разбирает другая задача — ошибкой не помечаем.
+    owns_document = False
     # Область сбора таймингов: все замеры внутри складываются сюда, и
     # словарь уезжает в extra_data документа. Без него на вопрос «почему
     # этот файл обрабатывался семь минут» отвечать нечем.
@@ -343,10 +346,7 @@ def process_document(
             doc_repo = DocumentRepository(session)
             document = doc_repo.get(doc_id, for_update=True)
 
-            # После ожидания чужого разбора того же файла его результат
-            # годится и для update: файл читался тот же, и свежее не будет.
-            if (document is not None and document.status == "indexed"
-                    and (operation != "update" or waited_for_peer)
+            if (document is not None and document.status == "indexed" and operation != "update"
                     and (document.extra_data or {}).get("processing_profile_version") == PROCESSING_PROFILE_VERSION
                     and (document.extra_data or {}).get("page_coverage_version") == PAGE_COVERAGE_VERSION):
                 logger.info("Документ %s уже проиндексирован, отдаём из БД", doc_id)
@@ -379,11 +379,13 @@ def process_document(
                         kwargs={
                             "request_id": request_id, "s3_fileid": s3_fileid,
                             "operation": operation, "dialog_id": dialog_id,
-                            "event_id": event_id, "waited_for_peer": True,
+                            "event_id": event_id,
                         },
                         countdown=PEER_WAIT_SECONDS,
-                        queue=(self.request.delivery_info or {}).get("routing_key"),
+                        queue=(self.request.delivery_info or {}).get("routing_key")
+                        or settings.CELERY_ML_QUEUE,
                     )
+                    mark_handed_off(request_id, s3_fileid)
                     return {"status": "waiting_for_peer", "doc_id": doc_id}
 
             if document is None:
@@ -399,6 +401,9 @@ def process_document(
                 doc_repo.update_metadata(
                     doc_id, status="pending", source_path=located.uri, s3_fileid=s3_fileid
                 )
+
+        # Транзакция закрылась без ошибки — документ теперь наш.
+        owns_document = True
 
         # ------------------------------------- 3. Долгие операции (без сессии)
         metadata: Dict[str, Any] = {
@@ -561,7 +566,8 @@ def process_document(
 
     except SoftTimeLimitExceeded as exc:
         logger.error("Мягкий таймаут на документе %s", doc_id)
-        _mark_error(session, doc_id)
+        if owns_document:
+            _mark_error(session, doc_id)
         finalize(request_id, s3_fileid, build_error_document(
             s3_fileid, doc_id, located.uri if located else "", exc,
             self.request.retries + 1,
@@ -570,11 +576,14 @@ def process_document(
 
     except Exception as exc:  # noqa: BLE001
         logger.error("Обработка %s не удалась: %s", s3_fileid, exc, exc_info=True)
-        _mark_error(session, doc_id)
+        if owns_document:
+            _mark_error(session, doc_id)
 
         if self.request.retries < self.max_retries:
             countdown = 60 * (self.request.retries + 1)
             logger.info("Повтор %s через %d с", s3_fileid, countdown)
+            # Пока повтор ждёт в очереди, файл не «пропавший».
+            mark_handed_off(request_id, s3_fileid)
             raise self.retry(exc=exc, countdown=countdown)
 
         logger.critical("Документ %s окончательно не обработан", doc_id)

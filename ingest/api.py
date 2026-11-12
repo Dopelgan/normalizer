@@ -31,7 +31,7 @@ from core.models.contract import (
     ResultsResponse,
     SyncPendingResponse,
 )
-from core.result_aggregator import get_meta, get_request_state, init_request_state
+from core.result_aggregator import get_request_state, init_request_state
 from core.workspace import configure_process_tempdir
 
 # Временные файлы процесса — в том сервиса, а не на слой контейнера.
@@ -106,7 +106,10 @@ def _dispatch(
 
 
 def _existing_request(
-    request_id: str, s3_fileids: List[str], event_id: str = "", dialog_id: str = ""
+    request_id: str,
+    operations: Dict[str, str],
+    event_id: str = "",
+    dialog_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
     Состояние уже известного запроса, если повтор POST относится к нему же.
@@ -118,8 +121,8 @@ def _existing_request(
     - запроса нет или он закончился ошибкой — None, запуск заново
       (повтор после ошибки — это и есть ретрай RAG с тем же request_id);
     - запрос ещё идёт — 409, как и раньше по контракту;
-    - запрос готов (completed/partial), тот же набор файлов и те же
-      event_id/dialog_id — возвращается его состояние, разбор не ставится;
+    - запрос готов (completed/partial), те же файлы с теми же операциями и
+      те же event_id/dialog_id — возвращается его состояние, разбор не ставится;
     - готовый запрос с другим содержимым — 409: это чужой запрос.
     """
     state = get_request_state(request_id)
@@ -130,9 +133,11 @@ def _existing_request(
             status_code=409,
             detail=f"Запрос {request_id} уже выполняется. Используйте новый request_id.",
         )
-    meta_files = list((get_meta(request_id) or {}).get("s3_fileids") or [])
+    stored_ops = state.get("operations") or {
+        fileid: state.get("operation") for fileid in state.get("s3_fileids") or []
+    }
     same = (
-        sorted(meta_files) == sorted(s3_fileids)
+        stored_ops == operations
         and (state.get("event_id") or "") == (event_id or "")
         and (state.get("dialog_id") or "") == (dialog_id or "")
     )
@@ -172,7 +177,8 @@ async def parse_sync(request: ParseRequest):
     остаётся доступен через /internal/v1/parse/results/{request_id}.
     """
     existing = await asyncio.to_thread(
-        _existing_request, request.request_id, list(request.s3_fileid),
+        _existing_request, request.request_id,
+        {fileid: "create" for fileid in request.s3_fileid},
         dialog_id=request.dialog_id,
     )
     if existing is None:
@@ -225,7 +231,7 @@ async def parse_background(request: BackgroundParseRequest):
     common = next(iter(set(operations.values()))) if len(set(operations.values())) == 1 else None
 
     existing = await asyncio.to_thread(
-        _existing_request, request.request_id, [item.s3_fileid for item in items],
+        _existing_request, request.request_id, operations,
         event_id=request.event_id,
     )
     # Повтор готового запроса — тот же 202 без нового разбора. Статус в

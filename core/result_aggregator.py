@@ -140,6 +140,15 @@ def mark_started(request_id: str, s3_fileid: Optional[str] = None) -> None:
     pipe.execute()
 
 
+def mark_handed_off(request_id: str, s3_fileid: str) -> None:
+    """
+    Задача файла отдала работу следующей (повтор после ошибки, ожидание
+    чужого разбора) и сама завершилась. Пока следующая стоит в очереди,
+    файл не считается пропавшим: время отсчитывается от её старта.
+    """
+    get_client().hdel(_since_key(request_id), s3_fileid)
+
+
 def put_document_result(request_id: str, s3_fileid: str, document: Dict[str, Any]) -> int:
     """
     Кладёт результат по одному файлу. Возвращает число готовых документов.
@@ -209,6 +218,7 @@ def get_request_state(request_id: str) -> Optional[Dict[str, Any]]:
         "event_id": meta.get("event_id", ""),
         "operation": meta.get("operation"),
         "operations": meta.get("operations") or {},
+        "s3_fileids": list(meta.get("s3_fileids") or []),
         "total": total,
         "processed": processed,
         "status": compute_status(total, ordered, bool(started)),
