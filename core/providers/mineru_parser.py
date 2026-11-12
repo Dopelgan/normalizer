@@ -51,6 +51,7 @@ from core.providers.text_layer import (
     lines_to_text,
     merge_line_bboxes,
     open_pdf,
+    page_turn,
     reconcile_with_text_layer,
 )
 
@@ -336,8 +337,10 @@ class MinerUParserProvider(DocumentParserProvider):
         for page in sorted(layer.pages):
             if layer.overlay_only(page):
                 continue
-            for group in group_lines([l for l in layer.lines(page) if l.char_count()]):
-                text = lines_to_text(group)
+            lines = [l for l in layer.lines(page) if l.char_count()]
+            turn = page_turn(lines)
+            for group in group_lines(lines, turn):
+                text = lines_to_text(group, turn)
                 if not text:
                     continue
                 blocks.append(ParsedBlock(

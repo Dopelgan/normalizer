@@ -326,3 +326,29 @@ class TestTimeBudget:
         processor.process(SHEET_URI, {})
         kinds = [what for what, _, _ in processor.qwen.asked]
         assert kinds.index("title_block") < kinds.index("table")
+
+
+class TestSidewaysScan:
+    """Скан PDF с листом боком и без /Rotate: модель получает лист штампом вниз справа."""
+
+    def test_title_block_is_cut_from_the_turned_sheet(self, storage, monkeypatch):
+        pymupdf = pytest.importorskip("pymupdf")
+        monkeypatch.setattr("core.providers.ocr_prepare.osd_rotation", lambda _: None)
+        document = pymupdf.open()
+        page = document.new_page(width=595, height=842)
+        page.insert_image(page.rect, stream=sheet.png_bytes(with_table=False), rotate=90)
+        storage.write_file("assets/doc-1/sideways.pdf", document.tobytes())
+        document.close()
+
+        processor = DrawingProcessor(storage, qwen=FakeQwen(
+            reading=reading(annotation("size", "20")),
+            title_block={"fields": {"Наименование": "Вилка"}, "rows": []},
+        ))
+        result = processor.process("assets/doc-1/sideways.pdf", {})
+
+        sheet_size = processor.qwen.asked[0][1]
+        assert sheet_size[0] > sheet_size[1], "лист ушёл в модель книжным"
+        assert "повёрнут" in processor.qwen.asked[0][2]
+        assert "title_block" in [what for what, _, _ in processor.qwen.asked]
+        assert result["payload"]["layout"]["turn"] == 270
+        assert result["payload"]["title_block"]["Наименование"] == "Вилка"

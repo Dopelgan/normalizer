@@ -86,3 +86,34 @@ def overlap(first: List[float], second: List[float]) -> float:
 
 def expected() -> Dict[str, List[float]]:
     return {"title_block": title_block_bbox(), "table": table_bbox()}
+
+
+def build_a4_portrait():
+    """
+    Лист A4 книжный (≈100 dpi): штамп формы 1 во всю ширину рамки (185×55 мм)
+    и колонка дополнительных граф на поле подшивки (12×145 мм). Длинные
+    линии штампа уходят в рамку, и штамп распадается на куски.
+    """
+    from PIL import Image, ImageDraw
+
+    width, height = 827, 1169
+    mm = width / 210
+    image = Image.new("L", (width, height), 255)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([5 * mm, 5 * mm, width - 5 * mm, height - 5 * mm], outline=0, width=3)
+    fx0, fy0, fx1, fy1 = 20 * mm, 5 * mm, 205 * mm, 292 * mm
+    draw.rectangle([fx0, fy0, fx1, fy1], outline=0, width=3)
+    sy0 = fy1 - 55 * mm
+    draw.line([fx0, sy0, fx1, sy0], fill=0, width=2)
+    for k in range(1, 11):
+        draw.line([fx0, sy0 + k * 5 * mm, fx0 + 65 * mm, sy0 + k * 5 * mm], fill=0, width=2)
+    for xo in (7, 17, 40, 55, 65, 135, 150, 170):
+        draw.line([fx0 + xo * mm, sy0, fx0 + xo * mm, fy1], fill=0, width=2)
+    for yo in (15, 20, 35, 40):
+        draw.line([fx0 + 135 * mm, sy0 + yo * mm, fx1, sy0 + yo * mm], fill=0, width=2)
+    x0, x1, y0 = 8 * mm, 20 * mm, fy1 - 145 * mm
+    draw.rectangle([x0, y0, x1, fy1], outline=0, width=2)
+    draw.line([x0 + 5 * mm, y0, x0 + 5 * mm, fy1], fill=0, width=2)
+    for yo in (25, 60, 85, 110):
+        draw.line([x0, y0 + yo * mm, x1, y0 + yo * mm], fill=0, width=2)
+    return image

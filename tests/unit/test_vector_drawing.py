@@ -56,6 +56,32 @@ class TestPageDetection:
     def test_broken_file_does_not_raise(self):
         assert detect_drawing_pages(b"not a pdf") == {}
 
+    def test_rotated_page_finds_title_block_in_visible_corner(self):
+        # Альбомный лист, сохранённый книжным с /Rotate 90: пути
+        # get_drawings() лежат в неповёрнутой системе, а угол штампа —
+        # в видимой. Без пересчёта сетка штампа не находилась.
+        pymupdf = pytest.importorskip("pymupdf")
+        document = pymupdf.open()
+        sheet = document.new_page(width=842, height=1190)
+        sheet.set_rotation(90)
+        to_file = sheet.derotation_matrix
+
+        def line_at(a, b):
+            sheet.draw_line(pymupdf.Point(*a) * to_file, pymupdf.Point(*b) * to_file)
+
+        sheet.draw_rect(pymupdf.Rect(20, 20, 1170, 822) * to_file)
+        for i in range(160):
+            line_at((100 + i, 200), (140 + i, 320))
+        for row in range(9):
+            line_at((820, 700 + row * 14), (1170, 700 + row * 14))
+        data = document.tobytes()
+        document.close()
+
+        verdict = detect_drawing_pages(data)[1]
+        assert verdict.signals["landscape"] is True
+        assert verdict.signals["title_block_lines"] >= 6
+        assert verdict.is_drawing is True
+
 
 class TestClassification:
     @pytest.mark.parametrize("text,category", [
@@ -151,3 +177,37 @@ class TestFieldExtraction:
 
     def test_no_fields_means_zero_ratio(self):
         assert structure_ratio([]) == 0.0
+
+
+class TestSidewaysSheet:
+    """
+    Чертёж, лист которого целиком повёрнут боком без /Rotate (альбомный
+    лист, выведенный на книжную страницу): штамп лежит не в правом нижнем
+    углу страницы, и обозначение с материалом из него уходили в
+    примечания (G1, вопросы про материал и обозначение по штампу).
+    """
+
+    @staticmethod
+    def turned(text, upright, turn):
+        u1, v1, u2, v2 = upright
+        bbox = [v1, 1 - u2, v2, 1 - u1] if turn == 90 else [1 - v2, u1, 1 - v1, u2]
+        return TextLine(text=text, page=1, bbox=bbox, rotation=90.0 if turn == 90 else -90.0)
+
+    @pytest.mark.parametrize("turn", [90, 270])
+    def test_title_block_found_in_upright_corner(self, turn):
+        lines = [
+            self.turned("АБВГ.301261.005", [0.62, 0.86, 0.80, 0.88], turn),
+            self.turned("Сталь 12Х18Н10Т ГОСТ 5632-2014", [0.62, 0.92, 0.90, 0.94], turn),
+            self.turned("Технические требования", [0.10, 0.60, 0.40, 0.62], turn),
+            self.turned("Неуказанные предельные отклонения размеров", [0.10, 0.64, 0.50, 0.66], turn),
+            # Подпись размера повёрнута относительно листа — меньшинство.
+            TextLine(text="85±0,2", page=1, bbox=[0.3, 0.3, 0.32, 0.4], rotation=0.0),
+        ]
+        fields = {f["value"]: f for f in extract_drawing_fields(TextLayer(pages={1: lines},
+                                                                         page_count=1), 1)}
+        assert fields["АБВГ.301261.005"]["category"] == "title_block"
+        assert fields["Сталь 12Х18Н10Т ГОСТ 5632-2014"]["category"] == "material"
+        assert fields["Сталь 12Х18Н10Т ГОСТ 5632-2014"]["confidence"] == 0.9
+        assert fields["Технические требования"]["category"] == "note"
+        # Рамки полей — в системе страницы, как её видно.
+        assert fields["АБВГ.301261.005"]["bbox"] == lines[0].bbox
