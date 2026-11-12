@@ -610,6 +610,8 @@ class ReconcileStats:
     split_tokens: int = 0
     #: Строк слоя из рамки таблицы, возвращённых текстом: их слов в ячейках нет.
     table_lines_kept: int = 0
+    #: «Таблиц» во весь лист с прозой внутри — рамок ЕСКД, разобранных в текст.
+    frame_tables: int = 0
     layer_chars_by_page: Dict[int, int] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -628,6 +630,7 @@ class ReconcileStats:
             "degraded_tables": self.degraded_tables,
             "split_tokens": self.split_tokens,
             "table_lines_kept": self.table_lines_kept,
+            "frame_tables": self.frame_tables,
         }
 
 
@@ -635,6 +638,7 @@ def reconcile_with_text_layer(
     blocks: Sequence[ParsedBlock],
     layer: TextLayer,
     source: LayerSource = VECTOR_LAYER,
+    frame_table_guard: bool = False,
 ) -> Tuple[List[ParsedBlock], ReconcileStats]:
     """
     Текст блоков берётся из слоя, а не из OCR; всё, что не попало ни в одну
@@ -646,6 +650,8 @@ def reconcile_with_text_layer(
     метода и уверенность: выдавать распознанное за текст из файла нельзя.
     """
     stats = ReconcileStats(layer_chars_by_page=layer.char_counts_by_page())
+    if frame_table_guard:
+        blocks = _drop_frame_tables(blocks, layer, stats)
     by_page: Dict[int, List[ParsedBlock]] = {}
     for block in blocks:
         by_page.setdefault(block.page, []).append(block)
@@ -764,6 +770,66 @@ def reconcile_with_text_layer(
         stats.repaired_cells,
     )
     return result, stats
+
+
+# «Таблица» MinerU, которая занимает столько листа, — рамка формата.
+_FRAME_TABLE_AREA = 0.5
+
+
+def _drop_frame_tables(
+    blocks: Sequence[ParsedBlock], layer: TextLayer, stats: ReconcileStats
+) -> List[ParsedBlock]:
+    """
+    Текст в рамке ЕСКД MinerU принимает за одну таблицу во весь лист, а
+    многостраничную — за одну таблицу на всю книгу (ПМ1: 3626 подчанков).
+    Такая рамка убирается до сшивки: строки слоя внутри неё возвращаются
+    обычным текстом, и в индекс таблицы этой книги она не попадает.
+    Настоящая таблица во весь лист остаётся: в её ячейках не проза.
+    """
+    from core.providers import page_prose
+
+    kept: List[ParsedBlock] = []
+    dropped_lines: List[str] = []
+    for block in blocks:
+        if block.type == "table" and block.area() >= _FRAME_TABLE_AREA:
+            x1, y1, x2, y2 = block.bbox
+            inside = [
+                line.text for line in layer.lines(block.page)
+                if x1 <= line.center[0] <= x2 and y1 <= line.center[1] <= y2
+            ]
+            if inside and page_prose.assess(inside).is_prose:
+                stats.frame_tables += 1
+                dropped_lines.extend(inside)
+                continue
+        kept.append(block)
+
+    # Многостраничную таблицу MinerU отдаёт целиком в рамке первого листа,
+    # а продолжения — пустыми рамками. Если первый лист сам не проза
+    # (титул, «УТВЕРЖДАЮ»), его «таблица» осталась бы и несла весь текст
+    # книги, а строки продолжений вернулись бы текстом второй копией.
+    # Поэтому снимается и та рамка во весь лист, в которой лежат строки
+    # уже снятых рамок.
+    probes = [_squash(t) for t in dropped_lines if len(_squash(t)) >= 20]
+    if not probes:
+        return kept
+    result: List[ParsedBlock] = []
+    for block in kept:
+        if block.type == "table" and block.area() >= _FRAME_TABLE_AREA:
+            own = _squash(_table_text(block))
+            hits = sum(1 for p in probes if p in own)
+            if own and hits >= min(3, len(probes)):
+                stats.frame_tables += 1
+                continue
+        result.append(block)
+    return result
+
+
+def _squash(text: str) -> str:
+    return "".join(fold_homoglyphs(text or "").split()).lower()
+
+
+def _table_text(block: ParsedBlock) -> str:
+    return f"{block.text or ''} {_table_index([block])}"
 
 
 def _assign_lines(

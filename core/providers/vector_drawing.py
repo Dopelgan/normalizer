@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from core.providers import page_prose
 from core.providers.text_layer import (
     PYMUPDF_AVAILABLE,
     TextLayer,
@@ -51,6 +52,11 @@ PROVENANCE_VECTOR = "vector_text_layer"
 _MANY_PATHS = 120          # столько векторных путей на листе уже не текст
 _FRAME_COVERAGE = 0.65     # рамка формата занимает почти весь лист
 _DRAWING_SCORE = 0.5       # порог отнесения страницы к чертежам
+_TEXT_IN_FRAME_SCORE = 0.4  # проза в рамке ЕСКД: ниже порога, но видно в signals
+# Столько векторных путей у листа с текстом в рамке не бывает: рамка, штамп
+# и пара таблиц — десятки-сотни. Сборочный чертёж с длинными техническими
+# требованиями остаётся чертежом, сколько бы прозы на нём ни было.
+_TEXT_IN_FRAME_MAX_PATHS = 400
 
 # Штамп по ГОСТ 2.104 — в правом нижнем углу листа.
 _TITLE_BLOCK_REGION = (0.55, 0.78, 1.0, 1.0)
@@ -181,7 +187,24 @@ def _score_page(page: Any, page_no: int) -> DrawingPage:
     if path_count >= _MANY_PATHS and chars < 2500:
         score += 0.15
 
-    return DrawingPage(page=page_no, score=round(min(1.0, score), 3), signals=signals)
+    score = min(1.0, score)
+    if (score >= _DRAWING_SCORE and path_count < _TEXT_IN_FRAME_MAX_PATHS
+            and _text_in_frame_enabled()):
+        # Рамка и штамп есть и у ПОК, ТУ, ТЗ, писем. Если на листе проза,
+        # это страница текста: её поля чертежа и Qwen-VL только портят.
+        verdict = page_prose.assess(text.splitlines())
+        signals["prose"] = verdict.signals
+        if verdict.is_prose:
+            signals["text_in_frame"] = True
+            score = min(score, _TEXT_IN_FRAME_SCORE)
+
+    return DrawingPage(page=page_no, score=round(score, 3), signals=signals)
+
+
+def _text_in_frame_enabled() -> bool:
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_TEXT_IN_FRAME_ENABLED", False))
 
 
 def _has_format_frame(drawings: Sequence[Dict[str, Any]], page_area: float) -> bool:

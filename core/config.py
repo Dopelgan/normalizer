@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     # сшивать его с блоками MinerU. Стоит одного прохода Tesseract на
     # документ; без него русская проза в ячейках таблиц остаётся LaTeX-кашей.
     OCR_LAYER_ENABLED: bool = True
+    # Строки слоя распознавания ниже этой уверенности отбрасываются на тех
+    # страницах, где MinerU дал свой текст: Tesseract-мусор («едприяувие = Fe»)
+    # иначе уезжает в индекс рядом с текстом MinerU. Выключено до A/B.
+    OCR_LAYER_DROP_LOW_CONFIDENCE: bool = False
+    OCR_LAYER_MIN_LINE_CONFIDENCE: float = 0.4
+    # Страница с прозой в рамке ЕСКД (ПОК, СТО, ТУ, ТЗ, письма) — текст, а
+    # не чертёж (core/providers/page_prose.py). Выключено до A/B.
+    DRAWING_TEXT_IN_FRAME_ENABLED: bool = False
+    # Таблица MinerU во весь лист с прозой внутри — это рамка формата, а не
+    # таблица: разбирается в текст по слою. Выключено до A/B.
+    FRAME_TABLE_GUARD_ENABLED: bool = False
 
     # ------------------------- Чертежи: разметка зрением + внешняя модель
     # Адрес хоста с моделью (vLLM, OpenAI-совместимый). По умолчанию — сосед
