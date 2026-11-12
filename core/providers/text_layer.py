@@ -189,6 +189,10 @@ class TextLine:
     # построению — текст взят из файла. У слоя, собранного распознаванием,
     # сюда уезжает уверенность OCR, и выдавать её за единицу нельзя.
     confidence: float = 1.0
+    # Куски строки распознавания между широкими пробелами; пусто — строка
+    # не делится. Берутся вместо строки только на развороте с колонками
+    # прозы (`column_lines`).
+    parts: Tuple["TextLine", ...] = ()
 
     @property
     def height(self) -> float:
@@ -432,6 +436,72 @@ def group_lines(lines: Sequence[TextLine], turn: Optional[int] = None) -> List[L
     return [[line for _, line in group] for group in groups]
 
 
+# Колонка — это проза: столько строк и такая медианная длина строки.
+_COLUMN_MIN_LINES = 4
+_COLUMN_MIN_CHARS = 20
+_COLUMN_SLACK = 0.005
+
+
+def group_columns(lines: Sequence[TextLine], turn: Optional[int] = None) -> List[List[TextLine]]:
+    """
+    Как `group_lines`, но колонки прозы собираются в абзацы по отдельности,
+    слева направо (`_prose_columns`). Нет колонок прозы — как `group_lines`.
+    """
+    if not lines:
+        return []
+    turn = page_turn(lines) if turn is None else turn
+    columns = _prose_columns(lines, turn)
+    if columns is None:
+        return group_lines(lines, turn)
+    groups: List[List[TextLine]] = []
+    for column in columns:
+        groups.extend(group_lines(column, turn))
+    return groups
+
+
+def column_lines(lines: Sequence[TextLine], turn: Optional[int] = None) -> List[TextLine]:
+    """
+    Строки страницы, где строка через разворот заменена своими кусками —
+    но только если по кускам лист делится на колонки прозы. Иначе строки
+    как есть: в таблице куски — это ячейки, и ряд должен остаться рядом.
+    """
+    if not any(line.parts for line in lines):
+        return list(lines)
+    flat = [part for line in lines for part in (line.parts or (line,))]
+    turn = page_turn(flat) if turn is None else turn
+    return flat if _prose_columns(flat, turn) is not None else list(lines)
+
+
+def _prose_columns(
+    lines: Sequence[TextLine], turn: int
+) -> Optional[List[List[TextLine]]]:
+    """
+    Колонки — участки по горизонтали (на прямо стоящем листе), которые не
+    пересекает ни одна строка. Делится только проза: в каждой колонке не
+    меньше `_COLUMN_MIN_LINES` строк с медианной длиной от
+    `_COLUMN_MIN_CHARS`. Столбцы таблицы (короткие ячейки) колонками не
+    считаются, иначе ряд таблицы развалился бы на столбцы.
+    """
+    pairs = list(zip(_upright_lines(lines, turn), lines))
+    pairs.sort(key=lambda pair: pair[0].bbox[0])
+    columns: List[List[TextLine]] = []
+    right = -1.0
+    for upright, line in pairs:
+        if columns and upright.bbox[0] <= right + _COLUMN_SLACK:
+            columns[-1].append(line)
+            right = max(right, upright.bbox[2])
+        else:
+            columns.append([line])
+            right = upright.bbox[2]
+    if len(columns) < 2:
+        return None
+    for column in columns:
+        lengths = sorted(len(line.text.strip()) for line in column)
+        if len(lengths) < _COLUMN_MIN_LINES or lengths[len(lengths) // 2] < _COLUMN_MIN_CHARS:
+            return None
+    return columns
+
+
 def _reading_pairs(lines: Sequence[TextLine], turn: int) -> List[Tuple[TextLine, TextLine]]:
     """(строка с рамкой прямо стоящего листа, исходная строка) в порядке чтения."""
     pairs = list(zip(_upright_lines(lines, turn), lines))
@@ -612,6 +682,8 @@ class ReconcileStats:
     table_lines_kept: int = 0
     #: «Таблиц» во весь лист с прозой внутри — рамок ЕСКД, разобранных в текст.
     frame_tables: int = 0
+    #: Строк слоя из рамки таблицы, отброшенных по уверенности.
+    low_confidence_table_lines: int = 0
     layer_chars_by_page: Dict[int, int] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -631,6 +703,7 @@ class ReconcileStats:
             "split_tokens": self.split_tokens,
             "table_lines_kept": self.table_lines_kept,
             "frame_tables": self.frame_tables,
+            "low_confidence_table_lines": self.low_confidence_table_lines,
         }
 
 
@@ -639,6 +712,9 @@ def reconcile_with_text_layer(
     layer: TextLayer,
     source: LayerSource = VECTOR_LAYER,
     frame_table_guard: bool = False,
+    keep_structured_tables: bool = False,
+    table_line_min_confidence: float = 0.0,
+    split_columns: bool = False,
 ) -> Tuple[List[ParsedBlock], ReconcileStats]:
     """
     Текст блоков берётся из слоя, а не из OCR; всё, что не попало ни в одну
@@ -648,10 +724,22 @@ def reconcile_with_text_layer(
     `source` говорит, откуда слой: у векторного PDF это сам файл, у растра —
     построчное распознавание. Разбор от этого не меняется, меняются подпись
     метода и уверенность: выдавать распознанное за текст из файла нельзя.
+
+    `keep_structured_tables` — рамка во весь лист с настоящими строками
+    таблицы (спецификация ЕСКД) не снимается защитой рамок, даже если под
+    таблицей проза примечаний. `table_line_min_confidence` — строки
+    распознавания из рамки таблицы, которые иначе вернулись бы текстом,
+    отбрасываются ниже этой уверенности: это повтор той же таблицы,
+    прочитанный через линии сетки. Оба — только для слоя распознавания.
+    `split_columns` — строки вне рамок собираются в абзацы по колонкам
+    (`group_columns`).
     """
     stats = ReconcileStats(layer_chars_by_page=layer.char_counts_by_page())
     if frame_table_guard:
-        blocks = _drop_frame_tables(blocks, layer, stats)
+        blocks = _drop_frame_tables(
+            blocks, layer, stats, keep_structured=keep_structured_tables and not source.exact
+        )
+    line_floor = table_line_min_confidence if not source.exact else 0.0
     by_page: Dict[int, List[ParsedBlock]] = {}
     for block in blocks:
         by_page.setdefault(block.page, []).append(block)
@@ -667,6 +755,10 @@ def reconcile_with_text_layer(
     for page in pages:
         page_blocks = by_page.get(page, [])
         page_lines = [l for l in layer.lines(page) if l.char_count()]
+        if split_columns and not source.exact:
+            # Разворот в две колонки: строка через обе колонки заменяется
+            # кусками, и каждый уходит в свою рамку и свою колонку.
+            page_lines = column_lines(page_lines)
 
         if not page_lines:
             result.extend(page_blocks)
@@ -719,7 +811,7 @@ def reconcile_with_text_layer(
                     block, matched, stats, vocab, exact=source.exact, turn=turn
                 )
                 extra_blocks.extend(replacements)
-                leftovers.extend(kept)
+                leftovers.extend(_confident(kept, line_floor, stats))
             elif matched and not _carries_own_text(block):
                 # Рамка распознана как таблица или картинка, но содержимого
                 # в ней не оказалось (у MinerU это обычное дело на сложной
@@ -729,6 +821,11 @@ def reconcile_with_text_layer(
                 # тогда возвращать нечего, а пустую рамку незачем держать.
                 if block.type == "table":
                     fresh = _drop_duplicates(matched, parsed_tables, stats)
+                    if parsed_tables:
+                        # Пустая рамка — продолжение уже разобранной таблицы:
+                        # неуверенные строки в ней — та же таблица через сетку.
+                        # Без разобранных таблиц слой — единственный источник.
+                        fresh = _confident(fresh, line_floor, stats)
                     if not fresh:
                         stats.dropped_empty_tables += 1
                         dropped.append(block)
@@ -742,7 +839,8 @@ def reconcile_with_text_layer(
             page_blocks = [b for b in page_blocks if not any(b is d for d in dropped)]
         page_blocks.extend(extra_blocks)
 
-        for group in group_lines(leftovers, turn):
+        grouping = group_columns if split_columns else group_lines
+        for group in grouping(leftovers, turn):
             text = lines_to_text(group, turn)
             if not text:
                 continue
@@ -774,10 +872,52 @@ def reconcile_with_text_layer(
 
 # «Таблица» MinerU, которая занимает столько листа, — рамка формата.
 _FRAME_TABLE_AREA = 0.5
+# Настоящая таблица: строк хотя бы с двумя заполненными ячейками не меньше
+# стольких и не меньше такой доли строк, а ячейки короткие (не строки прозы).
+_STRUCTURED_MIN_ROWS = 5
+_STRUCTURED_MIN_SHARE = 0.4
+_STRUCTURED_MAX_CELL = 40
+
+
+def _confident(
+    lines: Sequence[TextLine], floor: float, stats: "ReconcileStats"
+) -> List[TextLine]:
+    """Строки не ниже `floor` по уверенности; остальные считаются в статистике."""
+    if floor <= 0:
+        return list(lines)
+    kept = [line for line in lines if line.confidence >= floor]
+    stats.low_confidence_table_lines += len(lines) - len(kept)
+    return kept
+
+
+def _structured_table(block: ParsedBlock) -> bool:
+    """
+    В рамке настоящая таблица, а не текст листа: много строк с несколькими
+    короткими заполненными ячейками (позиция, обозначение, наименование).
+    Проза в рамке ЕСКД так не выглядит: у неё одна длинная ячейка на строку.
+    """
+    rows = (block.table_data or {}).get("rows") or []
+    if not rows:
+        return False
+    filled_rows = 0
+    lengths: List[int] = []
+    for row in rows:
+        filled = [str(c).strip() for c in row if str(c).strip()]
+        lengths.extend(len(c) for c in filled)
+        if len(filled) >= 2:
+            filled_rows += 1
+    if not lengths:
+        return False
+    return (
+        filled_rows >= _STRUCTURED_MIN_ROWS
+        and filled_rows >= len(rows) * _STRUCTURED_MIN_SHARE
+        and statistics.median(lengths) <= _STRUCTURED_MAX_CELL
+    )
 
 
 def _drop_frame_tables(
-    blocks: Sequence[ParsedBlock], layer: TextLayer, stats: ReconcileStats
+    blocks: Sequence[ParsedBlock], layer: TextLayer, stats: ReconcileStats,
+    keep_structured: bool = False,
 ) -> List[ParsedBlock]:
     """
     Текст в рамке ЕСКД MinerU принимает за одну таблицу во весь лист, а
@@ -791,7 +931,8 @@ def _drop_frame_tables(
     kept: List[ParsedBlock] = []
     dropped_lines: List[str] = []
     for block in blocks:
-        if block.type == "table" and block.area() >= _FRAME_TABLE_AREA:
+        if (block.type == "table" and block.area() >= _FRAME_TABLE_AREA
+                and not (keep_structured and _structured_table(block))):
             x1, y1, x2, y2 = block.bbox
             inside = [
                 line.text for line in layer.lines(block.page)
@@ -814,7 +955,8 @@ def _drop_frame_tables(
         return kept
     result: List[ParsedBlock] = []
     for block in kept:
-        if block.type == "table" and block.area() >= _FRAME_TABLE_AREA:
+        if (block.type == "table" and block.area() >= _FRAME_TABLE_AREA
+                and not (keep_structured and _structured_table(block))):
             own = _squash(_table_text(block))
             hits = sum(1 for p in probes if p in own)
             if own and hits >= min(3, len(probes)):

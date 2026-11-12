@@ -49,6 +49,7 @@ from core.providers.document_parser import (
     ParserFailed,
     ParserUnavailable,
 )
+from core.providers import ocr_cleanup
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.tesseract_fallback import TesseractFallbackProvider
 from core.providers.vector_drawing import (
@@ -274,14 +275,26 @@ class MinerUParserProvider(DocumentParserProvider):
                 ocr_layer = drop_low_confidence_lines(
                     ocr_layer, result.blocks, settings.OCR_LAYER_MIN_LINE_CONFIDENCE
                 )
+            vocab = ocr_cleanup.load_vocabulary() if settings.OCR_WORD_FIX_ENABLED else None
+            word_fix = ocr_cleanup.CleanupStats()
+            if ocr_layer is not None and vocab is not None:
+                ocr_layer, word_fix = ocr_cleanup.clean_layer(ocr_layer, vocab)
             if ocr_layer is not None:
                 blocks, stats = reconcile_with_text_layer(
                     result.blocks, ocr_layer, source=OCR_LAYER,
                     frame_table_guard=settings.FRAME_TABLE_GUARD_ENABLED,
+                    keep_structured_tables=settings.OCR_KEEP_STRUCTURED_TABLES,
+                    table_line_min_confidence=settings.OCR_TABLE_LINE_MIN_CONFIDENCE,
+                    split_columns=settings.OCR_SPLIT_WIDE_GAPS,
                 )
+                if vocab is not None:
+                    # Ячейки таблиц и текст MinerU, не перекрытые слоем.
+                    word_fix.add(ocr_cleanup.clean_blocks(blocks, vocab))
                 result.blocks = blocks
                 result.text_layer_chars = stats.layer_chars_by_page
                 result.text_layer_stats = {**stats.as_dict(), "layer": "ocr"}
+                if vocab is not None:
+                    result.text_layer_stats["word_fix"] = word_fix.as_dict()
                 # Происхождение известно только здесь: слоя в файле не
                 # оказалось и текст собран распознаванием. До этой ветки
                 # `source_kind` ставился по расширению, и скан уезжал в

@@ -51,10 +51,13 @@ from celery.exceptions import SoftTimeLimitExceeded
 from core import deadline
 from core.config import settings
 from core.models.parse_result import ParsedBlock
+from core.providers import ocr_cleanup
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.ocr_prepare import PreparedPage, prepare_page
 from core.workspace import temp_dir
-from core.providers.text_layer import TextLayer, TextLine, group_lines, merge_line_bboxes
+from core.providers.text_layer import (
+    TextLayer, TextLine, column_lines, group_columns, group_lines, merge_line_bboxes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +91,9 @@ class OcrLine:
     # Угол письма на исходном листе, против часовой: лист, повёрнутый
     # перед чтением по OSD на 90° по часовой, даёт 90 (строки снизу вверх).
     rotation: float = 0.0
+    # Куски строки между широкими пробелами (`OCR_SPLIT_WIDE_GAPS`); пусто —
+    # строка не делится. Нужны для разворота в две колонки.
+    parts: List["OcrLine"] = field(default_factory=list)
 
 
 class TesseractFallbackProvider:
@@ -221,14 +227,7 @@ class TesseractFallbackProvider:
             images = self._images_of(local_path, file_type)
             pages: Dict[int, List[TextLine]] = {}
             for page_num, ocr_lines in self._map_pages(images, lambda image, _: self.ocr_lines(image)):
-                lines = [
-                    TextLine(
-                        text=line.text, bbox=list(line.bbox), page=page_num,
-                        confidence=line.confidence, rotation=line.rotation,
-                    )
-                    for line in ocr_lines
-                    if line.text.strip()
-                ]
+                lines = [_text_line(line, page_num) for line in ocr_lines if line.text.strip()]
                 if lines:
                     pages[page_num] = lines
             if not pages:
@@ -418,13 +417,16 @@ class TesseractFallbackProvider:
         lines = self.ocr_lines(image)
         if lines:
             blocks: List[ParsedBlock] = []
-            as_text_lines = [
-                TextLine(text=l.text, bbox=list(l.bbox), page=page, confidence=l.confidence,
-                         rotation=l.rotation)
-                for l in lines if l.text.strip()
-            ]
-            for group in group_lines(as_text_lines):
+            as_text_lines = [_text_line(l, page) for l in lines if l.text.strip()]
+            vocab = ocr_cleanup.load_vocabulary() if settings.OCR_WORD_FIX_ENABLED else None
+            if settings.OCR_SPLIT_WIDE_GAPS:
+                groups = group_columns(column_lines(as_text_lines))
+            else:
+                groups = group_lines(as_text_lines)
+            for group in groups:
                 text = "\n".join(l.text.strip() for l in group).strip()
+                if vocab is not None and text:
+                    text = ocr_cleanup.clean_text(text, vocab)[0]
                 if not text:
                     continue
                 blocks.append(ParsedBlock(
@@ -476,7 +478,7 @@ class TesseractFallbackProvider:
             if cached:
                 with _MEMO_LOCK:
                     cached = memo.setdefault(key, cached)
-        return [replace(line, bbox=list(line.bbox)) for line in cached]
+        return [replace(line, bbox=list(line.bbox), parts=list(line.parts)) for line in cached]
 
     def _read_lines(self, image: "Image.Image", psm: int = PSM_BLOCK) -> List[OcrLine]:
         """
@@ -508,7 +510,7 @@ class TesseractFallbackProvider:
         orientation = prepared.orientation % 360 if prepared is not None else 0
         rotation = float(orientation - 360 if orientation > 180 else orientation)
 
-        grouped: Dict[tuple, Dict[str, Any]] = {}
+        grouped: Dict[tuple, List[tuple]] = {}
         for index, raw in enumerate(data.get("text") or []):
             word = (raw or "").strip()
             if not word:
@@ -532,24 +534,15 @@ class TesseractFallbackProvider:
                 bottom = top + data["height"][index]
             except (KeyError, IndexError, TypeError):
                 continue
-            entry = grouped.setdefault(
-                key, {"words": [], "weight": 0.0, "sum": 0.0,
-                      "box": [left, top, right, bottom]}
+            grouped.setdefault(key, []).append(
+                (left, top, right, bottom, word, confidence / 100.0)
             )
-            entry["words"].append(word)
-            weight = max(1, len(word))
-            entry["weight"] += weight
-            entry["sum"] += (confidence / 100.0) * weight
-            box = entry["box"]
-            entry["box"] = [
-                min(box[0], left), min(box[1], top),
-                max(box[2], right), max(box[3], bottom),
-            ]
 
-        lines: List[OcrLine] = []
-        for key in sorted(grouped):
-            entry = grouped[key]
-            left, top, right, bottom = entry["box"]
+        def to_line(segment: Sequence[tuple]) -> OcrLine:
+            left = min(w[0] for w in segment)
+            top = min(w[1] for w in segment)
+            right = max(w[2] for w in segment)
+            bottom = max(w[3] for w in segment)
             bbox = [
                 max(0.0, min(1.0, left / width)),
                 max(0.0, min(1.0, top / height)),
@@ -560,12 +553,26 @@ class TesseractFallbackProvider:
                 # Координаты — в долях исходного листа, иначе строки
                 # повёрнутого скана не сошьются с рамками MinerU.
                 bbox = prepared.to_source(bbox)
-            lines.append(OcrLine(
-                text=" ".join(entry["words"]),
+            weights = [max(1, len(w[4])) for w in segment]
+            return OcrLine(
+                text=" ".join(w[4] for w in segment),
                 bbox=bbox,
-                confidence=round(entry["sum"] / entry["weight"], 3) if entry["weight"] else 0.0,
+                confidence=round(
+                    sum(w[5] * k for w, k in zip(segment, weights)) / sum(weights), 3
+                ),
                 rotation=rotation,
-            ))
+            )
+
+        split = settings.OCR_SPLIT_WIDE_GAPS
+        lines: List[OcrLine] = []
+        for key in sorted(grouped):
+            words = grouped[key]
+            line = to_line(words)
+            if split:
+                segments = _split_wide_gaps(words, width)
+                if len(segments) > 1:
+                    line.parts = [to_line(segment) for segment in segments]
+            lines.append(line)
         return lines
 
     @staticmethod
@@ -666,6 +673,42 @@ class TesseractFallbackProvider:
         if file_type:
             return filetypes.kind_of(file_type) == filetypes.KIND_IMAGE
         return TesseractFallbackProvider._is_image(path)
+
+
+# Разрыв между словами строки, после которого это уже разные строки:
+# столько высот строки и не меньше такой доли ширины листа.
+_GAP_HEIGHTS = 2.5
+_GAP_MIN_SHARE = 0.03
+
+
+def _split_wide_gaps(words: Sequence[tuple], width: int) -> List[List[tuple]]:
+    """
+    Слова одной строки Tesseract -> куски, разделённые широким пробелом.
+
+    В режиме `--psm 6` страница — один блок, и строка идёт через весь лист:
+    на развороте паспорта в две колонки «...предназначены Сбор и заготовка
+    цветных металлов...» склеивает строку левой колонки со строкой правой,
+    в таблице — ячейки ряда. Куски по отдельности попадают в свои рамки
+    MinerU и в свои колонки (`group_columns`).
+    """
+    ordered = sorted(words, key=lambda w: w[0])
+    heights = sorted(w[3] - w[1] for w in ordered)
+    typical = heights[len(heights) // 2] if heights else 0
+    limit = max(typical * _GAP_HEIGHTS, width * _GAP_MIN_SHARE)
+    segments: List[List[tuple]] = [[ordered[0]]] if ordered else []
+    for word in ordered[1:]:
+        if word[0] - segments[-1][-1][2] > limit:
+            segments.append([word])
+        else:
+            segments[-1].append(word)
+    return segments
+
+
+def _text_line(line: OcrLine, page: int) -> TextLine:
+    return TextLine(
+        text=line.text, bbox=list(line.bbox), page=page, confidence=line.confidence,
+        rotation=line.rotation, parts=tuple(_text_line(p, page) for p in line.parts),
+    )
 
 
 def _weighted_lines(lines: Sequence[Any]) -> float:

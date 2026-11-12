@@ -94,6 +94,22 @@ class Settings(BaseSettings):
     # выключено, значения на проде — в README, раздел «Флаги разбора».
     OCR_LAYER_DROP_LOW_CONFIDENCE: bool = False
     OCR_LAYER_MIN_LINE_CONFIDENCE: float = 0.4
+    # Шум распознавания растра (core/providers/ocr_cleanup.py и сшивка в
+    # core/providers/text_layer.py). Все три по умолчанию выключены.
+    # Выправка слов по словарю моделей Tesseract: латиница в русском слове
+    # («Bbod», «TY», «no»), курсивные б/в/д, и/п/н, обрывки линий сетки.
+    OCR_WORD_FIX_ENABLED: bool = False
+    # Таблица MinerU во весь лист с настоящими строками (спецификация ЕСКД)
+    # не снимается защитой рамок FRAME_TABLE_GUARD_ENABLED на скане.
+    OCR_KEEP_STRUCTURED_TABLES: bool = False
+    # Строки слоя из рамки таблицы, которые возвращались бы текстом
+    # (повтор таблицы через линии сетки), ниже этой уверенности
+    # отбрасываются. 0 — выключено.
+    OCR_TABLE_LINE_MIN_CONFIDENCE: float = 0.0
+    # Строка Tesseract режется по широкому пробелу, а строки без рамки
+    # MinerU собираются в абзацы по колонкам: разворот паспорта в две
+    # колонки иначе читается одной строкой через обе.
+    OCR_SPLIT_WIDE_GAPS: bool = False
     # Страница с прозой в рамке ЕСКД (ПОК, СТО, ТУ, ТЗ, письма) — текст, а
     # не чертёж (core/providers/page_prose.py). Проверка в опознании листа
     # векторного PDF (core/providers/vector_drawing.py). По умолчанию выключено.
