@@ -49,7 +49,7 @@ from core.providers.document_parser import (
     ParserFailed,
     ParserUnavailable,
 )
-from core.providers import ocr_cleanup
+from core.providers import ocr_cleanup, table_vlm
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.tesseract_fallback import TesseractFallbackProvider
 from core.providers.vector_drawing import (
@@ -286,6 +286,7 @@ class MinerUParserProvider(DocumentParserProvider):
                     keep_structured_tables=settings.OCR_KEEP_STRUCTURED_TABLES,
                     table_line_min_confidence=settings.OCR_TABLE_LINE_MIN_CONFIDENCE,
                     split_columns=settings.OCR_SPLIT_WIDE_GAPS,
+                    table_reader=table_vlm.table_reader(file_bytes, file_type),
                 )
                 if vocab is not None:
                     # Ячейки таблиц и текст MinerU, не перекрытые слоем.
