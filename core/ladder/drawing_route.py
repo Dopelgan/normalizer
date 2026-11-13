@@ -192,11 +192,21 @@ def settle(
     got = volume(fragments)
     reserve_chars = text_chars(reserve)
     found = drawing_structure(fragments)
+    # Нижняя граница объёма. Состав решает, кто старше, но отбрасывать
+    # вдвое более богатое чтение из-за двух полей нельзя: порог на состав
+    # можно перешагнуть и случайно — спасённая надпись, число, принятое за
+    # размер. Граница ничего не отнимает: при её срабатывании чертёжный
+    # разбор из документа не убирается, к нему добавляется текст
+    # распознавания, то есть итог заведомо не беднее любого из двух чтений.
+    # На корпусе прода (14 прочитанных листов) она не срабатывает ни разу:
+    # разбор держит от 1.4 до 7 раз больше символов, чем запас.
+    floor = reserve_chars * settings.LADDER_CONTENT_KEEP_RATIO
+    enough_text = got.chars >= floor
     if settings.LADDER_STRUCTURE_OVER_LENGTH:
         # Решает состав прочитанного, а не объём. Плоский текст полей листа
         # не возвращает вовсе, поэтому чертёжный разбор с полями старше
-        # распознавания при любом числе символов.
-        won = found.structured
+        # распознавания почти при любом числе символов — но не ниже границы.
+        won = found.structured and enough_text
     else:
         won = got.read > 0 and got.chars >= reserve_chars * settings.LADDER_CONTENT_KEEP_RATIO
     # Ключи исхода пишутся всегда, в том числе ложными значениями: по ним
@@ -216,6 +226,10 @@ def settle(
         "thinner_kept": bool(won and got.chars < reserve_chars),
         # Чертёжная ветка проиграла сверку: текст распознавания возвращён.
         "lost": not won,
+        # Состав чертёжный, а символов меньше нижней границы объёма: разбор
+        # остался в документе, но текст распознавания к нему возвращён.
+        "below_content_floor": bool(settings.LADDER_STRUCTURE_OVER_LENGTH
+                                    and found.structured and not enough_text),
     }
     parse_result.ladder["drawing_route"] = outcome
     parse_result.fallback_reserve = None
@@ -261,7 +275,13 @@ def settle(
             )
         return fragments, {}
 
-    if settings.LADDER_STRUCTURE_OVER_LENGTH:
+    if outcome["below_content_floor"]:
+        note = (
+            f"чертёжный разбор ниже границы объёма: {got.chars} символов при "
+            f"границе {floor:.0f} ({reserve_chars} у {reserve.parser_name}) — "
+            "разбор чертежа оставлен, текст распознавания возвращён рядом"
+        )
+    elif settings.LADDER_STRUCTURE_OVER_LENGTH:
         note = (
             "чертёжный разбор без структуры: полей "
             f"{found.fields}, штамп {'есть' if found.title_block else 'нет'}, "

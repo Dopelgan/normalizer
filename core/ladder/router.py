@@ -272,6 +272,12 @@ class LadderRouter:
 
             if structural:
                 structural_seen = True
+                # Место этих строк важно, и важность его не видна: признак
+                # должен быть выставлен до `candidates.append` ниже, потому
+                # что `candidate_rank` читает `sheet_read_later` из
+                # объемлющей области на каждом вызове `max`. Переставишь —
+                # кандидат попадёт в сравнение с прежним значением, и
+                # лестница молча вернётся к счёту символов.
                 if (not sheet_read_later
                         and not self._keeps_content(chars, fallback_chars)
                         and drawing_route.unread_frame_sheet(context, result)):

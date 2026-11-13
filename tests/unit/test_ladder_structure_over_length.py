@@ -248,8 +248,13 @@ class TestRouteOnASheetTheDetectorCalledText:
         assert result.ladder["chosen_strategy"] == "layout"
         settled, flags = drawing_route.settle(
             [sheet_fragment(
-                text="Инв. № подл.\nПодп. и дата\nФормат А4",
-                fields=tuple(("size", v) for v in ("⌀12", "45", "М8", "R3")),
+                text="\n".join(["Инв. № подл.", "Подп. и дата", "Формат А4",
+                                "Рис. 1", "Вид А", "Б-Б (2:1)", "⌀12", "45",
+                                "М8", "R3", "2 фаски", "1×45°", "Ra 6,3",
+                                "120", "80"]),
+                fields=tuple(("size", v) for v in
+                             ("⌀12", "45", "М8", "R3", "120", "80", "Ra 6,3",
+                              "1×45°", "2 фаски", "⌀8H7", "15")),
                 payload={"transcript_line_count": 15},
             )],
             result, METADATA, TextNormalizer())
@@ -454,16 +459,44 @@ class TestSettleDecidedByStructure:
 
     def test_wins_even_when_recognition_brought_far_more_characters(self):
         """
-        Состав важнее объёма: 3228 символов распознавания правоты не дают,
-        маршрут остаётся чертёжным. Но недостача объёма видна — лист,
-        прочитанный короче распознавания, за полный не выдаётся.
+        Настоящая пара с прода: 3228 символов распознавания против 7323 у
+        чертёжного разбора того же листа (421451.003 лист 2). Объём у
+        распознавания большой, и всё равно проигрывает.
         """
         result = chosen_with_reserve(3228)
+        sheet = sheet_fragment(
+            text="\n".join([f"XT{i} A{i} 0,75 ⌀{i}" for i in range(400)]),
+            fields=SM1638_FIELDS,
+            payload={"transcript_line_count": 400},
+        )
         settled, flags = drawing_route.settle(
-            [sm1638_sheet()], result, METADATA, TextNormalizer())
+            [sheet], result, METADATA, TextNormalizer())
         assert [f.type for f in settled] == ["drawing"] and flags == {}
         assert result.ladder["drawing_route"]["won"] is True
-        assert drawing_route.thinner_kept(result) is True
+        assert result.ladder["drawing_route"]["below_content_floor"] is False
+        assert drawing_route.thinner_kept(result) is False
+
+    def test_two_fields_do_not_discard_a_much_richer_ocr_read(self):
+        """
+        Нижняя граница объёма. Порог на состав — два поля с величиной, и
+        перешагнуть его можно случайно: спасённая надпись, число, принятое
+        за размер. Отбрасывать из-за этого чтение, которое держит в
+        двести раз больше символов, нельзя. Чертёжный разбор при этом из
+        документа не убирается — к нему возвращается текст распознавания,
+        и итог не беднее ни одного из двух чтений.
+        """
+        result = chosen_with_reserve(1692)
+        sheet = sheet_fragment(fields=(("size", "⌀12"), ("size", "45")))
+        settled, flags = drawing_route.settle(
+            [sheet], result, METADATA, TextNormalizer())
+        outcome = result.ladder["drawing_route"]
+        assert outcome["structure"]["structured"] is True
+        assert outcome["won"] is False
+        assert outcome["below_content_floor"] is True
+        assert settled[0].type == "drawing"
+        restored = [f for f in settled if f.type == "text"]
+        assert sum(len("".join((f.content.text or "").split())) for f in restored) == 1692
+        assert any("ниже границы объёма" in note for note in result.degraded)
 
     def test_sheet_without_structure_returns_the_recognition_text(self):
         """Ветка листа не прочитала: текст распознавания возвращается."""
@@ -495,8 +528,8 @@ class TestSettleDecidedByStructure:
         нашла, и тогда нужен повторный разбор. Недочитанный штамп остаётся
         счётным признаком, но предупреждением документа не становится.
         """
-        result = chosen_with_reserve(1692)
-        sheet = sheet_fragment(fields=(("size", "⌀12"), ("size", "45")))
+        result = chosen_with_reserve(12)
+        sheet = sheet_fragment(fields=(("size", "⌀12"), ("size", "45"), ("size", "М8")))
         settled, flags = drawing_route.settle(
             [sheet], result, METADATA, TextNormalizer())
         assert [f.type for f in settled] == ["drawing"] and flags == {}
@@ -626,9 +659,9 @@ class TestQualityNeverCallsAHuman:
     def test_sheet_without_a_title_block_asks_no_one_either(self, flag_on, run):
         """Недочитанный штамп — причина перечитать лист, а не позвать человека."""
         document, extra = run(
-            chosen_with_reserve(98),
+            chosen_with_reserve(12),
             lambda self, fragments, metadata: [
-                sheet_fragment(fields=(("size", "⌀12"), ("size", "45")))],
+                sheet_fragment(fields=(("size", "⌀12"), ("size", "45"), ("size", "М8")))],
         )
         assert document["review_required"] is False
         assert extra["drawing_route"]["thin_structure"] is True
