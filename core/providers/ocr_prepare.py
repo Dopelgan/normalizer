@@ -30,6 +30,7 @@ import numpy as np
 from PIL import Image, ImageFilter, ImageOps
 
 from core.config import settings
+from core.providers.ocr_line_guard import quantise, stroke_guard
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,9 @@ def _unrotate(point, angle, before, after):
     return ox + before[0] / 2.0, oy + before[1] / 2.0
 
 
-def prepare_page(image: Image.Image, upscaled: bool = False) -> PreparedPage:
+def prepare_page(
+    image: Image.Image, upscaled: bool = False, keep_lines: bool = False
+) -> PreparedPage:
     """
     Повернуть, выровнять, очистить лист и снять линии таблиц перед OCR.
 
@@ -85,6 +88,11 @@ def prepare_page(image: Image.Image, upscaled: bool = False) -> PreparedPage:
     вдвое замедляла Tesseract на плотных страницах. Линии сетки
     закрашиваются белым по маске. `upscaled` — лист увеличен перед OCR
     (`_fit`): штрихи букв на нём толстые и длинные, линии не снимаются.
+
+    `keep_lines` — не снимать линии на этом листе; то же делает настройка
+    `OCR_LINE_REMOVAL_SKIP` для всех листов сразу. На чертёжном листе
+    снятие отнимает больше, чем даёт, но решает это вызывающая сторона:
+    жанр листа подготовке неизвестен (см. `core/providers/ocr_line_guard.py`).
     """
     gray = ImageOps.grayscale(image)
     page = PreparedPage(image=gray, source_size=gray.size)
@@ -106,9 +114,15 @@ def prepare_page(image: Image.Image, upscaled: bool = False) -> PreparedPage:
     page.speckle = _speckle_share(cleaned)
     if page.speckle >= settings.OCR_DESPECKLE_MIN_SHARE:
         cleaned = cleaned.filter(ImageFilter.MedianFilter(3))
-    if settings.OCR_REMOVE_TABLE_LINES and not upscaled:
+    skip_lines = keep_lines or settings.OCR_LINE_REMOVAL_SKIP
+    if settings.OCR_REMOVE_TABLE_LINES and not upscaled and not skip_lines:
         pixels = np.asarray(cleaned)
-        lines = _line_mask(pixels <= _otsu(pixels))
+        black = pixels <= _otsu(pixels)
+        lines = _line_mask(black)
+        if settings.OCR_LINE_STROKE_GUARD:
+            lines = stroke_guard(
+                black, lines, settings.OCR_LINE_STROKE_GUARD_REACH
+            )
         page.removed_line_pixels = int(lines.sum())
         if page.removed_line_pixels:
             pixels = pixels.copy()
@@ -228,7 +242,10 @@ def _otsu(pixels: np.ndarray) -> int:
     with np.errstate(divide="ignore", invalid="ignore"):
         between = (m[-1] * w - m) ** 2 / (w * (1.0 - w))
     between = np.nan_to_num(between, nan=-1.0, posinf=-1.0)
-    return int(np.argmax(between))
+    # Порог один на весь лист. Он прыгает на уровень от изменения размера
+    # листа на 0,2 %, и вместе с ним меняется маска линий; округление
+    # (`OCR_OTSU_THRESHOLD_STEP`) эту дрожь убирает.
+    return quantise(int(np.argmax(between)), settings.OCR_OTSU_THRESHOLD_STEP)
 
 
 def _skew_angle(gray: Image.Image, limit: float) -> float:
