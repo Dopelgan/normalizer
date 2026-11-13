@@ -49,6 +49,11 @@
 срока задачи не укладывается даже один вызов (`VLM_TIMEOUT`), фрагмент
 остаётся с пометкой `DRAWING_SKIPPED_NO_TIME`, а неразобранные листы скана —
 с `DRAWING_SHEETS_SKIPPED`: документ сохраняется, а не теряется целиком.
+
+На листе, весь текст которого переписан моделью, записи распознавания того же
+листа правятся её текстом (`core/drawing_transcript.py`,
+`DRAWING_TRANSCRIPT_FIXES_OCR`), а повторы и шум распознавания убираются
+(`core/drawing_stale_sources.py`, `DRAWING_SUPPRESS_STALE_ON_FULL_READ`).
 """
 
 import logging
@@ -68,6 +73,7 @@ from core.providers.qwen_client import CATEGORIES, QwenVisionClient
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.vector_drawing import structure_ratio
 from core.drawing_quality import apply_drawing_quality
+from core.drawing_stale_sources import suppress_stale_sources
 from core.drawing_transcript import apply_transcripts
 
 logger = logging.getLogger(__name__)
@@ -348,6 +354,10 @@ class DrawingProcessor:
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
         if settings.DRAWING_TRANSCRIPT_FIXES_OCR:
             result = apply_transcripts(result)
+        if settings.DRAWING_SUPPRESS_STALE_ON_FULL_READ:
+            # После правки абзацев: исправленный абзац к этому моменту —
+            # текст модели, и убирается как повтор, а не как расхождение.
+            result = suppress_stale_sources(result)
         return result
 
     # -------------------------------------------------- лист-картинка целиком

@@ -125,7 +125,7 @@ def _best_run(
                 continue
             # Другое число — другой текст, как бы ни были похожи слова вокруг.
             found = _DIGITS.sub("", joined)
-            if found != digits and (same_digits or not _one_digit_apart(found, digits)):
+            if found != digits and (same_digits or not digits_one_apart(found, digits)):
                 continue
             matcher.set_seq1(joined)
             if matcher.real_quick_ratio() < best_ratio or matcher.quick_ratio() < best_ratio:
@@ -136,7 +136,7 @@ def _best_run(
     return best
 
 
-def _one_digit_apart(first: str, second: str) -> bool:
+def digits_one_apart(first: str, second: str) -> bool:
     """Цифры двух текстов расходятся одной вставкой, пропуском или заменой."""
     if abs(len(first) - len(second)) > 1:
         return False
