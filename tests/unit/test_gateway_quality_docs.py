@@ -148,3 +148,41 @@ def test_official_letter_number_without_sign_yields_eskd():
     """Письмо со ссылкой на обозначение остаётся письмом (деловым)."""
     match = rules.classify("исх 1082-113 от 22.08.2022 по ТАДУ 305179.001.01 СБ")
     assert match.category == CATEGORY_BUSINESS
+
+
+# Прод, 13.11.2026: сканы технологической документации и документов СМК
+# заказчика ушли в карантин G-4 с тем же «деловой, 0.50».
+TECHNOLOGICAL_SCANS = [
+    "ТАДУ 25290.00022 КТПС С-23-2.pdf",
+    "Карта ТПС ТАДУ 25290.00019 (Теплообменник, 2 мм_14).pdf",
+    "КТД_1_3_1_03_002_4855-2021__КТД на ремонт .pdf",
+    "СТО 06.18 Руководство по качеству метрологической службы.pdf",
+    "Руководство по качеству.pdf",
+    "Технологическая карта сварки.pdf",
+]
+
+
+@pytest.mark.parametrize("name", TECHNOLOGICAL_SCANS)
+def test_technological_document_scan_is_accepted_by_name(name):
+    verdict = evaluate_scan(name)
+    assert verdict.outcome == ACCEPT, (name, verdict.layer, verdict.reason)
+    assert verdict.category == CATEGORY_TECHNICAL
+
+
+@pytest.mark.parametrize("value", [
+    "СТО 12.05.24",         # дата у станции техобслуживания, а не стандарт
+    "Заказ-наряд СТО 25.11.2024",
+    "сто 06.18",            # строчными — не шифр
+    "ктд",                  # строчными — не шифр
+    "АБВГ 12345",           # нет второй группы технологического обозначения
+    "Телефон 8 495 12345.67890",
+])
+def test_technological_markers_do_not_fire(value):
+    match = rules.classify(value, allowed=rules.PATH_CATEGORIES)
+    assert not match.matched, (value, match.hits)
+
+
+def test_technological_designation_yields_to_personal():
+    """Личное в имени важнее шифра, как и у обозначения ЕСКД."""
+    match = rules.classify("личное ТАДУ 25290.00022")
+    assert match.category != CATEGORY_TECHNICAL
