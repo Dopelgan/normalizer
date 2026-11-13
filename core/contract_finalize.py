@@ -24,6 +24,7 @@ from core.facts.extractor import extract_facts
 from core.models.contract import Fragment
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import apply_drawing_quality
+from core import drawing_record
 from core.providers import designation_repair, mixed_script
 
 logger = logging.getLogger(__name__)
@@ -185,6 +186,26 @@ def finalize_fragments(
                     "Извлечение фактов из %s не удалось: %s", fragment_id, exc
                 )
                 fragment.extracted_facts = []
+
+    # Сборка записи чертежа — последним шагом, после идентификаторов и
+    # фактов (`DRAWING_RECORD_COMPOSED`). Позже всех потребителей
+    # `content.text` внутри конвейера: правка абзацев OCR и сверка «чертёж
+    # против OCR» к этому моменту уже прошли по прежнему тексту, факты
+    # извлечены из него же, а `fragment_id` чертежа считается по полям и
+    # таблицам, а не по тексту. Поэтому сборка не меняет ни маршрут, ни
+    # факты, ни идентификаторы — только то, что увидит заказчик.
+    #
+    # Только при `extract`. Эта функция вызывается дважды: нормализатор
+    # зовёт её с `extract=False` (`core/normalizer/normalizer.py`) ещё до
+    # ветки чертежей и до сверки маршрута, и собирать запись там нельзя
+    # дважды. Во-первых, собранная запись попала бы в сверку «чертёж
+    # против OCR» и изменила бы её исход. Во-вторых, второй проход вложил
+    # бы готовую сборку внутрь её же части «Надписи листа в порядке
+    # чтения» — заголовок стал бы неправдой в тексте, который видит
+    # заказчик. `extract=True` ставит только финализация после ветки
+    # чертежей, то есть ровно то место, где собирать и надо.
+    if extract:
+        drawing_record.apply(fragments)
 
     return fragments, id_map
 
