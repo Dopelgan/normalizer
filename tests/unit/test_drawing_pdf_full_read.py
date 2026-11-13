@@ -21,7 +21,7 @@ from core.drawing_processor import DrawingProcessor, _field
 from core.drawing_quality import document_quality
 from core.drawing_transcript import VARIANT_MARK, VARIANT_WARNING, WARNING, apply_transcripts
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
-from core.providers.qwen_client import QwenVisionClient, enlarge_small, salvage_list
+from core.providers.qwen_client import QwenVisionClient, enlarge_small, fix_grade, salvage_list
 
 pytest.importorskip("PIL")
 
@@ -242,6 +242,28 @@ class TestSmallPrint:
         assert client.transcribe_sheet(image).lines == ["Ra 1,6"]
         assert "Запятую в десятичной дроби" not in asked[0]
         assert "Запятую в десятичной дроби" in asked[1]
+
+    def test_flag_on_grade_letter_z_becomes_three(self, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_SMALL_PRINT_CARE", True)
+        assert fix_grade("Сварочная проволока Св-04Х19Н11МЗ ГОСТ 2246-70.") == "Сварочная проволока Св-04Х19Н11М3 ГОСТ 2246-70."
+        assert fix_grade("Св-04X19H11MЗ") == "Св-04X19H11M3"
+        # Не марка: «ТЗ» в обозначении, слово, уже верная марка.
+        for text in ("Остальные требования по ТАДУ 305179.001ТЗ", "12Х18Н10Т", "Св-04Х19Н11М3", "ЗИП 10Х17Н13М2Т"):
+            assert fix_grade(text) == text
+
+    def test_flag_off_grade_is_left_as_read(self):
+        assert fix_grade("Св-04Х19Н11МЗ") == "Св-04Х19Н11МЗ"
+
+    def test_flag_on_grade_is_fixed_in_fields_and_lines(self, monkeypatch):
+        from PIL import Image
+        monkeypatch.setattr(settings, "DRAWING_SMALL_PRINT_CARE", True)
+        client = QwenVisionClient(endpoint="http://qwen.test/v1")
+        image = Image.new("RGB", (1600, 1100), "white")
+        monkeypatch.setattr(client, "_post", lambda body: answer(
+            '{"sheet_type": "assembly", "annotations": [{"category": "note", "value": "проволока Св-04Х19Н11МЗ"}]}'))
+        assert client.read_sheet(image).annotations[0]["value"] == "проволока Св-04Х19Н11М3"
+        monkeypatch.setattr(client, "_post", lambda body: answer('{"lines": ["Св-04Х19Н11МЗ ГОСТ 2246-70"]}'))
+        assert client.transcribe(image) == ["Св-04Х19Н11М3 ГОСТ 2246-70"]
 
     def test_enlarge_small_leaves_large_image(self):
         from PIL import Image

@@ -238,7 +238,7 @@ class QwenVisionClient:
             annotations = []
         return SheetReading(
             sheet_type=str(data.get("sheet_type") or "unknown"),
-            annotations=[a for a in annotations if isinstance(a, dict)],
+            annotations=[_with_fixed_grade(a) for a in annotations if isinstance(a, dict)],
             raw=data,
         )
 
@@ -535,6 +535,24 @@ class QwenVisionClient:
 # Помощники
 # ===========================================================================
 
+# Марка стали или сварочной проволоки с молибденом на конце: «…Н11М3». Чертёжную
+# тройку после «М» модель через раз пишет буквой «З» («Св-04Х19Н11МЗ») — по
+# такой записи марку не найти.
+_GRADE_M3 = re.compile(r"(\d{2}[ХXхx]\d{1,2}[НHнh]\d{1,2}[А-ЯA-Z0-9]*[МM])З(?![А-Яа-яA-Za-z0-9])")
+
+
+def _with_fixed_grade(annotation: Dict[str, Any]) -> Dict[str, Any]:
+    value = annotation.get("value")
+    if isinstance(value, str) and settings.DRAWING_SMALL_PRINT_CARE:
+        return {**annotation, "value": fix_grade(value)}
+    return annotation
+
+
+def fix_grade(text: str) -> str:
+    """«04Х19Н11МЗ» -> «04Х19Н11М3» (DRAWING_SMALL_PRINT_CARE); прочий текст не меняется."""
+    return _GRADE_M3.sub(r"\g<1>3", text) if settings.DRAWING_SMALL_PRINT_CARE else text
+
+
 def _transcribe_prompt() -> str:
     """Запрос «перепиши весь текст листа»; с DRAWING_SMALL_PRINT_CARE — с правилом про дроби."""
     return _TRANSCRIBE_PROMPT + (_SMALL_PRINT_RULE if settings.DRAWING_SMALL_PRINT_CARE else "")
@@ -665,7 +683,7 @@ def _finish_of(payload: Dict[str, Any]) -> Optional[str]:
 
 
 def _clean_lines(lines: Sequence[Any]) -> List[str]:
-    return [str(line).strip() for line in lines
+    return [fix_grade(str(line).strip()) for line in lines
             if isinstance(line, (str, int, float)) and str(line).strip()]
 
 
