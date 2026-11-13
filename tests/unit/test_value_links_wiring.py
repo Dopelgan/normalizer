@@ -13,9 +13,14 @@ import pytest
 pytest.importorskip("PIL")
 from PIL import Image  # noqa: E402
 
+import core.providers as providers_pkg
 from core.config import settings
 from core.drawing_processor import DrawingProcessor
 from core.providers.qwen_client import SheetReading
+
+# Модуль видов и настройку приносит чужая ветка. До её слияния их здесь нет,
+# после — есть, и проверки на отсутствие верны только до.
+PAIRED = hasattr(settings, "DRAWING_VALUE_VIEW_LINKS")
 
 LINKS = {
     "coordinate_reference": "deskewed_page",
@@ -61,13 +66,15 @@ def links_on(monkeypatch):
             calls.append((layout, fields))
             return dict(LINKS)
 
-    import sys
-
     from core import drawing_processor
 
     # Подменяется флаг и модуль — но не `_value_links`: проверяется именно
-    # он, вместе с ленивым импортом внутри него.
-    monkeypatch.setitem(sys.modules, "core.providers.drawing_views", Views)
+    # он, вместе с ленивым импортом внутри него. Подмена идёт атрибутом
+    # пакета, а не записью в `sys.modules`: `from core.providers import
+    # drawing_views` берёт готовый атрибут пакета, когда он есть, и только
+    # иначе лезет за подмодулем — то есть атрибут работает в дереве и с
+    # чужой ветвью, и без неё.
+    monkeypatch.setattr(providers_pkg, "drawing_views", Views, raising=False)
     monkeypatch.setattr(drawing_processor, "_value_view_links", lambda: True)
     return calls
 
@@ -79,10 +86,12 @@ class TestSafeWithoutItsOwnBranch:
     — то есть ни один документ не был бы разобран, не только чертёж.
     """
 
+    @pytest.mark.skipif(PAIRED, reason="ветка связи величин уже в дереве")
     def test_the_module_is_absent_here(self):
         with pytest.raises(ImportError):
             __import__("core.providers.drawing_views")
 
+    @pytest.mark.skipif(PAIRED, reason="ветка связи величин уже в дереве")
     def test_the_setting_is_absent_here(self):
         assert not hasattr(settings, "DRAWING_VALUE_VIEW_LINKS")
 
@@ -94,18 +103,25 @@ class TestSafeWithoutItsOwnBranch:
         assert importlib.reload(module) is module
 
     def test_and_a_sheet_is_still_parsed(self, monkeypatch):
+        from core import drawing_processor
+
+        monkeypatch.setattr(drawing_processor, "_value_view_links", lambda: False)
         result = worker(monkeypatch).process("sheet.jpg", {}, page=1)
         assert result["parsed_fields"]
         assert "value_links" not in result["payload"]
 
     def test_the_helper_answers_without_importing_anything(self, monkeypatch):
         """Флаг выключен — до импорта дело не доходит, отвечает `None`."""
+        from core import drawing_processor
+
+        monkeypatch.setattr(drawing_processor, "_value_view_links", lambda: False)
         assert DrawingProcessor._value_links(object(), []) is None
 
     def test_the_flag_reader_never_raises(self):
+        """Главное свойство: читатель отвечает, а не падает, в любом дереве."""
         from core.drawing_processor import _value_view_links
 
-        assert _value_view_links() is False
+        assert _value_view_links() in (True, False)
 
 
 class TestWiring:
@@ -124,8 +140,6 @@ class TestWiring:
 
     def test_none_adds_no_key_at_all(self, monkeypatch):
         """«Связывать нечего» — это отсутствие ключа, а не пустой блок."""
-        import sys
-
         from core import drawing_processor
 
         class Silent:
@@ -133,7 +147,7 @@ class TestWiring:
             def attach(layout, fields):
                 return None
 
-        monkeypatch.setitem(sys.modules, "core.providers.drawing_views", Silent)
+        monkeypatch.setattr(providers_pkg, "drawing_views", Silent, raising=False)
         monkeypatch.setattr(drawing_processor, "_value_view_links", lambda: True)
         result = worker(monkeypatch).process("sheet.jpg", {}, page=1)
         assert "value_links" not in result["payload"]
