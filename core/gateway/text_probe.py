@@ -8,8 +8,12 @@
 последовательность `re:`.
 
 Здесь из файла достаётся именно текст — тем инструментом, который понимает
-формат. Если текста нет (скан, картинка, чертёж), это честно сообщается:
-классифицировать такой файл по содержимому нельзя, решают путь и имя.
+формат. У PDF без текстового слоя (скан) текст берётся быстрым OCR первых
+страниц (`GATEWAY_OCR_PROBE_PAGES`, `GATEWAY_OCR_PROBE_SECONDS`) — тем же
+`TesseractFallbackProvider.parse_pages`, что у проверки читаемости Quality
+Gate. Если текста нет и так (картинка, чертёж, OCR недоступен), это честно
+сообщается: классифицировать такой файл по содержимому нельзя, решают путь
+и имя.
 """
 
 from __future__ import annotations
@@ -17,10 +21,14 @@ from __future__ import annotations
 import io
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from core import filetypes
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +46,7 @@ SOURCE_XLSX = "xlsx"
 SOURCE_XLS = "xls"
 SOURCE_ODS = "ods"
 SOURCE_PLAIN = "plain"
+SOURCE_OCR = "ocr"
 SOURCE_NONE = "none"
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -50,6 +59,8 @@ class TextProbe:
     text: str
     source: str
     reason: Optional[str] = None
+    # Страниц в PDF без текстового слоя — столько можно отдать OCR.
+    pages: int = 0
 
     @property
     def reliable(self) -> bool:
@@ -64,12 +75,22 @@ class TextProbe:
         }
 
 
-def extract(file_type: str, data: bytes) -> TextProbe:
-    """Текст документа по его типу. Байты — весь файл, а не образец."""
+def extract(
+    file_type: str, data: bytes, uri: Optional[str] = None, storage=None,
+) -> TextProbe:
+    """
+    Текст документа по его типу. Байты — весь файл, а не образец.
+
+    `uri` и `storage` нужны быстрому OCR скана: без них PDF без текстового
+    слоя остаётся без текста, как раньше.
+    """
     kind = filetypes.kind_of(file_type)
 
     if kind == filetypes.KIND_PDF:
-        return _from_pdf(data)
+        probe = _from_pdf(data)
+        if probe.source == SOURCE_NONE and probe.pages and uri:
+            return _from_ocr(uri, data, storage, probe)
+        return probe
     if kind == filetypes.KIND_OFFICE_TEXT:
         return _from_office_text(file_type, data)
     if kind == filetypes.KIND_SPREADSHEET:
@@ -98,6 +119,7 @@ def _from_pdf(data: bytes) -> TextProbe:
     document = open_pdf(data)
     if document is None:
         return TextProbe("", SOURCE_NONE, "PDF не открылся")
+    page_count = document.page_count
     try:
         chunks = []
         for index in range(min(document.page_count, PDF_PAGES)):
@@ -113,9 +135,63 @@ def _from_pdf(data: bytes) -> TextProbe:
 
     if not text.strip():
         # Скан: текстового слоя нет. Это не ошибка, но и судить по
-        # содержимому не о чем — маркеры применять нельзя.
-        return TextProbe("", SOURCE_NONE, "PDF без текстового слоя (скан)")
+        # содержимому слоя не о чем — текст может дать только OCR.
+        return TextProbe(
+            "", SOURCE_NONE, "PDF без текстового слоя (скан)", pages=page_count,
+        )
     return TextProbe(text, SOURCE_PDF)
+
+
+def _from_ocr(uri: str, data: bytes, storage, scan: TextProbe) -> TextProbe:
+    """
+    Текст скана быстрым OCR первых страниц.
+
+    Прод, 13.11: пятнадцать сканов без текстового слоя и без маркера в имени
+    («ЦО-11-101-13225 (конструирование оборудования) 2028.pdf», «Лист
+    ознакомления.pdf») получали запасной «деловой, 0.50» и уходили в
+    карантин: судить было не по чему, кроме имени. Текст у них есть — на
+    картинке.
+
+    Распознавание то же, что у быстрого OCR Quality Gate, страницы и
+    разрешение те же: в задаче приёма (`ocr_memo`) второй этап их не
+    распознаёт заново. Страницы читаются по одной, и после бюджета времени
+    следующая не начинается. Сбой OCR — не ошибка приёма: остаётся прежнее
+    «текста нет».
+    """
+    limit = min(scan.pages, max(0, settings.GATEWAY_OCR_PROBE_PAGES))
+    if limit <= 0:
+        return scan
+
+    from core.providers.tesseract_fallback import TesseractFallbackProvider
+
+    provider = TesseractFallbackProvider(storage=storage)
+    deadline = time.monotonic() + max(0.0, settings.GATEWAY_OCR_PROBE_SECONDS)
+    chunks = []
+    read = 0
+    for page in range(1, limit + 1):
+        if page > 1 and time.monotonic() >= deadline:
+            logger.info("OCR приёма %s остановлен по бюджету на странице %d", uri, page)
+            break
+        try:
+            blocks = provider.parse_pages(uri, [page], file_type="pdf", data=data)
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as exc:  # noqa: BLE001 — OCR не обязан быть поднят
+            logger.info("OCR приёма недоступен для %s: %s", uri, exc)
+            break
+        read += 1
+        chunks.extend(block.text for block in blocks if (block.text or "").strip())
+
+    text = _clean("\n".join(chunks))
+    if not text.strip():
+        reason = scan.reason
+        if read:
+            reason = f"{reason}; OCR {read} стр. текста не дал"
+        return TextProbe("", SOURCE_NONE, reason, pages=scan.pages)
+    return TextProbe(
+        text, SOURCE_OCR, f"PDF без текстового слоя, OCR {read} стр.",
+        pages=scan.pages,
+    )
 
 
 def _from_office_text(file_type: str, data: bytes) -> TextProbe:

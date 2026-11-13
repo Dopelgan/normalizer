@@ -165,6 +165,64 @@ class TestPipeline:
         assert second["outcome"] == REJECT
         assert "дубликат" in second["verdicts"][-1]["reason"].lower()
 
+    def test_twin_deleted_after_acceptance_is_not_a_duplicate(
+        self, pipeline, storage, fake_redis
+    ):
+        """
+        Прод, 13.11: принятый файл удалили, а повторную загрузку того же
+        содержимого отклонили как дубликат — и по журналу решений, и по
+        заявке на содержимое, которая живёт сутки.
+        """
+        first = pipeline.run("r17", IntakeFile(s3_fileid="копия.txt"))
+        assert first["outcome"] == ACCEPT
+        storage.delete_file("копия.txt")
+
+        second = pipeline.run("r18", IntakeFile(s3_fileid="договор.txt"))
+        assert second["outcome"] == ACCEPT
+
+        # Третья копия — снова дубль: сверяется с живой, а не с удалённой.
+        storage.write_file("третья.txt", CONTENT)
+        third = pipeline.run("r18b", IntakeFile(s3_fileid="третья.txt"))
+        assert third["outcome"] == REJECT
+        assert "договор.txt" in third["verdicts"][-1]["reason"]
+
+    def test_stale_claim_of_a_deleted_file_is_taken_over(
+        self, pipeline, fake_redis
+    ):
+        """Заявка удалённого файла не держит хеш: в журнале его может не быть."""
+        import hashlib
+
+        digest = hashlib.sha256(CONTENT).hexdigest()
+        assert state.claim_content(digest, "удалённый.txt") is None
+
+        result = pipeline.run("r19", IntakeFile(s3_fileid="договор.txt"))
+        assert result["outcome"] == ACCEPT
+        assert state.claim_content(digest, "третий.txt") == "договор.txt"
+
+    def test_live_claim_still_rejects_a_twin(self, pipeline, fake_redis):
+        """Гонка внутри пакета: двойник ещё не в журнале, но файл его на месте."""
+        import hashlib
+
+        digest = hashlib.sha256(CONTENT).hexdigest()
+        assert state.claim_content(digest, "копия.txt") is None
+
+        result = pipeline.run("r20", IntakeFile(s3_fileid="договор.txt"))
+        assert result["outcome"] == REJECT
+        assert "копия.txt" in result["verdicts"][-1]["reason"]
+
+    def test_soft_time_limit_is_not_taken_for_storage_error(self, storage):
+        """Предел задачи в проверке двойника — не «хранилище не ответило»."""
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        from core.providers.file_locator import FileLocator
+
+        def boom(uri):
+            raise SoftTimeLimitExceeded()
+
+        storage.exists = boom
+        with pytest.raises(SoftTimeLimitExceeded):
+            FileLocator(storage).is_present("договор.txt")
+
     def test_failed_stage_does_not_raise(self, pipeline, fake_redis, monkeypatch):
         """Сбой на одном файле не уводит в повтор вердикты по остальным."""
         def boom(*_args, **_kwargs):

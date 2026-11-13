@@ -551,6 +551,156 @@ class TestClassificationUsesText:
         assert verdict.signals["text_source"] == "docx"
 
 
+class TestScanOcrProbe:
+    """
+    Прод, 13.11: пятнадцать сканов без текстового слоя и без маркера в имени
+    («ЦО-11-101-13225 (конструирование оборудования) 2028.pdf», «Лист
+    ознакомления.pdf»…) получали запасной «деловой, 0.50» и уходили в
+    карантин G-4. Текст у них есть — на картинке; быстрый OCR первых страниц
+    отдаёт его тем же правилам.
+    """
+
+    @staticmethod
+    def _scan(pages=1) -> bytes:
+        pymupdf = pytest.importorskip("pymupdf")
+        document = pymupdf.open()
+        for _ in range(pages):
+            document.new_page(width=600, height=800).draw_rect(
+                pymupdf.Rect(20, 20, 580, 780), color=(0, 0, 0)
+            )
+        data = document.tobytes()
+        document.close()
+        return data
+
+    @staticmethod
+    def _ocr(monkeypatch, text_by_page, calls=None):
+        from core.models.parse_result import ParsedBlock
+        from core.providers.tesseract_fallback import TesseractFallbackProvider
+
+        def parse_pages(self, uri, pages, file_type=None, data=None):
+            if calls is not None:
+                calls.extend(pages)
+            return [
+                ParsedBlock(type="text", text=text_by_page[p], page=p, confidence=0.6)
+                for p in pages if text_by_page.get(p)
+            ]
+
+        monkeypatch.setattr(TesseractFallbackProvider, "parse_pages", parse_pages)
+
+    def _evaluate(self, name, data):
+        uri = f"imports/u/{name}"
+        return gateway({uri: data}).evaluate(uri, uri, len(data))
+
+    def test_scan_is_classified_by_recognised_text(self, monkeypatch):
+        self._ocr(monkeypatch, {1: "ПРИКАЗ № 15 Об утверждении регламента "
+                                   "конструирования оборудования"})
+        verdict = self._evaluate(
+            "ЦО-11-101-13225 (конструирование оборудования) 2028.pdf", self._scan()
+        )
+        assert verdict.outcome == ACCEPT
+        assert verdict.category == CATEGORY_BUSINESS
+        assert verdict.signals["text_source"] == "ocr"
+        assert verdict.signals["matched_in"] == "текст"
+
+    def test_scanned_passport_is_still_not_accepted(self, monkeypatch):
+        self._ocr(monkeypatch, {1: (
+            "РОССИЙСКАЯ ФЕДЕРАЦИЯ ПАСПОРТ ВЫДАН ОТДЕЛОМ УФМС РОССИИ ПО Г. МОСКВЕ "
+            "ДАТА ВЫДАЧИ 01.02.2015 КОД ПОДРАЗДЕЛЕНИЯ 770-001 ФАМИЛИЯ ИВАНОВ "
+            "ИМЯ ИВАН ОТЧЕСТВО ИВАНОВИЧ ПОЛ МУЖ. ДАТА РОЖДЕНИЯ 01.01.1980 "
+            "МЕСТО РОЖДЕНИЯ Г. МОСКВА"
+        )})
+        verdict = self._evaluate("scan_001.pdf", self._scan())
+        assert verdict.outcome == QUARANTINE
+        assert verdict.signals["text_source"] == "ocr"
+
+    def test_recognised_personal_marker_quarantines_not_rejects(self, monkeypatch):
+        """
+        Распознанный текст может ошибаться: по нему документ принимается или
+        уходит человеку, но не отклоняется навсегда.
+        """
+        self._ocr(monkeypatch, {1: "Фото с отпуска, день рождения, семья"})
+        verdict = self._evaluate("scan_002.pdf", self._scan())
+        assert verdict.outcome == QUARANTINE
+        assert verdict.category == CATEGORY_PERSONAL
+
+    def test_probe_reads_only_the_first_pages(self, monkeypatch):
+        from core.config import settings
+
+        calls = []
+        self._ocr(monkeypatch, {}, calls)
+        monkeypatch.setattr(settings, "GATEWAY_OCR_PROBE_PAGES", 2)
+        self._evaluate("scan_003.pdf", self._scan(pages=6))
+        assert sorted(calls) == [1, 2]
+
+    def test_time_budget_stops_before_the_next_page(self, monkeypatch):
+        from core.config import settings
+
+        calls = []
+        self._ocr(monkeypatch, {}, calls)
+        monkeypatch.setattr(settings, "GATEWAY_OCR_PROBE_PAGES", 2)
+        monkeypatch.setattr(settings, "GATEWAY_OCR_PROBE_SECONDS", 0)
+        self._evaluate("scan_004.pdf", self._scan(pages=3))
+        assert calls == [1]
+
+    def test_probe_can_be_switched_off(self, monkeypatch):
+        from core.config import settings
+
+        calls = []
+        self._ocr(monkeypatch, {1: "Договор поставки"}, calls)
+        monkeypatch.setattr(settings, "GATEWAY_OCR_PROBE_PAGES", 0)
+        verdict = self._evaluate("scan_005.pdf", self._scan())
+        assert calls == []
+        assert verdict.outcome == QUARANTINE
+        assert verdict.signals["text_source"] == "none"
+
+    def test_ocr_failure_falls_back_to_previous_behaviour(self, monkeypatch):
+        from core.providers.tesseract_fallback import (
+            OcrUnavailable,
+            TesseractFallbackProvider,
+        )
+
+        def broken(self, *args, **kwargs):
+            raise OcrUnavailable("poppler не найден")
+
+        monkeypatch.setattr(TesseractFallbackProvider, "parse_pages", broken)
+        verdict = self._evaluate("Аттестат аккредитации.pdf", self._scan())
+        assert verdict.outcome == ACCEPT
+        assert verdict.signals["matched_in"] == "путь"
+        assert verdict.signals["text_source"] == "none"
+
+    def test_intake_shares_page_ocr_between_stages(self, monkeypatch, tmp_path):
+        """
+        Быстрый OCR Quality Gate читает те же страницы в том же разрешении:
+        в одном блоке `ocr_memo` второй раз они не распознаются.
+        """
+        from core.intake import pipeline as pipeline_module
+        from core.models.intake import IntakeFile
+        from core.providers import tesseract_fallback
+
+        seen = []
+
+        class Probe:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def evaluate(self, *args, **kwargs):
+                seen.append(tesseract_fallback._MEMO.get() is not None)
+                raise RuntimeError("стоп")
+
+        monkeypatch.setattr(pipeline_module, "DataGateway", Probe)
+        storage = FakeStorage({"documents/x.pdf": b"%PDF"})
+        intake = pipeline_module.IntakePipeline(
+            storage=storage, session_factory=lambda: None, profile=GatewayProfile(),
+        )
+        monkeypatch.setattr(
+            intake.locator, "locate",
+            lambda fileid: type("L", (), {"uri": "documents/x.pdf"})(),
+        )
+        with pytest.raises(RuntimeError):
+            intake.run("r", IntakeFile(s3_fileid="x.pdf"))
+        assert seen == [True]
+
+
 class TestTypeBySignature:
     """Расширение — утверждение отправителя; тип берётся по содержимому."""
 
@@ -619,10 +769,48 @@ class TestDuplicates:
 
         data = pdf_bytes()
         digest = hashlib.sha256(data).hexdigest()
-        gate = quality({"documents/копия.pdf": data}, known_hashes={digest: "оригинал.pdf"})
+        gate = quality(
+            {"documents/копия.pdf": data, "documents/оригинал.pdf": data},
+            known_hashes={digest: "оригинал.pdf"},
+        )
         verdict = gate.evaluate("копия.pdf", "documents/копия.pdf")
         assert verdict.outcome == REJECT
         assert "оригинал.pdf" in verdict.reason
+
+    def test_twin_deleted_from_storage_is_not_a_duplicate(self):
+        """
+        Прод, 13.11: принятый ранее файл удалили (объекта в хранилище нет),
+        а новую загрузку того же содержимого отклонили как «точный дубликат»
+        — единственную оставшуюся копию.
+        """
+        import hashlib
+
+        data = pdf_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        gate = quality({"documents/новый.pdf": data}, known_hashes={digest: "удалённый.pdf"})
+        verdict = gate.evaluate("новый.pdf", "documents/новый.pdf")
+        assert verdict.outcome == ACCEPT
+
+    def test_twin_unverifiable_goes_to_quarantine_not_rejection(self):
+        """Хранилище не ответило о двойнике — отказ был бы ложным, решает человек."""
+        import hashlib
+
+        class FlakyStorage(FakeStorage):
+            def exists(self, uri):
+                if "оригинал" in uri:
+                    raise ConnectionError("S3 недоступно")
+                return super().exists(uri)
+
+        data = pdf_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        gate = QualityGate(
+            profile=GatewayProfile(),
+            storage=FlakyStorage({"documents/копия.pdf": data}),
+            known_hashes={digest: "оригинал.pdf"},
+        )
+        verdict = gate.evaluate("копия.pdf", "documents/копия.pdf")
+        assert verdict.outcome == QUARANTINE
+        assert verdict.stage == "QG-2"
 
     def test_near_duplicate_only_raises_a_flag(self):
         """Похожий документ — это «обновление или дубль», решает человек."""
@@ -766,10 +954,35 @@ class TestReadabilityWithoutText:
         assert verdict.stage == "QG-4"
 
     def test_unreadable_text_is_still_quarantined(self, monkeypatch):
-        """Текст нашёлся, но распознан почти на ноль — прежнее поведение."""
+        """Страница текста распознана почти на ноль — прежнее поведение."""
         monkeypatch.setattr(QualityGate, "_quick_ocr", probe_of(0.1, 5))
+        verdict = quality().ocr_check(FakeContext(filetypes.KIND_IMAGE), [])
+        assert verdict.outcome == QUARANTINE
+
+    @pytest.mark.parametrize("confidence", [0.1, 0.28, 0.34])
+    def test_drawing_with_low_ocr_confidence_is_accepted(self, monkeypatch, confidence):
+        """
+        Прод, 13.11: десять растровых чертежей (ТАДУ 421451.003 СППИ, отрезной
+        лист СМ1638…) ушли в карантин с уверенностью быстрого OCR 0.28–0.35.
+        Tesseract на листе чертежа меряет графику, а не читаемость: лист
+        читает ветка чертежей. Уверенность остаётся в вердикте и в
+        предупреждении.
+        """
+        monkeypatch.setattr(QualityGate, "_quick_ocr", probe_of(confidence, 5))
+        warnings = []
         verdict = quality().ocr_check(
-            FakeContext(filetypes.KIND_IMAGE, genre=GENRE_DRAWING), []
+            FakeContext(filetypes.KIND_PDF, genre=GENRE_DRAWING, file_type="pdf"),
+            warnings,
+        )
+        assert verdict.outcome == ACCEPT
+        assert verdict.confidence == pytest.approx(confidence)
+        assert any("чертежа" in w for w in warnings)
+
+    def test_unknown_scan_with_low_ocr_confidence_stays_in_quarantine(self, monkeypatch):
+        """«Программа подтверждения сертификатных данных.pdf», жанр unknown, 0.34."""
+        monkeypatch.setattr(QualityGate, "_quick_ocr", probe_of(0.34, 5))
+        verdict = quality().ocr_check(
+            FakeContext(filetypes.KIND_PDF, genre="unknown", file_type="pdf"), []
         )
         assert verdict.outcome == QUARANTINE
 
@@ -921,6 +1134,20 @@ class TestUnreadableShare:
         verdict = quality().ocr_check(FakeContext(filetypes.KIND_IMAGE), [])
         assert verdict.outcome == QUARANTINE
         assert "80%" in verdict.reason
+
+    def test_drawing_with_mostly_unreadable_sheet_is_accepted(self, monkeypatch):
+        """Надписи чертежа рвутся линиями — доля «нечитаемого» тут не о качестве."""
+        monkeypatch.setattr(
+            QualityGate, "_quick_ocr",
+            lambda self, ctx: _OcrProbe(confidence=0.5, blocks=4, unreadable_share=0.8),
+        )
+        warnings = []
+        verdict = quality().ocr_check(
+            FakeContext(filetypes.KIND_IMAGE, genre=GENRE_DRAWING), warnings
+        )
+        assert verdict.outcome == ACCEPT
+        assert verdict.confidence == pytest.approx(0.5)
+        assert any("80%" in w for w in warnings)
 
     def test_small_share_is_only_a_warning(self, monkeypatch):
         monkeypatch.setattr(

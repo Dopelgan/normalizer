@@ -66,7 +66,12 @@ def _known(session) -> Tuple[Dict[str, str], List[Tuple[str, int]]]:
         .order_by(IntakeDecisionDB.created_at.desc())
         .limit(1000)
     ).scalars()
-    hashes = {row.file_hash: row.s3_fileid for row in rows if row.file_hash}
+    # У хеша остаётся самая свежая принятая копия: прежняя могла быть
+    # удалена, и по ней дубль больше не опознаётся.
+    hashes: Dict[str, str] = {}
+    for row in rows:
+        if row.file_hash:
+            hashes.setdefault(row.file_hash, row.s3_fileid)
     return hashes, IntakeRepository(session).fingerprints()
 
 

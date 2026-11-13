@@ -46,6 +46,7 @@ from core.ladder.context import (
     SOURCE_RASTER,
     DocumentContext,
 )
+from core.providers.file_locator import FileLocator
 from core.providers.storage import StorageProvider, StorageProviderFactory
 
 logger = logging.getLogger(__name__)
@@ -123,9 +124,13 @@ class QualityGate:
         storage: Optional[StorageProvider] = None,
         known_hashes: Optional[Dict[str, str]] = None,
         known_fingerprints: Optional[List[Tuple[str, int]]] = None,
+        locator: Optional[FileLocator] = None,
     ):
         self.profile = profile or load_profile()
         self.storage = storage or StorageProviderFactory.default()
+        # Через него проверяется, жив ли двойник точного дубля: журнал
+        # решений об удалении файла ничего не знает.
+        self.locator = locator or FileLocator(self.storage)
         # Отпечатки и хеши уже принятого приходят снаружи: ходить в БД из
         # проверки не нужно, а тестировать так заметно проще.
         self.known_hashes = dict(known_hashes or {})
@@ -300,18 +305,56 @@ class QualityGate:
         """
         twin = self.known_hashes.get(file_hash)
         if twin and twin != s3_fileid:
-            return QualityVerdict(
-                REJECT,
-                f"Точный дубликат уже принятого файла {twin!r} "
-                f"(совпадает контрольная сумма).",
-                "QG-2", file_hash=file_hash,
+            verdict = self.twin_verdict(
+                twin, file_hash, self.locator.is_present(twin)
             )
+            if verdict is not None:
+                return verdict
 
         if fingerprint is None:
             fingerprint = _simhash(_text_sample(context))
         if fingerprint:
             self._near_duplicate(s3_fileid, fingerprint, warnings)
         return None
+
+    @staticmethod
+    def twin_verdict(
+        twin: str, file_hash: str, present: Optional[bool]
+    ) -> Optional[QualityVerdict]:
+        """
+        Вердикт по найденному двойнику с той же контрольной суммой.
+
+        Дубль — это вторая копия, а не просто совпавший хеш в журнале: если
+        принятый ранее файл с тех пор удалили, новая загрузка — единственная
+        копия, и отклонять её значит потерять документ (прод, 13.11:
+        «14Х17Н2 Шестигранник 32 Акт ВК…» после удаления первой загрузки).
+
+        Хранилище не ответило — ни отказа, ни молчаливого приёма: отказ
+        окончателен и на ложном основании теряет документ, а приём без
+        проверки пропускает дубль. Карантин оставляет решение человеку.
+
+        `present` — ответ `FileLocator.is_present` по двойнику.
+        """
+        if present is False:
+            logger.info(
+                "Двойник %s по хешу %s удалён из хранилища — не дубль",
+                twin, file_hash[:12],
+            )
+            return None
+        if present is None:
+            return QualityVerdict(
+                QUARANTINE,
+                f"Совпадает контрольная сумма с принятым ранее файлом {twin!r}, "
+                f"но хранилище не ответило, лежит ли он ещё на месте — "
+                f"нужно решение человека.",
+                "QG-2", file_hash=file_hash,
+            )
+        return QualityVerdict(
+            REJECT,
+            f"Точный дубликат уже принятого файла {twin!r} "
+            f"(совпадает контрольная сумма).",
+            "QG-2", file_hash=file_hash,
+        )
 
     def _near_duplicate(
         self, s3_fileid: str, fingerprint: int, warnings: List[str]
@@ -384,6 +427,27 @@ class QualityGate:
             return self._no_text_verdict(context, warnings)
 
         confidence = probe.confidence
+        if _is_drawing(context) and (
+            confidence < settings.QG_OCR_BLOCK_CONFIDENCE
+            or probe.unreadable_share > settings.QG_OCR_UNREADABLE_SHARE
+        ):
+            # Tesseract на листе чертежа читает надписи вперемешку с линиями,
+            # штриховкой и размерами: низкая уверенность здесь говорит о
+            # графике, а не о том, что лист нечитаем. Чертёж разбирает ветка
+            # чертежей (Qwen-VL), а не этот OCR; пустой лист чертежа уже
+            # принимается (`_no_text_verdict`). Прод, 13.11: десять растровых
+            # чертежей с уверенностью 0.28–0.35 ушли в карантин.
+            warnings.append(
+                f"Быстрый OCR на листе чертежа: уверенность {confidence:.2f}, "
+                f"неуверенно прочитано {probe.unreadable_share:.0%} текста — "
+                f"содержимое оценит разбор чертежа."
+            )
+            return QualityVerdict(
+                ACCEPT,
+                "Это чертёж: уверенность быстрого OCR о его читаемости не говорит.",
+                "QG-4", confidence=confidence,
+            )
+
         if confidence < settings.QG_OCR_BLOCK_CONFIDENCE:
             return QualityVerdict(
                 QUARANTINE,
@@ -460,7 +524,7 @@ class QualityGate:
         где текст ожидается — скан страницы, фотокопия, снимок экрана, —
         пустой результат остаётся поводом для карантина.
         """
-        if context.classification.genre == GENRE_DRAWING:
+        if _is_drawing(context):
             warnings.append(
                 "Надписей на листе не найдено — содержимое оценит разбор чертежа."
             )
@@ -674,6 +738,17 @@ class _OcrProbe:
     blocks: int
     unreadable_share: float = 0.0
     text: str = ""
+
+
+def _is_drawing(context: DocumentContext) -> bool:
+    """Жанр «чертёж». Классификация не вправе ронять вердикт: сбой — не чертёж."""
+    try:
+        return context.classification.genre == GENRE_DRAWING
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Классификация %s не удалась: %s", context.uri, exc)
+        return False
 
 
 def _probe_from_blocks(blocks) -> _OcrProbe:

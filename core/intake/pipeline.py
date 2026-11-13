@@ -62,7 +62,15 @@ class IntakePipeline:
         Ничего не бросает наружу: приём одного файла не должен уводить в
         повтор задачу, которая уже вынесла вердикты по остальным.
         """
-        with telemetry.collect() as timings:
+        # Модуль OCR тяжёлый (pytesseract, pdf2image): импорт здесь, а не при
+        # загрузке, чтобы ручка Data Gateway его не тянула.
+        from core.providers.tesseract_fallback import ocr_memo
+
+        # Скан без текстового слоя распознаётся на обоих этапах: Data
+        # Gateway классифицирует его по тексту первых страниц, Quality Gate
+        # мерит по ним читаемость. Страницы, разрешение и Tesseract те же —
+        # в общем блоке памяти второй этап их не распознаёт заново.
+        with telemetry.collect() as timings, ocr_memo():
             with telemetry.measure(
                 "intake.file", request_id=request_id, s3_fileid=item.s3_fileid
             ) as span:
@@ -145,6 +153,7 @@ class IntakePipeline:
         gate = QualityGate(
             profile=self.profile, storage=self.storage,
             known_hashes=known_hashes, known_fingerprints=known_fingerprints,
+            locator=self.locator,
         )
         result = gate.evaluate(s3_fileid, uri)
 
@@ -153,13 +162,19 @@ class IntakePipeline:
         # в базе ещё не видят, поэтому по базе оба проходят как новые.
         if result.outcome == ACCEPT and result.file_hash:
             owner = state.claim_content(result.file_hash, s3_fileid)
+            present = self.locator.is_present(owner) if owner else None
+            if owner and present is False:
+                # Заявка живёт сутки (`INTAKE_STATE_TTL_SECONDS`), а файл
+                # владельца за это время могли удалить: тогда хеш держался за
+                # файлом, которого нет, и новую загрузку отклоняли как дубль.
+                owner = state.take_over_content(result.file_hash, owner, s3_fileid)
+                present = self.locator.is_present(owner) if owner else None
             if owner:
-                result.outcome = REJECT
-                result.reason = (
-                    f"Точный дубликат уже принятого файла {owner!r} "
-                    f"(совпадает контрольная сумма)."
-                )
-                result.stage = "QG-2"
+                twin = gate.twin_verdict(owner, result.file_hash, present)
+                if twin is not None:
+                    result.outcome = twin.outcome
+                    result.reason = twin.reason
+                    result.stage = twin.stage
 
         self._record(
             s3_fileid=s3_fileid, stage=STAGE_QUALITY, outcome=result.outcome,
@@ -190,7 +205,12 @@ class IntakePipeline:
                     .order_by(IntakeDecisionDB.created_at.desc())
                     .limit(1000)
                 ).scalars()
-                hashes = {r.file_hash: r.s3_fileid for r in rows if r.file_hash}
+                # У хеша остаётся самая свежая принятая копия: прежняя могла быть
+                # удалена, и по ней дубль больше не опознаётся.
+                hashes: Dict[str, str] = {}
+                for row in rows:
+                    if row.file_hash:
+                        hashes.setdefault(row.file_hash, row.s3_fileid)
                 fingerprints = IntakeRepository(session).fingerprints()
             return hashes, fingerprints
         except Exception as exc:  # noqa: BLE001 — без базы приём всё равно идёт
