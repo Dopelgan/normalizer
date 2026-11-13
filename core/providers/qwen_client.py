@@ -157,6 +157,15 @@ _TRANSCRIBE_PROMPT = """Перепиши весь текст, который е�
 """
 
 
+# Знак отклонения и справочная звёздочка (`DRAWING_DIMENSION_FIDELITY`).
+# В транскрипции листа «30±10*» приходило как «30+10*», а на вырезке вида
+# знак был верный: модель подменяет «±» на «+» сама, и правится это запросом.
+_SIGN_RULE = """- Знак отклонения переписывай ровно тот, что стоит на листе: «±» — это «±»,
+  а не «+»; «−» — это «−», а не «+». Симметричное отклонение пиши одним
+  знаком «±»: «30±10», «⌀4,5±1».
+- Звёздочку справочного размера не теряй: «30±10*», «(Y+12)*».
+"""
+
 _SMALL_PRINT_RULE = """- Запятую в десятичной дроби не теряй: «M20x1,5», «Rz 3,2», «⌀8,5» — а не
   «M20x15», «Rz 32», «⌀85». Предельные отклонения, написанные мелко справа
   вверху и внизу от размера, пиши полностью, со знаком и запятой: «12+0,8»,
@@ -226,6 +235,8 @@ class QwenVisionClient:
             categories=", ".join(CATEGORIES),
             hint=f"\n- Подсказка по разметке листа: {hint}" if hint else "",
         )
+        if settings.DRAWING_DIMENSION_FIDELITY:
+            prompt += _SIGN_RULE
         if settings.DRAWING_SMALL_PRINT_CARE:
             prompt += _SMALL_PRINT_RULE
             image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
@@ -555,7 +566,11 @@ def fix_grade(text: str) -> str:
 
 def _transcribe_prompt() -> str:
     """Запрос «перепиши весь текст листа»; с DRAWING_SMALL_PRINT_CARE — с правилом про дроби."""
-    return _TRANSCRIBE_PROMPT + (_SMALL_PRINT_RULE if settings.DRAWING_SMALL_PRINT_CARE else "")
+    return (
+        _TRANSCRIBE_PROMPT
+        + (_SIGN_RULE if settings.DRAWING_DIMENSION_FIDELITY else "")
+        + (_SMALL_PRINT_RULE if settings.DRAWING_SMALL_PRINT_CARE else "")
+    )
 
 
 def enlarge_small(image, small_side: int):

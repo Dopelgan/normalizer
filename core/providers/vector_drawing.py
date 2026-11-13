@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from core.providers import page_prose
+from core.providers import dimension_fidelity, page_prose
 from core.providers.text_layer import (
     PYMUPDF_AVAILABLE,
     TextLayer,
@@ -421,6 +421,10 @@ def classify(text: str, line: Optional[TextLine] = None, turn: int = 0) -> Tuple
         return "size", 0.95
     if any(word in text.lower() for word in _MATERIAL_WORDS):
         return "material", 0.85
+    # Марка стали («12Х18Н10Т») — материал, а не размер с посадкой: правило
+    # посадки видит в ней «H10» и объявляло её допуском.
+    if _fidelity_enabled() and dimension_fidelity.is_steel_grade(text):
+        return "material", 0.85
     if _CALLOUT.match(text):
         return "callout", 0.8
     if _PLAIN_SIZE.match(text) or _ANGLE.search(text):
@@ -439,18 +443,35 @@ def _in_title_block(line: TextLine, turn: int = 0) -> bool:
     return x1 <= cx <= x2 and y1 <= cy <= y2
 
 
+def _fidelity_enabled() -> bool:
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_DIMENSION_FIDELITY", False))
+
+
+def _without_grades(text: str) -> str:
+    """Текст, в котором марки стали закрыты точками (`DRAWING_DIMENSION_FIDELITY`)."""
+    if not _fidelity_enabled():
+        return text
+    return dimension_fidelity.mask_steel_grades(text)
+
+
 def extract_tolerance(text: str) -> Optional[str]:
+    masked = _without_grades(text)
     for pattern in (_EXPLICIT_TOL, _FIT, _RANGE_TOL):
-        match = pattern.search(text)
+        match = pattern.search(masked)
         if match:
-            return match.group().strip()
+            # Марки стали закрыты: «12Х18Н10Т» допуска не даёт. Вне марок
+            # закрытый текст совпадает с исходным посимвольно.
+            return text[match.start():match.end()].strip()
     return None
 
 
 def tolerance_source(text: str) -> str:
-    if _EXPLICIT_TOL.search(text) or _RANGE_TOL.search(text):
+    masked = _without_grades(text)
+    if _EXPLICIT_TOL.search(masked) or _RANGE_TOL.search(masked):
         return "explicit"
-    if _FIT.search(text):
+    if _FIT.search(masked):
         return "fit_notation"
     return "unknown"
 
