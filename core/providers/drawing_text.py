@@ -21,6 +21,8 @@ from __future__ import annotations
 import re
 from typing import Tuple
 
+from core.providers import dimension_fidelity
+
 # Знак диаметра во всех начертаниях, которые встречаются в текстовом слое и
 # в ответах моделей. Внутри системы он всегда один.
 DIAMETER = "⌀"
@@ -40,9 +42,6 @@ _FIT_CYRILLIC = {"Н": "H", "К": "K", "М": "M", "Р": "P", "Е": "E", "С": "C
 # Резьба: «М12», «М12х1,5». Кириллическая «М» встречается почти всегда.
 _THREAD_CYRILLIC = re.compile(r"(?<![А-Яа-яЁёA-Za-z])[Мм](?=\s?\d+(?:[.,]\d+)?)")
 
-# Шероховатость: «Ка 3.2», «Ва 3,2», «Rа» с кириллической «а».
-_ROUGHNESS = re.compile(r"(?<![А-Яа-яЁёA-Za-z])([RКВВK])\s?([aаzз])(?=\s?\d)")
-
 # Поле допуска резьбы пишется через дефис: «M12-6H».
 _THREAD_FIELD = re.compile(r"(?<=\d)-(\d)([НhКк])(?![А-Яа-яЁё\w])")
 
@@ -57,13 +56,45 @@ def normalize(text: str) -> str:
     result = _DIAMETER_GLYPHS.sub(DIAMETER, result)
     result = _DIAMETER_CYRILLIC.sub(DIAMETER, result)
     result = _PLUS_MINUS.sub("±", result)
-    result = _THREAD_CYRILLIC.sub("M", result)
-    result = _ROUGHNESS.sub(lambda m: ("R" if m.group(1) in "RКВВK" else m.group(1))
-                            + ("a" if m.group(2) in "aа" else "z"), result)
-    result = _FIT_AFTER_SIZE.sub(lambda m: _FIT_CYRILLIC.get(m.group(1), m.group(1)), result)
+    result = _outside_grades(result, _THREAD_CYRILLIC, lambda m: "M")
+    # Знак шероховатости — один образец на весь разбор
+    # (`dimension_fidelity.ROUGHNESS_LETTERS`): он же нужен абзацам MinerU
+    # и строкам транскрипции, которые нормализовать целиком нельзя.
+    result = dimension_fidelity.fix_roughness_letters(result, wide=_fidelity_enabled())
+    result = _outside_grades(result, _FIT_AFTER_SIZE,
+                             lambda m: _FIT_CYRILLIC.get(m.group(1), m.group(1)))
     result = _THREAD_FIELD.sub(lambda m: "-" + m.group(1) + ("H" if m.group(2) in "Нh" else "K"),
                                result)
+    if _fidelity_enabled():
+        result = dimension_fidelity.repair(result, "надпись чертежа")
     return result.strip()
+
+
+def _outside_grades(text: str, pattern: re.Pattern, replace) -> str:
+    """
+    Замена по образцу везде, кроме марок стали. В «12Х18Н10Т» правило
+    посадки видит «Н10» и переводит её в латинскую «H10» — после этого
+    марка объявляется размером с допуском, которого на чертеже нет.
+    Марки на время замены закрыты точками: места букв и цифр не сдвигаются.
+    """
+    if not _fidelity_enabled():
+        return pattern.sub(replace, text)
+    masked = dimension_fidelity.mask_steel_grades(text)
+    out, last = [], 0
+    for match in pattern.finditer(masked):
+        out.append(text[last:match.start()])
+        # Вне марок закрытый текст совпадает с исходным посимвольно, и
+        # группы совпадения те же.
+        out.append(replace(match))
+        last = match.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _fidelity_enabled() -> bool:
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_DIMENSION_FIDELITY", False))
 
 
 def looks_like_text(text: str) -> Tuple[bool, str]:

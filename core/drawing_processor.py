@@ -67,7 +67,8 @@ from core import deadline
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
-    drawing_text, drawing_vision, raster_drawing, title_block, vector_drawing,
+    dimension_fidelity, drawing_text, drawing_vision, raster_drawing, title_block,
+    vector_drawing,
 )
 from core.providers.qwen_client import CATEGORIES, QwenVisionClient
 from core.providers.storage import StorageProvider, StorageProviderFactory
@@ -201,6 +202,10 @@ class DrawingProcessor:
             payload["regions_skipped"] = skipped
 
         fields = _deduplicate(fields)
+        if settings.DRAWING_DIMENSION_FIDELITY:
+            # Один размер, прочитанный и на листе целиком, и на вырезке вида:
+            # остаётся прочтение со знаком «±» и со справочной звёздочкой.
+            fields = dimension_fidelity.merge_readings(fields)
         mode = MODE_VISION_VLM if (self.vision_enabled and layout.regions) else MODE_SHEET_ONLY
         if not fields and not payload["tables"] and not payload.get("transcript_lines"):
             return _empty(MODE_NONE)
@@ -492,7 +497,7 @@ class DrawingProcessor:
         не считается переписанным целиком (core/drawing_quality.py).
         """
         if not settings.DRAWING_TRANSCRIBE_TILES:
-            return self.qwen.transcribe(image)
+            return self._fidelity(self.qwen.transcribe(image))
         budget = settings.DRAWING_TIME_BUDGET
         transcript = self.qwen.transcribe_sheet(image, until=started + budget if budget else None)
         if transcript is None:
@@ -505,7 +510,14 @@ class DrawingProcessor:
                 {"kind": "transcript_tile", "bbox": box, "reason": reason}
                 for box, reason in transcript.failed
             )
-        return transcript.lines
+        return self._fidelity(transcript.lines)
+
+    @staticmethod
+    def _fidelity(lines: Optional[List[str]]) -> Optional[List[str]]:
+        """Строки транскрипции с восстановленными числами и знаками."""
+        if lines is None or not settings.DRAWING_DIMENSION_FIDELITY:
+            return lines
+        return dimension_fidelity.repair_lines(lines)
 
     def _out_of_time(self, started: float) -> bool:
         budget = settings.DRAWING_TIME_BUDGET
@@ -538,6 +550,10 @@ class DrawingProcessor:
 
         for name, value in (block.get("fields") or {}).items():
             text = drawing_text.normalize(str(value))
+            if settings.DRAWING_DIMENSION_FIDELITY and "масштаб" in str(name).lower():
+                # «7:1» в графе «Масштаб» — это «1:1»: курсивная «1» похожа
+                # на «7», а ряд масштабов по ГОСТ 2.302 узкий.
+                text = dimension_fidelity.repair_scale(text)
             readable, _ = drawing_text.looks_like_text(text)
             if not readable:
                 continue

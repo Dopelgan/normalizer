@@ -49,7 +49,7 @@ from core.providers.document_parser import (
     ParserFailed,
     ParserUnavailable,
 )
-from core.providers import ocr_cleanup, table_vlm
+from core.providers import dimension_fidelity, ocr_cleanup, table_vlm
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.tesseract_fallback import TesseractFallbackProvider
 from core.providers.vector_drawing import (
@@ -364,9 +364,12 @@ class MinerUParserProvider(DocumentParserProvider):
                 frame_table_guard=settings.FRAME_TABLE_GUARD_ENABLED,
             )
             blocks = self._apply_vector_drawings(blocks, layer, drawing_verdicts)
+            dimension_fixes = self._fix_dimensions(blocks, drawing_verdicts)
             result.blocks = blocks
             result.text_layer_chars = stats.layer_chars_by_page
             result.text_layer_stats = stats.as_dict()
+            if dimension_fixes:
+                result.text_layer_stats["dimension_fixes"] = dimension_fixes
             return result
 
         # Растр: слоя в файле нет, но его можно собрать распознаванием. Схема
@@ -395,6 +398,7 @@ class MinerUParserProvider(DocumentParserProvider):
                 if vocab is not None:
                     # Ячейки таблиц и текст MinerU, не перекрытые слоем.
                     word_fix.add(ocr_cleanup.clean_blocks(blocks, vocab))
+                dimension_fixes = self._fix_dimensions(blocks, drawing_verdicts)
                 repeated = None
                 if settings.OCR_LAYER_DROP_REPEATED:
                     blocks, repeated = drop_repeated_recovered_blocks(
@@ -403,6 +407,8 @@ class MinerUParserProvider(DocumentParserProvider):
                 result.blocks = blocks
                 result.text_layer_chars = stats.layer_chars_by_page
                 result.text_layer_stats = {**stats.as_dict(), "layer": "ocr"}
+                if dimension_fixes:
+                    result.text_layer_stats["dimension_fixes"] = dimension_fixes
                 if vocab is not None:
                     result.text_layer_stats["word_fix"] = word_fix.as_dict()
                 if repeated is not None:
@@ -936,6 +942,31 @@ class MinerUParserProvider(DocumentParserProvider):
         )
 
     # ------------------------------------------------------------- чертежи
+    @staticmethod
+    def _fix_dimensions(
+        blocks: List[ParsedBlock], verdicts: Optional[Dict[int, DrawingPage]] = None,
+    ) -> int:
+        """
+        Числа и знаки размеров в тексте и ячейках MinerU
+        (`DRAWING_DIMENSION_FIDELITY`); сколько записей поправлено. Своя
+        таблица MinerU лежит в выдаче рядом с чтением модели: пока в ячейке
+        оставался «M24×15», верная запись «M24x1,5» из чтения модели
+        находила лишь одну из двух.
+
+        Правятся только страницы-чертежи, если вердикт по страницам есть:
+        в прозе договора или ТЗ размеров по ГОСТ нет, и трогать её незачем.
+        Вердикта нет только у входа-картинки — там лист и есть весь файл.
+        """
+        if not settings.DRAWING_DIMENSION_FIDELITY:
+            return 0
+        chosen = blocks
+        if verdicts:
+            drawings = {page for page, verdict in verdicts.items() if verdict.is_drawing}
+            if not drawings:
+                return 0
+            chosen = [block for block in blocks if block.page in drawings]
+        return dimension_fidelity.repair_blocks(chosen)
+
     def _apply_vector_drawings(
         self,
         blocks: List[ParsedBlock],
