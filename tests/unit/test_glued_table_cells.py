@@ -80,7 +80,7 @@ class TestSplitGluedText:
 
 
 class TestSplitGuards:
-    """Замечания ревью: шифры, мусор словаря OCR, буквы с цифрами."""
+    """Шифры, мусор словаря OCR, буквы с цифрами."""
 
     def test_designation_code_is_not_cut_at_punctuation(self):
         vocab = layer_vocabulary([line("АБВГ 301611.002", 0.1)])
@@ -214,7 +214,7 @@ class TestMixedScript:
 
 
 class TestLegitMixedTokens:
-    """Ревью bd7b651: законные смеси латиницы и греческого не трогаются."""
+    """Законные смеси латиницы и греческого не трогаются."""
 
     TOKENS = ["kΩ", "μm", "Δp", "τmax"]
 
@@ -237,7 +237,7 @@ class TestLegitMixedTokens:
 
 
 class TestGostSymbols:
-    """Ревью e501bde: греческая буква с русским индексом — законное обозначение."""
+    """Греческая буква с русским индексом — законное обозначение."""
 
     @pytest.mark.parametrize("token", ["τср", "αт", "ρв", "κп", "εр", "ТипA1"])
     def test_kept_without_vocabulary(self, token):
@@ -329,7 +329,7 @@ class TestOcrTextBlocks:
 
 
 class TestStampDetection:
-    """Ревью d54e808: обычная таблица не штамп, коды — не марки стали."""
+    """Обычная таблица не штамп, коды — не марки стали."""
 
     def _reconcile(self, headers, rows, bbox=(0.05, 0.80, 0.95, 0.99)):
         block = ParsedBlock(type="table", page=1, bbox=list(bbox),

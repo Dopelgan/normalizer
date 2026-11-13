@@ -1,10 +1,10 @@
 """
 Текст в рамке ЕСКД: не чертёж, не таблица; мусор OCR-слоя рядом с MinerU.
 
-Страницы смоделированы по разбору прод-индекса 12.11 (parser-quality):
-ТЗ/ПОК/СТО в рамке со штампом уходили в поля чертежа «Примечание: …»
-и в Qwen-VL, ПМ1 (изм. 4) становилась одной таблицей на всю книгу,
-Tesseract-слой со строками conf < 0.4 дублировал MinerU на сканах.
+Страницы смоделированы по реальным документам: ТЗ/ПОК/СТО в рамке со
+штампом уходят в поля чертежа «Примечание: …» и в Qwen-VL, многостраничная
+ПМ становится одной таблицей на всю книгу, Tesseract-слой со строками
+conf < 0.4 дублирует MinerU на сканах.
 """
 
 from dataclasses import dataclass
@@ -100,7 +100,7 @@ class TestProse:
         assert verdict.signals["heading"] and verdict.signals["sheet_number"]
 
     def test_english_tz_page_is_prose(self):
-        # ТЗ (анг): худший документ отчёта, 65 страниц в виде полей чертежа.
+        # ТЗ на английском: без проверки прозы все страницы — поля чертежа.
         lines = [
             "1 General provisions",
             "1.1 This technical specification applies to the automated dosing unit",
@@ -133,7 +133,7 @@ class TestProse:
 # ------------------------------------------------------- классификатор
 class TestDrawingClassifier:
     def test_flag_off_keeps_old_verdict(self):
-        # Без флага поведение прежнее: рамка + штамп + геометрия = чертёж.
+        # Без флага: рамка + штамп + геометрия = чертёж.
         verdict = _score_page(_Page(TZ_PAGE, extra_paths=150), 1)
         assert verdict.is_drawing
         assert "text_in_frame" not in verdict.signals
@@ -343,7 +343,7 @@ class TestGridOnlyPage:
         assert _score_page(_GeometryPage(TABLE_CELLS), 66).is_drawing
 
     def test_table_in_frame_is_text_page(self, text_in_frame):
-        # ПМ1 (изм. 4), ТЗ (анг), ПОК: таблица в рамке, строки ячеек короткие —
+        # ПМ, ТЗ, ПОК: таблица в рамке, строки ячеек короткие —
         # прозой не считается, но вся графика — сетка.
         assert not page_prose.assess(TABLE_CELLS).is_prose
         verdict = _score_page(_GeometryPage(TABLE_CELLS, grid=900), 66)
@@ -361,7 +361,7 @@ class TestGridOnlyPage:
         assert verdict.is_drawing
 
     def test_inserted_drawing_image_stays_drawing(self, text_in_frame):
-        # ТУ 681821.001, прил. А: габаритный чертёж вставлен картинкой в рамку.
+        # Приложение к ТУ: габаритный чертёж вставлен картинкой в рамку.
         verdict = _score_page(_GeometryPage(DRAWING_PAGE, grid=120,
                                             image_bbox=(60, 60, 560, 520)), 29)
         assert verdict.is_drawing
@@ -380,10 +380,10 @@ class TestGridOnlyPage:
 
         verdict = _score_page(_Broken(TABLE_CELLS, grid=200), 66)
         assert "geometry" not in verdict.signals
-        assert verdict.is_drawing  # ячейки — не проза, прежний вердикт
+        assert verdict.is_drawing  # ячейки — не проза, лист остаётся чертежом
 
 
-# ------------------------------------------- классификатор листа (флаг 2)
+# --------------------------- классификатор листа (DRAWING_PAGE_CLASSIFIER_ENABLED)
 FIGURE_PAGE = [
     "Приложение Б (справочное)",
     "Общий вид, габаритные размеры установки подготовки проб",
@@ -405,7 +405,7 @@ def page_classifier(text_in_frame, monkeypatch):
 
 
 class TestPageClassifier:
-    """Лист ТЗ/ПМ/ТУ с рисунком-картинкой: текст, а не чертёж (флаг 2)."""
+    """Лист ТЗ/ПМ/ТУ с рисунком-картинкой: текст, а не чертёж."""
 
     IMAGE = (60, 160, 560, 560)   # треть листа: рисунок в приложении ТЗ
 

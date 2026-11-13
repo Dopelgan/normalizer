@@ -1,4 +1,4 @@
-"""Source cardinality and whole-document strategy selection without model calls."""
+"""Число исходных единиц и выбор стратегии на весь документ без вызовов модели."""
 import io
 
 import fitz

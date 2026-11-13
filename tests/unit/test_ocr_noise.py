@@ -285,7 +285,7 @@ def test_continuation_frame_drops_unsure_lines():
     assert stats.low_confidence_table_lines == 1
 
 
-# --------------------------------------------- примечания чертежа (13.11)
+# ---------------------------------------------------- примечания чертежа
 DRAWING_VOCAB = Vocabulary(
     rus=frozenset("договора поставки масса изделия технологических операций".split()),
     eng=frozenset("the".split()),

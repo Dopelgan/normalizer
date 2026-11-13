@@ -117,8 +117,8 @@ def s3_settings(monkeypatch):
 
 class TestChatAttachments:
     """
-    Регрессия: uuid вложения чата искался только в основном бакете
-    (uuid + 17 расширений) и всегда давал SourceFileNotFound.
+    Uuid вложения чата ищется и в бакете вложений: в основном бакете
+    (uuid + 17 расширений) его нет, и поиск дал бы SourceFileNotFound.
     """
 
     def test_docx_attachment_found_with_type_from_metadata(self, s3_settings):
