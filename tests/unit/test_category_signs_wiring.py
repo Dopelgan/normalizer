@@ -89,10 +89,18 @@ class TestDecisiveNotationWiring:
                             lambda text: settled.get(" ".join(text.split())),
                             raising=False)
 
-    def test_rules_win_where_the_notation_settles_it(self, monkeypatch, strict):
-        """«⌀32x2,5» — размер, что бы модель ни заявила."""
-        self.decisive(monkeypatch, {"⌀32x2,5": "size"})
-        assert _reconcile("thread", "size", "⌀32x2,5") == ("size", 0.6)
+    @pytest.mark.parametrize("text,settled,claimed", [
+        ("⌀32x2,5", "size", "thread"),
+        ("Ra 6,3", "roughness", "size"),
+        ("M24x1,5", "thread", "size"),
+        ("R12", "radius", "note"),
+    ])
+    def test_notation_wins_wherever_it_settles_the_question(
+        self, monkeypatch, strict, text, settled, claimed,
+    ):
+        """На этих четырёх записях оба помощника отвечают одинаково."""
+        self.decisive(monkeypatch, {text: settled})
+        assert _reconcile(claimed, settled, text) == (settled, 0.6)
 
     def test_agreement_on_decisive_notation_keeps_full_confidence(
         self, monkeypatch, strict,
@@ -100,21 +108,25 @@ class TestDecisiveNotationWiring:
         self.decisive(monkeypatch, {"Ra 6,3": "roughness"})
         assert _reconcile("roughness", "roughness", "Ra 6,3") == ("roughness", 0.9)
 
-    def test_the_patch_returns_the_rules_answer_not_the_decisive_one(
+    def test_the_decisive_answer_wins_not_the_rules_one(
         self, monkeypatch, strict,
     ):
         """
-        Зафиксировано нарочно. Правка возвращает `by_rules`, то есть ответ
-        `vector_drawing.classify`, а не ответ `decisive_category`. На четырёх
-        нотациях из пяти они совпадают (⌀ -> size, Ra/Rz -> roughness,
-        «M…×…» -> thread, «R»+число -> radius), и разницы нет. Расходятся они
-        на склеенной пометке «№» с цифрой: `decisive_category("2№3")` даёт
-        `position`, а `classify("2№3")` — `note`. Значит «2№3» перестаёт
-        стоять под «Резьба» (это и была порча), но встаёт под «Примечание», а
-        не под «Позиция». Если это решат менять, здесь и сломается.
+        В эту ветку входят потому, что нотация ответила, поэтому
+        возвращается её ответ. Разойтись с `classify` она может только на
+        склеенном «№» с цифрой: для «2№3» нотация говорит `position`, а
+        старый `classify` — `note`. Раньше правка отдавала `note`, и «2№3»
+        уходил из «Резьба» под «Примечание»; теперь — под «Позиция».
         """
         self.decisive(monkeypatch, {"2№3": "position"})
-        assert _reconcile("thread", "note", "2№3") == ("note", 0.6)
+        assert _reconcile("thread", "note", "2№3") == ("position", 0.6)
+
+    def test_the_model_agreeing_with_the_notation_keeps_full_confidence(
+        self, monkeypatch, strict,
+    ):
+        """Уверенность сверяется с тем, что возвращаем, а не с `by_rules`."""
+        self.decisive(monkeypatch, {"№1": "position"})
+        assert _reconcile("position", "note", "№1") == ("position", 0.9)
 
     def test_a_judgement_call_is_left_to_the_model(self, monkeypatch, strict):
         """Там, где нотация молчит, спор остаётся спором — как и раньше."""

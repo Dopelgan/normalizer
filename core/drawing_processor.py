@@ -907,8 +907,21 @@ def _reconcile(claimed: str, by_rules: str, text: str = "") -> tuple:
     # Исключение — записи, у которых по ЕСКД другого прочтения нет
     # (`vector_drawing.decisive_category`): на замере модель спорила с такой
     # нотацией 27 раз и не была права ни разу, правила — 26 из 26.
-    if text and _category_strict() and vector_drawing.decisive_category(text) is not None:
-        return by_rules, _AGREED if claimed == by_rules else _DISAGREED
+    #
+    # Возвращается ответ самой `decisive_category`, а не `by_rules`: в эту
+    # ветку и входят потому, что нотация ответила, и отдавать другое значит
+    # противоречить причине входа. Разойтись эти два ответа могут только на
+    # склеенном «№» с цифрой («2№3»: нотация говорит `position`, старый
+    # `classify` — `note`), и сварной шов под «Примечанием» тратит выдачу,
+    # не используя `position`, которую модель на этой нотации и заявляет.
+    # С включённым флагом `classify` сам спрашивает `decisive_category`
+    # первой, так что в собранном дереве эти ответы совпадают и выражение
+    # ничего не меняет; расхождение остаётся только там, где флаг выключен,
+    # а значит ветка недостижима.
+    if text and _category_strict():
+        decisive = vector_drawing.decisive_category(text)
+        if decisive is not None:
+            return decisive, _AGREED if claimed == decisive else _DISAGREED
     if claimed not in CATEGORIES:
         return by_rules, _MODEL_ONLY if by_rules != "note" else 0.4
     if claimed == by_rules:
