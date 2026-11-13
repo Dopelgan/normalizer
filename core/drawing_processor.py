@@ -129,12 +129,16 @@ class DrawingProcessor:
     # ------------------------------------------------------------- публичное
     def process(
         self, image_ref: str, metadata: Dict[str, Any], page: int = 1,
-        transcribe: bool = False,
+        transcribe: bool = False, log_page: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Возвращает:
         {'detected_count', 'parsed_fields', 'avg_confidence', 'completeness',
          'mode', 'payload'}
+
+        `log_page` — номер страницы только для лога: у вырезки MinerU номер
+        страницы живёт во фрагменте, а не в `page` (там всегда 1, потому что
+        вырезка — отдельная картинка). На разбор не влияет.
         """
         if not self.qwen.available:
             logger.error(
@@ -148,6 +152,7 @@ class DrawingProcessor:
             return _empty(MODE_NONE)
 
         started = time.monotonic()
+        sheet = page if log_page is None else log_page
         layout = (
             drawing_vision.analyse(image) if self.vision_enabled
             else drawing_vision.plain(image)
@@ -158,17 +163,32 @@ class DrawingProcessor:
         payload["coordinate_reference"] = "deskewed_page"
         missing_regions: List[Dict[str, Any]] = []
 
+        pass_started = time.monotonic()
         reading = self.qwen.read_sheet(layout.image, hint=layout.hint())
+        self._log_pass(
+            sheet, "лист целиком", pass_started,
+            ("надписей %d" % len(reading.annotations)) if reading is not None
+            else "лист не прочитан",
+        )
         # Весь текст листа отдельным проходом (DRAWING_IMAGE_FULL_READ):
         # разметка надписей по категориям теряет штамп, графы, номер листа
         # и примечания, а без них лист нельзя найти ни по обозначению, ни
         # по требованиям.
-        lines = (self._transcribe(layout.image, payload, missing_regions, started)
-                 if transcribe else None)
+        lines = None
+        if transcribe:
+            pass_started = time.monotonic()
+            lines = self._transcribe(layout.image, payload, missing_regions, started)
+            tiles = int(payload.get("transcript_tiles") or 0)
+            self._log_pass(
+                sheet, "весь текст листа", pass_started,
+                ("строк текста %d%s" % (len(lines), ", частей %d" % tiles if tiles else ""))
+                if lines else "текст не прочитан",
+            )
         if lines:
             payload["transcript_lines"] = lines
         if reading is None and not lines:
             logger.error("Модель не прочитала лист %s", image_ref)
+            self._log_sheet(image_ref, sheet, MODE_NONE, 0, 0, 0, 0, started)
             return _empty(MODE_NONE)
         if reading is not None:
             payload["sheet_type"] = reading.sheet_type
@@ -186,11 +206,25 @@ class DrawingProcessor:
                 skipped += 1
                 missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "time_budget"})
                 continue
+            pass_started = time.monotonic()
+            before = len(fields)
             if region.kind == drawing_vision.KIND_TITLE_BLOCK:
                 read = self._read_title_block(layout, region, fields, payload)
+                with_side = bool((payload.get("side_column") or {}).get("read"))
+                self._log_pass(
+                    sheet, "штамп", pass_started,
+                    ("граф %d%s" % (len(fields) - before,
+                                    ", с боковой колонкой" if with_side else ""))
+                    if read else "штамп не прочитан",
+                )
             else:
                 piece = drawing_vision.crop(layout.image, region.bbox)
                 read = self._read_table(piece, region, payload)
+                self._log_pass(
+                    sheet, "таблица", pass_started,
+                    ("строк %d" % len(payload["tables"][-1]["rows"])) if read
+                    else "таблица не прочитана",
+                )
             regions_read += int(read)
             if not read:
                 missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "region_not_read"})
@@ -208,10 +242,14 @@ class DrawingProcessor:
             fields = dimension_fidelity.merge_readings(fields)
         mode = MODE_VISION_VLM if (self.vision_enabled and layout.regions) else MODE_SHEET_ONLY
         if not fields and not payload["tables"] and not payload.get("transcript_lines"):
+            self._log_sheet(image_ref, sheet, MODE_NONE, 0, len(lines or []),
+                            regions_read, len(regions), started)
             return _empty(MODE_NONE)
 
         payload["regions_read"] = regions_read
         payload["model"] = self.qwen.model
+        self._log_sheet(image_ref, sheet, mode, len(fields), len(lines or []),
+                        regions_read, len(regions), started)
         confidence = (
             sum(f["confidence"] for f in fields) / len(fields) if fields else 0.0
         )
@@ -235,6 +273,30 @@ class DrawingProcessor:
             "mode": mode,
             "payload": payload,
         }
+
+    # ------------------------------------------------------------------- лог
+    # Доказательство работы модели на чертеже читается прямо из лога: по
+    # строке на каждый вызов Qwen-VL и строка-итог на лист. Содержимого
+    # листа в лог не попадает — только номер страницы, вид прохода, счётчики,
+    # имя модели и время.
+    def _log_pass(self, sheet: Any, kind: str, started: float, produced: str) -> None:
+        """Один вызов модели: что за проход, что дал и сколько шёл."""
+        logger.info(
+            "Qwen-VL: стр. %s, проход «%s», %s, модель %s, %.1f с",
+            sheet, kind, produced, self.qwen.model, time.monotonic() - started,
+        )
+
+    def _log_sheet(
+        self, image_ref: str, sheet: Any, mode: str, fields: int, lines: int,
+        regions_read: int, regions: int, started: float,
+    ) -> None:
+        """Итог по листу: один вызов `process` — одна строка."""
+        logger.info(
+            "Qwen-VL итог: лист %s стр. %s, режим %s, полей %d, строк текста %d, "
+            "областей %d из %d, модель %s, %.1f с",
+            image_ref, sheet, mode, fields, lines, regions_read, regions,
+            self.qwen.model, time.monotonic() - started,
+        )
 
     def build_fragment(
         self,
@@ -327,7 +389,10 @@ class DrawingProcessor:
                 result.append(fragment)
                 continue
             try:
-                drawing_result = self.process(fragment.content.image_ref, metadata)
+                drawing_result = self.process(
+                    fragment.content.image_ref, metadata,
+                    log_page=fragment.position.page if fragment.position else None,
+                )
                 enriched = self.build_fragment(drawing_result, fragment, metadata)
             except SoftTimeLimitExceeded:
                 raise

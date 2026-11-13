@@ -16,6 +16,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
 from celery.exceptions import SoftTimeLimitExceeded
 
@@ -71,6 +72,24 @@ def generate_doc_id(s3_fileid: str) -> str:
     """Стабильный идентификатор документа: один и тот же файл — один doc_id."""
     digest = hashlib.sha256(s3_fileid.encode("utf-8")).hexdigest()
     return f"doc-{digest[:32]}"
+
+
+def original_name(storage, uri: str) -> str:
+    """
+    Исходное имя загруженного файла из метаданных объекта (`filename`,
+    URL-encoded). Ключ в хранилище транслитерирован, и по логу нельзя
+    сказать, какой из загруженных файлов разбирается. Имя только для лога:
+    ни на разбор, ни на контракт не влияет, а сбой хранилища не должен
+    ронять задачу — отсюда пустая строка вместо исключения.
+    """
+    try:
+        meta = {k.lower(): v for k, v in (storage.metadata(uri) or {}).items()}
+        return unquote(str(meta.get("filename") or "")).strip()
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001 — имя для лога не стоит задачи
+        logger.debug("Исходное имя %s не получено: %s", uri, exc)
+        return ""
 
 
 def compute_file_hash(storage, uri: str) -> Optional[str]:
@@ -341,6 +360,12 @@ def process_document(
                 dialog_id, event_id,
             )
             return {"status": "error", "doc_id": doc_id, "reason": "source_not_found"}
+
+        logger.info(
+            "Документ %s: снимок %s, исходное имя «%s», тип .%s",
+            doc_id, s3_fileid, original_name(storage, located.uri) or "неизвестно",
+            located.file_type or "?",
+        )
 
         # ------------------------------- 2. Идемпотентность и запись документа
         with session.begin():
