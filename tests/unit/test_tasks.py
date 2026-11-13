@@ -418,6 +418,36 @@ class TestFailures:
         assert get_request_state("req-1")["status"] == "error"
 
 
+class TestOriginalNameInLog:
+    """
+    Имя загруженного файла в логе: по снимку с кластером человек не скажет,
+    какой из файлов сейчас разбирается.
+    """
+
+    @pytest.mark.parametrize("fileid, expected", [
+        ("cluster-a/Чертёж вилки АБВГ.123456.001.pdf", "Чертёж вилки АБВГ.123456.001.pdf"),
+        ("Договор 1507-2-26.docx", "Договор 1507-2-26.docx"),
+        ("cluster-a/%D0%A2%D0%97.pdf", "ТЗ.pdf"),            # имя пришло URL-encoded
+        ("0b3f8c1e-1111-2222-3333-444455556666", ""),         # вложение чата: имени нет
+    ])
+    def test_readable_name_comes_from_the_fileid(self, fileid, expected):
+        assert tasks.original_name(fileid) == expected
+
+    def test_log_line_names_the_uploaded_file(self, pipeline, fake_redis, caplog):
+        import logging
+
+        fileid = "cluster-a/Чертёж вилки АБВГ.123456.001.pdf"
+        init_request_state("req-name", [fileid])
+        with caplog.at_level(logging.INFO, logger="ingest.tasks"):
+            process_document("req-name", fileid)
+        line = next(m for m in (r.getMessage() for r in caplog.records)
+                    if m.startswith("Документ ") and "снимок" in m)
+
+        assert f"снимок {fileid}" in line
+        assert "исходное имя «Чертёж вилки АБВГ.123456.001.pdf»" in line
+        assert "тип .pdf" in line
+
+
 class TestHelpers:
     def test_build_error_document_is_valid_contract(self):
         from core.models.contract import DocumentResult

@@ -14,6 +14,7 @@ push-доставка.
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
@@ -74,22 +75,21 @@ def generate_doc_id(s3_fileid: str) -> str:
     return f"doc-{digest[:32]}"
 
 
-def original_name(storage, uri: str) -> str:
+def original_name(s3_fileid: str) -> str:
     """
-    Исходное имя загруженного файла из метаданных объекта (`filename`,
-    URL-encoded). Ключ в хранилище транслитерирован, и по логу нельзя
-    сказать, какой из загруженных файлов разбирается. Имя только для лога:
-    ни на разбор, ни на контракт не влияет, а сбой хранилища не должен
-    ронять задачу — отсюда пустая строка вместо исключения.
+    Читаемое имя загруженного файла — из самого `s3_fileid`.
+
+    `s3_fileid` приходит как «<кластер>/<имя файла>» и несёт настоящее
+    русское имя; кластер в логе не нужен, остаётся имя. Метаданные объекта
+    тут не спрашиваются: снимок для разбора RAG создаёт `put_object` без
+    `Metadata`, поля `filename` у объекта нет ни у новой загрузки, ни у
+    переразбора, и запрос мог бы только провалиться.
+
+    Вложение чата — голый uuid без расширения: имени у него нет, и выдавать
+    uuid за имя файла нечестно (пустая строка, в логе «неизвестно»).
     """
-    try:
-        meta = {k.lower(): v for k, v in (storage.metadata(uri) or {}).items()}
-        return unquote(str(meta.get("filename") or "")).strip()
-    except SoftTimeLimitExceeded:
-        raise
-    except Exception as exc:  # noqa: BLE001 — имя для лога не стоит задачи
-        logger.debug("Исходное имя %s не получено: %s", uri, exc)
-        return ""
+    name = unquote(str(s3_fileid or "")).replace("\\", "/").rstrip("/").split("/")[-1].strip()
+    return name if os.path.splitext(name)[1] else ""
 
 
 def compute_file_hash(storage, uri: str) -> Optional[str]:
@@ -363,7 +363,7 @@ def process_document(
 
         logger.info(
             "Документ %s: снимок %s, исходное имя «%s», тип .%s",
-            doc_id, s3_fileid, original_name(storage, located.uri) or "неизвестно",
+            doc_id, s3_fileid, original_name(s3_fileid) or "неизвестно",
             located.file_type or "?",
         )
 
