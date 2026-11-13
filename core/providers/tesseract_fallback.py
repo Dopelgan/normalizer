@@ -51,7 +51,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from core import deadline
 from core.config import settings
 from core.models.parse_result import ParsedBlock
-from core.providers import ocr_cleanup
+from core.providers import ocr_cleanup, per_line_language
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.ocr_prepare import PreparedPage, prepare_page
 from core.workspace import temp_dir
@@ -462,18 +462,33 @@ class TesseractFallbackProvider:
         уровень 4 (plain_ocr) и слой распознавания уровня 5 рендерят их с тем
         же DPI и читают тем же `_read_lines`, — второй проход дал бы тот же
         результат за те же секунды Tesseract на страницу.
+
+        С `OCR_PER_LINE_LANGUAGE` страница читается каждой языковой моделью
+        по отдельности, и для каждой строки остаётся чтение той модели,
+        которая в ней уверена больше (`core/providers/per_line_language.py`).
         """
+        languages = self.lang.split("+")
+        if settings.OCR_PER_LINE_LANGUAGE and len(languages) > 1:
+            return per_line_language.choose(
+                [self._lines_by_lang(image, psm, lang) for lang in languages]
+            )
+        return self._lines_by_lang(image, psm, self.lang)
+
+    def _lines_by_lang(
+        self, image: "Image.Image", psm: int, lang: str
+    ) -> List[OcrLine]:
+        """Строки страницы одной языковой моделью, с памятью прохода."""
         memo = _MEMO.get()
         if memo is None:
-            return self._read_lines(image, psm)
-        key = (_image_digest(image), self.lang, psm)
+            return self._read_lines(image, psm, lang)
+        key = (_image_digest(image), lang, psm)
         with _MEMO_LOCK:
             cached = memo.get(key)
         if cached is None:
             # Читается вне замка: страницы идут параллельно. Одинаковые
             # листы, попавшие в работу одновременно, прочитаются дважды —
             # результат тот же, теряются только секунды.
-            cached = self._read_lines(image, psm)
+            cached = self._read_lines(image, psm, lang)
             # Пустой ответ не запоминается: так же выглядит и сбой Tesseract,
             # а его стоит повторить следующим проходом.
             if cached:
@@ -481,7 +496,10 @@ class TesseractFallbackProvider:
                     cached = memo.setdefault(key, cached)
         return [replace(line, bbox=list(line.bbox), parts=list(line.parts)) for line in cached]
 
-    def _read_lines(self, image: "Image.Image", psm: int = PSM_BLOCK) -> List[OcrLine]:
+    def _read_lines(
+        self, image: "Image.Image", psm: int = PSM_BLOCK,
+        lang: Optional[str] = None,
+    ) -> List[OcrLine]:
         """
         Строки с координатами и уверенностью распознавания. Координаты в
         долях изображения — как и везде в конвейере.
@@ -493,7 +511,7 @@ class TesseractFallbackProvider:
             image = prepared.image
         try:
             data = pytesseract.image_to_data(
-                image, lang=self.lang, config=f"--psm {psm}",
+                image, lang=lang or self.lang, config=f"--psm {psm}",
                 output_type=pytesseract.Output.DICT,
             )
         except SoftTimeLimitExceeded:
