@@ -64,6 +64,12 @@ logger = logging.getLogger(__name__)
 PEER_WAIT_SECONDS = 60
 PAGE_COVERAGE_VERSION = 1
 
+# Префикс ключа снимка, который RAG создаёт под разбор: имя в ключе
+# транслитерировано, настоящее — в метаданных объекта.
+SNAPSHOT_PREFIX = "rag-parser-snapshots/"
+# Имя метаданных, в которое RAG кладёт исходное имя файла (percent-encoded).
+_SNAPSHOT_FILENAME_META = "filename"
+
 
 # ===========================================================================
 # Вспомогательные функции
@@ -75,20 +81,51 @@ def generate_doc_id(s3_fileid: str) -> str:
     return f"doc-{digest[:32]}"
 
 
-def original_name(s3_fileid: str) -> str:
+def _snapshot_meta_name(storage, uri: str) -> str:
     """
-    Читаемое имя загруженного файла — из самого `s3_fileid`.
+    Исходное имя снимка из метаданных объекта: `filename`, percent-encoded.
 
-    `s3_fileid` приходит как «<кластер>/<имя файла>» и несёт настоящее
-    русское имя; кластер в логе не нужен, остаётся имя. Метаданные объекта
-    тут не спрашиваются: снимок для разбора RAG создаёт `put_object` без
-    `Metadata`, поля `filename` у объекта нет ни у новой загрузки, ни у
-    переразбора, и запрос мог бы только провалиться.
+    Ровно один `head_object` на документ. Сбой хранилища тут не ошибка
+    задачи: имя в логе всего лишь уедет к ключу снимка, поэтому сбой
+    уходит в debug, а не в error, и наружу не поднимается.
+    """
+    try:
+        meta = storage.metadata(uri) or {}
+    except Exception as exc:  # noqa: BLE001 — имя в логе не стоит падения разбора
+        logger.debug("Метаданные снимка %s не получены: %s", uri, exc)
+        return ""
+    raw = {str(key).lower(): value for key, value in meta.items()}.get(
+        _SNAPSHOT_FILENAME_META
+    )
+    return unquote(str(raw or "")).strip()
+
+
+def original_name(s3_fileid: str, storage=None, uri: str = "") -> str:
+    """
+    Читаемое имя загруженного файла для лога.
+
+    Снимок для разбора (`rag-parser-snapshots/<хеш>/<имя>`) RAG создаёт с
+    транслитерированным именем в самом ключе, поэтому по ключу в логе
+    стояло бы «_____421451.003-01__4__.1_____._34_.jpg». Настоящее имя RAG
+    кладёт в метаданные объекта — ключ `filename`, percent-encoded, чтобы
+    кириллица пережила HTTP-заголовок. Для снимков имя берётся оттуда.
+
+    Запас на всё остальное — имя из самого `s3_fileid` («<кластер>/<имя
+    файла>», кластер в логе не нужен). К нему же откат, когда метаданных
+    нет или они пустые: у снимков, сделанных до правки RAG, их нет вовсе,
+    а пустое и слишком длинное имя RAG не записывает сознательно. Файлы,
+    которые приходят реальным путём, метаданные вообще не трогают — для
+    них ничего не меняется и `head_object` не делается.
 
     Вложение чата — голый uuid без расширения: имени у него нет, и выдавать
     uuid за имя файла нечестно (пустая строка, в логе «неизвестно»).
     """
-    name = unquote(str(s3_fileid or "")).replace("\\", "/").rstrip("/").split("/")[-1].strip()
+    fileid = str(s3_fileid or "")
+    if storage is not None and uri and fileid.strip().lstrip("/").startswith(SNAPSHOT_PREFIX):
+        from_meta = _snapshot_meta_name(storage, uri)
+        if from_meta:
+            return from_meta
+    name = unquote(fileid).replace("\\", "/").rstrip("/").split("/")[-1].strip()
     return name if os.path.splitext(name)[1] else ""
 
 
@@ -363,7 +400,8 @@ def process_document(
 
         logger.info(
             "Документ %s: снимок %s, исходное имя «%s», тип .%s",
-            doc_id, s3_fileid, original_name(s3_fileid) or "неизвестно",
+            doc_id, s3_fileid,
+            original_name(s3_fileid, storage, located.uri) or "неизвестно",
             located.file_type or "?",
         )
 

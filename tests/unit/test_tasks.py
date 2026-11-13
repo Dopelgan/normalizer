@@ -448,6 +448,117 @@ class TestOriginalNameInLog:
         assert "тип .pdf" in line
 
 
+class TestSnapshotNameFromMetadata:
+    """
+    Снимок под разбор RAG кладёт с транслитерированным именем в ключе, а
+    настоящее — в метаданные объекта (`filename`, percent-encoded). Имя
+    берётся оттуда, но отсутствие метаданных и сбой хранилища не должны
+    ни ломать разбор, ни превращать имя в «неизвестно».
+    """
+
+    # Ключ снимка ровно такой, какой приходит с прода.
+    SNAPSHOT = (
+        "rag-parser-snapshots/4f1c/_____421451.003-01__4__.1_____._34_.jpg"
+    )
+    FALLBACK = "_____421451.003-01__4__.1_____._34_.jpg"
+    URI = "s3://bucket/rag-parser-snapshots/4f1c/_____421451.003-01__4__.1_____._34_.jpg"
+
+    class Storage:
+        """Хранилище, отдающее заданные метаданные и считающее запросы."""
+
+        def __init__(self, meta=None, boom=None):
+            self._meta = meta
+            self._boom = boom
+            self.calls = []
+
+        def metadata(self, uri):
+            self.calls.append(uri)
+            if self._boom is not None:
+                raise self._boom
+            return self._meta
+
+    def test_metadata_name_wins_over_the_key(self):
+        storage = self.Storage({
+            # quote("Сборочный чертёж 421451.003-01.jpg", safe="")
+            "filename": "%D0%A1%D0%B1%D0%BE%D1%80%D0%BE%D1%87%D0%BD%D1%8B%D0%B9"
+                        "%20%D1%87%D0%B5%D1%80%D1%82%D1%91%D0%B6%20421451.003-01.jpg",
+        })
+
+        name = tasks.original_name(self.SNAPSHOT, storage, self.URI)
+
+        assert name == "Сборочный чертёж 421451.003-01.jpg"
+        assert storage.calls == [self.URI]
+
+    def test_metadata_key_case_is_ignored(self):
+        # boto3 нормализует x-amz-meta-* в нижний регистр, но полагаться на
+        # регистр чужого ответа незачем.
+        storage = self.Storage({"Filename": "%D0%A2%D0%97.pdf"})
+        assert tasks.original_name(self.SNAPSHOT, storage, self.URI) == "ТЗ.pdf"
+
+    @pytest.mark.parametrize("meta", [None, {}, {"filename": ""}, {"filename": "   "}])
+    def test_no_metadata_keeps_the_old_name(self, meta):
+        # Старые снимки метаданных не несут, а пустое и слишком длинное имя
+        # RAG не записывает сознательно. Откат — имя из ключа, не «неизвестно».
+        storage = self.Storage(meta)
+
+        name = tasks.original_name(self.SNAPSHOT, storage, self.URI)
+
+        assert name == self.FALLBACK
+        assert name and name != "неизвестно"
+
+    def test_storage_error_keeps_the_old_name_without_raising(self):
+        storage = self.Storage(boom=RuntimeError("S3 недоступен"))
+
+        assert tasks.original_name(self.SNAPSHOT, storage, self.URI) == self.FALLBACK
+
+    def test_storage_error_is_logged_at_debug_not_error(self, caplog):
+        import logging
+
+        storage = self.Storage(boom=RuntimeError("S3 недоступен"))
+        with caplog.at_level(logging.DEBUG, logger="ingest.tasks"):
+            tasks.original_name(self.SNAPSHOT, storage, self.URI)
+
+        records = [r for r in caplog.records if "Метаданные снимка" in r.getMessage()]
+        assert records and all(r.levelno == logging.DEBUG for r in records)
+
+    def test_real_path_document_does_not_ask_for_metadata(self):
+        # 193 документа с реальным путём уже пишутся в лог верно; лишний
+        # head_object им не нужен.
+        storage = self.Storage({"filename": "%D0%A2%D0%97.pdf"})
+        fileid = "cluster-a/Чертёж вилки АБВГ.123456.001.pdf"
+
+        name = tasks.original_name(fileid, storage, f"s3://bucket/{fileid}")
+
+        assert name == "Чертёж вилки АБВГ.123456.001.pdf"
+        assert storage.calls == []
+
+    def test_log_line_shows_the_decoded_snapshot_name(
+        self, pipeline, temp_storage, fake_redis, monkeypatch, caplog
+    ):
+        import logging
+
+        monkeypatch.setattr(
+            tasks.FileLocator, "locate",
+            lambda self, fileid: LocatedFile(fileid, f"s3://bucket/{fileid}", "jpg"),
+        )
+        monkeypatch.setattr(
+            type(temp_storage), "metadata",
+            lambda self, uri: {"filename": "%D0%A2%D0%97%20%E2%84%961.jpg"},
+            raising=False,
+        )
+
+        init_request_state("req-snapshot", [self.SNAPSHOT])
+        with caplog.at_level(logging.INFO, logger="ingest.tasks"):
+            process_document("req-snapshot", self.SNAPSHOT)
+        line = next(m for m in (r.getMessage() for r in caplog.records)
+                    if m.startswith("Документ ") and "снимок" in m)
+
+        assert f"снимок {self.SNAPSHOT}" in line
+        assert "исходное имя «ТЗ №1.jpg»" in line
+        # Транслитерация осталась только в самом ключе снимка, не в имени.
+        assert f"«{self.FALLBACK}»" not in line
+
+
 class TestHelpers:
     def test_build_error_document_is_valid_contract(self):
         from core.models.contract import DocumentResult
