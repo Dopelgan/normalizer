@@ -146,6 +146,11 @@ class TestSalvage:
         assert salvage_lines('{"lines": ["Кабель \\"ВВГ\\"", "оборв') == ['Кабель "ВВГ"']
 
 
+    def test_model_loop_is_collapsed(self):
+        content = '{"lines": ["Блок", ' + '"1", ' * 500 + '"1'
+        assert salvage_lines(content) == ["Блок", "1", "1", "1"]
+
+
 class TestMerge:
     def test_overlap_duplicate_dropped_repeat_inside_part_kept(self):
         merged = merge_lines([["XT1", "XT1", "QF1"], ["QF1", "XT1", "QF2"]])
@@ -234,6 +239,22 @@ class TestTranscribeSheet:
         assert transcript.lines == ALL_LINES[:12]
         assert len(model.calls) == 1
 
+    def test_sheet_budget_spent_stops_tiles(self, tiles):
+        import time
+        model = TruncatingModel(capacity=12)
+        transcript = client(model).transcribe_sheet(quartered(), until=time.monotonic() - 1)
+        assert {reason for _, reason in transcript.failed} == {TILE_NO_TIME}
+        assert len(model.calls) == 1
+
+    def test_wrong_shape_is_not_tiled(self, tiles):
+        class Shapeless(TruncatingModel):
+            def post(self, url, json=None, headers=None, timeout=None):
+                self.calls.append([])
+                return Response(reply('{"annotations": []}'))
+        model = Shapeless()
+        assert client(model).transcribe_sheet(quartered()) is None
+        assert len(model.calls) == 1
+
     def test_no_answer_on_sheet_is_none(self, tiles):
         model = TruncatingModel(fail=list(COLORS))
         assert client(model).transcribe_sheet(quartered()) is None
@@ -263,7 +284,7 @@ class FakeQwen:
         self.asked.append("transcribe")
         return None
 
-    def transcribe_sheet(self, image):
+    def transcribe_sheet(self, image, until=None):
         self.asked.append("transcribe_sheet")
         return self.transcript
 
@@ -328,7 +349,15 @@ class TestSheetFragment:
                                   "reason": "region_not_read", "page": 1} for _ in missing],
                 provenance=Provenance(method="vision_plus_vlm", strategy_level=7, source="drawing"),
             )
+        def tile_lost(payload):
+            fragment = drawing([], payload)
+            fragment.missing_regions = [{"kind": "transcript_tile", "bbox": [0, 0, 1, 1],
+                                         "reason": TILE_NOT_READ, "page": 1}]
+            return fragment
         whole = drawing([], {"transcript_line_count": 3})
+        # Другой фрагмент страницы с целым текстом не покрывает недочитанную часть.
+        assert document_quality([whole, tile_lost({"transcript_line_count": 3,
+                                                   "transcript_complete": False})])[0]
         cut = drawing([], {"transcript_line_count": 3, "transcript_complete": False})
         assert not document_quality([whole, drawing([1], {})])[0]
         assert document_quality([cut, drawing([1], {})])[0]

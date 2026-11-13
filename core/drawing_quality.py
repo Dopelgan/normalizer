@@ -42,8 +42,11 @@ _LOSS_WARNINGS = ("DRAWING_NOT_RECOGNIZED", "DRAWING_SKIPPED_NO_TIME", "DRAWING_
 def _drawing_lost(fragment, transcribed_pages=frozenset()):
     # Область, которую модель не прочитала отдельно, не потеряна, если весь
     # текст её листа переписан проходом полного чтения (DRAWING_IMAGE_FULL_READ).
+    # Недочитанная часть самого переписанного текста (transcript_tile)
+    # потеря всегда: её не покрывает другой фрагмент той же страницы.
     unread = [region for region in fragment.missing_regions
-              if region.get("page") not in transcribed_pages]
+              if region.get("kind") == "transcript_tile"
+              or region.get("page") not in transcribed_pages]
     return bool(unread) or any(
         warning.startswith(_LOSS_WARNINGS) for warning in fragment.warnings
     )

@@ -152,7 +152,8 @@ class DrawingProcessor:
         # разметка надписей по категориям теряет штамп, графы, номер листа
         # и примечания, а без них лист нельзя найти ни по обозначению, ни
         # по требованиям.
-        lines = self._transcribe(layout.image, payload, missing_regions) if transcribe else None
+        lines = (self._transcribe(layout.image, payload, missing_regions, started)
+                 if transcribe else None)
         if lines:
             payload["transcript_lines"] = lines
         if reading is None and not lines:
@@ -454,7 +455,7 @@ class DrawingProcessor:
             return False
         return raster_drawing.analyse(data).is_drawing
 
-    def _transcribe(self, image, payload, missing_regions) -> Optional[List[str]]:
+    def _transcribe(self, image, payload, missing_regions, started) -> Optional[List[str]]:
         """
         Весь текст листа. С DRAWING_TRANSCRIBE_TILES плотный лист, текст
         которого не помещается в один ответ, дочитывается частями; часть,
@@ -463,7 +464,8 @@ class DrawingProcessor:
         """
         if not settings.DRAWING_TRANSCRIBE_TILES:
             return self.qwen.transcribe(image)
-        transcript = self.qwen.transcribe_sheet(image)
+        budget = settings.DRAWING_TIME_BUDGET
+        transcript = self.qwen.transcribe_sheet(image, until=started + budget if budget else None)
         if transcript is None:
             return None
         if transcript.tiles:

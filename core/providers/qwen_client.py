@@ -270,14 +270,16 @@ class QwenVisionClient:
             return None
         return _clean_lines(lines)
 
-    def transcribe_sheet(self, image) -> Optional[Transcript]:
+    def transcribe_sheet(self, image, until: Optional[float] = None) -> Optional[Transcript]:
         """
         Весь текст листа с дочитыванием частями (DRAWING_TRANSCRIBE_TILES).
 
         Плотная схема не помещается в потолок ответа: JSON обрывается. Строки,
         которые модель успела вернуть, не выбрасываются, а лист читается
         заново частями с перекрытием; оборванная часть делится ещё раз.
-        `None` — модель не ответила на лист вовсе.
+        `None` — модель не ответила на лист вовсе. `until` — момент
+        time.monotonic(), после которого части листа уже не читаются
+        (бюджет листа DRAWING_TIME_BUDGET).
         """
         lines, cut = self._transcribe_piece(image)
         if lines is None:
@@ -290,7 +292,7 @@ class QwenVisionClient:
         )
         limit = threading.Semaphore(max(1, settings.DRAWING_TRANSCRIBE_TILE_PARALLEL))
         failed: List[Tuple[List[float], str]] = []
-        parts, counted = self._read_tiles(image, [0.0, 0.0, 1.0, 1.0], 1, limit, failed)
+        parts, counted = self._read_tiles(image, [0.0, 0.0, 1.0, 1.0], 1, limit, failed, until)
         # Части идут первыми — они покрывают весь лист; строки оборванного
         # ответа добавляются, если их нет ни в одной части (строка на стыке,
         # которую обе части прочитали лишь кусками).
@@ -301,7 +303,7 @@ class QwenVisionClient:
         )
         return Transcript(lines=merged, tiles=counted, failed=failed)
 
-    def _read_tiles(self, image, box, depth, limit, failed):
+    def _read_tiles(self, image, box, depth, limit, failed, until=None):
         """
         Часть листа `box` сеткой GRID x GRID. Возвращает списки строк частей
         в порядке чтения и число прочитанных частей. Оборванная часть
@@ -312,10 +314,14 @@ class QwenVisionClient:
                            settings.DRAWING_TRANSCRIBE_TILE_OVERLAP)
 
         def read(part):
-            left = deadline.remaining()
-            if left is not None and left < settings.VLM_TIMEOUT:
-                return None, TILE_NO_TIME
+            # Срок проверяется после ожидания очереди: часть, дождавшаяся
+            # места, не должна начинать вызов, на который времени уже нет.
             with limit:
+                left = deadline.remaining()
+                if left is not None and left < settings.VLM_TIMEOUT:
+                    return None, TILE_NO_TIME
+                if until is not None and time.monotonic() > until:
+                    return None, TILE_NO_TIME
                 lines, cut = self._transcribe_piece(crop_box(image, part))
             if lines is None:
                 return None, TILE_NOT_READ
@@ -331,7 +337,7 @@ class QwenVisionClient:
         for part, (lines, problem) in zip(boxes, answers):
             counted += 1
             if problem == TILE_CUT and depth < settings.DRAWING_TRANSCRIBE_TILE_DEPTH:
-                inner, inner_count = self._read_tiles(image, part, depth + 1, limit, failed)
+                inner, inner_count = self._read_tiles(image, part, depth + 1, limit, failed, until)
                 result.extend(inner)
                 result.append(lines)
                 counted += inner_count
@@ -346,7 +352,9 @@ class QwenVisionClient:
         """
         Строки листа или его части и признак обрыва. Обрыв — ответ упёрся в
         потолок токенов или не разобрался как JSON; тогда возвращаются
-        строки, которые модель успела закончить. `(None, False)` — ответа нет.
+        строки, которые модель успела закончить. `(None, False)` — ответа
+        нет или он целый, но не того вида (без списка lines): делением листа
+        такой ответ не исправить.
         """
         answer = self._ask_text(
             image, _TRANSCRIBE_PROMPT, settings.DRAWING_TRANSCRIBE_MAX_SIDE,
@@ -356,8 +364,11 @@ class QwenVisionClient:
             return None, False
         content, finish = answer
         data = extract_json(content)
-        if data is not None and finish != "length" and isinstance(data.get("lines"), list):
-            return _clean_lines(data["lines"]), False
+        if data is not None and finish != "length":
+            if isinstance(data.get("lines"), list):
+                return _clean_lines(data["lines"]), False
+            logger.warning("Модель вернула JSON без списка lines")
+            return None, False
         return salvage_lines(content), True
 
     def health(self) -> bool:
@@ -598,7 +609,22 @@ def salvage_lines(content: str) -> List[str]:
         except ValueError:
             break
         found.append(value)
-    return _clean_lines(found)
+    return _collapse_runs(_clean_lines(found))
+
+
+# Ответ часто упирается в потолок оттого, что модель зациклилась на одной
+# строке: подряд больше стольких одинаковых строк — повтор, а не текст листа.
+_MAX_RUN = 3
+
+
+def _collapse_runs(lines: List[str]) -> List[str]:
+    result: List[str] = []
+    run = 0
+    for line in lines:
+        run = run + 1 if result and result[-1] == line else 1
+        if run <= _MAX_RUN:
+            result.append(line)
+    return result
 
 
 def tile_boxes(box: Sequence[float], grid: int, overlap: float) -> List[List[float]]:
@@ -641,7 +667,9 @@ def merge_lines(parts: Sequence[Sequence[str]]) -> List[str]:
     Слияние строк частей листа без повторов из перекрытия. Строка части
     добавляется, если в этой части она встречается чаще, чем уже добавлено:
     повтор внутри одной части (две клеммы «XT1» на схеме) сохраняется, а
-    та же строка из соседней части, видевшей перекрытие, — нет.
+    та же строка из соседней части, видевшей перекрытие, — нет. Цена: одна
+    и та же короткая надпись в разных частях вне перекрытия («PE», «N»)
+    остаётся одной строкой — её текст в листе есть, теряется лишь повтор.
     """
     emitted: Dict[str, int] = {}
     merged: List[str] = []
