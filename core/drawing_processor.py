@@ -296,6 +296,8 @@ class DrawingProcessor:
             produced += ", ответ оборван"
         if reading.failed:
             produced += ", не прочитано частей %d" % len(reading.failed)
+        if reading.lost:
+            produced += ", пропало элементов %d" % reading.lost
         return produced
 
     @staticmethod
@@ -308,22 +310,35 @@ class DrawingProcessor:
         оборвалась снова), получает пометку и непрочитанные области — и
         документ уходит человеку как разобранный не полностью
         (core/drawing_quality.py).
+
+        Элементы списка, которые надписью стать не смогли (`lost`), — такая
+        же потеря, и она считается даже у целого ответа: пропасть молча
+        прочтение листа не должно ни при обрыве, ни без него.
         """
         if reading.tiles:
             payload["sheet_tiles"] = reading.tiles
-        if not reading.cut or not settings.DRAWING_SHEET_CUT_VISIBLE:
+        if not settings.DRAWING_SHEET_CUT_VISIBLE:
             return
-        payload["sheet_answer_cut"] = True
+        if reading.cut:
+            payload["sheet_answer_cut"] = True
+        if reading.lost:
+            payload["sheet_annotations_lost"] = reading.lost
         if reading.complete:
             return
         payload["sheet_annotations_complete"] = False
         warnings.append("DRAWING_SHEET_ANSWER_CUT")
         # Части листа, которые не дочитаны, называются поимённо; если частями
-        # лист не читался вовсе, недочитан он весь.
-        boxes = reading.failed or [[0.0, 0.0, 1.0, 1.0]]
-        missing_regions.extend(
-            {"kind": "sheet_tile", "bbox": box, "reason": "sheet_answer_cut"}
-            for box in boxes
+        # лист не читался вовсе, недочитан он весь. Причина у области —
+        # та, что случилась, а не одна на все случаи.
+        if reading.failed:
+            missing_regions.extend(
+                {"kind": "sheet_tile", "bbox": box, "reason": "sheet_answer_cut"}
+                for box in reading.failed
+            )
+            return
+        reason = "sheet_answer_cut" if reading.cut else "sheet_annotations_lost"
+        missing_regions.append(
+            {"kind": "sheet_tile", "bbox": [0.0, 0.0, 1.0, 1.0], "reason": reason}
         )
 
     # ------------------------------------------------------------------- лог

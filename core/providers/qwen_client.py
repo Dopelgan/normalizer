@@ -242,7 +242,8 @@ class SheetReading:
     Прочитанный лист: надписи и род чертежа. `cut` — ответ модели оборвался
     на потолке токенов, и список надписей неполон. `tiles` — сколько частей
     листа прочитано сверх самого листа (DRAWING_SHEET_TILES), `failed` —
-    части листа (доли стороны), надписи которых прочитать не удалось.
+    части листа (доли стороны), надписи которых прочитать не удалось,
+    `lost` — сколько элементов списка не удалось превратить в надпись.
     """
 
     sheet_type: str = "unknown"
@@ -251,16 +252,17 @@ class SheetReading:
     cut: bool = False
     tiles: int = 0
     failed: List[List[float]] = field(default_factory=list)
+    lost: int = 0
 
     @property
     def complete(self) -> bool:
         """
         Список надписей полон: либо ответ не обрывался, либо оборванный лист
-        дочитан частями и все части прочитаны. `cut` при этом остаётся
-        правдой — она говорит, что ответ по листу целиком не поместился,
-        и это видно в логе и в payload.
+        дочитан частями и все части прочитаны, и ни один элемент списка не
+        пропал по виду. `cut` при этом остаётся правдой — она говорит, что
+        ответ по листу целиком не поместился, и это видно в логе и в payload.
         """
-        if self.failed:
+        if self.failed or self.lost:
             return False
         return not self.cut or bool(self.tiles)
 
@@ -391,11 +393,24 @@ class QwenVisionClient:
         if not isinstance(annotations, list):
             logger.warning("Модель вернула JSON без списка annotations")
             annotations = []
+        readable, lost = as_annotations(annotations)
+        if lost:
+            # Вид элемента называется в логе: каким именно он был, по
+            # сохранённому ответу уже не узнать — сырые ответы модели нигде
+            # не хранятся, и разбирать следующий такой случай придётся
+            # отсюда.
+            logger.warning(
+                "Из списка annotations не прочитано %d элементов (%s): "
+                "прочтения на листе не найдены",
+                sum(lost.values()),
+                ", ".join(f"{name} — {count}" for name, count in sorted(lost.items())),
+            )
         return SheetReading(
             sheet_type=str(data.get("sheet_type") or "unknown"),
-            annotations=[_with_fixed_grade(a) for a in annotations if isinstance(a, dict)],
+            annotations=[_with_fixed_grade(a) for a in readable],
             raw=data,
             cut=cut,
+            lost=sum(lost.values()),
         )
 
     def _read_sheet_tiles(
@@ -437,12 +452,13 @@ class QwenVisionClient:
 
         parts: List[List[Dict[str, Any]]] = []
         failed: List[List[float]] = []
-        read_count = 0
+        read_count, lost = 0, 0
         for box, part in zip(boxes, answers):
             if part is None:
                 failed.append([round(value, 4) for value in box])
                 continue
             read_count += 1
+            lost += part.lost
             parts.append([place_in_sheet(a, box) for a in part.annotations])
             if part.cut:
                 failed.append([round(value, 4) for value in box])
@@ -461,6 +477,9 @@ class QwenVisionClient:
             cut=whole.cut,
             tiles=read_count,
             failed=failed,
+            # Непрочитанные по виду элементы листа дочитываются частями, а
+            # вот такие же элементы самих частей дочитывать уже нечем.
+            lost=lost,
         )
 
     def read_title_block(self, image) -> Optional[Dict[str, Any]]:
@@ -921,6 +940,62 @@ def salvage_list(content: str, key: str) -> List[Any]:
             break
         items.append(item)
     return items
+
+
+def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Элементы списка `annotations` в надписи. Возвращает надписи и счётчик
+    видов, которые надписью стать не смогли.
+
+    Раньше здесь стоял `isinstance(a, dict)`, и всё, что не объект,
+    выбрасывалось молча: на листе-паспорте из 108 спасённых элементов до
+    разбора дошли 24, а 83 прочтения исчезли без следа — ровно та потеря,
+    которую мы и ищем. Виды элементов перечислены не наугад: `salvage_list`
+    отдаёт то, что возвращает `json.JSONDecoder.raw_decode`, то есть объект,
+    массив, строку, число, `true`/`false`/`null` — других не бывает.
+
+    * объект — надпись, как и прежде;
+    * строка — надпись без места: модель бросила обёртку объекта и
+      перечисляет значения подряд. Текст на листе есть, и терять его
+      незачем; места нет, поэтому разбор поставит ему рамку всего листа, а
+      категорию определят правила ГОСТ (уверенность ниже, чем у надписи с
+      категорией от модели, — так и должно быть);
+    * массив — либо надписи вложенным списком, либо строка таблицы
+      («Термометр», «2 шт.»): объекты из него разбираются как надписи,
+      строки — как строки;
+    * число, `true`/`false`/`null` — надписью не становятся. Отдельное
+      число в ответе — это почти всегда доля из `bbox`, а не прочтение, и
+      превращать «0.52» в надпись листа значит сорить в индексе. Такой
+      элемент считается потерянным и доходит до человека пометкой.
+    """
+    annotations: List[Dict[str, Any]] = []
+    lost: Dict[str, int] = {}
+
+    def take(item: Any, depth: int = 0) -> None:
+        if isinstance(item, dict):
+            annotations.append(item)
+            return
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                annotations.append({"category": "", "value": text})
+            else:
+                lost["пустая строка"] = lost.get("пустая строка", 0) + 1
+            return
+        # Вложенность глубже пары уровней — это уже не разметка листа.
+        if isinstance(item, (list, tuple)) and depth < 2:
+            if not item:
+                lost["пустой массив"] = lost.get("пустой массив", 0) + 1
+                return
+            for inner in item:
+                take(inner, depth + 1)
+            return
+        name = "массив" if isinstance(item, (list, tuple)) else type(item).__name__
+        lost[name] = lost.get(name, 0) + 1
+
+    for item in items:
+        take(item)
+    return annotations, lost
 
 
 def _content_of(payload: Dict[str, Any]) -> Optional[str]:

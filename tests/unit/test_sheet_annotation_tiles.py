@@ -24,7 +24,8 @@ from core.drawing_processor import DrawingProcessor
 from core.drawing_quality import document_quality
 from core.models.contract import Content, Fragment, Position, Provenance
 from core.providers.qwen_client import (
-    QwenVisionClient, merge_annotations, place_in_sheet,
+    QwenVisionClient, as_annotations, merge_annotations, place_in_sheet,
+    salvage_list,
 )
 
 pytest.importorskip("numpy")
@@ -108,7 +109,10 @@ class SheetModel:
     `cut_always` — обрывает ответ и по части листа тоже.
     """
 
-    def __init__(self, capacity=10, fail=(), cut_always=False, cut_parts=()):
+    def __init__(self, capacity=10, fail=(), cut_always=False, cut_parts=(), junk=()):
+        # Элементы списка, которые надписью стать не могут (доли bbox,
+        # пришедшие отдельными элементами): они обязаны дойти до человека.
+        self.junk = list(junk)
         self.capacity = capacity
         self.fail = set(fail)
         self.cut_always = cut_always
@@ -126,6 +130,7 @@ class SheetModel:
             raise requests.ConnectionError("обрыв")
         items = [annotation(text, centroid(image, COLORS[name]))
                  for name in parts for text in TEXTS[name]]
+        items += self.junk
         dense = bool(parts) and set(parts) <= self.cut_parts
         if len(items) <= self.capacity and not self.cut_always and not dense:
             return Response(reply(_whole(items)))
@@ -171,6 +176,115 @@ def tiles(monkeypatch):
 @pytest.fixture
 def visible(monkeypatch):
     monkeypatch.setattr(settings, "DRAWING_SHEET_CUT_VISIBLE", True)
+
+
+# ------------------------------------------- элементы списка не только объекты
+# Настоящий лист: «Паспорт ТАДУ 405210.001ПС Зав (2).pdf», стр. 6 — таблица
+# технических характеристик. 13.11.2026 проход «лист целиком» на нём
+# оборвался, из списка спасено 108 элементов, а до разбора дошли 24: всё,
+# что не объект, выбрасывал `isinstance(a, dict)`. Значения ниже — те самые
+# 24, прочитанные из сохранённого payload на проде.
+REAL_SHEET = [
+    ("note", "2 ОСНОВНЫЕ ТЕХНИЧЕСКИЕ ХАРАКТЕРИСТИКИ", [0.92, 0.04, 0.96, 0.37]),
+    ("note", "2.1 Условное обозначение изделия", [0.52, 0.04, 0.92, 0.06]),
+    ("note", "СБ210/СП-01-50П-В- 4.0.32/К03-0.12", [0.42, 0.04, 0.52, 0.1]),
+    ("note", "2.2 Номинальная статическая характеристика преобразования (НСХ) "
+             "по ГОСТ 6651-2009", [0.52, 0.06, 0.92, 0.1]),
+    ("note", "50П", [0.42, 0.1, 0.52, 0.11]),
+    ("note", "2.3 Рабочий диапазон измеряемых температур, °С", [0.52, 0.1, 0.92, 0.12]),
+    ("note", "От -50 до + 400", [0.42, 0.12, 0.52, 0.14]),
+    ("note", "2.4 Классы допуска по ГОСТ 6651-2009", [0.52, 0.12, 0.92, 0.14]),
+    ("note", "В", [0.42, 0.14, 0.52, 0.15]),
+    ("note", "2.9 Длина монтажной части, Л, м", [0.52, 0.27, 0.92, 0.29]),
+    ("note", "0,32", [0.42, 0.29, 0.52, 0.3]),
+    ("note", "2.12 Масса, не более, кг", [0.52, 0.33, 0.92, 0.35]),
+]
+# Значения, которые на этом листе шли дальше по таблице и пропадали.
+REAL_TAIL = ["2.13 Степень защиты по ГОСТ 14254-2015", "IP65",
+             "2.14 Средний срок службы, лет", "10"]
+
+
+def real_annotations():
+    return [{"category": c, "value": v, "bbox": b} for c, v, b in REAL_SHEET]
+
+
+class TestSalvagedShapesAreNotDropped:
+    """
+    `salvage_list` отдаёт то, что возвращает `json.JSONDecoder.raw_decode`:
+    объект, массив, строку, число, true/false/null. Виды перечислены по
+    коду, а не наугад; каким именно был пропавший хвост того листа, по
+    сохранённому ответу уже не узнать — сырые ответы модели не хранятся.
+    """
+
+    def test_objects_are_annotations_as_before(self):
+        readable, lost = as_annotations(real_annotations())
+        assert len(readable) == len(REAL_SHEET) and lost == {}
+
+    def test_bare_strings_become_annotations_without_a_place(self):
+        """Модель бросила обёртку объекта и перечисляет значения подряд."""
+        readable, lost = as_annotations(real_annotations() + REAL_TAIL)
+        assert lost == {}
+        values = [a["value"] for a in readable]
+        assert values[-len(REAL_TAIL):] == REAL_TAIL
+        assert "bbox" not in readable[-1]
+
+    def test_a_table_row_as_an_array_is_read_cell_by_cell(self):
+        readable, lost = as_annotations([["2.13 Степень защиты", "IP65"]])
+        assert [a["value"] for a in readable] == ["2.13 Степень защиты", "IP65"]
+        assert lost == {}
+
+    def test_nested_objects_in_an_array_are_read(self):
+        readable, lost = as_annotations([real_annotations()[:2]])
+        assert len(readable) == 2 and lost == {}
+
+    def test_a_stray_bbox_is_counted_lost_not_turned_into_text(self):
+        """«0.52» — доля из bbox, а не прочтение листа: в индекс не идёт."""
+        readable, lost = as_annotations([[0.52, 0.04, 0.92, 0.06]])
+        assert readable == [] and sum(lost.values()) == 4
+
+    def test_numbers_and_nulls_are_counted_lost(self):
+        readable, lost = as_annotations([1, 2.5, None, True])
+        assert readable == [] and sum(lost.values()) == 4
+
+    def test_empty_strings_and_arrays_are_counted_lost(self):
+        readable, lost = as_annotations(["", "   ", []])
+        assert readable == [] and sum(lost.values()) == 3
+
+    def test_lost_shapes_are_named_for_the_log(self):
+        _, lost = as_annotations([1, None, ""])
+        assert set(lost) == {"int", "NoneType", "пустая строка"}
+
+    def test_the_real_sheet_loses_nothing_it_used_to_lose(self):
+        """
+        Тот же лист: раньше из объектов и хвоста строк доходили только
+        объекты, теперь — всё, что на листе прочитано.
+        """
+        items = real_annotations() + REAL_TAIL
+        before = [a for a in items if isinstance(a, dict)]
+        readable, lost = as_annotations(items)
+        assert len(before) == len(REAL_SHEET)
+        assert len(readable) == len(REAL_SHEET) + len(REAL_TAIL)
+        assert lost == {}
+
+    def test_a_cut_answer_of_the_real_shape_salvages_then_converts(self):
+        """От оборванного текста ответа до надписей — весь путь целиком."""
+        body = ", ".join(
+            json.dumps({"category": c, "value": v, "bbox": b}, ensure_ascii=False)
+            for c, v, b in REAL_SHEET)
+        tail = ", ".join(json.dumps(v, ensure_ascii=False) for v in REAL_TAIL)
+        content = ('{"sheet_type": "detail", "annotations": [' + body + ", " + tail
+                   + ', {"category": "note", "value": "2.15 Габарит')
+        items = salvage_list(content, "annotations")
+        assert len(items) == len(REAL_SHEET) + len(REAL_TAIL)
+        readable, lost = as_annotations(items)
+        assert len(readable) == len(items) and lost == {}
+
+
+class TestLostElementsReachAHuman:
+    def test_lost_elements_make_the_reading_incomplete(self):
+        from core.providers.qwen_client import SheetReading
+        assert SheetReading(lost=3).complete is False
+        assert SheetReading().complete is True
 
 
 # --------------------------------------------------------------- слияние
@@ -433,6 +547,35 @@ class TestCutIsVisible:
         assert regions[0]["bbox"][0] > 0.4 and regions[0]["bbox"][1] > 0.4
         assert "DRAWING_SHEET_ANSWER_CUT" in fragment.warnings
         assert document_quality([fragment])[0] is True
+
+    def test_lost_elements_are_marked_even_on_a_whole_answer(
+        self, monkeypatch, visible,
+    ):
+        """
+        Ответ целый, но часть элементов списка — не прочтения (доли bbox
+        отдельными элементами). Молча они больше не пропадают.
+        """
+        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
+        model = SheetModel(capacity=100, junk=[0.52, 0.04, None])
+        fragment = built(model, monkeypatch)
+        payload = fragment.content.structured_payload
+        assert payload["sheet_annotations_lost"] == 3
+        assert payload["sheet_annotations_complete"] is False
+        assert "sheet_answer_cut" not in payload
+        assert [r["reason"] for r in fragment.missing_regions] == ["sheet_annotations_lost"]
+        assert document_quality([fragment])[0] is True
+
+    def test_flag_off_lost_elements_are_still_recovered_but_not_marked(self, monkeypatch):
+        """
+        Спасение прочтений — исправление потери, а не механизм под флагом:
+        строки из списка становятся полями и без флагов. Пометка — под флагом.
+        """
+        model = SheetModel(capacity=100, junk=["2.13 Степень защиты по ГОСТ 14254-2015"])
+        fragment = built(model, monkeypatch)
+        values = [f.value for f in fragment.content.structured_drawing_fields]
+        assert "2.13 Степень защиты по ГОСТ 14254-2015" in values
+        assert "sheet_annotations_lost" not in fragment.content.structured_payload
+        assert fragment.missing_regions == []
 
     def test_more_annotations_come_back_than_before(self, monkeypatch):
         """Та же плотная страница: до — спасённый хвост, после — весь лист."""
