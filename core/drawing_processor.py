@@ -83,6 +83,9 @@ logger = logging.getLogger(__name__)
 # чтобы не тянуть сюда модуль лестницы ради двух констант.
 GENRE_DRAWING = "drawing"
 SOURCE_RASTER = "raster_only"
+# Жанры, которыми лестница прямо говорит «это не чертёж». Жанр `unknown` и
+# отсутствие классификации в список не входят: молчание — не запрет.
+GENRES_NOT_DRAWING = ("text", "spreadsheet", "mixed")
 
 MODE_VISION_VLM = "vision_vlm"   # разметка зрением + чтение моделью
 MODE_SHEET_ONLY = "sheet_only"   # только чтение листа целиком
@@ -378,6 +381,12 @@ class DrawingProcessor:
             if text_document and _is_small_picture(fragment):
                 # Логотип или печать в тексте: чертежом не становится и
                 # вызова модели не стоит. Фрагмент остаётся картинкой.
+                result.append(fragment)
+                continue
+            if not _genre_allows_sheet(fragment, metadata):
+                # Иллюстрация в договоре, программе качества, гарантии:
+                # документ не чертёжный, и страница не чертёжная. Листом её
+                # не читают — ни вызова модели, ни псевдочертежа в индексе.
                 result.append(fragment)
                 continue
             left = deadline.remaining()
@@ -807,6 +816,59 @@ def _is_text_document(fragments: List[Fragment], metadata: Dict[str, Any]) -> bo
 
 def _visible_chars(text: str) -> int:
     return len("".join(text.split()))
+
+
+def _drawing_pages(metadata: Dict[str, Any]) -> set:
+    """
+    Страницы, которые лестница назвала чертёжными
+    (`classification.signals`). Векторный детектор и растровый складываются:
+    у скана чертёжные листы перечислены во втором списке.
+    """
+    signals = ((metadata.get("classification") or {}).get("signals") or {})
+    pages = set()
+    for key in ("drawing_pages", "raster_drawing_pages"):
+        for page in signals.get(key) or ():
+            try:
+                pages.add(int(page))
+            except (TypeError, ValueError):
+                continue
+    return pages
+
+
+def _genre_allows_sheet(fragment: Fragment, metadata: Dict[str, Any]) -> bool:
+    """
+    Читать ли картинку из документа как лист чертежа
+    (DRAWING_IMAGE_GENRE_GATE).
+
+    Жанр берётся готовым из классификации лестницы
+    (`metadata["classification"]["genre"]`, core/ladder/context.py): здесь
+    он только читается, а считается он там. Иллюстрация в договоре,
+    программе обеспечения качества или банковской гарантии уходила в
+    Qwen-VL как чертёжный лист — это и вызов модели впустую, и
+    псевдочертёжная запись в индексе.
+
+    Гейт только отказывает и никогда не разрешает сверх сегодняшнего:
+
+    * жанр `drawing` — читаем, как и раньше;
+    * жанра нет, классификации нет или жанр `unknown` — читаем, как и
+      раньше. Молчание классификации не должно тихо прекращать чтение
+      настоящих листов;
+    * жанр прямо говорит «не чертёж» — читаем только ту страницу, которую
+      лестница назвала чертёжной. Чертёж, вплетённый в текстовый документ,
+      несёт свою основную надпись формы 1, страница попадает в
+      `drawing_pages`, и такой лист читается по-прежнему.
+    """
+    if not settings.DRAWING_IMAGE_GENRE_GATE:
+        return True
+    genre = (metadata.get("classification") or {}).get("genre")
+    if genre not in GENRES_NOT_DRAWING:
+        return True
+    page = fragment.position.page if fragment.position is not None else None
+    if page is None:
+        # Страницы у фрагмента нет — доказать, что он не на чертёжном листе,
+        # нечем. Отказ требует основания, поэтому читаем, как и раньше.
+        return True
+    return page in _drawing_pages(metadata)
 
 
 def _is_small_picture(fragment: Fragment) -> bool:
