@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import List, Optional
 from urllib.parse import unquote
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from core import filetypes
 from core.config import settings
 from core.providers.storage import StorageProvider, StorageProviderFactory
@@ -108,6 +110,8 @@ class FileLocator:
             try:
                 if self.storage.exists(uri):
                     return True
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as exc:  # noqa: BLE001 — сбой не равен отсутствию
                 logger.warning("Проверка %s не удалась: %s", uri, exc)
                 unknown = True

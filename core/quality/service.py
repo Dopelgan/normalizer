@@ -305,7 +305,9 @@ class QualityGate:
         """
         twin = self.known_hashes.get(file_hash)
         if twin and twin != s3_fileid:
-            verdict = self.twin_verdict(twin, file_hash)
+            verdict = self.twin_verdict(
+                twin, file_hash, self.locator.is_present(twin)
+            )
             if verdict is not None:
                 return verdict
 
@@ -315,7 +317,10 @@ class QualityGate:
             self._near_duplicate(s3_fileid, fingerprint, warnings)
         return None
 
-    def twin_verdict(self, twin: str, file_hash: str) -> Optional[QualityVerdict]:
+    @staticmethod
+    def twin_verdict(
+        twin: str, file_hash: str, present: Optional[bool]
+    ) -> Optional[QualityVerdict]:
         """
         Вердикт по найденному двойнику с той же контрольной суммой.
 
@@ -327,8 +332,9 @@ class QualityGate:
         Хранилище не ответило — ни отказа, ни молчаливого приёма: отказ
         окончателен и на ложном основании теряет документ, а приём без
         проверки пропускает дубль. Карантин оставляет решение человеку.
+
+        `present` — ответ `FileLocator.is_present` по двойнику.
         """
-        present = self.locator.is_present(twin)
         if present is False:
             logger.info(
                 "Двойник %s по хешу %s удалён из хранилища — не дубль",
@@ -433,8 +439,8 @@ class QualityGate:
             # чертежей с уверенностью 0.28–0.35 ушли в карантин.
             warnings.append(
                 f"Быстрый OCR на листе чертежа: уверенность {confidence:.2f}, "
-                f"ниже порога {probe.unreadable_share:.0%} текста — содержимое "
-                f"оценит разбор чертежа."
+                f"неуверенно прочитано {probe.unreadable_share:.0%} текста — "
+                f"содержимое оценит разбор чертежа."
             )
             return QualityVerdict(
                 ACCEPT,

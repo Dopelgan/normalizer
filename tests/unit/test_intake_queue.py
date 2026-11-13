@@ -210,6 +210,19 @@ class TestPipeline:
         assert result["outcome"] == REJECT
         assert "копия.txt" in result["verdicts"][-1]["reason"]
 
+    def test_soft_time_limit_is_not_taken_for_storage_error(self, storage):
+        """Предел задачи в проверке двойника — не «хранилище не ответило»."""
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        from core.providers.file_locator import FileLocator
+
+        def boom(uri):
+            raise SoftTimeLimitExceeded()
+
+        storage.exists = boom
+        with pytest.raises(SoftTimeLimitExceeded):
+            FileLocator(storage).is_present("договор.txt")
+
     def test_failed_stage_does_not_raise(self, pipeline, fake_redis, monkeypatch):
         """Сбой на одном файле не уводит в повтор вердикты по остальным."""
         def boom(*_args, **_kwargs):

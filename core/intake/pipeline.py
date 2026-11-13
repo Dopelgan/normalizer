@@ -162,10 +162,15 @@ class IntakePipeline:
         # в базе ещё не видят, поэтому по базе оба проходят как новые.
         if result.outcome == ACCEPT and result.file_hash:
             owner = state.claim_content(result.file_hash, s3_fileid)
+            present = self.locator.is_present(owner) if owner else None
+            if owner and present is False:
+                # Заявка живёт сутки (`INTAKE_STATE_TTL_SECONDS`), а файл
+                # владельца за это время могли удалить: тогда хеш держался за
+                # файлом, которого нет, и новую загрузку отклоняли как дубль.
+                owner = state.take_over_content(result.file_hash, owner, s3_fileid)
+                present = self.locator.is_present(owner) if owner else None
             if owner:
-                owner = self._live_claim(result, owner, s3_fileid)
-            if owner:
-                twin = gate.twin_verdict(owner, result.file_hash)
+                twin = gate.twin_verdict(owner, result.file_hash, present)
                 if twin is not None:
                     result.outcome = twin.outcome
                     result.reason = twin.reason
@@ -184,21 +189,6 @@ class IntakePipeline:
             warnings=result.warnings, routing=result.routing,
             decision_id=decision_id(s3_fileid, STAGE_QUALITY),
         ), result.file_hash
-
-    def _live_claim(self, result, owner: str, s3_fileid: str) -> Optional[str]:
-        """
-        Владелец заявки, если его файл ещё в хранилище; None — заявка
-        перешла к нам.
-
-        Заявка живёт сутки (`INTAKE_STATE_TTL_SECONDS`), а принятый файл за
-        это время могут удалить: тогда она держала хеш за файлом, которого
-        больше нет, и новую загрузку того же содержимого отклоняли как
-        дубль. Если хранилище не ответило — владелец остаётся, и решение
-        принимает `twin_verdict` (карантин).
-        """
-        if self.locator.is_present(owner) is not False:
-            return owner
-        return state.take_over_content(result.file_hash, owner, s3_fileid)
 
     def _known(self):
         """Хеши и отпечатки уже принятого — для поиска дублей."""
