@@ -1,6 +1,6 @@
 """
 Оборванный ответ прохода «лист целиком» (DRAWING_SHEET_HIGH_TOKENS,
-DRAWING_SHEET_TILES, DRAWING_SHEET_CUT_VISIBLE).
+DRAWING_SHEET_TILES) и учёт потерянных прочтений.
 
 Список надписей плотного листа не влезает в потолок ответа: JSON обрывается
 посреди списка, спасаются только дописанные надписи, а хвост пропадал молча —
@@ -173,11 +173,6 @@ def tiles(monkeypatch):
     monkeypatch.setattr(settings, "DRAWING_SHEET_TILES", True)
 
 
-@pytest.fixture
-def visible(monkeypatch):
-    monkeypatch.setattr(settings, "DRAWING_SHEET_CUT_VISIBLE", True)
-
-
 # ------------------------------------------- элементы списка не только объекты
 # Настоящий лист: «Паспорт ТАДУ 405210.001ПС Зав (2).pdf», стр. 6 — таблица
 # технических характеристик. 13.11.2026 проход «лист целиком» на нём
@@ -241,6 +236,57 @@ class TestSalvagedShapesAreNotDropped:
         """«0.52» — доля из bbox, а не прочтение листа: в индекс не идёт."""
         readable, lost = as_annotations([[0.52, 0.04, 0.92, 0.06]])
         assert readable == [] and sum(lost.values()) == 4
+
+    def test_the_category_token_does_not_become_a_field(self):
+        """
+        Та самая поломка, под которую написан разбор: поля схемы идут по
+        порядку {category, value, bbox}, и, бросив обёртку, модель
+        перечисляет их все. «size» и «note» — разметка, а не прочтение, но
+        `looks_like_text` их пропускает, и полями они доходили до индекса.
+        """
+        stream = ('{"annotations": ["size", "D80", [0.1,0.2,0.3,0.4], '
+                  '"note", "Stal 3", "dimension", "110"')
+        items = salvage_list(stream, "annotations")
+        assert items == ["size", "D80", [0.1, 0.2, 0.3, 0.4],
+                         "note", "Stal 3", "dimension", "110"]
+        readable, lost = as_annotations(items)
+        # Остаются прочтения, уходят слова схемы и доли bbox.
+        assert [a["value"] for a in readable] == ["D80", "Stal 3", "110"]
+        assert lost["слово схемы"] == 3     # size, note, dimension
+        assert lost["float"] == 4           # доли bbox
+
+    def test_every_category_name_is_refused(self):
+        from core.providers.qwen_client import CATEGORIES
+        readable, lost = as_annotations(list(CATEGORIES))
+        assert readable == []
+        assert lost["слово схемы"] == len(CATEGORIES)
+
+    def test_sheet_type_words_are_refused_too(self):
+        readable, _ = as_annotations(["detail", "assembly", "scheme", "unknown"])
+        assert readable == []
+
+    def test_a_quoted_coordinate_is_refused(self):
+        """«0.1» в кавычках обходил отказ от чисел и ничего не считал."""
+        readable, lost = as_annotations([["0.1", "0.2"]])
+        assert readable == [] and lost["доля bbox строкой"] == 2
+
+    def test_readings_that_look_like_numbers_are_kept(self):
+        """
+        На чертеже по ЕСКД десятичный разделитель запятая: «0,32» —
+        настоящее прочтение с листа-паспорта, а «0.32» — доля из bbox.
+        Целые числа не отбрасываются вовсе: «110» — размер, «1» — позиция.
+        """
+        keep = ["0,32", "0,12", "0,35", "110", "1", "1.5", "50П", "Ra 6,3",
+                "M20x1,5", "H7", "IP65", "УХЛ4", "12Х18Н10Т", "⌀44H7",
+                "От -50 до + 400", "1:2", "Ст3"]
+        readable, lost = as_annotations(keep)
+        assert [a["value"] for a in readable] == keep
+        assert lost == {}
+
+    def test_refusals_are_counted_so_over_refusal_would_show(self):
+        """Отказ не тишина: он виден числом в логе и в payload."""
+        _, lost = as_annotations(["size", "0.1", ""])
+        assert sum(lost.values()) == 3
 
     def test_numbers_and_nulls_are_counted_lost(self):
         readable, lost = as_annotations([1, 2.5, None, True])
@@ -484,15 +530,24 @@ class TestNobodyIsCalledForParseQuality:
     говорит правду и просит машинного перечитывания.
     """
 
-    def test_flag_off_a_cut_answer_still_passes_as_before(self, monkeypatch):
-        """Выключенный флаг ничего не меняет: ни пометки, ни области."""
+    def test_a_cut_answer_changes_nothing_a_person_would_see(self, monkeypatch):
+        """Пометки и области остаются ровно такими, как без этой ветки."""
         fragment = built(SheetModel(capacity=10), monkeypatch)
         assert fragment.warnings == ["DRAWING_COMPLETENESS_UNKNOWN"]
         assert fragment.missing_regions == []
-        assert "sheet_answer_cut" not in fragment.content.structured_payload
+
+    def test_the_count_is_stored_without_any_flag(self, monkeypatch):
+        """
+        Учёт и эскалация развязаны: считать обрывы нужно по сохранённым
+        данным, а не грепом по логам воркера, поэтому ключи пишутся всегда.
+        """
+        payload = built(SheetModel(capacity=10), monkeypatch).content.structured_payload
+        assert payload["sheet_answer_cut"] is True
+        assert payload["sheet_annotations_complete"] is False
+        assert payload["sheet_reparse_candidate"] is True
 
     def test_cut_sheet_is_recorded_but_sends_nobody_anywhere(
-        self, monkeypatch, visible,
+        self, monkeypatch,
     ):
         monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
         fragment = built(SheetModel(capacity=10), monkeypatch)
@@ -506,7 +561,7 @@ class TestNobodyIsCalledForParseQuality:
         assert document_quality([fragment])[0] is False
 
     def test_a_sheet_with_lost_readings_asks_to_be_reparsed(
-        self, monkeypatch, visible,
+        self, monkeypatch,
     ):
         """Правильное автоматическое действие — перечитать, а не спросить."""
         fragment = built(SheetModel(capacity=10), monkeypatch)
@@ -515,7 +570,7 @@ class TestNobodyIsCalledForParseQuality:
         assert payload["sheet_reparse_reason"] == "sheet_answer_cut"
 
     def test_unread_tiles_are_named_for_the_reparse(
-        self, monkeypatch, tiles, visible,
+        self, monkeypatch, tiles,
     ):
         monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
         fragment = built(SheetModel(capacity=10, cut_always=True), monkeypatch)
@@ -526,7 +581,7 @@ class TestNobodyIsCalledForParseQuality:
         assert fragment.missing_regions == []
         assert document_quality([fragment])[0] is False
 
-    def test_whole_answer_is_not_recorded_at_all(self, monkeypatch, visible):
+    def test_whole_answer_is_not_recorded_at_all(self, monkeypatch):
         monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
         fragment = built(SheetModel(capacity=100), monkeypatch)
         payload = fragment.content.structured_payload
@@ -535,7 +590,7 @@ class TestNobodyIsCalledForParseQuality:
         assert document_quality([fragment])[0] is False
 
     def test_sheet_recovered_in_parts_is_not_a_reparse_candidate(
-        self, monkeypatch, tiles, visible,
+        self, monkeypatch, tiles,
     ):
         """
         Дочитанный частями лист прочитан: перечитывать нечего, записывать
@@ -552,7 +607,7 @@ class TestNobodyIsCalledForParseQuality:
         assert document_quality([fragment])[0] is False
 
     def test_dense_corner_names_only_that_part_for_the_reparse(
-        self, monkeypatch, tiles, visible,
+        self, monkeypatch, tiles,
     ):
         """
         Лист-таблица: вся плотность в одном углу, и часть с ней обрывается
@@ -565,7 +620,7 @@ class TestNobodyIsCalledForParseQuality:
         assert boxes[0][0] > 0.4 and boxes[0][1] > 0.4
 
     def test_lost_elements_are_recorded_even_on_a_whole_answer(
-        self, monkeypatch, visible,
+        self, monkeypatch,
     ):
         """
         Ответ целый, но часть элементов списка — не прочтения (доли bbox
@@ -584,7 +639,7 @@ class TestNobodyIsCalledForParseQuality:
         assert document_quality([fragment])[0] is False
 
     def test_no_drawing_warning_of_ours_can_make_a_document_partial(
-        self, monkeypatch, visible,
+        self, monkeypatch,
     ):
         """
         Страховка от возврата старого поведения: ни один лист этой ветки не
@@ -651,7 +706,7 @@ class TestSheetShapes:
         reading = client(SheetModel(capacity=10)).read_sheet(quartered((595, 842)))
         assert sorted(a["value"] for a in reading.annotations) == sorted(ALL_TEXTS)
 
-    def test_photograph_without_a_cut_costs_nothing(self, tiles, visible):
+    def test_photograph_without_a_cut_costs_nothing(self, tiles):
         """
         Фотография чертежа: надписей мало, ответ целый — ни одного лишнего
         вызова, ни пометки, ни непрочитанной области.
@@ -662,7 +717,7 @@ class TestSheetShapes:
         assert reading.complete and not reading.cut and not reading.failed
 
     def test_each_page_of_a_multi_sheet_document_is_judged_on_its_own(
-        self, monkeypatch, tiles, visible,
+        self, monkeypatch, tiles,
     ):
         """
         Многолистовой PDF: учёт потери живёт в payload своего листа, а

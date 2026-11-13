@@ -302,9 +302,8 @@ class DrawingProcessor:
     @staticmethod
     def _sheet_record(reading, payload) -> None:
         """
-        Что случилось с ответом прохода «лист целиком» — в payload листа
-        (DRAWING_SHEET_CUT_VISIBLE). Это наш учёт, а не повод позвать
-        человека.
+        Что случилось с ответом прохода «лист целиком» — в payload листа.
+        Это наш учёт, а не повод позвать человека.
 
         Человека зовут только за тем, чего он один и может решить: кластер,
         имя, конфликт версий. Насколько хорошо прочитан лист — наша забота,
@@ -318,11 +317,14 @@ class DrawingProcessor:
         прочтения потеряны; `sheet_reparse_candidate`=`true` — лист, который
         имеет смысл перечитать машинно (вот это и есть правильное
         автоматическое действие), с причиной в `sheet_reparse_reason`.
+
+        Ключи пишутся всегда и ни от какого флага не зависят: это факты о
+        разборе, а не эскалация. Под флагом учёт означал бы, что посчитать
+        обрывы можно только грепом по логам воркера — а считать их нужно по
+        сохранённым данным.
         """
         if reading.tiles:
             payload["sheet_tiles"] = reading.tiles
-        if not settings.DRAWING_SHEET_CUT_VISIBLE:
-            return
         if reading.cut:
             payload["sheet_answer_cut"] = True
         if reading.lost:

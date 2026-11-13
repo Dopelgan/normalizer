@@ -942,6 +942,39 @@ def salvage_list(content: str, key: str) -> List[Any]:
     return items
 
 
+# Слова самой схемы ответа: имена категорий и значения `sheet_type`. Когда
+# модель бросает обёртку объекта, она перечисляет поля схемы по порядку
+# («size», «D80», [bbox], «note», «Stal 3»), и имя категории приходит
+# отдельной строкой наравне со прочтением.
+_SCHEMA_WORDS = frozenset(CATEGORIES) | {"detail", "assembly", "scheme", "unknown"}
+# Одинокое латинское слово строчными буквами без цифр — тоже слово схемы
+# («dimension», которого в CATEGORIES нет вовсе: модель придумала его сама).
+# На чертеже по ЕСКД прочтение — это русский текст, число, обозначение ГОСТ
+# или символ; «Ra», «M20», «H7», «IP65», «УХЛ4» под правило не попадают,
+# потому что в них есть цифры или заглавные буквы.
+_SCHEMA_LIKE = re.compile(r"^[a-z][a-z_]{2,19}$")
+
+
+def _is_schema_word(text: str) -> bool:
+    """Строка — слово схемы ответа, а не прочтение листа."""
+    return text.casefold() in _SCHEMA_WORDS or bool(_SCHEMA_LIKE.match(text))
+
+
+# Доля из bbox, пришедшая строкой: «0.1» в кавычках обходила отказ от чисел.
+# Дробь с точкой в пределах 0..1 — это координата: на чертеже по ЕСКД
+# десятичный разделитель запятая («0,32», «0,12» — настоящие прочтения с
+# листа-паспорта), поэтому запятая под правило не попадает, а целые числа
+# («110», «1») не попадают из-за требования точки.
+def _is_bbox_fraction(text: str) -> bool:
+    if "." not in text:
+        return False
+    try:
+        value = float(text)
+    except ValueError:
+        return False
+    return 0.0 <= value <= 1.0
+
+
 def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Элементы списка `annotations` в надписи. Возвращает надписи и счётчик
@@ -965,8 +998,22 @@ def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str
       строки — как строки;
     * число, `true`/`false`/`null` — надписью не становятся. Отдельное
       число в ответе — это почти всегда доля из `bbox`, а не прочтение, и
-      превращать «0.52» в надпись листа значит сорить в индексе. Такой
-      элемент считается потерянным и доходит до человека пометкой.
+      превращать «0.52» в надпись листа значит сорить в индексе.
+
+    Надписью не становятся и две разновидности строк, иначе в индекс
+    попадает мусор от той же поломки, которую мы и чиним:
+
+    * слово самой схемы ответа. Поля схемы идут по порядку
+      `{category, value, bbox}`, и, бросив обёртку, модель перечисляет их
+      все: «size», «D80», [bbox], «note», «Stal 3». «size» и «note» —
+      разметка, а не прочтение, но `looks_like_text` их пропускает, и они
+      доходили до индекса полями;
+    * доля из `bbox`, пришедшая строкой: «0.1» в кавычках обходила отказ
+      от чисел.
+
+    Обе разновидности считаются потерянными, а не выбрасываются: счётчик
+    виден в логе и в payload, поэтому если правило начнёт отказывать
+    настоящим прочтениям, это будет заметно по числу, а не по тишине.
     """
     annotations: List[Dict[str, Any]] = []
     lost: Dict[str, int] = {}
@@ -977,10 +1024,14 @@ def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str
             return
         if isinstance(item, str):
             text = item.strip()
-            if text:
-                annotations.append({"category": "", "value": text})
-            else:
+            if not text:
                 lost["пустая строка"] = lost.get("пустая строка", 0) + 1
+            elif _is_schema_word(text):
+                lost["слово схемы"] = lost.get("слово схемы", 0) + 1
+            elif _is_bbox_fraction(text):
+                lost["доля bbox строкой"] = lost.get("доля bbox строкой", 0) + 1
+            else:
+                annotations.append({"category": "", "value": text})
             return
         # Вложенность глубже пары уровней — это уже не разметка листа.
         if isinstance(item, (list, tuple)) and depth < 2:
