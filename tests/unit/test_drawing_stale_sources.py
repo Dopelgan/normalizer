@@ -128,6 +128,20 @@ class TestDigitsDiffer:
         assert len(out) == 2
         assert stale.content.structured_payload[VARIANTS_KEY] == [{"block": "63", "model": "6,3"}]
 
+    def test_other_number_without_a_ratio_is_not_a_variant(self):
+        # «0,1» и «0,5» в графе допуска против «0,3» у модели — разные
+        # значения, а не два чтения одного: пометки нет, запись остаётся.
+        stale = table([["Допуск", "0,1", "0,5"]])
+        out = suppress_stale_sources([sheet(fields=(("tolerance", "0,3"),)), stale])
+        assert len(out) == 2 and not stale.warnings
+        assert not (stale.content.structured_payload or {})
+
+    def test_lost_ratio_separator_is_marked(self):
+        stale = paragraph("Масштаб 140 лист 1")
+        out = suppress_stale_sources([sheet(lines=[*SHEET_LINES, "Масштаб 1:40 лист 1"]), stale])
+        assert len(out) == 2
+        assert {"block": "140", "model": "1:40"} in stale.content.structured_payload[VARIANTS_KEY]
+
     def test_the_sheet_fragment_tells_what_was_marked(self):
         stale = table([["Масса", "Масштаб"], ["0,42", "7:1"]])
         model = sheet()

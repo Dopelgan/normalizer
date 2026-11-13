@@ -303,21 +303,25 @@ def _variant(token: str, model: Dict[str, str]) -> Optional[str]:
     Чтение модели того же значения с другими цифрами, иначе None.
 
     Сравниваются только лексемы с одинаковыми буквами: «м24х15» и «м24х1,5».
-    Расхождение — либо в разделителе при тех же цифрах («16» и «1,6»), либо
-    в одной цифре при той же форме записи («7:1» и «1:1»). Запись без
-    разделителя («001» и «002») вариантом не считается: это разные значения.
+    Расхождение — либо в разделителе при тех же цифрах («16» и «1,6», «140» и
+    «1:40»), либо в одной цифре при той же форме записи («7:1» и «1:1»).
+
+    Расхождение в цифре у записи без букв берётся только у отношения с
+    двоеточием: «0,1» и «0,3» в графе допуска — разные значения, а не два
+    чтения одного, и помечать их друг другом нельзя. Запись без разделителя
+    («001» и «002») вариантом не считается по той же причине.
     """
     letters, digits, mask = _letters(token), _digits(token), _mask(token)
     if len(digits) < _MIN_VARIANT_DIGITS:
         return None
-    separated = any(char in ".,:/-×" for char in token)
+    one_apart_allowed = bool(letters) or ":" in mask
     for other in model.values():
         if _letters(other) != letters or _key(other) == _key(token):
             continue
         other_digits = _digits(other)
         if other_digits == digits:
             return other
-        if ((separated or letters) and _mask(other) == mask
+        if (one_apart_allowed and _mask(other) == mask
                 and digits_one_apart(other_digits, digits)):
             return other
     return None
