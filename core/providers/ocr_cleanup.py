@@ -40,6 +40,8 @@ from dataclasses import dataclass, replace
 from celery.exceptions import SoftTimeLimitExceeded
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
+from core.providers import ocr_model
+
 logger = logging.getLogger(__name__)
 
 # Латинская (и греческая) буква -> кириллические прочтения, первое — самое
@@ -157,7 +159,17 @@ class CleanupStats:
 
 # ---------------------------------------------------------------- словарь
 def _tessdata_dir() -> Optional[str]:
-    candidates = [os.environ.get("TESSDATA_PREFIX") or ""]
+    """
+    Каталог моделей, из которых собирается словарь.
+
+    Первым спрашивается `ocr_model`: словарь обязан быть из той же модели,
+    которой прочитана страница (`OCR_TESSDATA_DIR`). Иначе выправка сверяет
+    слова `tessdata_best` со словарём системной модели — а словари у
+    вариантов разные, и «исправление» становится подменой по чужому
+    словарю.
+    """
+    candidates = [ocr_model.tessdata_dir() or "",
+                  os.environ.get("TESSDATA_PREFIX") or ""]
     candidates += [
         "/usr/share/tesseract-ocr/5/tessdata", "/usr/share/tesseract-ocr/4.00/tessdata",
         "/usr/share/tessdata", "/usr/local/share/tessdata",

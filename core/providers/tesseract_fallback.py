@@ -51,7 +51,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from core import deadline
 from core.config import settings
 from core.models.parse_result import ParsedBlock
-from core.providers import ocr_cleanup, per_line_language
+from core.providers import ocr_cleanup, ocr_model, per_line_language
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.ocr_prepare import PreparedPage, prepare_page
 from core.workspace import temp_dir
@@ -511,7 +511,8 @@ class TesseractFallbackProvider:
             image = prepared.image
         try:
             data = pytesseract.image_to_data(
-                image, lang=lang or self.lang, config=f"--psm {psm}",
+                image, lang=lang or self.lang,
+                config=f"--psm {psm}{ocr_model.tessdata_option()}",
                 output_type=pytesseract.Output.DICT,
             )
         except SoftTimeLimitExceeded:
@@ -624,7 +625,10 @@ class TesseractFallbackProvider:
         if prepared is not None:
             image = prepared.image
         try:
-            return pytesseract.image_to_string(image, lang=self.lang, config="--psm 6")
+            return pytesseract.image_to_string(
+                image, lang=self.lang,
+                config=f"--psm 6{ocr_model.tessdata_option()}",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Ошибка OCR: %s", exc)
             return ""

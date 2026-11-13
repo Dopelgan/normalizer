@@ -18,6 +18,8 @@
   английская строка остаётся английской (`OCR_PER_LINE_LANGUAGE`).
 """
 
+import pytest
+
 from dataclasses import dataclass, field
 from typing import List
 
@@ -344,3 +346,62 @@ def test_equal_confidence_keeps_the_primary_reading():
     russian = [_Line("Лист 2", [0, 0.1, 1, 0.2], 0.90)]
     english = [_Line("Jlucm 2", [0, 0.1, 1, 0.2], 0.91)]
     assert per_line_language.choose([russian, english])[0].text == "Лист 2"
+
+
+# ------------------------------------- модель распознавания доходит до вызова
+def test_model_directory_reaches_every_recognition_call(monkeypatch, tmp_path):
+    """
+    `OCR_TESSDATA_DIR` обязан доходить до самого Tesseract: без этого
+    модели `best` лежат в образе и не читают ни одной страницы.
+
+    Заодно проверяется, что язык у каждого прохода свой: построчный выбор
+    зовёт `rus` и `eng` по отдельности, а не совмещённую связку.
+    """
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    from core.config import settings
+    from core.providers import ocr_model, tesseract_fallback
+
+    for name in ocr_model.REQUIRED:
+        (tmp_path / name).write_bytes(b"")
+    monkeypatch.setattr(settings, "OCR_TESSDATA_DIR", str(tmp_path))
+    monkeypatch.setattr(settings, "OCR_PREPROCESS_ENABLED", False)
+    monkeypatch.setattr(settings, "OCR_PER_LINE_LANGUAGE", True)
+    monkeypatch.setattr(ocr_model, "_warned", set())
+
+    seen = []
+
+    def fake(image, lang=None, config=None, output_type=None):
+        seen.append((lang, config))
+        return {"text": ["Лист"], "conf": [90], "block_num": [1],
+                "par_num": [1], "line_num": [1], "left": [10], "top": [10],
+                "width": [50], "height": [20]}
+
+    monkeypatch.setattr(tesseract_fallback.pytesseract, "image_to_data", fake)
+    provider = tesseract_fallback.TesseractFallbackProvider(storage=object())
+    provider.ocr_lines(Image.new("RGB", (400, 200), "white"))
+
+    assert [lang for lang, _ in seen] == ["rus", "eng"]
+    assert all("--tessdata-dir" in config for _, config in seen)
+    assert all(str(tmp_path) in config for _, config in seen)
+
+
+def test_vocabulary_is_built_from_the_model_that_read_the_page(monkeypatch, tmp_path):
+    """
+    Словарь выправки собирается из того же каталога, что и распознавание:
+    иначе слова `best` сверяются со словарём системной модели.
+    """
+    from core.config import settings
+    from core.providers import ocr_cleanup, ocr_model
+
+    for name in ocr_model.REQUIRED:
+        (tmp_path / name).write_bytes(b"")
+    monkeypatch.setattr(settings, "OCR_TESSDATA_DIR", str(tmp_path))
+    monkeypatch.setattr(ocr_model, "_warned", set())
+    assert ocr_cleanup._tessdata_dir() == str(tmp_path)
+
+    # Каталога нет — читаем системной моделью, и словарь тоже системный.
+    monkeypatch.setattr(settings, "OCR_TESSDATA_DIR", str(tmp_path / "нет"))
+    monkeypatch.setattr(ocr_model, "_warned", set())
+    assert ocr_cleanup._tessdata_dir() != str(tmp_path / "нет")
