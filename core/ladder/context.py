@@ -298,6 +298,15 @@ def _classify_pdf(context: DocumentContext) -> Classification:
     drawing_pages = [p for p, v in verdicts.items() if v.is_drawing]
     signals["drawing_pages"] = drawing_pages
     signals["page_count"] = len(verdicts)
+    # Решение жанрового гейта — в признаках классификации: оно должно быть
+    # счётным снаружи, и ровно это, без разбора признаков по страницам.
+    gated = {p: v.signals["genre_gate"] for p, v in verdicts.items()
+             if "genre_gate" in v.signals}
+    if gated:
+        signals["genre_gate"] = {
+            "demoted_pages": sorted(p for p, g in gated.items() if g["demote"]),
+            "kept_pages": sorted(p for p, g in gated.items() if not g["demote"]),
+        }
     share = len(drawing_pages) / len(verdicts) if verdicts else 0.0
     signals["drawing_share"] = round(share, 3)
     mostly_drawings = share >= _DRAWING_GENRE_SHARE
@@ -361,13 +370,30 @@ def _raster_drawing_pages(data: bytes):
     except Exception as exc:  # noqa: BLE001
         logger.debug("Скан не открылся для поиска чертежей: %s", exc)
         return [], 0
+    from core.providers import drawing_genre
+
     pages = []
+    gate_on = drawing_genre.enabled()
     try:
         checked = min(document.page_count, _RASTER_DRAWING_PAGES)
         for index in range(checked):
             png = document[index].get_pixmap(dpi=100).tobytes("png")
-            if raster_drawing.analyse(png).is_drawing:
-                pages.append(index + 1)
+            if not raster_drawing.analyse(png).is_drawing:
+                continue
+            # Жанровый гейт: у гибридного скана (напечатанный лист с
+            # текстовым слоем от исходного вывода или от прежнего
+            # распознавания) текст страницы читается и здесь, и лист в
+            # рамке без признаков чертежа чертежом не становится. Если
+            # текста на странице нет, гейт молчит: положительные признаки
+            # взять неоткуда, и решает геометрия, как раньше.
+            if gate_on:
+                try:
+                    text = document[index].get_text("text") or ""
+                except Exception:  # noqa: BLE001
+                    text = ""
+                if drawing_genre.gate(text)["demote"]:
+                    continue
+            pages.append(index + 1)
     finally:
         document.close()
     return pages, checked

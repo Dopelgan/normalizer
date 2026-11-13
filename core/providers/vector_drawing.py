@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from core.providers import dimension_fidelity, page_prose
+from core.providers import dimension_fidelity, drawing_genre, page_prose
 from core.providers.text_layer import (
     PYMUPDF_AVAILABLE,
     TextLayer,
@@ -218,6 +218,15 @@ def _score_page(page: Any, page_no: int) -> DrawingPage:
         score += 0.15
 
     score = min(1.0, score)
+    # Жанровый гейт (DRAWING_GENRE_GATE): лист считается чертёжным только по
+    # собственным признакам чертежа. Признаки геометрические набраны выше и
+    # у таблицы в рамке набираются тоже — поэтому решает текст листа, а не
+    # число отрезков. Гейт только снимает жанр и никогда не выдаёт его.
+    if score >= _DRAWING_SCORE and drawing_genre.enabled():
+        verdict = drawing_genre.gate(text)
+        signals["genre_gate"] = verdict
+        if verdict["demote"]:
+            score = min(score, _TEXT_IN_FRAME_SCORE)
     if score >= _DRAWING_SCORE and _text_in_frame_enabled():
         # Рамка и штамп есть и у ПОК, ТУ, ТЗ, писем. Если на листе проза или
         # одна сетка таблиц, это страница текста: её поля чертежа и Qwen-VL
