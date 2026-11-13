@@ -5,6 +5,18 @@
 Все значения в тестах — настоящие: выборка из прода
 (`platform_parser_ingest_queue.parser_payload`, 300 фрагментов чертежей в
 порядке md5, 10 174 поля). Придуманных записей здесь нет.
+
+Что в замере измерено и что посчитано. Точность заголовка 87,2 % (64 неверных
+из 501) и счёт спора модели с решающей нотацией — 27 спорных записей, правила
+правы 26 из 26, модель 0 из 26 — **измерены** на этой выборке. Итог «неверных
+заголовков 87 → 22» вместе с правкой `drawing_processor._reconcile`
+**смоделирован**: заявка модели до `_reconcile` в контракте не сохраняется, и
+за неё взята прод-категория. Измеренная часть того же сравнения — 87 → 60,
+правкой одного `classify`.
+
+Флаги здесь ставятся только через `monkeypatch.setattr` на поле, которое в
+`Settings` объявлено: прямое присваивание оставило бы флаг включённым до конца
+прогона, а неизвестное поле на синглтоне — ещё и в чужих тестах.
 """
 
 import pytest
@@ -92,6 +104,50 @@ class TestDecisiveNotation:
     ])
     def test_not_decisive(self, strict, text):
         assert decisive_category(text) is None
+
+
+class TestDecisiveWinsOverClassify:
+    """
+    Решающая нотация отвечает одно и то же независимо от флага.
+
+    `drawing_processor._reconcile` на решающей нотации возвращает
+    `decisive_category(text) or by_rules`. При включённом флаге
+    `decisive_category` и `classify` совпадают, и выражение ничего не
+    меняет; при выключенном — `classify` склеенную пометку «№» с цифрой не
+    знает и отдаёт «note», а `decisive_category` знает. Разойтись они могут
+    только здесь, и побеждает тот, кого и спрашивали: сварной шов,
+    названный примечанием, вреда не наносит, но остаётся неверным.
+    """
+
+    #                 (заявка модели, надпись, категория по нотации)
+    ROWS = [
+        ("thread", "⌀32x2,5", "size"),
+        ("size", "Ra 6,3", "roughness"),
+        ("size", "M24x1,5", "thread"),
+        ("note", "R12", "radius"),
+        ("thread", "2№3", "position"),
+        ("callout", "№1", "position"),
+    ]
+
+    @pytest.mark.parametrize("claimed,text,category", ROWS)
+    def test_resolution_is_flag_independent(self, strict_off, claimed, text, category):
+        # Ровно то выражение, которое стоит в _reconcile.
+        resolved = decisive_category(text) or classify(text)[0]
+        assert resolved == category
+        assert resolved != claimed
+
+    @pytest.mark.parametrize("claimed,text,category", ROWS)
+    def test_strict_classify_agrees(self, strict, claimed, text, category):
+        assert decisive_category(text) == category
+        assert classify(text)[0] == category
+
+    def test_numero_is_the_only_divergence(self, strict_off):
+        # При выключенном флаге «№» с цифрой — единственное расхождение
+        # между двумя помощниками на решающей нотации.
+        assert decisive_category("2№3") == "position"
+        assert classify("2№3")[0] == "note"
+        for text in ("⌀32x2,5", "Ra 6,3", "M24x1,5", "R12"):
+            assert decisive_category(text) == classify(text)[0]
 
 
 class TestLatinMetreIsNotThread:
@@ -192,6 +248,18 @@ class TestTranscriptSigns:
         )
         assert fixed == 1
         assert fields[0]["value"] == "1087±3"
+
+    def test_silent_without_a_match(self):
+        # Ни одного знака в транскрипции — ни правки, ни трогания полей.
+        fields = [
+            {"category": "size", "value": "⌀57"},
+            {"category": "size", "value": "1087+3"},
+        ]
+        before = [dict(f) for f in fields]
+        assert dimension_fidelity.adopt_transcript_signs(
+            fields, ["Корпус в сборе", "⌀57", "Ra 6,3"]
+        ) == 0
+        assert fields == before
 
     def test_reference_star_restored(self):
         fields = [{"category": "size", "value": "30+10"}]
