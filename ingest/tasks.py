@@ -41,6 +41,7 @@ from core.models.contract import (
     ResultsResponse,
 )
 from core.models.parse_result import ParseResult
+from core.providers.mineru_parser import page_ranges
 from core.normalizer import TextNormalizer
 from core.providers.document_parser import ParserFailed, ParserUnavailable
 from core.providers.document_parser_factory import DocumentParserFactory
@@ -246,8 +247,39 @@ def build_warnings(parse_result: ParseResult, failed_pages: List[int]) -> List[s
     """Деградации разбора и непрочитанные страницы — одним списком."""
     warnings = list(parse_result.degraded)
     warnings += [f"PAGE_NOT_PARSED: page {page}" for page in failed_pages]
+    if parse_result.unread_text_pages:
+        warnings.append(f"TEXT_NOT_READ: pages {page_ranges(parse_result.unread_text_pages)}")
     warnings += page_report(parse_result)["coverage_warnings"]
     return warnings
+
+
+def mark_unread_pages(fragments, pages: List[int]) -> int:
+    """
+    Страницы, текст которых не прочитан, — в `missing_regions` фрагментов.
+
+    Блоки MinerU на такой странице есть, и по покрытию страниц документ
+    выглядит полным; единственное место, где потеря видна человеку, —
+    область страницы, помеченная непрочитанной. Пометка ставится только
+    нечертёжным фрагментам: `missing_regions` чертежа отправляет документ
+    на проверку человеку, а качество разбора поводом для этого не является
+    — непрочитанные страницы система дочитывает сама.
+    """
+    if not pages:
+        return 0
+    unread = set(pages)
+    marked = 0
+    seen: set = set()
+    for fragment in fragments:
+        page = getattr(fragment.position, "page", None) if fragment.position else None
+        if page not in unread or fragment.type == "drawing" or page in seen:
+            continue
+        fragment.missing_regions = list(fragment.missing_regions) + [
+            {"kind": "page_text", "bbox": [0.0, 0.0, 1.0, 1.0], "page": page,
+             "reason": "ocr_pages_not_read"}
+        ]
+        seen.add(page)
+        marked += 1
+    return marked
 
 
 def build_document_result(
@@ -551,7 +583,18 @@ def process_document(
             review_required = True
             drawing_warnings.append(drawing_route.WARNING_THIN_KEPT)
         warnings = list(dict.fromkeys(warnings + drawing_warnings))
-        document_status = "partial" if report["failed_pages"] or report["coverage_unknown"] or review_required else "completed"
+        # Непрочитанные страницы не повод звать человека — дочитать их
+        # может только система, — но и документ с ними не разобран целиком:
+        # статус остаётся partial, а страницы названы по номерам.
+        unread_marked = mark_unread_pages(fragments, parse_result.unread_text_pages)
+        if parse_result.unread_text_pages:
+            logger.warning(
+                "Документ %s: текст не прочитан на страницах %s — помечено фрагментов %d",
+                doc_id, parse_result.unread_text_pages, unread_marked,
+            )
+        document_status = ("partial" if report["failed_pages"] or report["coverage_unknown"]
+                           or review_required or parse_result.unread_text_pages
+                           else "completed")
         mime_type = filetypes.mime_for(located.file_type)
         normalized_hash = normalized_content_hash(fragments)
 
@@ -583,6 +626,9 @@ def process_document(
                 "processed_pages": report["processed_pages"],
                 "failed_pages": report["failed_pages"],
                 "unknown_pages": report["unknown_pages"],
+                # Страницы с блоками, но без прочитанного текста. Отдельно
+                # от unknown_pages: покрытие страниц у них полное.
+                "unread_text_pages": parse_result.unread_text_pages,
                 "page_coverage_version": PAGE_COVERAGE_VERSION,
                 "warnings": warnings,
                 "processing_profile_version": PROCESSING_PROFILE_VERSION,

@@ -33,6 +33,7 @@ import os
 import re
 import time
 from dataclasses import replace
+from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -142,25 +143,79 @@ def _designations(text: str) -> List[str]:
     return [m.group(0) for m in _DESIGNATION_RE.finditer(_norm_codes(text))]
 
 
+def page_ranges(pages: List[int]) -> str:
+    """«51-158» вместо списка из ста восьми чисел — для лога и пометки."""
+    ranges: List[str] = []
+    for page in sorted(set(pages)):
+        if ranges and page == _range_end(ranges[-1]) + 1:
+            ranges[-1] = f"{ranges[-1].split('-')[0]}-{page}"
+        else:
+            ranges.append(str(page))
+    return ", ".join(ranges)
+
+
+def _range_end(chunk: str) -> int:
+    return int(chunk.split("-")[-1])
+
+
+def _contained_share(part: List[str], whole: List[str]) -> float:
+    """
+    Какая доля основ `part` нашлась в `whole` одной последовательностью.
+
+    Сравнение идёт по порядку слов: совпадающие отрезки
+    `SequenceMatcher` монотонны в обеих последовательностях, поэтому
+    случайные пересечения словаря в счёт не идут — только тот же текст,
+    прочитанный с пропусками и другими окончаниями.
+    """
+    if not part:
+        return 0.0
+    matcher = SequenceMatcher(a=part, b=whole, autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return matched / len(part)
+
+
 def drop_repeated_recovered_blocks(
-    blocks: List[ParsedBlock], min_share: float
-) -> Tuple[List[ParsedBlock], int]:
+    blocks: List[ParsedBlock], min_contained: float
+) -> Tuple[List[ParsedBlock], Dict[str, int]]:
     """
     Блоки, восстановленные из слоя распознавания, без повторов текста MinerU.
 
     Только на страницах, где у MinerU свой текст (как у
     `drop_low_confidence_lines`): там восстановленный блок либо повторяет
-    этот текст хуже, либо собран из графики («a С» 125) \/ R263»). Блок
-    уходит, если в нём нет ни одного русского слова или доля его слов, чья
-    основа есть в тексте MinerU страницы, не ниже `min_share`. Правило «нет
-    русского слова» — только на русской странице (русских слов у MinerU не
-    меньше латинских): на английском скане такой блок — недостающий текст.
-    На странице без текста MinerU слой — единственный источник и не трогается.
-    Блок с обозначением (KKS, ⌀, R1,5), которого нет в тексте страницы у
-    MinerU/модели, не отбрасывается ни по одному из правил.
+    этот текст хуже, либо собран из графики («a С» 125) \/ R263»).
+
+    Повтором считается блок, который целиком содержится в одном другом
+    блоке страницы: не меньше `min_contained` его основ нашлись в основах
+    того блока одной последовательностью, по порядку слов. Прежнее правило
+    сравнивало блок с объединением всех слов страницы и без порядка, и
+    этого хватало, чтобы потерять настоящий текст: предложение «проводится
+    расследование. Покупатель письменно извещает Поставщика о необходимости
+    прибытия для расследования выявленных несоответствий.» делит с
+    соседним фрагментом только хвост «о необходимости прибытия…», а
+    остальные его слова нашлись по странице вразнобой — доля вышла выше
+    порога, и пункт договора остался без сказуемого. По новому правилу у
+    него совпадает 7 основ из 11 с соседом (0.64) и меньше с остальными: ни
+    сравнение порога не достигает, и блок остаётся.
+
+    Второе правило — графика: блок без русских слов на русской странице
+    (русских слов у MinerU не меньше латинских). Отбрасывается только
+    заведомый мусор обводки — ни русского, ни латинского слова от четырёх
+    букв. Блок, который на текст всё-таки похож, остаётся и считается в
+    `kept_uncertain`: сомнительное удаление заменено сомнительным
+    сохранением, потому что лишняя строка в индексе дешевле потерянной.
+
+    На странице без текста MinerU слой — единственный источник и не
+    трогается. Блок с обозначением (KKS, ⌀, R1,5), которого нет в тексте
+    страницы у MinerU/модели, не отбрасывается ни по одному из правил.
+
+    Возвращает оставшиеся блоки и счётчики: `repeat` — доказанных повторов,
+    `graphics` — мусора обводки, `kept_uncertain` — сохранённых спорных,
+    `total` — всего удалено.
     """
     page_chars: Dict[int, int] = {}
-    page_stems: Dict[int, set] = {}
+    # Основы каждого блока страницы по отдельности: повтор доказывается
+    # сравнением с одним блоком, а не с объединением слов страницы.
+    page_block_stems: Dict[int, List[List[str]]] = {}
     # Русских и латинских слов в тексте MinerU страницы: правило «нет
     # русского слова — графика» верно только для русской страницы. На
     # английском скане восстановленный блок — текст, которого у MinerU нет.
@@ -182,33 +237,50 @@ def drop_repeated_recovered_blocks(
             page_codes[b.page].append(_norm_codes(text))
         if b.type in _TEXTISH or b.type == "table":
             stems = _stems(text)
-            page_stems.setdefault(b.page, set()).update(stems)
+            if stems:
+                page_block_stems.setdefault(b.page, []).append(stems)
             page_rus[b.page] = page_rus.get(b.page, 0) + len(stems)
             page_lat[b.page] = page_lat.get(b.page, 0) + len(_LAT_WORD_RE.findall(text))
         if b.type in _TEXTISH and b.text:
             page_chars[b.page] = page_chars.get(b.page, 0) + len("".join(b.text.split()))
     kept: List[ParsedBlock] = []
-    dropped = 0
+    counts = {"repeat": 0, "graphics": 0, "kept_uncertain": 0, "total": 0}
     for b in blocks:
         if (b.method == METHOD_OCR_LAYER_RECOVERED
                 and page_chars.get(b.page, 0) >= _MINERU_PAGE_TEXT_CHARS):
-            stems = _stems(b.text or "")
-            known = page_stems.get(b.page, set())
+            text = b.text or ""
+            stems = _stems(text)
             russian_page = page_rus.get(b.page, 0) > 0 and (
                 page_rus.get(b.page, 0) >= page_lat.get(b.page, 0))
-            if ((not stems and russian_page)
-                    or (stems and sum(s in known for s in stems) >= min_share * len(stems))):
+            repeat = any(
+                _contained_share(stems, other) >= min_contained
+                for other in page_block_stems.get(b.page, ())
+            ) if stems else False
+            # Мусор обводки: ни русского, ни латинского слова — читать в нём
+            # нечего. Латиница от четырёх букв означает, что блок всё-таки
+            # похож на текст, пусть и прочитанный неверно.
+            graphics = (not stems and russian_page
+                        and not _LAT_WORD_RE.search(text))
+            uncertain = not stems and russian_page and not graphics
+            if repeat or graphics:
                 # Пробелы внутри обозначения у MinerU («10JEB10 CT001») не в счёт.
                 page_text = "".join("|".join(page_codes.get(b.page, [])).split())
-                if any(code not in page_text for code in _designations(b.text or "")):
+                if any(code not in page_text for code in _designations(text)):
                     kept.append(b)
                     continue
-                dropped += 1
+                counts["repeat" if repeat else "graphics"] += 1
+                counts["total"] += 1
                 continue
+            if uncertain:
+                counts["kept_uncertain"] += 1
         kept.append(b)
-    if dropped:
-        logger.info("Слой распознавания: отброшено повторов текста MinerU: %d", dropped)
-    return kept, dropped
+    if counts["total"] or counts["kept_uncertain"]:
+        logger.info(
+            "Слой распознавания: доказанных повторов %d, мусора обводки %d, "
+            "спорных блоков сохранено %d",
+            counts["repeat"], counts["graphics"], counts["kept_uncertain"],
+        )
+    return kept, counts
 
 
 # Типы блоков MinerU, которые сводятся к текстовому.
@@ -377,7 +449,7 @@ class MinerUParserProvider(DocumentParserProvider):
         # модель таблиц MinerU отдаёт русскую прозу побуквенной LaTeX-
         # разметкой, а Tesseract с `rus` читает её как текст.
         if self._has_content(result):
-            ocr_layer = self._ocr_layer(uri, file_type)
+            ocr_layer, unread_pages = self._ocr_layer(uri, file_type, total_pages=pages)
             if ocr_layer is not None and settings.OCR_LAYER_DROP_LOW_CONFIDENCE:
                 ocr_layer = drop_low_confidence_lines(
                     ocr_layer, result.blocks, settings.OCR_LAYER_MIN_LINE_CONFIDENCE
@@ -402,7 +474,7 @@ class MinerUParserProvider(DocumentParserProvider):
                 repeated = None
                 if settings.OCR_LAYER_DROP_REPEATED:
                     blocks, repeated = drop_repeated_recovered_blocks(
-                        blocks, settings.OCR_LAYER_REPEAT_SHARE
+                        blocks, settings.OCR_LAYER_REPEAT_CONTAIN
                     )
                 result.blocks = blocks
                 result.text_layer_chars = stats.layer_chars_by_page
@@ -412,7 +484,17 @@ class MinerUParserProvider(DocumentParserProvider):
                 if vocab is not None:
                     result.text_layer_stats["word_fix"] = word_fix.as_dict()
                 if repeated is not None:
-                    result.text_layer_stats["dropped_repeated"] = repeated
+                    # Доказанных повторов — отдельно от мусора обводки и от
+                    # спорных блоков, которые оставлены в тексте. Одно число
+                    # «отброшено N» не позволяло отличить верное удаление от
+                    # потери, и спросить было не у чего.
+                    result.text_layer_stats["dropped_repeated"] = repeated["total"]
+                    result.text_layer_stats["dropped_detail"] = repeated
+                    if repeated["kept_uncertain"]:
+                        result.degraded.append(
+                            f"ocr_layer_uncertain_kept: спорных блоков слоя "
+                            f"оставлено в тексте {repeated['kept_uncertain']}"
+                        )
                 # Происхождение известно только здесь: слоя в файле не
                 # оказалось и текст собран распознаванием. До этой ветки
                 # `source_kind` ставился по расширению, и скан уезжал в
@@ -431,6 +513,16 @@ class MinerUParserProvider(DocumentParserProvider):
                     result.degraded.append(
                         f"formula_not_text: блоков с разметкой вместо текста "
                         f"{stats.decoded_formulas}"
+                    )
+                if unread_pages:
+                    # Блоки MinerU на этих страницах есть, покрытие страниц
+                    # полное, но текста на них не прочитано: без этой записи
+                    # две трети документа пропадали молча.
+                    result.unread_text_pages = unread_pages
+                    result.degraded.append(
+                        f"text_not_read: распознавание не дошло до страниц "
+                        f"{page_ranges(unread_pages)} "
+                        f"(предел OCR_FULL_MAX_PAGES или бюджет времени)"
                     )
                 return result
 
@@ -487,29 +579,82 @@ class MinerUParserProvider(DocumentParserProvider):
         finally:
             document.close()
 
-    def _ocr_layer(self, uri: str, file_type: Optional[str] = None) -> Optional[TextLayer]:
+    def _ocr_layer(
+        self, uri: str, file_type: Optional[str] = None, total_pages: int = 0,
+    ) -> Tuple[Optional[TextLayer], List[int]]:
         """
-        Построчное распознавание растра как слой. Недоступность OCR здесь не
-        фатальна: без слоя разбор останется как был, поэтому ошибка уходит в
-        лог, а не наружу.
+        Построчное распознавание растра как слой и страницы, текст которых
+        прочитать не удалось. Недоступность OCR здесь не фатальна: без слоя
+        разбор останется как был, поэтому ошибка уходит в лог, а не наружу.
+
+        Проход по страницам ограничен `OCR_FULL_MAX_PAGES` и бюджетом
+        времени. Прежде усечение прохода здесь просто терялось: слой
+        обрывался на полусотне страниц, MinerU при этом отдавал блоки по
+        всему документу, покрытие страниц выходило полным — и документ со
+        ста непрочитанными страницами выдавался как разобранный целиком.
+        Теперь проход продолжается с места обрыва (`OCR_LAYER_CONTINUATION_
+        PASSES` дополнительных проходов), а то, что не прочитано и после
+        них, возвращается списком страниц и доезжает до выдачи.
         """
         if not settings.OCR_LAYER_ENABLED:
-            return None
-        try:
-            layer = self.tesseract.text_layer(uri, file_type)
-        except SoftTimeLimitExceeded:
-            raise
-        except Exception as exc:  # noqa: BLE001 — слой не обязателен
-            logger.warning("Слой распознавания для %s не собрался: %s", uri, exc)
-            return None
-        if layer is None or not layer.char_count():
+            return None, []
+        pages: Dict[int, Any] = {}
+        first = 1
+        truncated: Optional[tuple] = None
+        for _ in range(max(0, settings.OCR_LAYER_CONTINUATION_PASSES) + 1):
+            try:
+                part = self.tesseract.text_layer(uri, file_type, first_page=first)
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 — слой не обязателен
+                logger.warning("Слой распознавания для %s не собрался: %s", uri, exc)
+                break
+            truncated = getattr(self.tesseract, "truncated_at", None)
+            if part is not None:
+                pages.update(part.pages)
+            if not truncated:
+                break
+            done, total = truncated
+            if total and done >= total:
+                truncated = None
+                break
+            if done < first:
+                # Проход не продвинулся ни на страницу (кончился бюджет
+                # времени задачи) — следующий не продвинется тем более.
+                break
+            first = done + 1
+        if not pages:
             logger.info("Распознавание не дало строк для %s — сшивать нечего", uri)
-            return None
+            return None, self._unread_pages(pages, total_pages, truncated)
+        layer = TextLayer(pages=pages, page_count=max(pages))
+        unread = self._unread_pages(pages, total_pages, truncated)
         logger.info(
-            "Слой распознавания для %s: страниц %d, символов %d",
+            "Слой распознавания для %s: страниц %d, символов %d%s",
             uri, layer.page_count, layer.char_count(),
+            f", не прочитано страниц {len(unread)}: {page_ranges(unread)}" if unread else "",
         )
-        return layer
+        return layer, unread
+
+    @staticmethod
+    def _unread_pages(
+        pages: Dict[int, Any], total_pages: int, truncated: Optional[tuple],
+    ) -> List[int]:
+        """
+        Страницы, до которых распознавание не дошло.
+
+        Пустая страница скана и страница, которую не успели прочитать, —
+        разные вещи, и путать их нельзя. Непрочитанными считаются только
+        страницы за местом обрыва прохода: страница внутри прочитанного
+        участка без строк — это пустая страница, а не потеря.
+        """
+        if not truncated:
+            return []
+        done, total = truncated
+        last = max(1, int(done))
+        total = max(int(total or 0), int(total_pages or 0))
+        if total <= last:
+            return []
+        return [page for page in range(last + 1, total + 1) if page not in pages]
 
     @staticmethod
     def _has_content(result: ParseResult) -> bool:

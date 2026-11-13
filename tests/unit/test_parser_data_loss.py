@@ -449,7 +449,7 @@ class TestExtensionlessAttachmentIsOcrAsImage:
         class FakeTesseract:
             truncated_at = None
 
-            def text_layer(self, uri, file_type=None):
+            def text_layer(self, uri, file_type=None, first_page=1):
                 calls.append(("layer", uri, file_type))
                 return None
 
