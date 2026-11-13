@@ -234,7 +234,8 @@ class TesseractFallbackProvider:
             return 0
 
     # ------------------------------------------------------------ внутреннее
-    def text_layer(self, uri: str, file_type: Optional[str] = None) -> Optional[TextLayer]:
+    def text_layer(self, uri: str, file_type: Optional[str] = None,
+                   first_page: int = 1) -> Optional[TextLayer]:
         """
         Построчное распознавание всего документа как текстовый слой.
 
@@ -242,14 +243,20 @@ class TesseractFallbackProvider:
         источником структуры, а текст берётся отсюда. Для растра это
         единственный способ прочитать русскую прозу, которую модель таблиц
         MinerU отдаёт побуквенной LaTeX-разметкой.
+
+        `first_page` — начало прохода; `truncated_at` после возврата
+        показывает, на какой странице проход остановился. Прежде усечение
+        здесь не сбрасывалось и не читалось вызывающим: слой обрывался на
+        полусотне страниц, а документ выдавался полным.
         """
         self.failed_pages = []
+        self.truncated_at = None
         local_path, cleanup = self._materialize(uri, file_type=file_type)
         if not local_path:
             raise OcrUnavailable(f"Файл {uri} не удалось получить локально")
 
         try:
-            images = self._images_of(local_path, file_type)
+            images = self._images_of(local_path, file_type, first_page=first_page)
             pages: Dict[int, List[TextLine]] = {}
             for page_num, ocr_lines in self._map_pages(images, lambda image, _: self.ocr_lines(image, _page_psm())):
                 lines = [_text_line(line, page_num) for line in ocr_lines if line.text.strip()]
@@ -315,7 +322,8 @@ class TesseractFallbackProvider:
             # обычно секунды, на крупном листе дольше.
             pool.shutdown(wait=False, cancel_futures=True)
 
-    def _images_of(self, local_path: str, file_type: Optional[str] = None):
+    def _images_of(self, local_path: str, file_type: Optional[str] = None,
+                   first_page: int = 1):
         """
         Страницы документа по одной: (номер, картинка).
 
@@ -323,17 +331,23 @@ class TesseractFallbackProvider:
         разворачивала весь PDF в список картинок разом — на многостраничном
         сканированном приложении это съедало память воркера целиком, ещё до
         первой строки распознавания.
+
+        `first_page` — с какой страницы начинать. Нужен продолжению прохода:
+        усечённый по лимиту или бюджету документ дочитывается следующими
+        проходами с того места, где остановился предыдущий.
         """
         if self._treat_as_image(local_path, file_type):
+            if first_page > 1:
+                return []
             try:
                 image = Image.open(local_path)
                 image.load()
             except Exception as exc:  # noqa: BLE001
                 raise OcrUnavailable(f"Изображение не открылось: {exc}") from exc
             return [(1, image)]
-        return self._pdf_pages(local_path)
+        return self._pdf_pages(local_path, first_page=first_page)
 
-    def _pdf_pages(self, local_path: str):
+    def _pdf_pages(self, local_path: str, first_page: int = 1):
         """
         Генератор страниц PDF: рендерим пачками, лишнего в памяти не держим.
 
@@ -345,15 +359,17 @@ class TesseractFallbackProvider:
         задачи по таймауту Celery.
         """
         total = self._page_count(local_path)
+        start = max(1, int(first_page))
         limit = max(1, settings.OCR_FULL_MAX_PAGES)
-        last_page = min(total, limit) if total else limit
-        if total and total > limit:
-            logger.warning("OCR %s усечён: %d страниц из %d", local_path, limit, total)
-            self.truncated_at = (limit, total)
+        last_page = min(total, start + limit - 1) if total else start + limit - 1
+        if total and total > last_page:
+            logger.warning("OCR %s усечён: страницы %d-%d из %d",
+                           local_path, start, last_page, total)
+            self.truncated_at = (last_page, total)
         batch = max(1, settings.OCR_BATCH_PAGES)
         until = time.monotonic() + deadline.bounded(settings.OCR_TIME_BUDGET)
         yielded, error = 0, None
-        for first in range(1, last_page + 1, batch):
+        for first in range(start, last_page + 1, batch):
             last = min(first + batch - 1, last_page)
             if time.monotonic() > until:
                 logger.warning("OCR %s остановлен по бюджету времени на странице %d", local_path, first)

@@ -330,8 +330,8 @@ def test_recovered_repeat_of_mineru_text_dropped():
         # Другая страница без текста MinerU — слой единственный источник.
         _block("a С» 125) \/ R263", REC, page=2),
     ]
-    kept, dropped = drop_repeated_recovered_blocks(blocks, 0.6)
-    assert dropped == 2
+    kept, counts = drop_repeated_recovered_blocks(blocks, 0.9)
+    assert counts["total"] == 2
     assert [b.text[:10] for b in kept] == [
         MINERU_NOTES[:10], "Маркироват", "a С» 125) ",
     ]
@@ -354,8 +354,8 @@ def test_recovered_english_text_kept_on_english_page():
         _block(english, "mineru_ocr"),
         _block("Warranty does not cover damage caused by improper storage", REC),
     ]
-    kept, dropped = drop_repeated_recovered_blocks(blocks, 0.6)
-    assert dropped == 0
+    kept, counts = drop_repeated_recovered_blocks(blocks, 0.9)
+    assert counts["total"] == 0
     assert len(kept) == 2
 
 
@@ -373,8 +373,8 @@ def test_recovered_designation_absent_from_mineru_kept(recovered):
     from core.providers.text_layer import METHOD_OCR_LAYER_RECOVERED as REC
 
     blocks = [_block(MINERU_NOTES, "mineru_ocr"), _block(recovered, REC)]
-    kept, dropped = drop_repeated_recovered_blocks(blocks, 0.6)
-    assert dropped == 0
+    kept, counts = drop_repeated_recovered_blocks(blocks, 0.9)
+    assert counts["total"] == 0
     assert kept[-1].text == recovered
 
 
@@ -387,6 +387,6 @@ def test_recovered_designation_known_to_mineru_dropped():
         _block(MINERU_NOTES + " Датчик 10JEB10 СТ001, отверстие ⌀ 14.", "mineru_ocr"),
         _block("10JEB10CT001 ⌀14", REC),
     ]
-    kept, dropped = drop_repeated_recovered_blocks(blocks, 0.6)
-    assert dropped == 1
+    kept, counts = drop_repeated_recovered_blocks(blocks, 0.9)
+    assert counts["total"] == 1
     assert len(kept) == 1
