@@ -184,6 +184,18 @@ class TestTableReader:
         with pytest.raises(SoftTimeLimitExceeded):
             reader(table_block())
 
+    def test_no_call_when_task_deadline_is_near(self, enabled, monkeypatch):
+        # До срока задачи меньше одного вызова модели: таблица остаётся
+        # прежнему исходу, а не роняет документ мягким лимитом.
+        from core import deadline
+
+        monkeypatch.setattr(deadline, "remaining", lambda: settings.VLM_TIMEOUT - 1)
+        client = FakeClient(QWEN_TABLE)
+        reader = table_vlm.table_reader(png_bytes(), "png", client=client)
+
+        assert reader(table_block()) is None
+        assert client.images == []
+
 
 class TestUpright:
     def test_rotates_by_confident_osd(self, monkeypatch):

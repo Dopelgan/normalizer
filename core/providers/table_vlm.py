@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import filetypes
+from core import deadline, filetypes
 from core.config import settings
 from core.models.parse_result import ParsedBlock
 
@@ -51,6 +51,13 @@ def table_reader(file_bytes: Optional[bytes], file_type: str, client=None) -> Op
         if budget["left"] <= 0:
             logger.warning("Таблица на стр. %s не перечитана: исчерпан предел %d на документ",
                            block.page, settings.TABLE_VLM_MAX_TABLES)
+            return None
+        left = deadline.remaining()
+        if left is not None and left < settings.VLM_TIMEOUT:
+            # До срока задачи не уложится вызов модели: таблица разбирается
+            # на текст, как раньше, а документ не теряется по сроку.
+            logger.warning("Таблица на стр. %s не перечитана: до срока задачи %.0f с",
+                           block.page, left)
             return None
         budget["left"] -= 1
         try:
