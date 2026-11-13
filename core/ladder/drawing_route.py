@@ -43,7 +43,7 @@ from core import filetypes
 from core.config import settings
 from core.ladder.base import text_chars
 from core.ladder.context import GENRE_DRAWING, SOURCE_RASTER, DocumentContext
-from core.ladder.structure import drawing_structure
+from core.ladder.structure import drawing_structure, picture_only
 from core.models.contract import Fragment
 from core.models.parse_result import ParseResult
 
@@ -95,18 +95,43 @@ def deferred(context: DocumentContext) -> bool:
     if context.kind != filetypes.KIND_IMAGE:
         return False
     classification = context.classification
-    if classification.source != SOURCE_RASTER:
+    return (classification.source == SOURCE_RASTER
+            and classification.genre == GENRE_DRAWING)
+
+
+def unread_frame_sheet(context: DocumentContext, result: ParseResult) -> bool:
+    """
+    Лист с рамкой формата, который разбор вернул картинкой, ничего не прочитав.
+
+    Жанр листа ставит растровый детектор по числу длинных линий и полос
+    строк, и плотный лист он называет страницей текста: у СМ1638 при рамке
+    формата нашлось 2 длинных линии вместо трёх и 7 полос строк, род листа —
+    `text_scan`, и `deferred` на него не включался.
+
+    Но одной рамки мало. Рамку детектор находит и на обычной странице с
+    таблицами — по аудиту прода на 595 листах из 4771, среди них договоры,
+    банковские гарантии и программы обеспечения качества, — и лист
+    фотографии письма с печатной рамкой выиграть спор не должен. Поэтому
+    нужен второй признак, и приходит он от другого механизма: разбор с
+    детекцией областей вернул лист одной картинкой и не взял с него ни
+    строки (`structure.picture_only`). Страницу текста MinerU читает, а
+    чертёж отдаёт картинкой — и только во втором случае счёт символов
+    сравнивает непрочитанный лист с распознаванием.
+
+    Читает такой лист всё равно чертёжная ветка, по той же рамке
+    (`DrawingProcessor._full_read_image`): условие здесь то же, что у ветки,
+    иначе два шага одного конвейера считают лист разным.
+    """
+    if not settings.LADDER_STRUCTURE_OVER_LENGTH:
         return False
-    if classification.genre == GENRE_DRAWING:
-        return True
-    # Жанр листа ставит растровый детектор по числу длинных линий и полос
-    # строк, и плотный лист он называет страницей текста: у СМ1638 при
-    # рамке формата нашлось 2 длинных линии вместо трёх и 7 полос строк.
-    # Читает такой лист всё равно чертёжная ветка — по той же рамке
-    # (`DrawingProcessor._full_read_image`), — значит и в лестнице его
-    # число символов о потере текста не говорит. Условие здесь то же, что
-    # у ветки: иначе два шага одного конвейера считают лист разным.
-    return settings.LADDER_STRUCTURE_OVER_LENGTH and has_sheet_frame(classification)
+    if not (settings.LADDER_DRAWING_OVER_OCR and settings.DRAWING_IMAGE_FULL_READ):
+        return False
+    if context.kind != filetypes.KIND_IMAGE:
+        return False
+    classification = context.classification
+    if classification.source != SOURCE_RASTER or classification.genre == GENRE_DRAWING:
+        return False
+    return has_sheet_frame(classification) and picture_only(result)
 
 
 def has_sheet_frame(classification) -> bool:
@@ -174,12 +199,23 @@ def settle(
         won = found.structured
     else:
         won = got.read > 0 and got.chars >= reserve_chars * settings.LADDER_CONTENT_KEEP_RATIO
+    # Ключи исхода пишутся всегда, в том числе ложными значениями: по ним
+    # качество разбора считают запросом к БД, а ключ, которого при хорошем
+    # исходе нет, в запросе неотличим от разбора, где сверки не было вовсе.
     outcome: Dict[str, Any] = {
         "won": won,
         "volume": got.as_dict(),
         "structure": found.as_dict(),
         "reserve_strategy": reserve.parser_name,
         "reserve_chars": reserve_chars,
+        # Лист опознан не полностью: ни штампа, ни обозначения.
+        "thin_structure": bool(won and settings.LADDER_STRUCTURE_OVER_LENGTH
+                               and not found.complete),
+        # Разбор оставлен победителем, но символов в нём меньше, чем у
+        # распознавания.
+        "thinner_kept": bool(won and got.chars < reserve_chars),
+        # Чертёжная ветка проиграла сверку: текст распознавания возвращён.
+        "lost": not won,
     }
     parse_result.ladder["drawing_route"] = outcome
     parse_result.fallback_reserve = None
@@ -200,7 +236,6 @@ def settle(
             # недочитанный штамп остаётся измеримым в `drawing_route`:
             # по нему видно, сколько таких листов в установке, и это повод
             # править чтение штампа, а не звать человека к каждому листу.
-            outcome["thin_structure"] = True
             logger.info(
                 "Лист %s прочитан без штампа и обозначения: полей %d, величин %d, "
                 "надписей видов %d — разбор принят",
@@ -216,7 +251,6 @@ def settle(
                 f"против {reserve_chars} у {reserve.parser_name} — "
                 "оставлен разбор чертежа"
             )
-            outcome["thinner_kept"] = True
             outcome["note"] = note
             parse_result.degraded = list(dict.fromkeys(
                 list(parse_result.degraded) + [note]
@@ -269,9 +303,16 @@ def lost(parse_result: ParseResult) -> bool:
 
 
 def thinner_kept(parse_result: ParseResult) -> bool:
-    """Разбор оставлен победителем, но символов в нём меньше, чем у распознавания."""
+    """
+    Разбор оставлен победителем, но символов в нём меньше, чем у распознавания.
+
+    Недочитанный штамп эту недостачу поглощает: лист, который не опознан,
+    и так записан на повторное чтение, а второе имя той же причины добавило
+    бы документу предупреждение — то есть вернуло бы его человеку на стороне
+    потребителя. В самом исходе оба факта лежат рядом и считаются оба.
+    """
     route = (parse_result.ladder or {}).get("drawing_route", {})
-    return bool(route.get("thinner_kept"))
+    return bool(route.get("thinner_kept")) and not route.get("thin_structure")
 
 
 # Признаки качества, которые лечатся повторным чтением листа, а не человеком:

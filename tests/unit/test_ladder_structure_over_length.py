@@ -17,6 +17,8 @@
 скан страницы текста) по-прежнему идёт плоским путём.
 """
 
+import io
+
 import pytest
 
 from core.config import settings
@@ -315,6 +317,123 @@ class TestOrdinaryDocumentsKeepThePlainRoute:
         """«Договор поставки №16940/337.pdf», страница 1: 52 полосы, 6 линеек."""
         signals = dict(LETTER_SIGNALS, long_rules=6, text_bands=52, ink=0.1088)
         assert route(1900, 0, signals=signals).ladder["chosen_strategy"] == "plain_ocr"
+
+
+def bordered_text_page(width=1654, height=2339, lines=40, border=3):
+    """
+    Страница текста в печатной рамке: письмо на бланке, фотография листа с
+    рамкой. Рисуется здесь, потому что в корпусе прода такого листа нет —
+    ни одной картинки, которая не была бы чертежом, там не нашлось, и
+    отсутствие контрпримера легко принять за доказательство.
+    """
+    from PIL import Image, ImageDraw
+    image = Image.new("L", (width, height), 255)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([border * 4, border * 4, width - border * 4, height - border * 4],
+                   outline=0, width=border)
+    draw.rectangle([border * 10, border * 10, width - border * 6, height - border * 6],
+                   outline=0, width=border)
+    top, step = 200, (height - 400) // lines
+    for i in range(lines):
+        y = top + i * step
+        length = int((width - 400) * (0.55 + 0.4 * ((i * 7) % 10) / 10))
+        draw.rectangle([200, y, 200 + length, y + max(6, step // 4)], fill=40)
+    return image
+
+
+def as_jpeg(image) -> bytes:
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, "JPEG", quality=92)
+    return buffer.getvalue()
+
+
+def as_multipage_tiff(*images) -> bytes:
+    buffer = io.BytesIO()
+    first, rest = images[0], list(images[1:])
+    first.save(buffer, "TIFF", save_all=True, append_images=rest)
+    return buffer.getvalue()
+
+
+def read_page_result(chars: int) -> ParseResult:
+    """Так разбор с детекцией областей возвращает страницу текста: текстом."""
+    return ParseResult(
+        blocks=[ParsedBlock(type="text", text=text_of(chars), page=1, confidence=0.9)],
+        parser_name="layout", source_kind="image", page_count=1,
+    )
+
+
+def picture_result() -> ParseResult:
+    """А так он возвращает лист чертежа: одной картинкой, без текста."""
+    return ParseResult(
+        blocks=[ParsedBlock(type="image", image_ref="assets/doc/sheet.jpg", page=1,
+                            bbox=[0.02, 0.02, 0.98, 0.98], confidence=0.94)],
+        parser_name="layout", source_kind="image", page_count=1,
+    )
+
+
+class TestBorderedTextPageIsNotADrawing:
+    """
+    Контрпример, которого не было в корпусе: страница текста в печатной
+    рамке. Растровый детектор рамку на ней находит — значит одной рамки для
+    чертёжной ветки мало, и нужен второй признак от другого механизма.
+    """
+
+    @pytest.fixture
+    def page(self):
+        return as_jpeg(bordered_text_page())
+
+    def test_the_detector_really_does_find_a_frame_here(self, page):
+        """Риск настоящий: рамка найдена, хотя это страница текста."""
+        context = DocumentContext(uri="documents/letter", file_type="jpg", data=page)
+        classification = context.classification
+        assert classification.signals["frame"] is True
+        assert classification.genre == GENRE_TEXT
+        assert drawing_route.has_sheet_frame(classification) is True
+
+    def test_a_frame_alone_does_not_defer_the_page(self, flag_on, page):
+        """Разбор страницу прочитал — спорить не о чем, маршрут прежний."""
+        context = DocumentContext(uri="documents/letter", file_type="jpg", data=page)
+        assert drawing_route.deferred(context) is False
+        assert drawing_route.unread_frame_sheet(context, read_page_result(1240)) is False
+
+    def test_a_frame_plus_an_unread_sheet_does_defer(self, flag_on, page):
+        """А лист, вернувшийся картинкой без текста, читает чертёжная ветка."""
+        context = DocumentContext(uri="documents/letter", file_type="jpg", data=page)
+        assert drawing_route.unread_frame_sheet(context, picture_result()) is True
+
+    def test_the_whole_ladder_keeps_the_letter_on_the_plain_route(self, flag_on, page):
+        """Через лестницу целиком: текст письма доезжает полностью."""
+        router = LadderRouter([OcrLevel(1240), LayoutLevel(1180)], threshold=0.75)
+        result = router.parse(
+            DocumentContext(uri="documents/letter", file_type="jpg", data=page))
+        assert result.fallback_reserve is None
+        assert "drawing_deferred" not in result.ladder
+
+    def test_multipage_tiff_of_text_pages_loses_nothing(self, flag_on):
+        """
+        Многостраничный TIFF страниц текста в рамке. Здесь дороже всего
+        ошибиться: страниц несколько, и отданный чертёжной ветке файл
+        потерял бы текст всех страниц, кроме прочитанных моделью.
+        """
+        data = as_multipage_tiff(*(bordered_text_page(lines=n) for n in (40, 34, 46)))
+        context = DocumentContext(uri="documents/scan", file_type="tif", data=data)
+        assert drawing_route.deferred(context) is False
+        assert drawing_route.unread_frame_sheet(context, read_page_result(3600)) is False
+        router = LadderRouter([OcrLevel(3600), LayoutLevel(3400)], threshold=0.75)
+        result = router.parse(context)
+        assert result.fallback_reserve is None
+        assert "drawing_deferred" not in result.ladder
+
+    def test_sparse_text_in_a_frame_is_the_detectors_own_call(self, page):
+        """
+        Честная граница правила: страницу с рамкой и восемью строками
+        растровый детектор сам называет чертежом, и в чертёжную ветку её
+        отдаёт прежнее правило `LADDER_DRAWING_OVER_OCR`, а не это. Здесь
+        это зафиксировано как свойство детектора, а не как наше решение.
+        """
+        sparse = as_jpeg(bordered_text_page(lines=8))
+        context = DocumentContext(uri="documents/sparse", file_type="jpg", data=sparse)
+        assert context.classification.genre == GENRE_DRAWING
 
 
 @pytest.mark.usefixtures("flag_on")

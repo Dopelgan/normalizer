@@ -331,7 +331,9 @@ class TestSettleAfterSheetRead:
         lines = [f"XT{i} A{i} B{i} 0,75" for i in range(200)]
         fragments = [drawing_sheet(lines=lines, fields=["XT1", "XT2"])]
         drawing_route.settle(fragments, result, METADATA, TextNormalizer())
-        assert "thinner_kept" not in result.ladder["drawing_route"]
+        # Ключи исхода пишутся всегда, в том числе ложными значениями: иначе
+        # в запросе к БД «ключа нет» неотличимо от «сверки не было».
+        assert result.ladder["drawing_route"]["thinner_kept"] is False
         assert result.degraded == []
         assert drawing_route.thinner_kept(result) is False
 

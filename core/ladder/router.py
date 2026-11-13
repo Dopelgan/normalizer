@@ -202,18 +202,6 @@ class LadderRouter:
         # Лист прочитает чертёжная ветка: счёт символов у структурного
         # разбора сравнивал бы непрочитанный лист с распознаванием.
         sheet_read_later = drawing_route.deferred(context)
-        # Лист чертежа: плоский текст не побеждает структурный разбор ни при
-        # каком числе символов. Мерка сохранности здесь сравнивала бы
-        # непрочитанный лист с распознаванием, и у СМ1638 ровно она решила
-        # спор: `layout` с оценкой 0.465 проиграл `plain_ocr` с оценкой 0.295,
-        # потому что символов у непрочитанного листа было 0 против 98.
-        #
-        # Только там, где лист прочитает чертёжная ветка (`sheet_read_later`):
-        # старшинство выдаётся авансом, и вернуть текст распознавания, если
-        # лист прочитать не удалось, можно лишь из запаса, который заводится
-        # в том же случае. Скан PDF сюда не входит: страниц много, среди них
-        # бывает проза, и счёт символов на них — честная проверка сохранности.
-        structure_first = settings.LADDER_STRUCTURE_OVER_LENGTH and sheet_read_later
 
         def candidate_rank(candidate):
             parsed, evaluated, _, unit_coverage = candidate
@@ -225,9 +213,7 @@ class LadderRouter:
             # Дополнительная страница не оправдывает доказанную потерю уже
             # извлечённого текста. После нового fallback переоцениваем и
             # прежних кандидатов относительно той же мерки сохранности.
-            return (int(structured and structure_first),
-                    int(retains), unit_coverage, int(structured and retains),
-                    evaluated.value)
+            return (int(retains), unit_coverage, int(structured and retains), evaluated.value)
 
         for strategy in applicable:
             left = deadline.remaining()
@@ -286,6 +272,20 @@ class LadderRouter:
 
             if structural:
                 structural_seen = True
+                if (not sheet_read_later
+                        and not self._keeps_content(chars, fallback_chars)
+                        and drawing_route.unread_frame_sheet(context, result)):
+                    # Лист с рамкой формата вернулся картинкой без текста:
+                    # читать его будет чертёжная ветка, и до её чтения счёт
+                    # символов сравнивает непрочитанный лист с
+                    # распознаванием. Старшинство такому разбору даётся
+                    # авансом — ровно как листу жанра `drawing`.
+                    sheet_read_later = True
+                    logger.info(
+                        "Лист %s: рамка формата есть, уровень %d вернул лист "
+                        "картинкой без текста — лист прочитает чертёжная ветка",
+                        context.uri, strategy.level,
+                    )
             else:
                 fallback_chars = max(fallback_chars, chars)
 
