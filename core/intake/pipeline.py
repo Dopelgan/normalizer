@@ -62,7 +62,15 @@ class IntakePipeline:
         Ничего не бросает наружу: приём одного файла не должен уводить в
         повтор задачу, которая уже вынесла вердикты по остальным.
         """
-        with telemetry.collect() as timings:
+        # Модуль OCR тяжёлый (pytesseract, pdf2image): импорт здесь, а не при
+        # загрузке, чтобы ручка Data Gateway его не тянула.
+        from core.providers.tesseract_fallback import ocr_memo
+
+        # Скан без текстового слоя распознаётся на обоих этапах: Data
+        # Gateway классифицирует его по тексту первых страниц, Quality Gate
+        # мерит по ним читаемость. Страницы, разрешение и Tesseract те же —
+        # в общем блоке памяти второй этап их не распознаёт заново.
+        with telemetry.collect() as timings, ocr_memo():
             with telemetry.measure(
                 "intake.file", request_id=request_id, s3_fileid=item.s3_fileid
             ) as span:

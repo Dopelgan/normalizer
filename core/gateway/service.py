@@ -491,7 +491,7 @@ class DataGateway:
         разбор спорных случаев, а не объявляется тем, чей маркер оказался
         выше в списке.
         """
-        probe = text_probe.extract(file_type, data)
+        probe = text_probe.extract(file_type, data, uri=path, storage=self.storage)
         signals: Dict[str, Any] = probe.as_dict()
 
         if probe.reliable:
@@ -499,7 +499,17 @@ class DataGateway:
             if match.matched:
                 signals["matched_in"] = "текст"
                 signals.update(match.as_signals())
-                return match.category, match.confidence, signals
+                confidence = match.confidence
+                if (
+                    probe.source == text_probe.SOURCE_OCR
+                    and match.category not in self.profile.accepted_categories
+                ):
+                    # Распознанный текст ошибается: «отпуск» из «Положения об
+                    # отпусках» — не повод выбросить документ навсегда. По
+                    # тексту OCR файл принимается или уходит человеку (G-4),
+                    # но не отклоняется.
+                    confidence = min(confidence, 0.5)
+                return match.category, confidence, signals
 
         # Путь целиком, а не только имя файла: каталог «Договоры и ДС» —
         # такой же признак, как слово в названии. Для скана без текстового
