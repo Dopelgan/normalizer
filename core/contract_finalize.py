@@ -71,6 +71,53 @@ def stable_fragment_id(doc_id: str, fragment: Fragment) -> str:
     return f"{doc_id or 'doc'}:p{page:03d}:{fragment.type}:{digest}"
 
 
+def _without_nul(value: Any) -> Any:
+    """Значение без символа U+0000 — в строках, списках и словарях на любой глубине."""
+    if isinstance(value, str):
+        return value.replace("\x00", "") if "\x00" in value else value
+    if isinstance(value, list):
+        return [_without_nul(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _without_nul(item) for key, item in value.items()}
+    return value
+
+
+def _drop_nul(fragment: Fragment) -> None:
+    """
+    Убирает U+0000 из содержимого фрагмента.
+
+    Текстовый слой PDF отдаёт его на глифах без таблицы символов, и чертёжная
+    ветка делала из таких строк «примечания» со значением из одних нулей.
+    PostgreSQL не переводит `\\u0000` в текст: у Normalizer один такой фрагмент
+    ломает любую выборку `content->>...` по всей таблице `chunks`, а у RAG —
+    приведение результата к jsonb. Поле чертежа, от значения которого после
+    очистки ничего не осталось, выбрасывается: значения в нём не было.
+    """
+    content = fragment.content
+    if content.text and "\x00" in content.text:
+        content.text = content.text.replace("\x00", "")
+    if fragment.section_title and "\x00" in fragment.section_title:
+        fragment.section_title = fragment.section_title.replace("\x00", "")
+    if content.structured_drawing_fields:
+        kept = []
+        for field in content.structured_drawing_fields:
+            had_nul = "\x00" in field.value
+            for name in ("category", "value", "tolerance", "unit"):
+                current = getattr(field, name)
+                if isinstance(current, str) and "\x00" in current:
+                    setattr(field, name, current.replace("\x00", ""))
+            if had_nul and not field.value.strip():
+                continue
+            kept.append(field)
+        content.structured_drawing_fields = kept
+    if content.table_data is not None:
+        content.table_data.headers = _without_nul(content.table_data.headers)
+        content.table_data.rows = _without_nul(content.table_data.rows)
+        content.table_data.total_row = _without_nul(content.table_data.total_row)
+    if content.structured_payload:
+        content.structured_payload = _without_nul(content.structured_payload)
+
+
 def finalize_fragments(
     fragments: List[Fragment],
     doc_id: str,
@@ -86,6 +133,7 @@ def finalize_fragments(
     seen: Dict[str, int] = {}
 
     for order, fragment in enumerate(fragments, start=1):
+        _drop_nul(fragment)
         if fragment.type == "drawing":
             apply_drawing_quality(fragment)
         if fragment.provenance.source_unit_id is None:
