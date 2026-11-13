@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 KIND_TITLE_BLOCK = "title_block"
 KIND_TABLE = "table"
 
+# Колонка дополнительных граф по ГОСТ 2.104 — 12 мм у левого поля подшивки,
+# то есть слева от внутренней рамки. На A4 (210 мм) это 0,057 ширины листа,
+# на A1 (841 мм) — 0,014; берётся с запасом, лишняя полоса бумаги чтению не
+# мешает, а срезанная графа теряется целиком.
+_SIDE_COLUMN_WIDTH = 0.09
+# Полоса шире этого — не графы, а часть чертежа: рамка найдена неверно.
+_SIDE_COLUMN_MAX = 0.2
+
 # Отрезок считается линией сетки с этой доли стороны листа.
 _MIN_LINE = 0.05
 # Линии ближе этого друг к другу — одна и та же линия разной толщины.
@@ -277,11 +285,144 @@ def ink_mask(image, work_side: int = WORK_SIDE):
     return grey < _threshold(grey, numpy)
 
 
-def crop(image, bbox: Sequence[float], upscale: Optional[float] = None, padding: float = 0.01):
+def side_column(layout: "SheetLayout") -> Optional[List[float]]:
+    """
+    Полоса с колонкой дополнительных граф: от внутренней рамки влево на
+    `_SIDE_COLUMN_WIDTH`, во всю высоту рамки.
+
+    Там лежат «Перв. примен.», «Справ. №», «Инв. № подл.», «Подп. и дата»,
+    «Взам. инв. №», «Инв. № дубл.» — то, чего в вырезке штампа нет никогда:
+    штамп примыкает к рамке справа, а эти графы стоят слева от неё, в поле
+    подшивки. `None` — внутренней рамки нет или полоса не похожа на поле
+    подшивки.
+
+    Берётся только внутренняя рамка. Внешняя — это обрез листа, и слева от
+    неё лежит не поле подшивки, а пустая бумага: один вызов модели на
+    чистую полоску.
+    """
+    frame = layout.signals.get("inner_frame")
+    if not frame:
+        return None
+    left, top, _, bottom = (float(value) for value in frame)
+    if left <= 0.004 or left > _SIDE_COLUMN_MAX:
+        # Рамка у самого края: поля подшивки на листе нет (или скан обрезан).
+        return None
+    start = max(0.0, left - _SIDE_COLUMN_WIDTH)
+    return [round(start, 4), round(max(0.0, top), 4),
+            round(left, 4), round(min(1.0, bottom), 4)]
+
+
+# Внутренняя рамка по ГОСТ 2.301 для форматов, которые встречаются на
+# чертежах: (ширина, высота) в мм. Нужна только пропорция — по ней формат
+# узнаётся без знания разрешения, в котором лист отрисован.
+_FRAMES_MM = (
+    (185, 287), (277, 195),      # A4 и A4 альбомный
+    (395, 287), (272, 410),      # A3 и A3 книжный
+    (569, 407), (395, 584),      # A2 и A2 книжный
+    (816, 574), (569, 831),      # A1 и A1 книжный
+    (1159, 818),                 # A0
+)
+# Основная надпись формы 1 по ГОСТ 2.104 — 185×55 мм в правом нижнем углу
+# внутренней рамки.
+_STAMP_MM = (185.0, 55.0)
+# Пропорция рамки отличается от табличной больше чем на столько — формат не
+# узнан, и подгонять область по ГОСТ нельзя.
+_FORMAT_TOLERANCE = 0.06
+
+
+def stamp_bbox(layout: "SheetLayout") -> Optional[List[float]]:
+    """
+    Область основной надписи по ГОСТ: 185×55 мм в правом нижнем углу
+    внутренней рамки, в долях листа. `None` — рамки нет или её пропорция
+    не отвечает ни одному формату.
+
+    Зачем это поверх найденной сетки. Длинные линии штампа примыкают к
+    рамке формата и в группу линий не попадают, поэтому сетка находит не
+    весь штамп, а его кусок: на листе АЕГН…0015 СБ это оказался правый
+    блок «Лит. | Масса | Масштаб» — без обозначения, наименования и строк
+    подписей. Вырезка по ГОСТ не зависит от того, какие линии уцелели.
+    """
+    if layout.image is None:
+        return None
+    # Внутренняя рамка точнее, но её находит не каждый лист: на листе
+    # АЕГН…0015 СБ нижняя линия ушла на 0,85 высоты, и пропорция не сошлась
+    # ни с одним форматом. Тогда берётся рамка формата — у неё та же
+    # пропорция с точностью до поля подшивки.
+    for candidate in (layout.signals.get("inner_frame"), layout.frame):
+        found = _stamp_in(candidate, layout.image.size)
+        if found is not None:
+            return found
+    return None
+
+
+def _stamp_in(frame: Any, size: Tuple[int, int]) -> Optional[List[float]]:
+    """Область штампа внутри рамки `frame`, если её пропорция — формат ГОСТ."""
+    if not frame:
+        return None
+    left, top, right, bottom = (float(value) for value in frame)
+    width, height = right - left, bottom - top
+    if width <= 0 or height <= 0:
+        return None
+    # Рамка во весь лист — это не рамка, а обрез: её пропорция равна
+    # пропорции бумаги (0,707) и случайно сходится с форматом A2 книжным.
+    # Настоящая рамка всегда отступает от края.
+    if left <= 0.004 and top <= 0.004 and right >= 0.996 and bottom >= 0.996:
+        return None
+    # Пропорция рамки на листе: доли листа домножаются на его стороны.
+    aspect = (width * size[0]) / (height * size[1])
+    best = min(_FRAMES_MM, key=lambda mm: abs(mm[0] / mm[1] - aspect))
+    if abs(best[0] / best[1] - aspect) > _FORMAT_TOLERANCE * best[0] / best[1]:
+        return None
+    stamp = [
+        right - width * _STAMP_MM[0] / best[0],
+        bottom - height * _STAMP_MM[1] / best[1],
+        right, bottom,
+    ]
+    return [round(max(0.0, min(1.0, value)), 4) for value in stamp]
+
+
+def title_block_crop(layout: "SheetLayout", region: Region) -> List[float]:
+    """
+    Что вырезать под чтение штампа: область по ГОСТ, если формат листа
+    узнан, иначе — то, что нашла сетка.
+
+    Область по ГОСТ именно заменяет найденную, а не дополняет её. Сетка
+    ошибается в обе стороны: на одном листе она дала правый блок штампа
+    без обозначения и фамилий, на другом — половину листа, где сам штамп
+    занимает седьмую часть вырезки. Вырезать половину листа ради штампа
+    значит вернуться к тому разрешению, на котором путаются фамилии.
+    """
+    return stamp_bbox(layout) or list(region.bbox)
+
+
+def upright(image, turn: int = -90):
+    """
+    Колонка дополнительных граф, повёрнутая под чтение. По ГОСТ 2.104
+    надписи в ней читаются снизу вверх, поэтому полоса поворачивается по
+    часовой: нижняя графа уходит налево и становится первой в строке.
+    """
+    try:
+        return image.rotate(turn, expand=True, fillcolor="white")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Поворот колонки граф не удался: %s", exc)
+        return image
+
+
+def crop(
+    image,
+    bbox: Sequence[float],
+    upscale: Optional[float] = None,
+    padding: float = 0.01,
+    max_side: Optional[int] = None,
+):
     """
     Вырезает область по долям листа и увеличивает её. Увеличение — не
     украшение: мелкий текст штампа читается на увеличенном фрагменте
     заметно лучше, а лист целиком в таком разрешении не отправить.
+
+    `max_side` — потолок длинной стороны после увеличения. Он обязан
+    совпадать с тем, с которым вырезку отправят модели: ужать её здесь до
+    1600, а потом просить 2600 значит не увеличить ничего.
     """
     width, height = image.size
     x1 = max(0.0, float(bbox[0]) - padding)
@@ -296,7 +437,7 @@ def crop(image, bbox: Sequence[float], upscale: Optional[float] = None, padding:
         try:
             from PIL import Image
             target = (int(piece.width * factor), int(piece.height * factor))
-            limit = settings.QWEN_REGION_MAX_SIDE
+            limit = settings.QWEN_REGION_MAX_SIDE if max_side is None else max_side
             if max(target) > limit:
                 scale = limit / max(target)
                 target = (max(1, int(target[0] * scale)), max(1, int(target[1] * scale)))

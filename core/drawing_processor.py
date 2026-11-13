@@ -61,7 +61,9 @@ from celery.exceptions import SoftTimeLimitExceeded
 from core import deadline
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
-from core.providers import drawing_text, drawing_vision, raster_drawing, vector_drawing
+from core.providers import (
+    drawing_text, drawing_vision, raster_drawing, title_block, vector_drawing,
+)
 from core.providers.qwen_client import CATEGORIES, QwenVisionClient
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.vector_drawing import structure_ratio
@@ -90,6 +92,7 @@ _AGREED = 0.9            # модель и правило назвали одн�
 _MODEL_ONLY = 0.75       # правило не знает такой категории (позиция, штамп)
 _DISAGREED = 0.6         # разошлись: поле остаётся, но доверия меньше
 _FROM_REGION = 0.85      # прочитано в области, найденной геометрией
+_HANDWRITTEN = 0.5       # дописано от руки: проверить правилами нечем
 
 # Классификатор «чертёж или текст» (DRAWING_PAGE_CLASSIFIER_ENABLED). В
 # текстовом документе картинка меньше этой доли листа — логотип, печать,
@@ -175,10 +178,10 @@ class DrawingProcessor:
                 skipped += 1
                 missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "time_budget"})
                 continue
-            piece = drawing_vision.crop(layout.image, region.bbox)
             if region.kind == drawing_vision.KIND_TITLE_BLOCK:
-                read = self._read_title_block(piece, region, fields, payload)
+                read = self._read_title_block(layout, region, fields, payload)
             else:
+                piece = drawing_vision.crop(layout.image, region.bbox)
                 read = self._read_table(piece, region, payload)
             regions_read += int(read)
             if not read:
@@ -485,12 +488,15 @@ class DrawingProcessor:
     # ------------------------------------------------------------ чтение
     def _read_title_block(
         self,
-        piece,
+        layout: drawing_vision.SheetLayout,
         region: drawing_vision.Region,
         fields: List[Dict[str, Any]],
         payload: Dict[str, Any],
     ) -> bool:
         """Штамп: графы превращаются в поля, таблица целиком — в payload."""
+        if settings.DRAWING_TITLE_BLOCK_PASS:
+            return self._read_title_block_fields(layout, region, fields, payload)
+        piece = drawing_vision.crop(layout.image, region.bbox)
         block = self.qwen.read_title_block(piece)
         if block is None:
             logger.warning("Штамп не прочитан")
@@ -518,6 +524,81 @@ class DrawingProcessor:
                 label=str(name),
             ))
         return True
+
+    def _read_title_block_fields(
+        self,
+        layout: drawing_vision.SheetLayout,
+        region: drawing_vision.Region,
+        fields: List[Dict[str, Any]],
+        payload: Dict[str, Any],
+    ) -> bool:
+        """
+        Отдельный проход по штампу (DRAWING_TITLE_BLOCK_PASS).
+
+        Два отличия от обычного чтения области. Вырезка штампа идёт в
+        модель в своём, высоком разрешении: на ужатой вырезке путаются
+        фамилии и код документа. И колонка дополнительных граф у левого
+        поля читается отдельным запросом — в вырезку штампа она не входит
+        никогда, а «Инв. № подл.» и «Перв. примен.» лежат именно там.
+        """
+        bbox = drawing_vision.title_block_crop(layout, region)
+        payload["title_block_bbox"] = bbox
+        piece = drawing_vision.crop(
+            layout.image, bbox,
+            upscale=settings.QWEN_TITLE_BLOCK_UPSCALE,
+            max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE,
+        )
+        parsed = self.qwen.read_title_block_fields(piece)
+        side = self._read_side_column(layout, payload)
+        if parsed is None and side is None:
+            logger.warning("Штамп не прочитан")
+            return False
+        parsed = _merge_blocks(parsed, side)
+
+        payload["title_block"] = dict(parsed.get("fields") or {})
+        handwritten = dict(parsed.get("handwritten") or {})
+        if handwritten:
+            payload["title_block_handwritten"] = handwritten
+        if parsed.get("rows"):
+            payload["tables"].append({
+                "kind": drawing_vision.KIND_TITLE_BLOCK,
+                "bbox": region.bbox,
+                "rows": parsed["rows"],
+            })
+
+        for name, value, by_hand in title_block.entries(parsed):
+            text = drawing_text.normalize(value)
+            readable, _ = drawing_text.looks_like_text(text)
+            if not readable:
+                continue
+            category = "material" if _is_material(name, text) else "title_block"
+            fields.append(_field(
+                category=category,
+                text=title_block.mark(text, by_hand),
+                bbox=region.bbox,
+                # Рукописное прочитано с той же вырезки, но проверить его
+                # правилами нечем: уверенность ниже печатной графы.
+                confidence=_HANDWRITTEN if by_hand else _FROM_REGION,
+                label=name,
+            ))
+        return True
+
+    def _read_side_column(
+        self, layout: drawing_vision.SheetLayout, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Колонка дополнительных граф у левого поля, повёрнутая под чтение."""
+        if not settings.DRAWING_SIDE_COLUMN_READ:
+            return None
+        bbox = drawing_vision.side_column(layout)
+        if bbox is None:
+            return None
+        piece = drawing_vision.upright(drawing_vision.crop(
+            layout.image, bbox, upscale=settings.QWEN_TITLE_BLOCK_UPSCALE,
+            padding=0.0, max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE,
+        ))
+        parsed = self.qwen.read_side_column(piece)
+        payload["side_column"] = {"bbox": bbox, "read": parsed is not None}
+        return parsed
 
     def _read_table(
         self, piece, region: drawing_vision.Region, payload: Dict[str, Any]
@@ -721,6 +802,31 @@ def _deduplicate(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif field["confidence"] > best[key]["confidence"]:
             best[key] = field
     return [best[key] for key in order]
+
+
+def _merge_blocks(
+    block: Optional[Dict[str, Any]], side: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Графы штампа и графы боковой колонки в один разбор. Штамп главнее:
+    одну и ту же графу (обозначение бывает и там и там) он переопределяет,
+    а боковая колонка добавляет то, чего в штампе нет.
+    """
+    merged: Dict[str, Any] = {"fields": {}, "handwritten": {}, "unknown": {}, "rows": []}
+    for part in (side, block):
+        if not part:
+            continue
+        for key in ("fields", "handwritten", "unknown"):
+            merged[key].update(part.get(key) or {})
+        merged["rows"] = part.get("rows") or merged["rows"]
+    # Одно и то же значение, названное и печатным, и рукописным, остаётся
+    # одним — рукописным. Разные значения сохраняются оба: выбрать между
+    # «1085-02» из штампа и «1085» из боковой колонки нечем, а потерять
+    # лучшее из двух хуже, чем отдать оба.
+    for key, value in list(merged["fields"].items()):
+        if merged["handwritten"].get(key, "").strip() == value.strip():
+            merged["fields"].pop(key)
+    return merged
 
 
 def _is_material(name: str, text: str) -> bool:
