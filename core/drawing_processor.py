@@ -68,6 +68,7 @@ from core.providers.qwen_client import CATEGORIES, QwenVisionClient
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.vector_drawing import structure_ratio
 from core.drawing_quality import apply_drawing_quality
+from core.drawing_transcript import apply_transcripts
 
 logger = logging.getLogger(__name__)
 
@@ -330,7 +331,8 @@ class DrawingProcessor:
 
         had_drawings = any(f.type == "drawing" for f in result)
         sheets = self._sheet_drawings(result, metadata)
-        if sheets and had_drawings and settings.DRAWING_SHEET_MISSING_PAGES:
+        pdf_full_read = self._full_read_pdf(metadata)
+        if sheets and (pdf_full_read or (had_drawings and settings.DRAWING_SHEET_MISSING_PAGES)):
             # Дочитанный лист встаёт перед фрагментами своей страницы, а не
             # в начало документа: порядок страниц сохраняется.
             for sheet in sheets:
@@ -344,6 +346,8 @@ class DrawingProcessor:
             for fragment in result:
                 fragment.review_required = True
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
+        if settings.DRAWING_TRANSCRIPT_FIXES_OCR:
+            result = apply_transcripts(result)
         return result
 
     # -------------------------------------------------- лист-картинка целиком
@@ -357,7 +361,7 @@ class DrawingProcessor:
         лестницы), а не только файл как одна картинка: PDF как растр не
         открывается, и ветка молча вернула бы пустой результат.
         """
-        full_read = self._full_read_image(metadata)
+        full_read = self._full_read_image(metadata) or self._full_read_pdf(metadata)
         drawings = [fragment for fragment in fragments if fragment.type == "drawing"]
         drawn_pages = {int(f.position.page) for f in drawings if f.position is not None}
         # Нарезанные MinerU картинки листа — это виды, а не лист: штамп,
@@ -443,6 +447,18 @@ class DrawingProcessor:
             return False
         verdict = raster_drawing.analyse(data)
         return verdict.is_drawing or bool(verdict.signals.get("frame"))
+
+    def _full_read_pdf(self, metadata: Dict[str, Any]) -> bool:
+        """
+        Скан чертежа в PDF читается целиком со всем текстом листа
+        (DRAWING_PDF_FULL_READ): вырезки видов, которые нарезал MinerU, не
+        несут ни штампа, ни технических требований, ни размеров вне вырезок.
+        """
+        if not settings.DRAWING_PDF_FULL_READ:
+            return False
+        if str(metadata.get("file_type") or "").lower().lstrip(".") != "pdf":
+            return False
+        return self._source_is_raster_drawing(metadata)
 
     def _source_is_raster_drawing(self, metadata: Dict[str, Any]) -> bool:
         """Растровый чертёж по классификации лестницы, иначе — по самому файлу."""
