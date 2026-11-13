@@ -240,6 +240,14 @@ class DrawingProcessor:
             # Один размер, прочитанный и на листе целиком, и на вырезке вида:
             # остаётся прочтение со знаком «±» и со справочной звёздочкой.
             fields = dimension_fidelity.merge_readings(fields)
+        # Связь величины с видом: заголовок из уже прочитанных надписей,
+        # область — из геометрии листа. Поля не меняются, модель не
+        # вызывается; выключенный флаг не добавляет ничего. Место важно:
+        # `fields` к этой точке уже сведены и слиты по знакам, а привязка
+        # ссылается на них по номеру.
+        value_links = self._value_links(layout, fields)
+        if value_links is not None:
+            payload["value_links"] = value_links
         mode = MODE_VISION_VLM if (self.vision_enabled and layout.regions) else MODE_SHEET_ONLY
         if not fields and not payload["tables"] and not payload.get("transcript_lines"):
             self._log_sheet(image_ref, sheet, MODE_NONE, 0, len(lines or []),
@@ -273,6 +281,35 @@ class DrawingProcessor:
             "mode": mode,
             "payload": payload,
         }
+
+    # ------------------------------------------------- связь величин с видами
+    @staticmethod
+    def _value_links(layout, fields) -> Optional[Dict[str, Any]]:
+        """
+        Блок `value_links` или `None`, если связывать нечего.
+
+        Модуль `core/providers/drawing_views.py` и настройку
+        `DRAWING_VALUE_VIEW_LINKS` приносит ветка связывания величин с
+        видами (`fix/drawing-value-links-20261114`); в этом дереве нет ни
+        того, ни другого.
+
+        Поэтому импорт здесь ленивый и внутри проверки флага, а не наверху
+        файла. Импорт наверху в дереве без той ветки — это ImportError на
+        загрузке модуля, то есть падает не разбор чертежа, а весь
+        `core.drawing_processor`: ни один документ не будет разобран вовсе.
+        Это заметно хуже, чем AttributeError внутри функции, который широкий
+        `except Exception` в обогащении хотя бы удерживает на одном листе.
+
+        Сам `attach` тоже возвращает `None` при выключенном флаге, так что
+        отказ держится и структурно, независимо от этого места вызова;
+        проверка флага здесь нужна ровно для того, чтобы до импорта дело не
+        дошло, пока модуля нет.
+        """
+        if not _value_view_links():
+            return None
+        from core.providers import drawing_views
+
+        return drawing_views.attach(layout, fields)
 
     # ------------------------------------------------------------------- лог
     # Доказательство работы модели на чертеже читается прямо из лога: по
@@ -807,6 +844,20 @@ def _is_text_document(fragments: List[Fragment], metadata: Dict[str, Any]) -> bo
 
 def _visible_chars(text: str) -> int:
     return len("".join(text.split()))
+
+
+def _value_view_links() -> bool:
+    """
+    Связывать ли величины с видами (`DRAWING_VALUE_VIEW_LINKS`).
+
+    Настройку приносит ветка связывания величин с видами; пока её нет,
+    поля в `Settings` нет тоже, и прямое обращение подняло бы AttributeError
+    на каждом листе. Читается через `getattr` с умолчанием — тем же приёмом,
+    что `drawing_genre.enabled()`. Отдельной функцией, а не выражением на
+    месте, чтобы проводку можно было проверить тестом, не трогая singleton
+    настроек: pydantic отказывается заводить неизвестное поле даже на запись.
+    """
+    return bool(getattr(settings, "DRAWING_VALUE_VIEW_LINKS", False))
 
 
 def _is_small_picture(fragment: Fragment) -> bool:
