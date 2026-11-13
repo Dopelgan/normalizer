@@ -21,7 +21,7 @@ from core.drawing_quality import document_quality
 from core.models.contract import Content, Fragment, Position, Provenance
 from core.providers.qwen_client import (
     TILE_CUT, TILE_NO_TIME, TILE_NOT_READ, QwenVisionClient, Transcript,
-    merge_lines, salvage_lines, tile_boxes,
+    counting_run, merge_lines, salvage_lines, tile_boxes,
 )
 
 pytest.importorskip("numpy")
@@ -151,6 +151,18 @@ class TestSalvage:
         assert salvage_lines(content) == ["Блок", "1", "1", "1"]
 
 
+class TestCountingRun:
+    def test_long_count_is_found(self):
+        lines = ["ТАДУ", "XT21"] + [f"QF{n}" for n in range(1, 200)]
+        assert counting_run(lines) == 2
+
+    def test_short_real_row_is_kept(self):
+        assert counting_run([f"QF{n}" for n in range(1, 25)] + ["XT1"]) is None
+
+    def test_broken_count_is_not_a_run(self):
+        assert counting_run([f"X{n % 20}" for n in range(1, 100)]) is None
+
+
 class TestMerge:
     def test_overlap_duplicate_dropped_repeat_inside_part_kept(self):
         merged = merge_lines([["XT1", "XT1", "QF1"], ["QF1", "XT1", "QF2"]])
@@ -245,6 +257,22 @@ class TestTranscribeSheet:
         transcript = client(model).transcribe_sheet(quartered(), until=time.monotonic() - 1)
         assert {reason for _, reason in transcript.failed} == {TILE_NO_TIME}
         assert len(model.calls) == 1
+
+    def test_count_loop_is_cut_and_read_by_tiles(self, tiles):
+        class Counting(TruncatingModel):
+            def post(self, url, json=None, headers=None, timeout=None):
+                parts = shown_parts(json)
+                self.calls.append(parts)
+                lines = [line for name in parts for line in TEXT[name]]
+                if len(parts) == 4:
+                    # Лист целиком: модель сбилась на счёт и закончила JSON.
+                    lines = lines[:3] + [f"QF{n}" for n in range(1, 1001)]
+                return Response(reply(_json(lines)))
+        model = Counting()
+        transcript = client(model).transcribe_sheet(quartered())
+        assert transcript.complete and transcript.tiles == 4
+        assert all(line in transcript.lines for line in ALL_LINES)
+        assert "QF31" not in transcript.lines and "QF30" in transcript.lines
 
     def test_wrong_shape_is_not_tiled(self, tiles):
         class Shapeless(TruncatingModel):

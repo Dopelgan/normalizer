@@ -33,6 +33,7 @@ import contextvars
 import io
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -365,11 +366,21 @@ class QwenVisionClient:
         content, finish = answer
         data = extract_json(content)
         if data is not None and finish != "length":
-            if isinstance(data.get("lines"), list):
-                return _clean_lines(data["lines"]), False
-            logger.warning("Модель вернула JSON без списка lines")
-            return None, False
-        return salvage_lines(content), True
+            if not isinstance(data.get("lines"), list):
+                logger.warning("Модель вернула JSON без списка lines")
+                return None, False
+            lines, cut = _clean_lines(data["lines"]), False
+        else:
+            lines, cut = salvage_lines(content), True
+        start = counting_run(lines)
+        if start is not None:
+            # Модель сбилась на счёт («QF1», «QF2», … «QF1000»): хвост счёта —
+            # выдумка, а не текст листа. Ответ считается оборванным на нём,
+            # и часть листа дочитывается мельче.
+            logger.warning("Модель сбилась на счёт с «%s»: %d строк отброшено",
+                           lines[start], len(lines) - start - _COUNT_RUN)
+            return lines[:start + _COUNT_RUN], True
+        return lines, cut
 
     def health(self) -> bool:
         """Отвечает ли хост модели. Нужна для приёмки и для понятного лога."""
@@ -610,6 +621,30 @@ def salvage_lines(content: str) -> List[str]:
             break
         found.append(value)
     return _collapse_runs(_clean_lines(found))
+
+
+# Подряд столько строк «префикс + число» с шагом 1 — модель сбилась на
+# счёт. На схеме ряд клемм бывает длинным, но в одной части листа столько
+# подписей подряд не стоит; настоящие строки дочитает часть меньше.
+_COUNT_RUN = 30
+_NUMBERED = re.compile(r"^(.*?)(\d+)$")
+
+
+def counting_run(lines: Sequence[str]) -> Optional[int]:
+    """Начало счёта длиной больше _COUNT_RUN строк или None."""
+    start, length, previous = 0, 0, None
+    for index, line in enumerate(lines):
+        match = _NUMBERED.match(line)
+        current = (match.group(1), int(match.group(2))) if match else None
+        if (current and previous and current[0] == previous[0]
+                and current[1] == previous[1] + 1):
+            length += 1
+        else:
+            start, length = index, 1 if current else 0
+        if length > _COUNT_RUN:
+            return start
+        previous = current
+    return None
 
 
 # Ответ часто упирается в потолок оттого, что модель зациклилась на одной
