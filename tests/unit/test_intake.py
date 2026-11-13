@@ -804,10 +804,35 @@ class TestReadabilityWithoutText:
         assert verdict.stage == "QG-4"
 
     def test_unreadable_text_is_still_quarantined(self, monkeypatch):
-        """Текст нашёлся, но распознан почти на ноль — прежнее поведение."""
+        """Страница текста распознана почти на ноль — прежнее поведение."""
         monkeypatch.setattr(QualityGate, "_quick_ocr", probe_of(0.1, 5))
+        verdict = quality().ocr_check(FakeContext(filetypes.KIND_IMAGE), [])
+        assert verdict.outcome == QUARANTINE
+
+    @pytest.mark.parametrize("confidence", [0.1, 0.28, 0.34])
+    def test_drawing_with_low_ocr_confidence_is_accepted(self, monkeypatch, confidence):
+        """
+        Прод, 13.11: десять растровых чертежей (ТАДУ 421451.003 СППИ, отрезной
+        лист СМ1638…) ушли в карантин с уверенностью быстрого OCR 0.28–0.35.
+        Tesseract на листе чертежа меряет графику, а не читаемость: лист
+        читает ветка чертежей. Уверенность остаётся в вердикте и в
+        предупреждении.
+        """
+        monkeypatch.setattr(QualityGate, "_quick_ocr", probe_of(confidence, 5))
+        warnings = []
         verdict = quality().ocr_check(
-            FakeContext(filetypes.KIND_IMAGE, genre=GENRE_DRAWING), []
+            FakeContext(filetypes.KIND_PDF, genre=GENRE_DRAWING, file_type="pdf"),
+            warnings,
+        )
+        assert verdict.outcome == ACCEPT
+        assert verdict.confidence == pytest.approx(confidence)
+        assert any("чертежа" in w for w in warnings)
+
+    def test_unknown_scan_with_low_ocr_confidence_stays_in_quarantine(self, monkeypatch):
+        """«Программа подтверждения сертификатных данных.pdf», жанр unknown, 0.34."""
+        monkeypatch.setattr(QualityGate, "_quick_ocr", probe_of(0.34, 5))
+        verdict = quality().ocr_check(
+            FakeContext(filetypes.KIND_PDF, genre="unknown", file_type="pdf"), []
         )
         assert verdict.outcome == QUARANTINE
 
@@ -959,6 +984,20 @@ class TestUnreadableShare:
         verdict = quality().ocr_check(FakeContext(filetypes.KIND_IMAGE), [])
         assert verdict.outcome == QUARANTINE
         assert "80%" in verdict.reason
+
+    def test_drawing_with_mostly_unreadable_sheet_is_accepted(self, monkeypatch):
+        """Надписи чертежа рвутся линиями — доля «нечитаемого» тут не о качестве."""
+        monkeypatch.setattr(
+            QualityGate, "_quick_ocr",
+            lambda self, ctx: _OcrProbe(confidence=0.5, blocks=4, unreadable_share=0.8),
+        )
+        warnings = []
+        verdict = quality().ocr_check(
+            FakeContext(filetypes.KIND_IMAGE, genre=GENRE_DRAWING), warnings
+        )
+        assert verdict.outcome == ACCEPT
+        assert verdict.confidence == pytest.approx(0.5)
+        assert any("80%" in w for w in warnings)
 
     def test_small_share_is_only_a_warning(self, monkeypatch):
         monkeypatch.setattr(

@@ -421,6 +421,27 @@ class QualityGate:
             return self._no_text_verdict(context, warnings)
 
         confidence = probe.confidence
+        if _is_drawing(context) and (
+            confidence < settings.QG_OCR_BLOCK_CONFIDENCE
+            or probe.unreadable_share > settings.QG_OCR_UNREADABLE_SHARE
+        ):
+            # Tesseract на листе чертежа читает надписи вперемешку с линиями,
+            # штриховкой и размерами: низкая уверенность здесь говорит о
+            # графике, а не о том, что лист нечитаем. Чертёж разбирает ветка
+            # чертежей (Qwen-VL), а не этот OCR; пустой лист чертежа уже
+            # принимается (`_no_text_verdict`). Прод, 13.11: десять растровых
+            # чертежей с уверенностью 0.28–0.35 ушли в карантин.
+            warnings.append(
+                f"Быстрый OCR на листе чертежа: уверенность {confidence:.2f}, "
+                f"ниже порога {probe.unreadable_share:.0%} текста — содержимое "
+                f"оценит разбор чертежа."
+            )
+            return QualityVerdict(
+                ACCEPT,
+                "Это чертёж: уверенность быстрого OCR о его читаемости не говорит.",
+                "QG-4", confidence=confidence,
+            )
+
         if confidence < settings.QG_OCR_BLOCK_CONFIDENCE:
             return QualityVerdict(
                 QUARANTINE,
@@ -497,7 +518,7 @@ class QualityGate:
         где текст ожидается — скан страницы, фотокопия, снимок экрана, —
         пустой результат остаётся поводом для карантина.
         """
-        if context.classification.genre == GENRE_DRAWING:
+        if _is_drawing(context):
             warnings.append(
                 "Надписей на листе не найдено — содержимое оценит разбор чертежа."
             )
@@ -711,6 +732,17 @@ class _OcrProbe:
     blocks: int
     unreadable_share: float = 0.0
     text: str = ""
+
+
+def _is_drawing(context: DocumentContext) -> bool:
+    """Жанр «чертёж». Классификация не вправе ронять вердикт: сбой — не чертёж."""
+    try:
+        return context.classification.genre == GENRE_DRAWING
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Классификация %s не удалась: %s", context.uri, exc)
+        return False
 
 
 def _probe_from_blocks(blocks) -> _OcrProbe:
