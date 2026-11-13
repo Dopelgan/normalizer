@@ -456,7 +456,8 @@ class TestSnapshotNameFromMetadata:
     ни ломать разбор, ни превращать имя в «неизвестно».
     """
 
-    # Ключ снимка ровно такой, какой приходит с прода.
+    # Ключ снимка того же вида, что на проде; хеш укорочен для читаемости
+    # (на проде это 32 шестнадцатеричных знака) — на разбор ключа он не влияет.
     SNAPSHOT = (
         "rag-parser-snapshots/4f1c/_____421451.003-01__4__.1_____._34_.jpg"
     )
@@ -510,6 +511,17 @@ class TestSnapshotNameFromMetadata:
         storage = self.Storage(boom=RuntimeError("S3 недоступен"))
 
         assert tasks.original_name(self.SNAPSHOT, storage, self.URI) == self.FALLBACK
+
+    def test_soft_time_limit_is_not_swallowed(self):
+        # Мягкий лимит Celery — не сбой хранилища, а приказ закончиться.
+        # Проглоченный здесь, он довёл бы задачу до жёсткого убийства
+        # вместо аккуратного завершения по ошибке.
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        storage = self.Storage(boom=SoftTimeLimitExceeded())
+
+        with pytest.raises(SoftTimeLimitExceeded):
+            tasks.original_name(self.SNAPSHOT, storage, self.URI)
 
     def test_storage_error_is_logged_at_debug_not_error(self, caplog):
         import logging
