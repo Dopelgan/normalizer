@@ -157,6 +157,12 @@ _TRANSCRIBE_PROMPT = """Перепиши весь текст, который е�
 """
 
 
+_SMALL_PRINT_RULE = """- Запятую в десятичной дроби не теряй: «M20x1,5», «Rz 3,2», «⌀8,5» — а не
+  «M20x15», «Rz 32», «⌀85». Предельные отклонения, написанные мелко справа
+  вверху и внизу от размера, пиши полностью, со знаком и запятой: «12+0,8»,
+  «40−0,25», «⌀16(+0,018/−0,007)».
+"""
+
 @dataclass
 class SheetReading:
     """Прочитанный лист: надписи и род чертежа."""
@@ -220,7 +226,10 @@ class QwenVisionClient:
             categories=", ".join(CATEGORIES),
             hint=f"\n- Подсказка по разметке листа: {hint}" if hint else "",
         )
-        data = self._ask(image, prompt, settings.QWEN_SHEET_MAX_SIDE)
+        if settings.DRAWING_SMALL_PRINT_CARE:
+            prompt += _SMALL_PRINT_RULE
+            image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
+        data = self._ask(image, prompt, settings.QWEN_SHEET_MAX_SIDE, list_key="annotations")
         if data is None:
             return None
         annotations = data.get("annotations")
@@ -260,7 +269,7 @@ class QwenVisionClient:
     def transcribe(self, image) -> Optional[List[str]]:
         """Весь текст листа строками: штамп, графы, примечания, таблицы."""
         data = self._ask(
-            image, _TRANSCRIBE_PROMPT, settings.DRAWING_TRANSCRIBE_MAX_SIDE,
+            image, _transcribe_prompt(), settings.DRAWING_TRANSCRIBE_MAX_SIDE,
             max_tokens=settings.DRAWING_TRANSCRIBE_MAX_TOKENS,
         )
         if data is None:
@@ -358,7 +367,7 @@ class QwenVisionClient:
         такой ответ не исправить.
         """
         answer = self._ask_text(
-            image, _TRANSCRIBE_PROMPT, settings.DRAWING_TRANSCRIBE_MAX_SIDE,
+            image, _transcribe_prompt(), settings.DRAWING_TRANSCRIBE_MAX_SIDE,
             max_tokens=settings.DRAWING_TRANSCRIBE_MAX_TOKENS,
         )
         if answer is None:
@@ -399,12 +408,28 @@ class QwenVisionClient:
     # ----------------------------------------------------------- внутреннее
     def _ask(
         self, image, prompt: str, max_side: int, max_tokens: Optional[int] = None,
+        list_key: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        if not self.available:
+            logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
+            return None
         answer = self._ask_text(image, prompt, max_side, max_tokens)
         if answer is None:
             return None
         content = answer[0]
         data = extract_json(content)
+        if list_key and (data is None or not isinstance(data.get(list_key), list)):
+            # Ответ оборван потолком токенов: целого объекта нет, и разбор
+            # находил первый вложенный — одну надпись вместо всего листа.
+            items = salvage_list(content, list_key)
+            if items:
+                logger.warning("Ответ модели оборван: из списка %s спасено %d элементов",
+                               list_key, len(items))
+                salvaged: Dict[str, Any] = {list_key: items}
+                kind = re.search(r'"sheet_type"\s*:\s*"([^"]*)"', content)
+                if kind:
+                    salvaged["sheet_type"] = kind.group(1)
+                return salvaged
         if data is None:
             logger.error("Модель вернула не-JSON (%d символов): %.200s", len(content), content)
         return data
@@ -510,6 +535,23 @@ class QwenVisionClient:
 # Помощники
 # ===========================================================================
 
+def _transcribe_prompt() -> str:
+    """Запрос «перепиши весь текст листа»; с DRAWING_SMALL_PRINT_CARE — с правилом про дроби."""
+    return _TRANSCRIBE_PROMPT + (_SMALL_PRINT_RULE if settings.DRAWING_SMALL_PRINT_CARE else "")
+
+
+def enlarge_small(image, small_side: int):
+    """Небольшая картинка увеличивается вдвое: мелкие индексы и запятые читаются увереннее."""
+    try:
+        if not small_side or max(image.size) >= small_side:
+            return image
+        from PIL import Image
+        return image.resize((image.width * 2, image.height * 2), Image.LANCZOS)
+    except Exception as exc:  # noqa: BLE001 — битая картинка не должна ронять разбор
+        logger.error("Не удалось увеличить картинку для модели: %s", exc)
+        return image
+
+
 def encode_image(image, max_side: int) -> str:
     """PIL-картинка -> data-URL с PNG. Пустая строка, если не вышло."""
     try:
@@ -572,6 +614,34 @@ def extract_json(content: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def salvage_list(content: str, key: str) -> List[Any]:
+    """
+    Целые элементы списка `key` из оборванного ответа. Модель упёрлась в
+    потолок токенов посреди списка: всё, что она успела дописать целиком,
+    прочитано верно и пропадать не должно.
+    """
+    marker = content.find(f'"{key}"')
+    if marker == -1:
+        return []
+    index = content.find("[", marker)
+    if index == -1:
+        return []
+    decoder = json.JSONDecoder()
+    items: List[Any] = []
+    index += 1
+    while index < len(content):
+        while index < len(content) and (content[index].isspace() or content[index] == ","):
+            index += 1
+        if index >= len(content) or content[index] == "]":
+            break
+        try:
+            item, index = decoder.raw_decode(content, index)
+        except ValueError:
+            break
+        items.append(item)
+    return items
+
+
 def _content_of(payload: Dict[str, Any]) -> Optional[str]:
     choices = payload.get("choices") or []
     if not choices:
@@ -605,25 +675,7 @@ def salvage_lines(content: str) -> List[str]:
     `{"lines": ["…", "…", "незаконч`. Строка, на которой ответ оборвался,
     отбрасывается: её дочитает часть листа.
     """
-    if not content:
-        return []
-    key = content.find('"lines"')
-    start = content.find("[", key) if key != -1 else -1
-    if start == -1:
-        return []
-    decoder = json.JSONDecoder()
-    position, found = start + 1, []
-    while True:
-        while position < len(content) and content[position] in " \t\r\n,":
-            position += 1
-        if position >= len(content) or content[position] == "]":
-            break
-        try:
-            value, position = decoder.raw_decode(content, position)
-        except ValueError:
-            break
-        found.append(value)
-    return _collapse_runs(_clean_lines(found))
+    return _collapse_runs(_clean_lines(salvage_list(content or "", "lines")))
 
 
 # Подряд столько строк «префикс + число» с шагом 1 — модель сбилась на

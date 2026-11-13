@@ -509,5 +509,18 @@ deskewed_page`); при `turn != 0` они не совпадают с исход
   в `classification.signals` такого листа — `thin_line_frame`, `thin_line_rules`. Жанр документа и, значит,
   маршрут разбора и предлагаемый гриф у таких листов меняются;
 - `DRAWING_MATERIAL_NO_TOLERANCE` — у поля `material`, прочитанного Qwen-VL, `tolerance` = `null`,
-  `source_of_tolerance` = `unknown` (векторный разбор PDF не затронут).
+  `source_of_tolerance` = `unknown` (векторный разбор PDF не затронут);
+- `DRAWING_PDF_FULL_READ` — у скана чертежа в PDF на каждой чертёжной странице первым приходит фрагмент
+  `drawing` всего листа (`provenance.method` = `vision_plus_vlm` или `vlm_full_page`, `position.bbox` = весь лист)
+  с текстом листа в `content.text` и `transcript_line_count` в `structured_payload`; фрагменты `drawing`
+  вырезок видов приходят как раньше. Непрочитанная область на такой странице не делает документ `partial`
+  (вместе с `DRAWING_UNMEASURED_NOT_PARTIAL`);
+- `DRAWING_TRANSCRIPT_FIXES_OCR` — у фрагмента `text` (`mineru_ocr`, `ocr_layer`) на странице с переписанным
+  текстом листа `content.text` может быть заменён строками модели; такой фрагмент несёт предупреждение
+  `TEXT_FROM_VLM_TRANSCRIPT`. Если цифры в строках модели другие, текст фрагмента не заменяется: чтение модели
+  дописывается второй строкой с пометкой «(вариант чтения модели, требует сверки)», предупреждение —
+  `TEXT_VARIANT_FROM_VLM_TRANSCRIPT`. Состав и порядок фрагментов не меняются.
+
+Без флага: ответ Qwen-VL на запрос «прочитай чертёж», оборванный пределом длины, больше не разбирается как первый
+вложенный объект — из списка надписей берутся все целые элементы и род листа.
 
