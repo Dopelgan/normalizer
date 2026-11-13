@@ -239,7 +239,7 @@ class TestOcrLinesCarryOrientation:
 
     def test_full_ocr_blocks_follow_upright_order(self, monkeypatch):
         provider = TesseractFallbackProvider(storage=object())
-        monkeypatch.setattr(provider, "ocr_lines", lambda _image: [
+        monkeypatch.setattr(provider, "ocr_lines", lambda _image, _psm=None: [
             OcrLine(text=l.text, bbox=l.bbox, confidence=0.9, rotation=90.0)
             for l in turned_lines(90)
         ])
