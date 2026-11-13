@@ -36,25 +36,17 @@ def apply_drawing_quality(fragment):
 
 
 # Пометки реальной потери листа: с ними документ partial при любом флаге.
-# DRAWING_SHEET_ANSWER_CUT ставится только при DRAWING_SHEET_CUT_VISIBLE:
-# оборванный ответ прохода «лист целиком», который не дочитали частями, —
-# потеря хвоста списка надписей, а не успешный разбор.
-_LOSS_WARNINGS = ("DRAWING_NOT_RECOGNIZED", "DRAWING_SKIPPED_NO_TIME",
-                  "DRAWING_SHEETS_SKIPPED", "DRAWING_SHEET_ANSWER_CUT")
-
-# Непрочитанное внутри самого листа: такую область не покрывает другой
-# фрагмент той же страницы, поэтому она потеря при любом флаге.
-_UNREAD_IN_SHEET = ("transcript_tile", "sheet_tile")
+_LOSS_WARNINGS = ("DRAWING_NOT_RECOGNIZED", "DRAWING_SKIPPED_NO_TIME", "DRAWING_SHEETS_SKIPPED")
 
 
 def _drawing_lost(fragment, transcribed_pages=frozenset()):
     # Область, которую модель не прочитала отдельно, не потеряна, если весь
     # текст её листа переписан проходом полного чтения (DRAWING_IMAGE_FULL_READ,
     # DRAWING_PDF_FULL_READ).
-    # Недочитанная часть самого листа (transcript_tile — текст, sheet_tile —
-    # надписи) потеря всегда: её не покрывает другой фрагмент той же страницы.
+    # Недочитанная часть самого переписанного текста (transcript_tile)
+    # потеря всегда: её не покрывает другой фрагмент той же страницы.
     unread = [region for region in fragment.missing_regions
-              if region.get("kind") in _UNREAD_IN_SHEET
+              if region.get("kind") == "transcript_tile"
               or region.get("page") not in transcribed_pages]
     return bool(unread) or any(
         warning.startswith(_LOSS_WARNINGS) for warning in fragment.warnings

@@ -162,7 +162,6 @@ class DrawingProcessor:
         payload: Dict[str, Any] = {"layout": layout.as_dict(), "tables": []}
         payload["coordinate_reference"] = "deskewed_page"
         missing_regions: List[Dict[str, Any]] = []
-        warnings: List[str] = []
 
         pass_started = time.monotonic()
         budget = settings.DRAWING_TIME_BUDGET
@@ -180,7 +179,7 @@ class DrawingProcessor:
             self._sheet_produced(reading) if reading is not None else "лист не прочитан",
         )
         if reading is not None:
-            self._sheet_cut(reading, payload, missing_regions, warnings)
+            self._sheet_record(reading, payload)
         # Весь текст листа отдельным проходом (DRAWING_IMAGE_FULL_READ):
         # разметка надписей по категориям теряет штамп, графы, номер листа
         # и примечания, а без них лист нельзя найти ни по обозначению, ни
@@ -280,7 +279,7 @@ class DrawingProcessor:
                 "whole_sheet": {"coverage": None, "reason": "not_independently_measured"},
             },
             "missing_regions": missing_regions,
-            "warnings": ["DRAWING_COMPLETENESS_UNKNOWN"] + warnings,
+            "warnings": ["DRAWING_COMPLETENESS_UNKNOWN"],
             "mode": mode,
             "payload": payload,
         }
@@ -301,19 +300,24 @@ class DrawingProcessor:
         return produced
 
     @staticmethod
-    def _sheet_cut(reading, payload, missing_regions, warnings) -> None:
+    def _sheet_record(reading, payload) -> None:
         """
-        Оборванный ответ прохода «лист целиком» — видимая потеря, а не успех
-        (DRAWING_SHEET_CUT_VISIBLE). Лист, дочитанный частями полностью,
-        потерей не считается: хвост списка надписей прочитан. Лист, который
-        дочитать не удалось (флаг частей выключен, часть не ответила или
-        оборвалась снова), получает пометку и непрочитанные области — и
-        документ уходит человеку как разобранный не полностью
-        (core/drawing_quality.py).
+        Что случилось с ответом прохода «лист целиком» — в payload листа
+        (DRAWING_SHEET_CUT_VISIBLE). Это наш учёт, а не повод позвать
+        человека.
 
-        Элементы списка, которые надписью стать не смогли (`lost`), — такая
-        же потеря, и она считается даже у целого ответа: пропасть молча
-        прочтение листа не должно ни при обрыве, ни без него.
+        Человека зовут только за тем, чего он один и может решить: кластер,
+        имя, конфликт версий. Насколько хорошо прочитан лист — наша забота,
+        поэтому ни `warnings`, ни `missing_regions` здесь не появляются и
+        документ от обрыва ответа не становится partial: открыть такой
+        документ, найти его полным и получить вопрос «что с ним?» — чистый
+        расход для заказчика.
+
+        Но и `completed` при настоящей потере лист не изображает: своими
+        данными он говорит правду. `sheet_annotations_complete`=`false` —
+        прочтения потеряны; `sheet_reparse_candidate`=`true` — лист, который
+        имеет смысл перечитать машинно (вот это и есть правильное
+        автоматическое действие), с причиной в `sheet_reparse_reason`.
         """
         if reading.tiles:
             payload["sheet_tiles"] = reading.tiles
@@ -324,22 +328,20 @@ class DrawingProcessor:
         if reading.lost:
             payload["sheet_annotations_lost"] = reading.lost
         if reading.complete:
+            # Ответ обрывался, но лист дочитан: терять нечего и считать
+            # нечего. Такой лист в кандидаты на перечитывание не идёт.
             return
         payload["sheet_annotations_complete"] = False
-        warnings.append("DRAWING_SHEET_ANSWER_CUT")
-        # Части листа, которые не дочитаны, называются поимённо; если частями
-        # лист не читался вовсе, недочитан он весь. Причина у области —
-        # та, что случилась, а не одна на все случаи.
+        payload["sheet_reparse_candidate"] = True
+        # Причина — та, что случилась: по ней видно, поможет ли перечитывание
+        # вообще и что менять, если не поможет.
         if reading.failed:
-            missing_regions.extend(
-                {"kind": "sheet_tile", "bbox": box, "reason": "sheet_answer_cut"}
-                for box in reading.failed
-            )
-            return
-        reason = "sheet_answer_cut" if reading.cut else "sheet_annotations_lost"
-        missing_regions.append(
-            {"kind": "sheet_tile", "bbox": [0.0, 0.0, 1.0, 1.0], "reason": reason}
-        )
+            payload["sheet_reparse_reason"] = "sheet_tiles_unread"
+            payload["sheet_unread_tiles"] = [list(box) for box in reading.failed]
+        elif reading.cut:
+            payload["sheet_reparse_reason"] = "sheet_answer_cut"
+        else:
+            payload["sheet_reparse_reason"] = "sheet_annotations_lost"
 
     # ------------------------------------------------------------------- лог
     # Доказательство работы модели на чертеже читается прямо из лога: по

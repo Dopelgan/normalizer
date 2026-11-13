@@ -474,86 +474,103 @@ def built(model, monkeypatch):
     return worker.build_fragment(result, source_fragment(), {})
 
 
-class TestCutIsVisible:
+class TestNobodyIsCalledForParseQuality:
+    """
+    Файл уходит человеку только за тем, чего он один и может решить:
+    кластер, имя, конфликт версий. Насколько хорошо прочитан лист — наша
+    забота, поэтому обрыв ответа не ставит ни пометки в `warnings`, ни
+    области в `missing_regions` и документ partial от него не становится.
+    Лист при этом не изображает прочитанным целиком: своими данными он
+    говорит правду и просит машинного перечитывания.
+    """
+
     def test_flag_off_a_cut_answer_still_passes_as_before(self, monkeypatch):
         """Выключенный флаг ничего не меняет: ни пометки, ни области."""
         fragment = built(SheetModel(capacity=10), monkeypatch)
-        assert "DRAWING_SHEET_ANSWER_CUT" not in fragment.warnings
+        assert fragment.warnings == ["DRAWING_COMPLETENESS_UNKNOWN"]
         assert fragment.missing_regions == []
         assert "sheet_answer_cut" not in fragment.content.structured_payload
 
-    def test_cut_sheet_carries_a_warning_and_an_unread_region(
+    def test_cut_sheet_is_recorded_but_sends_nobody_anywhere(
         self, monkeypatch, visible,
     ):
+        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
         fragment = built(SheetModel(capacity=10), monkeypatch)
-        assert "DRAWING_SHEET_ANSWER_CUT" in fragment.warnings
-        assert [r["kind"] for r in fragment.missing_regions] == ["sheet_tile"]
         payload = fragment.content.structured_payload
+        # Учёт есть.
         assert payload["sheet_answer_cut"] is True
         assert payload["sheet_annotations_complete"] is False
+        # Человека не зовут.
+        assert fragment.warnings == ["DRAWING_COMPLETENESS_UNKNOWN"]
+        assert fragment.missing_regions == []
+        assert document_quality([fragment])[0] is False
 
-    def test_cut_sheet_makes_the_document_parsed_incompletely(
+    def test_a_sheet_with_lost_readings_asks_to_be_reparsed(
         self, monkeypatch, visible,
     ):
-        """И при DRAWING_UNMEASURED_NOT_PARTIAL: это реальная потеря."""
-        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
+        """Правильное автоматическое действие — перечитать, а не спросить."""
         fragment = built(SheetModel(capacity=10), monkeypatch)
-        partial, warnings = document_quality([fragment])
-        assert partial and "DRAWING_SHEET_ANSWER_CUT" in warnings
-        assert fragment.review_required
+        payload = fragment.content.structured_payload
+        assert payload["sheet_reparse_candidate"] is True
+        assert payload["sheet_reparse_reason"] == "sheet_answer_cut"
 
-    def test_whole_answer_is_not_marked(self, monkeypatch, visible):
-        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
-        fragment = built(SheetModel(capacity=100), monkeypatch)
-        assert "DRAWING_SHEET_ANSWER_CUT" not in fragment.warnings
-        assert fragment.missing_regions == []
-        assert document_quality([fragment])[0] is False
-
-    def test_sheet_read_in_parts_is_not_marked_as_lost(
-        self, monkeypatch, tiles, visible,
-    ):
-        """Дочитанный частями лист прочитан: пометки потери на нём нет."""
-        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
-        fragment = built(SheetModel(capacity=10), monkeypatch)
-        assert "DRAWING_SHEET_ANSWER_CUT" not in fragment.warnings
-        assert fragment.missing_regions == []
-        assert fragment.content.structured_payload["sheet_tiles"] == 4
-        assert document_quality([fragment])[0] is False
-
-    def test_part_that_stayed_cut_is_named_as_an_unread_region(
+    def test_unread_tiles_are_named_for_the_reparse(
         self, monkeypatch, tiles, visible,
     ):
         monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
         fragment = built(SheetModel(capacity=10, cut_always=True), monkeypatch)
-        assert "DRAWING_SHEET_ANSWER_CUT" in fragment.warnings
-        kinds = [r["kind"] for r in fragment.missing_regions]
-        assert kinds == ["sheet_tile"] * 4
-        assert document_quality([fragment])[0] is True
+        payload = fragment.content.structured_payload
+        assert payload["sheet_reparse_reason"] == "sheet_tiles_unread"
+        assert len(payload["sheet_unread_tiles"]) == 4
+        # И всё равно никого не зовут.
+        assert fragment.missing_regions == []
+        assert document_quality([fragment])[0] is False
 
-    def test_dense_corner_leaves_only_that_part_unread(
+    def test_whole_answer_is_not_recorded_at_all(self, monkeypatch, visible):
+        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
+        fragment = built(SheetModel(capacity=100), monkeypatch)
+        payload = fragment.content.structured_payload
+        assert "sheet_answer_cut" not in payload
+        assert "sheet_reparse_candidate" not in payload
+        assert document_quality([fragment])[0] is False
+
+    def test_sheet_recovered_in_parts_is_not_a_reparse_candidate(
+        self, monkeypatch, tiles, visible,
+    ):
+        """
+        Дочитанный частями лист прочитан: перечитывать нечего, записывать
+        потерю нечего, спрашивать некого.
+        """
+        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
+        fragment = built(SheetModel(capacity=10), monkeypatch)
+        payload = fragment.content.structured_payload
+        assert payload["sheet_tiles"] == 4
+        assert payload["sheet_answer_cut"] is True       # обрыв был
+        assert "sheet_reparse_candidate" not in payload  # но текст вернулся
+        assert "sheet_annotations_complete" not in payload
+        assert fragment.missing_regions == []
+        assert document_quality([fragment])[0] is False
+
+    def test_dense_corner_names_only_that_part_for_the_reparse(
         self, monkeypatch, tiles, visible,
     ):
         """
         Лист-таблица: вся плотность в одном углу, и часть с ней обрывается
-        и отдельным вызовом. Три части прочитаны, недочитана одна — она и
-        названа, а не весь лист.
+        и отдельным вызовом. Недочитана одна часть — она и названа.
         """
-        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
         model = SheetModel(capacity=10, cut_parts=["bottom_right"])
-        fragment = built(model, monkeypatch)
-        regions = fragment.missing_regions
-        assert [r["kind"] for r in regions] == ["sheet_tile"]
-        # Недочитана правая нижняя часть: её bbox начинается за серединой.
-        assert regions[0]["bbox"][0] > 0.4 and regions[0]["bbox"][1] > 0.4
-        assert "DRAWING_SHEET_ANSWER_CUT" in fragment.warnings
-        assert document_quality([fragment])[0] is True
+        payload = built(model, monkeypatch).content.structured_payload
+        boxes = payload["sheet_unread_tiles"]
+        assert len(boxes) == 1
+        assert boxes[0][0] > 0.4 and boxes[0][1] > 0.4
 
-    def test_lost_elements_are_marked_even_on_a_whole_answer(
+    def test_lost_elements_are_recorded_even_on_a_whole_answer(
         self, monkeypatch, visible,
     ):
         """
         Ответ целый, но часть элементов списка — не прочтения (доли bbox
-        отдельными элементами). Молча они больше не пропадают.
+        отдельными элементами). Молча они больше не пропадают — и человека
+        всё равно не зовут.
         """
         monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
         model = SheetModel(capacity=100, junk=[0.52, 0.04, None])
@@ -561,9 +578,26 @@ class TestCutIsVisible:
         payload = fragment.content.structured_payload
         assert payload["sheet_annotations_lost"] == 3
         assert payload["sheet_annotations_complete"] is False
+        assert payload["sheet_reparse_reason"] == "sheet_annotations_lost"
         assert "sheet_answer_cut" not in payload
-        assert [r["reason"] for r in fragment.missing_regions] == ["sheet_annotations_lost"]
-        assert document_quality([fragment])[0] is True
+        assert fragment.missing_regions == []
+        assert document_quality([fragment])[0] is False
+
+    def test_no_drawing_warning_of_ours_can_make_a_document_partial(
+        self, monkeypatch, visible,
+    ):
+        """
+        Страховка от возврата старого поведения: ни один лист этой ветки не
+        добавляет пометку потери, по которой документ стал бы partial.
+        """
+        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
+        for model in (SheetModel(capacity=10),
+                      SheetModel(capacity=10, cut_always=True),
+                      SheetModel(capacity=100, junk=[None, 0.5])):
+            fragment = built(model, monkeypatch)
+            partial, warnings = document_quality([fragment])
+            assert partial is False
+            assert warnings == ["DRAWING_COMPLETENESS_UNKNOWN"]
 
     def test_flag_off_lost_elements_are_still_recovered_but_not_marked(self, monkeypatch):
         """
@@ -631,18 +665,15 @@ class TestSheetShapes:
         self, monkeypatch, tiles, visible,
     ):
         """
-        Многолистовой PDF: плотный лист помечается, соседний целый — нет.
-        Пометка и непрочитанная область живут во фрагменте своего листа.
+        Многолистовой PDF: учёт потери живёт в payload своего листа, а
+        соседний целый лист остаётся чистым. Человека не зовут ни из-за
+        одного листа, ни из-за обоих.
         """
         monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
         dense = built(SheetModel(capacity=10, cut_always=True), monkeypatch)
         plain = built(SheetModel(capacity=100), monkeypatch)
         plain.fragment_id, plain.position.page = "f2", 2
-        for region in dense.missing_regions:
-            region["page"] = 1
-        assert "DRAWING_SHEET_ANSWER_CUT" in dense.warnings
-        assert "DRAWING_SHEET_ANSWER_CUT" not in plain.warnings
-        assert plain.missing_regions == []
-        # Документ уходит человеку из-за одного листа, а не из-за всех.
-        assert document_quality([dense, plain])[0] is True
+        assert dense.content.structured_payload["sheet_reparse_candidate"] is True
+        assert "sheet_reparse_candidate" not in plain.content.structured_payload
+        assert document_quality([dense, plain])[0] is False
         assert document_quality([plain])[0] is False
