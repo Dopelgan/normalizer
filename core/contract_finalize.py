@@ -23,6 +23,7 @@ from core.facts.extractor import extract_facts
 from core.models.contract import Fragment
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import apply_drawing_quality
+from core import drawing_record
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,15 @@ def finalize_fragments(
                     "Извлечение фактов из %s не удалось: %s", fragment_id, exc
                 )
                 fragment.extracted_facts = []
+
+    # Сборка записи чертежа — последним шагом, после идентификаторов и
+    # фактов (`DRAWING_RECORD_COMPOSED`). Позже всех потребителей
+    # `content.text` внутри конвейера: правка абзацев OCR и сверка «чертёж
+    # против OCR» к этому моменту уже прошли по прежнему тексту, факты
+    # извлечены из него же, а `fragment_id` чертежа считается по полям и
+    # таблицам, а не по тексту. Поэтому сборка не меняет ни маршрут, ни
+    # факты, ни идентификаторы — только то, что увидит заказчик.
+    drawing_record.apply(fragments)
 
     return fragments, id_map
 
