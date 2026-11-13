@@ -110,6 +110,39 @@ _EXPLICIT_TOL = re.compile(
 _RANGE_TOL = re.compile(_NUMBER + r"\s*\.{2,3}\s*" + _NUMBER)
 _REFERENCE_MARK = re.compile(r"(?:" + _NUMBER + r"\s*\*|\bсправ)", re.IGNORECASE)
 
+# --------------------------------------- строгая категория (DRAWING_FIELD_CATEGORY_STRICT)
+# Резьба по ГОСТ 8724 пишется прописной «M» (кириллическую «М» приводит к ней
+# `drawing_text.normalize`). Строчная «m» перед числом — единица измерения:
+# «0,1 m3/h», «0,25 m2». Поэтому здесь нет re.IGNORECASE, а за числом не
+# должно идти ни «/», ни буква: «M20x1,5» — резьба, «m3/h» — расход.
+_THREAD_STRICT = re.compile(
+    r"(?<![\w])M\s*" + _NUMBER + r"(?:\s*[x×]\s*" + _NUMBER + r")?(?![\w/])"
+)
+# «60°С» — температура, а не угловой размер: у угла после знака градуса
+# стоит либо конец записи, либо минуты, но не буква шкалы.
+_TEMPERATURE = re.compile(_NUMBER + r"\s*°\s*[CСFKК]")
+_ANGLE_STRICT = re.compile(_NUMBER + r"\s*°(?!\s*[CСFKК])")
+# Посадка существует только на размере и записывается вплотную к нему:
+# «⌀40H7», «20h6». Отдельная пара «буква+цифры» («fittings K4», «F1»,
+# «S27») посадкой не является, как и «0,1 m3» — там единица через пробел.
+# Квалитет замыкает запись: в марке «12X18H10Т» за «H10» стоит ещё буква.
+_FIT_ON_SIZE = re.compile(
+    _NUMBER + r"[HhJjKkNnPpSsEeFfGgMmDd][sS]?\d{1,2}(?![\dA-Za-zА-Яа-яЁё])"
+)
+# Знак отклонения — тоже только при размере: «20±0,1», «20-0,1». Одиночное
+# «-1300» на листе — отметка уровня или номер, а не допуск.
+_TOL_ON_SIZE = re.compile(_NUMBER + r"\s*(?:±|(?<![\w.,])[+\-])\s*" + _NUMBER)
+_TOL_ALONE = re.compile(r"^±\s*" + _NUMBER + r"$")
+_IT_GRADE = re.compile(r"(?<![A-Za-zА-Яа-яЁё])IT\s*\d{1,2}\b")
+# Номер позиции или сварного шва: «№1», «2№3», «4,№9» — пометка целиком,
+# без слова перед «№» («Зав. № 220483» — графа штампа, а не позиция).
+_POSITION_MARK = re.compile(r"^\d{0,3}[,.]?№\s?\d{1,3}(?:[.,]\d{1,3})?\*?$")
+# Фраза: техническое требование или подпись, а не подписанная величина.
+_PROSE_WORDS = 4
+_PROSE_CHARS = 40
+# Категории, которые ветка сборки записи выводит отдельным заголовком.
+_DIMENSION_CATEGORIES = ("size", "radius", "thread", "roughness", "tolerance", "position")
+
 _MATERIAL_WORDS = ("сталь", "чугун", "алюмин", "латунь", "бронза", "полиамид", "ГОСТ 380")
 _UNIT_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     ("мкм", re.compile(r"мкм|µm|μm", re.IGNORECASE)),
@@ -411,6 +444,9 @@ def classify(text: str, line: Optional[TextLine] = None, turn: int = 0) -> Tuple
             return "material", 0.9
         return "title_block", 0.9
 
+    if _strict_enabled():
+        return _classify_strict(text)
+
     if _THREAD.search(text):
         return "thread", 0.9
     if _RADIUS.search(text):
@@ -436,6 +472,80 @@ def classify(text: str, line: Optional[TextLine] = None, turn: int = 0) -> Tuple
     return "note", 0.4
 
 
+def decisive_category(text: str) -> Optional[str]:
+    """
+    Категория, которую решает сама нотация ЕСКД, или `None`.
+
+    Это те четыре записи, у которых другого прочтения нет: знак диаметра,
+    «R» перед числом, резьба «M…×…» по ГОСТ 8724, «Ra»/«Rz» по ГОСТ 2789 и
+    склеенная пометка «№» с цифрой (номер позиции или сварного шва). На
+    замере по проду (300 фрагментов, 10 174 поля) правила на этих записях
+    оказались правы 26 раз из 26 там, где нотация решает, а модель — ни
+    разу; поэтому спор на них решается в пользу правил, а не понижением
+    уверенности. Вне этих записей функция молчит: там спор остаётся спором.
+    """
+    stripped = " ".join((text or "").split())
+    if not stripped:
+        return None
+    if _ROUGHNESS.search(stripped):
+        return "roughness"
+    if _DIAMETER.search(stripped):
+        return "size"
+    if _RADIUS.match(stripped) and len(stripped) <= _PROSE_CHARS:
+        return "radius"
+    if (_THREAD_STRICT.search(stripped)
+            and len(stripped) <= _PROSE_CHARS
+            and len(stripped.split()) < _PROSE_WORDS):
+        return "thread"
+    if _POSITION_MARK.match(stripped):
+        return "position"
+    return None
+
+
+def _is_prose(text: str) -> bool:
+    """
+    Фраза, а не подписанная величина: техническое требование, подпись,
+    заголовок. Размерной категории такая строка не получает — заголовок
+    «Резьба» над «No more than 3,6 m3/h» стоит дороже, чем его отсутствие.
+    """
+    return len(text.split()) >= _PROSE_WORDS or len(text) >= _PROSE_CHARS
+
+
+def _classify_strict(text: str) -> Tuple[str, float]:
+    """
+    Категория поля при `DRAWING_FIELD_CATEGORY_STRICT`: ставится только
+    там, где её решает нотация. Где запись неоднозначна — «note», то есть
+    «не классифицировано»: ветка сборки записи оставит такое значение в
+    общем чтении листа, а не выведет под уверенным неверным заголовком.
+    """
+    stripped = " ".join(text.split())
+    decisive = decisive_category(stripped)
+    if decisive is not None:
+        return decisive, 0.9 if decisive in ("thread", "roughness", "position") else 0.95
+
+    lowered = stripped.lower()
+    if any(word in lowered for word in _MATERIAL_WORDS):
+        return "material", 0.85
+    if _fidelity_enabled() and dimension_fidelity.is_steel_grade(stripped):
+        return "material", 0.85
+    # Квалитет «IT14» называет допуск и в тексте требования: «Неуказанные
+    # предельные отклонения размеров: H14; h14, ±IT14/2».
+    if _IT_GRADE.search(stripped):
+        return "tolerance", 0.75
+    if _is_prose(stripped):
+        return "note", 0.4
+    if _CALLOUT.match(stripped):
+        return "callout", 0.8
+    if _PLAIN_SIZE.match(stripped) or _ANGLE_STRICT.search(stripped):
+        return "size", 0.8
+    # Посадка и знак отклонения — только при самом размере. «fittings K4»
+    # и отметка уровня «-1300» допуска не называют.
+    if (_TOL_ALONE.match(stripped) or _TOL_ON_SIZE.search(stripped)
+            or _RANGE_TOL.search(stripped) or _FIT_ON_SIZE.search(stripped)):
+        return "tolerance", 0.75
+    return "note", 0.4
+
+
 def _in_title_block(line: TextLine, turn: int = 0) -> bool:
     x1, y1, x2, y2 = _TITLE_BLOCK_REGION
     left, top, right, bottom = upright_bbox(line.bbox, turn)
@@ -447,6 +557,12 @@ def _fidelity_enabled() -> bool:
     from core.config import settings
 
     return bool(getattr(settings, "DRAWING_DIMENSION_FIDELITY", False))
+
+
+def _strict_enabled() -> bool:
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_FIELD_CATEGORY_STRICT", False))
 
 
 def _without_grades(text: str) -> str:

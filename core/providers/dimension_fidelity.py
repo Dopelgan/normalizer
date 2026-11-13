@@ -628,3 +628,62 @@ def _same_place(first: Any, second: Any) -> bool:
     if smaller <= 0:
         return False
     return overlap / smaller >= 0.5
+
+
+# =========================================================================
+# Знак отклонения из транскрипции листа
+# =========================================================================
+
+# Размер со знаком отклонения внутри строки: «1087±3», «30+10*», «20−0,1».
+# Берётся запись целиком, вместе со справочной звёздочкой.
+_SIGNED_SIZE = re.compile(
+    r"(?<![\w.,])\d{1,5}(?:[.,]\d{1,3})?\s?[±+−∓-]\s?\d{1,4}(?:[.,]\d{1,3})?\*?"
+)
+
+
+def adopt_transcript_signs(
+    fields: List[Dict[str, Any]], lines: Optional[Sequence[str]]
+) -> int:
+    """
+    Знак отклонения, который потерялся в проходе по надписям, но сохранён в
+    транскрипции листа. Возвращается число правок.
+
+    Зачем это нужно. Лист читается двумя независимыми проходами: «перепиши
+    лист целиком» даёт строки транскрипции, проход по надписям — поля с
+    категорией. Знак «±» модель подменяет на «+» в одном проходе и
+    сохраняет в другом: на ТАДУ 302318.207.00 транскрипция даёт «1087±3», а
+    поле — «1087+3». `merge_readings` такую пару не сводит: она сравнивает
+    поля между собой, а второе прочтение здесь — не поле.
+
+    Правится только знак и только в одну сторону — к более достоверному
+    прочтению по `prefer` («±» старше «−», «−» старше «+»): обратной
+    подмены модель не делает. Остальную запись функция не трогает, и если
+    в транскрипции того же размера нет, поле остаётся как было.
+    """
+    if not fields or not lines:
+        return 0
+    better: Dict[str, str] = {}
+    for line in lines:
+        for match in _SIGNED_SIZE.finditer(str(line or "")):
+            token = match.group(0)
+            key = sign_key(token)
+            current = better.get(key)
+            better[key] = token if current is None else prefer(current, token)
+    fixed = 0
+    for field in fields:
+        value = str(field.get("value") or "")
+        candidate = better.get(sign_key(value))
+        if candidate is None or _rank(candidate)[0] <= _rank(value)[0]:
+            continue
+        # Ключ знака совпал, значит запись отличается только знаком и
+        # звёздочкой: `prefer` выбирает достоверное прочтение целиком.
+        restored = prefer(value, candidate)
+        if restored == value:
+            continue
+        logger.info(
+            "Знак отклонения восстановлен по транскрипции листа: %r -> %r",
+            value, restored,
+        )
+        field["value"] = restored
+        fixed += 1
+    return fixed
