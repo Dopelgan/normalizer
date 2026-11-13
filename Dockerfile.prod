@@ -31,6 +31,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
+# Модели tessdata_best рядом с системными. В пакетах Debian лежит
+# tessdata_fast — самый маленький и самый неточный из трёх опубликованных
+# вариантов; отдельного пакета с best в Debian нет, поэтому файлы берутся
+# из официального хранилища tesseract-ocr (лицензия Apache-2.0, файл
+# LICENSE в том же хранилище) и проверяются по контрольной сумме: модель —
+# это данные, которыми читаются документы заказчика, и подменять их молча
+# нельзя. Выбор модели — настройка `OCR_TESSDATA_DIR`, по умолчанию пусто,
+# то есть читают системные модели и образ ведёт себя как прежде.
+#
+# osd в каталог берётся системная: в tessdata_best это тот же файл, что в
+# пакете Debian (побайтово), а каталог --tessdata-dir подменяется целиком,
+# и без osd отвалится определение поворота листа.
+ARG TESSDATA_BEST_URL=https://github.com/tesseract-ocr/tessdata_best/raw/4.1.0
+ARG TESSDATA_BEST_RUS_SHA256=b617eb6830ffabaaa795dd87ea7fd251adfe9cf0efe05eb9a2e8128b7728d6b6
+ARG TESSDATA_BEST_ENG_SHA256=8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba
+RUN mkdir -p /opt/tessdata/best \
+    && curl -sSLf -o /opt/tessdata/best/rus.traineddata "$TESSDATA_BEST_URL/rus.traineddata" \
+    && curl -sSLf -o /opt/tessdata/best/eng.traineddata "$TESSDATA_BEST_URL/eng.traineddata" \
+    && echo "$TESSDATA_BEST_RUS_SHA256  /opt/tessdata/best/rus.traineddata" | sha256sum -c - \
+    && echo "$TESSDATA_BEST_ENG_SHA256  /opt/tessdata/best/eng.traineddata" | sha256sum -c - \
+    && cp /usr/share/tesseract-ocr/5/tessdata/osd.traineddata /opt/tessdata/best/
+
 COPY --from=builder /install /usr/local
 
 COPY core/ ./core/
