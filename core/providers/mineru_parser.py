@@ -449,7 +449,8 @@ class MinerUParserProvider(DocumentParserProvider):
         # модель таблиц MinerU отдаёт русскую прозу побуквенной LaTeX-
         # разметкой, а Tesseract с `rus` читает её как текст.
         if self._has_content(result):
-            ocr_layer, unread_pages = self._ocr_layer(uri, file_type, total_pages=pages)
+            ocr_layer, layer_truncated = self._ocr_layer(uri, file_type, total_pages=pages)
+            layer_pages_read = set(ocr_layer.pages) if ocr_layer is not None else set()
             if ocr_layer is not None and settings.OCR_LAYER_DROP_LOW_CONFIDENCE:
                 ocr_layer = drop_low_confidence_lines(
                     ocr_layer, result.blocks, settings.OCR_LAYER_MIN_LINE_CONFIDENCE
@@ -489,12 +490,13 @@ class MinerUParserProvider(DocumentParserProvider):
                     # «отброшено N» не позволяло отличить верное удаление от
                     # потери, и спросить было не у чего.
                     result.text_layer_stats["dropped_repeated"] = repeated["total"]
+                    # Спорные блоки оставлены в тексте, терять нечего — и в
+                    # `degraded` этот счётчик не уходит. Любая неадвизорная
+                    # строка в предупреждениях документа лишает его спасения
+                    # на стороне RAG (`text_complete_document` спасает
+                    # partial только если все предупреждения адвизорные), и
+                    # сохранность текста обходилась бы вызовом человека.
                     result.text_layer_stats["dropped_detail"] = repeated
-                    if repeated["kept_uncertain"]:
-                        result.degraded.append(
-                            f"ocr_layer_uncertain_kept: спорных блоков слоя "
-                            f"оставлено в тексте {repeated['kept_uncertain']}"
-                        )
                 # Происхождение известно только здесь: слоя в файле не
                 # оказалось и текст собран распознаванием. До этой ветки
                 # `source_kind` ставился по расширению, и скан уезжал в
@@ -514,16 +516,18 @@ class MinerUParserProvider(DocumentParserProvider):
                         f"formula_not_text: блоков с разметкой вместо текста "
                         f"{stats.decoded_formulas}"
                     )
+                # Страницы, на которых текста не прочитано ничем: блоки
+                # MinerU на них есть, покрытие страниц полное, но без этой
+                # записи две трети документа пропадали молча. Предупреждение
+                # собирает `build_warnings` — одно, в контрактном виде
+                # `TEXT_NOT_READ: pages 51-158`; второй, нижним регистром, в
+                # `degraded` не кладётся, чтобы не множить одну и ту же
+                # пометку в выдаче.
+                unread_pages = self._unread_pages(
+                    layer_pages_read, pages, layer_truncated, blocks
+                )
                 if unread_pages:
-                    # Блоки MinerU на этих страницах есть, покрытие страниц
-                    # полное, но текста на них не прочитано: без этой записи
-                    # две трети документа пропадали молча.
                     result.unread_text_pages = unread_pages
-                    result.degraded.append(
-                        f"text_not_read: распознавание не дошло до страниц "
-                        f"{page_ranges(unread_pages)} "
-                        f"(предел OCR_FULL_MAX_PAGES или бюджет времени)"
-                    )
                 return result
 
         # MinerU ответил, но текста не дал — типично для скана без OCR-слоя.
@@ -581,10 +585,13 @@ class MinerUParserProvider(DocumentParserProvider):
 
     def _ocr_layer(
         self, uri: str, file_type: Optional[str] = None, total_pages: int = 0,
-    ) -> Tuple[Optional[TextLayer], List[int]]:
+    ) -> Tuple[Optional[TextLayer], Optional[tuple]]:
         """
-        Построчное распознавание растра как слой и страницы, текст которых
-        прочитать не удалось. Недоступность OCR здесь не фатальна: без слоя
+        Построчное распознавание растра как слой и точка, на которой проход
+        остановился (`None` — дочитано до конца). Какие именно страницы
+        остались без текста, знает только `parse`: там рядом есть блоки
+        MinerU, и страница, на которой у него свой текст, потерей не
+        является. Недоступность OCR здесь не фатальна: без слоя
         разбор останется как был, поэтому ошибка уходит в лог, а не наружу.
 
         Проход по страницам ограничен `OCR_FULL_MAX_PAGES` и бюджетом
@@ -593,11 +600,11 @@ class MinerUParserProvider(DocumentParserProvider):
         всему документу, покрытие страниц выходило полным — и документ со
         ста непрочитанными страницами выдавался как разобранный целиком.
         Теперь проход продолжается с места обрыва (`OCR_LAYER_CONTINUATION_
-        PASSES` дополнительных проходов), а то, что не прочитано и после
-        них, возвращается списком страниц и доезжает до выдачи.
+        PASSES` дополнительных проходов), а место, на котором он всё-таки
+        остановился, возвращается наружу и доезжает до выдачи.
         """
         if not settings.OCR_LAYER_ENABLED:
-            return None, []
+            return None, None
         pages: Dict[int, Any] = {}
         first = 1
         truncated: Optional[tuple] = None
@@ -625,27 +632,35 @@ class MinerUParserProvider(DocumentParserProvider):
             first = done + 1
         if not pages:
             logger.info("Распознавание не дало строк для %s — сшивать нечего", uri)
-            return None, self._unread_pages(pages, total_pages, truncated)
+            return None, truncated
         layer = TextLayer(pages=pages, page_count=max(pages))
-        unread = self._unread_pages(pages, total_pages, truncated)
         logger.info(
             "Слой распознавания для %s: страниц %d, символов %d%s",
             uri, layer.page_count, layer.char_count(),
-            f", не прочитано страниц {len(unread)}: {page_ranges(unread)}" if unread else "",
+            f", проход остановлен на странице {truncated[0]} из {truncated[1]}"
+            if truncated else "",
         )
-        return layer, unread
+        return layer, truncated
 
     @staticmethod
     def _unread_pages(
-        pages: Dict[int, Any], total_pages: int, truncated: Optional[tuple],
+        read_pages: set,
+        total_pages: int,
+        truncated: Optional[tuple],
+        blocks: List[ParsedBlock],
     ) -> List[int]:
         """
-        Страницы, до которых распознавание не дошло.
+        Страницы, на которых текста не прочитано ничем.
 
-        Пустая страница скана и страница, которую не успели прочитать, —
-        разные вещи, и путать их нельзя. Непрочитанными считаются только
-        страницы за местом обрыва прохода: страница внутри прочитанного
-        участка без строк — это пустая страница, а не потеря.
+        Три разные вещи, которые нельзя смешивать. Пустая страница скана —
+        не потеря. Страница внутри прочитанного участка слоя — не потеря.
+        И страница за местом обрыва прохода, на которой у MinerU есть свой
+        текст нормальной плотности, — тоже не потеря: распознавание до неё
+        не дошло, но читать её было незачем. Без последней проверки договор
+        АО РАСУ на 79 страниц (`doc-440f7e3c…`, 236 блоков MinerU и 107 191
+        символ на страницах 51-79, плотность та же, что на первых
+        пятидесяти) помечался бы partial с непрочитанными областями на 29
+        полностью прочитанных страницах.
         """
         if not truncated:
             return []
@@ -654,7 +669,14 @@ class MinerUParserProvider(DocumentParserProvider):
         total = max(int(total or 0), int(total_pages or 0))
         if total <= last:
             return []
-        return [page for page in range(last + 1, total + 1) if page not in pages]
+        page_chars: Dict[int, int] = {}
+        for block in blocks:
+            if block.type in _TEXTISH and block.text:
+                page_chars[block.page] = (page_chars.get(block.page, 0)
+                                          + len("".join(block.text.split())))
+        return [page for page in range(last + 1, total + 1)
+                if page not in read_pages
+                and page_chars.get(page, 0) < _MINERU_PAGE_TEXT_CHARS]
 
     @staticmethod
     def _has_content(result: ParseResult) -> bool:

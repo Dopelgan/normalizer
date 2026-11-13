@@ -149,10 +149,12 @@ def test_truncated_layer_reports_unread_pages(monkeypatch):
     monkeypatch.setattr(settings, "OCR_LAYER_ENABLED", True)
     monkeypatch.setattr(settings, "OCR_LAYER_CONTINUATION_PASSES", 0)
     tesseract = _Truncating(total=158, step=50)
-    layer, unread = _provider(monkeypatch, tesseract)._ocr_layer(
+    layer, truncated = _provider(monkeypatch, tesseract)._ocr_layer(
         "s3://x.pdf", "pdf", total_pages=158
     )
     assert layer is not None and layer.page_count == 50
+    assert truncated == (50, 158)
+    unread = MinerUParserProvider._unread_pages(set(layer.pages), 158, truncated, [])
     assert unread == list(range(51, 159))
     assert page_ranges(unread) == "51-158"
 
@@ -162,12 +164,13 @@ def test_continuation_passes_read_the_whole_document(monkeypatch):
     monkeypatch.setattr(settings, "OCR_LAYER_ENABLED", True)
     monkeypatch.setattr(settings, "OCR_LAYER_CONTINUATION_PASSES", 3)
     tesseract = _Truncating(total=158, step=50)
-    layer, unread = _provider(monkeypatch, tesseract)._ocr_layer(
+    layer, truncated = _provider(monkeypatch, tesseract)._ocr_layer(
         "s3://x.pdf", "pdf", total_pages=158
     )
     assert tesseract.starts == [1, 51, 101, 151]
     assert layer.page_count == 158
-    assert unread == []
+    assert truncated is None
+    assert MinerUParserProvider._unread_pages(set(layer.pages), 158, truncated, []) == []
 
 
 def test_continuation_stops_when_a_pass_makes_no_progress(monkeypatch):
@@ -184,17 +187,31 @@ def test_continuation_stops_when_a_pass_makes_no_progress(monkeypatch):
                                                  confidence=0.9, page=1)]}, page_count=1)
 
     tesseract = _Stuck(total=158, step=50)
-    _, unread = _provider(monkeypatch, tesseract)._ocr_layer(
+    layer, truncated = _provider(monkeypatch, tesseract)._ocr_layer(
         "s3://x.pdf", "pdf", total_pages=158
     )
     assert tesseract.starts == [1, 51]
-    assert unread == list(range(51, 159))
+    assert MinerUParserProvider._unread_pages(
+        set(layer.pages), 158, truncated, []) == list(range(51, 159))
 
 
 def test_blank_page_inside_the_read_part_is_not_unread():
     # Пустая страница скана и непрочитанная страница — разные вещи.
-    unread = MinerUParserProvider._unread_pages({1: [], 3: []}, 5, (3, 5))
+    unread = MinerUParserProvider._unread_pages({1, 3}, 5, (3, 5), [])
     assert unread == [4, 5]
+
+
+def test_page_with_own_mineru_text_is_not_unread():
+    # Договор АО РАСУ на 79 страниц: распознавание остановилось на
+    # пятидесятой, но у MinerU на страницах 51-79 свой текст той же
+    # плотности — читать их было незачем, и потери нет.
+    blocks = [_block("ё" * 4000, "mineru_ocr", page=page) for page in range(51, 80)]
+    assert MinerUParserProvider._unread_pages(set(range(1, 51)), 79, (50, 79), blocks) == []
+    # Та же точка обрыва, но у MinerU на этих страницах по два десятка
+    # символов на лист (doc-791df8db, 90 страниц из 140) — это потеря.
+    thin = [_block("шапка", "mineru_ocr", page=page) for page in range(51, 80)]
+    assert MinerUParserProvider._unread_pages(
+        set(range(1, 51)), 79, (50, 79), thin) == list(range(51, 80))
 
 
 # ------------------------------------------------- пометки для выдачи
