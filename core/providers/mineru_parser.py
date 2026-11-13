@@ -119,6 +119,29 @@ def _stems(text: str) -> List[str]:
     return [w.lower().replace("ё", "е")[:_STEM] for w in _RUS_WORD_RE.findall(text or "")]
 
 
+# Обозначения, которые нельзя терять вместе с «графикой»: код KKS
+# («10JEB10CT001»), диаметр («⌀14»), радиус или резьба с дробной частью
+# («R1,5», «M2,5»). Без русских слов они похожи на мусор чертежа, но это
+# данные, и если у MinerU/модели на странице их нет — блок остаётся.
+# «R263» и «125» из графики под правило не попадают: нет дроби и букв кода.
+_DESIGNATION_RE = re.compile(
+    r"(?<![A-Z0-9])\d{0,3}[A-Z]{2,}\d{1,}[A-Z0-9]*\d(?![A-Z0-9])"
+    r"|[⌀Ø]\d+(?:[.,]\d+)?"
+    r"|(?<![A-Z0-9])[RM]\d+[.,]\d+"
+)
+# Кириллица, похожая на латиницу: Tesseract и MinerU путают «СТ» и «CT».
+_LOOKALIKE = str.maketrans("АВЕКМНОРСТХУ", "ABEKMHOPCTXY")
+
+
+def _norm_codes(text: str) -> str:
+    text = (text or "").upper().translate(_LOOKALIKE).replace("Ø", "⌀")
+    return re.sub(r"⌀\s+", "⌀", text)
+
+
+def _designations(text: str) -> List[str]:
+    return [m.group(0) for m in _DESIGNATION_RE.finditer(_norm_codes(text))]
+
+
 def drop_repeated_recovered_blocks(
     blocks: List[ParsedBlock], min_share: float
 ) -> Tuple[List[ParsedBlock], int]:
@@ -133,6 +156,8 @@ def drop_repeated_recovered_blocks(
     русского слова» — только на русской странице (русских слов у MinerU не
     меньше латинских): на английском скане такой блок — недостающий текст.
     На странице без текста MinerU слой — единственный источник и не трогается.
+    Блок с обозначением (KKS, ⌀, R1,5), которого нет в тексте страницы у
+    MinerU/модели, не отбрасывается ни по одному из правил.
     """
     page_chars: Dict[int, int] = {}
     page_stems: Dict[int, set] = {}
@@ -141,15 +166,20 @@ def drop_repeated_recovered_blocks(
     # английском скане восстановленный блок — текст, которого у MinerU нет.
     page_rus: Dict[int, int] = {}
     page_lat: Dict[int, int] = {}
+    # Весь текст страницы помимо слоя (любые типы блоков, включая ответы
+    # модели по чертежу) — для проверки обозначений.
+    page_codes: Dict[int, List[str]] = {}
     for b in blocks:
         if b.method == METHOD_OCR_LAYER_RECOVERED:
             continue
         text = b.text or ""
+        page_codes.setdefault(b.page, []).append(_norm_codes(text))
         if b.type == "table" and b.table_data:
             cells = [str(h) for h in (b.table_data.get("headers") or [])]
             for row in b.table_data.get("rows") or []:
                 cells.extend(str(c) for c in row)
             text = " ".join(cells)
+            page_codes[b.page].append(_norm_codes(text))
         if b.type in _TEXTISH or b.type == "table":
             stems = _stems(text)
             page_stems.setdefault(b.page, set()).update(stems)
@@ -168,6 +198,11 @@ def drop_repeated_recovered_blocks(
                 page_rus.get(b.page, 0) >= page_lat.get(b.page, 0))
             if ((not stems and russian_page)
                     or (stems and sum(s in known for s in stems) >= min_share * len(stems))):
+                # Пробелы внутри обозначения у MinerU («10JEB10 CT001») не в счёт.
+                page_text = "".join("|".join(page_codes.get(b.page, [])).split())
+                if any(code not in page_text for code in _designations(b.text or "")):
+                    kept.append(b)
+                    continue
                 dropped += 1
                 continue
         kept.append(b)

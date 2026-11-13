@@ -357,3 +357,36 @@ def test_recovered_english_text_kept_on_english_page():
     kept, dropped = drop_repeated_recovered_blocks(blocks, 0.6)
     assert dropped == 0
     assert len(kept) == 2
+
+
+@pytest.mark.parametrize("recovered", [
+    "10JEB10CT001",
+    "⌀14 R1,5",
+    "Ø 8",
+    # Русские слова — повтор MinerU, но кода у MinerU нет.
+    "4. Размеры Х и У - габаритные размеры конечного изделия 10LAB20AA101",
+])
+def test_recovered_designation_absent_from_mineru_kept(recovered):
+    # Обозначение без русских слов похоже на графику, но это данные: если
+    # у MinerU на странице его нет, блок не отбрасывается.
+    from core.providers.mineru_parser import drop_repeated_recovered_blocks
+    from core.providers.text_layer import METHOD_OCR_LAYER_RECOVERED as REC
+
+    blocks = [_block(MINERU_NOTES, "mineru_ocr"), _block(recovered, REC)]
+    kept, dropped = drop_repeated_recovered_blocks(blocks, 0.6)
+    assert dropped == 0
+    assert kept[-1].text == recovered
+
+
+def test_recovered_designation_known_to_mineru_dropped():
+    # Код уже есть у MinerU (кириллические «СТ», пробел внутри) — блок повтор.
+    from core.providers.mineru_parser import drop_repeated_recovered_blocks
+    from core.providers.text_layer import METHOD_OCR_LAYER_RECOVERED as REC
+
+    blocks = [
+        _block(MINERU_NOTES + " Датчик 10JEB10 СТ001, отверстие ⌀ 14.", "mineru_ocr"),
+        _block("10JEB10CT001 ⌀14", REC),
+    ]
+    kept, dropped = drop_repeated_recovered_blocks(blocks, 0.6)
+    assert dropped == 1
+    assert len(kept) == 1
