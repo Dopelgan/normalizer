@@ -324,8 +324,17 @@ class DrawingProcessor:
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
             result.append(enriched or fragment)
 
+        had_drawings = any(f.type == "drawing" for f in result)
         sheets = self._sheet_drawings(result, metadata)
-        if sheets:
+        if sheets and had_drawings and settings.DRAWING_SHEET_MISSING_PAGES:
+            # Дочитанный лист встаёт перед фрагментами своей страницы, а не
+            # в начало документа: порядок страниц сохраняется.
+            for sheet in sheets:
+                page = sheet.position.page
+                index = next((i for i, f in enumerate(result)
+                              if f.position is not None and f.position.page >= page), len(result))
+                result.insert(index, sheet)
+        elif sheets:
             result[0:0] = sheets
         elif not any(f.type == "drawing" for f in result) and self._source_is_raster_drawing(metadata):
             for fragment in result:
@@ -345,18 +354,19 @@ class DrawingProcessor:
         открывался как растр, и ветка молча возвращала пустой результат.
         """
         full_read = self._full_read_image(metadata)
-        drawn_pages = {
-            int(fragment.position.page) for fragment in fragments
-            if fragment.type == "drawing" and fragment.position is not None
-        }
+        drawings = [fragment for fragment in fragments if fragment.type == "drawing"]
+        drawn_pages = {int(f.position.page) for f in drawings if f.position is not None}
         # Нарезанные MinerU картинки листа — это виды, а не лист: штамп,
         # номер листа и примечания остаются за ними. При полном чтении
         # картинки лист читается целиком и в этом случае.
         only_undrawn = False
-        if not full_read and drawn_pages:
+        if not full_read and drawings:
             # Листы без единого фрагмента drawing (повёрнутый лист, который
             # MinerU принял за таблицу) иначе не читались моделью вовсе.
-            if not (settings.DRAWING_SHEET_MISSING_PAGES and self._source_is_raster_drawing(metadata)):
+            # Фрагмент без страницы не даёт сказать, какой лист уже прочитан.
+            if (not settings.DRAWING_SHEET_MISSING_PAGES
+                    or len(drawn_pages) == 0 or any(f.position is None for f in drawings)
+                    or not self._source_is_raster_drawing(metadata)):
                 return []
             only_undrawn = True
         if not full_read and not self._source_is_raster_drawing(metadata):

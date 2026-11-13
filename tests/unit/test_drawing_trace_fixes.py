@@ -99,6 +99,22 @@ class TestSheetWithoutDrawingFragment:
         # Фрагменты других листов не тронуты и не задвоены.
         assert sum(1 for f in out if f.type == "drawing") == 4
 
+    def test_flag_on_sheet_keeps_page_order(self, processor, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_SHEET_MISSING_PAGES", True)
+        out = processor.enrich_fragments(self.fragments(), scan_metadata())
+        pages = [f.position.page for f in out]
+        assert pages == sorted(pages)
+
+    @pytest.mark.parametrize("flag", [False, True])
+    def test_drawing_without_page_cancels_sheets(self, processor, monkeypatch, flag):
+        # Фрагмент drawing без страницы: какой лист прочитан — неизвестно,
+        # поведение прежнее и при включённом флаге.
+        monkeypatch.setattr(settings, "DRAWING_SHEET_MISSING_PAGES", flag)
+        loose = drawn(1)
+        loose.position = None
+        processor.enrich_fragments([loose, junk_table(3)], scan_metadata())
+        assert processor.asked == []
+
     def test_flag_on_all_sheets_drawn_reads_nothing(self, processor, monkeypatch):
         monkeypatch.setattr(settings, "DRAWING_SHEET_MISSING_PAGES", True)
         processor.enrich_fragments([drawn(1), drawn(2)], scan_metadata(pages=(1, 2)))
