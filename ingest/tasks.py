@@ -282,6 +282,58 @@ def mark_unread_pages(fragments, pages: List[int]) -> int:
     return marked
 
 
+SHEETS_SKIPPED_PREFIX = "DRAWING_SHEETS_SKIPPED:"
+
+
+def skipped_sheet_pages(fragments) -> List[int]:
+    """
+    Страницы-чертежи, которые ветка чертежей не читала: предел
+    `DRAWING_MAX_SHEETS` или остаток срока задачи.
+
+    Номера страниц уже есть — внутри пометки `DRAWING_SHEETS_SKIPPED:7,8`,
+    списком через запятую, а не числом. Но строка предупреждения не
+    машиночитаема дальше первой попытки её разобрать, и в `extra_data`
+    документа её нет вовсе: чтобы ответить «какие листы не прочитаны»,
+    приходилось читать текст пометки глазами.
+    """
+    pages: List[int] = []
+    for fragment in fragments:
+        for warning in fragment.warnings:
+            if not warning.startswith(SHEETS_SKIPPED_PREFIX):
+                continue
+            for part in warning[len(SHEETS_SKIPPED_PREFIX):].split(","):
+                part = part.strip()
+                if part.isdigit():
+                    pages.append(int(part))
+    return sorted(set(pages))
+
+
+def mark_unread_sheets(fragments, pages: List[int]) -> int:
+    """
+    Непрочитанные листы — в `missing_regions` фрагментов этих страниц.
+
+    Пометка ставится только нечертёжным фрагментам: `missing_regions`
+    чертежа ведёт документ на проверку человеком
+    (`core/drawing_quality.py`), а качество разбора поводом для этого не
+    является — непрочитанный лист дочитывает система, а не оператор.
+    """
+    if not pages:
+        return 0
+    unread = set(pages)
+    marked, seen = 0, set()
+    for fragment in fragments:
+        page = getattr(fragment.position, "page", None) if fragment.position else None
+        if page not in unread or fragment.type == "drawing" or page in seen:
+            continue
+        fragment.missing_regions = list(fragment.missing_regions) + [
+            {"kind": "sheet", "bbox": [0.0, 0.0, 1.0, 1.0], "page": page,
+             "reason": "sheet_not_read"}
+        ]
+        seen.add(page)
+        marked += 1
+    return marked
+
+
 def build_document_result(
     s3_fileid: str,
     document,
@@ -600,6 +652,16 @@ def process_document(
                 "Документ %s: текст не прочитан на страницах %s — помечено фрагментов %d",
                 doc_id, parse_result.unread_text_pages, unread_marked,
             )
+        # Листы, которые ветка чертежей не читала, — по номерам страниц, а
+        # не только внутри текста пометки. Статуса это не меняет: документ
+        # с такой пометкой и так partial.
+        unread_sheets = skipped_sheet_pages(fragments)
+        if unread_sheets:
+            marked = mark_unread_sheets(fragments, unread_sheets)
+            logger.warning(
+                "Документ %s: листы %s не прочитаны моделью — помечено фрагментов %d",
+                doc_id, ", ".join(str(page) for page in unread_sheets), marked,
+            )
         # Неполнота документа и вызов человека — разные вещи, и до сих пор
         # они были одним флагом. Непрочитанные страницы входят в неполноту:
         # статус partial они ставят, человека не зовут.
@@ -657,6 +719,9 @@ def process_document(
                 # Страницы с блоками, но без прочитанного текста. Отдельно
                 # от unknown_pages: покрытие страниц у них полное.
                 "unread_text_pages": parse_result.unread_text_pages,
+                # Страницы-чертежи, которые модель не читала (предел
+                # DRAWING_MAX_SHEETS или остаток срока задачи).
+                "unread_sheet_pages": unread_sheets,
                 "page_coverage_version": PAGE_COVERAGE_VERSION,
                 "warnings": warnings,
                 "processing_profile_version": PROCESSING_PROFILE_VERSION,
