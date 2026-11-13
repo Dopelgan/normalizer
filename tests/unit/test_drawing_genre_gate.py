@@ -284,6 +284,119 @@ class TestScorePage:
         assert not _score_page(page, 1).is_drawing
 
 
+# ------------------------------------------------- распознанный штамп
+class TestStampOcr:
+    """
+    Решение по распознанной основной надписи скана.
+
+    Тексты ниже — настоящий ответ Tesseract 5.5.0 (`--psm 11`, модель,
+    дообученная под ГОСТ 2.304) на вырезках зоны штампа из корпуса
+    заказчика, со всеми ошибками распознавания как есть. Это те два
+    случая, на которых ломается геометрия: лист «ТАДУ 302318.207.00 СБ»
+    обрезан, и рамки формата на нём детектор не видит; «Паспорт ТАДУ
+    405210.001ПС» — повёрнутый на 90° скан таблицы, который детектор зовёт
+    схемой.
+    """
+
+    # Обозначение прочитано с потерей кода организации («TAY» вместо
+    # «ТАДУ»), зато подписи граф формы 1 читаются — и решают.
+    ASSEMBLY_STAMP = """стенда гидроиспытаний к трубной обвязке.
+7. Химполировка сварных соединений
+8 Общая длина трубы #16x25 - 2772 мм
+9. Маркировать на вирке обозначение спецификации, штамп OTK
+TAY 302318.207.00 СБ
+Лит. Macca Масштаб |
+yu Лист [Nao Поз), _ Дата
+Разра
+Прохоров
+Трубная обвязка
+26,02
+pobepun  Постнов
+Сборочный чертех
+I контр.  Оханов
+Лист Листов 7"""
+
+    PASSPORT_TEXT = """от минус 50 до +150 °С (для ТС типа СГ1-01(-02))
+- абсолютное давление - до 0,63 МПа;
+- относительная влажность - до 98% при температуре плюс 35°C.
+Степень защиты TC от пыли и воды (по ГОСТ 14254-2015) — IP67.
+Категория сейсмостойкости (no НП-031-01) - 1.
+ТС изготавливаются по техническим условиям ТАДУ 405210.001ТУ"""
+
+    # Та же зона на неверном повороте: распознавание возвращает шум.
+    NOISE = """=] 2, x
+220
+ю Qo
+сл "Э
+У © ©
+[234"""
+
+    def test_mixed_script_form_one_labels_keep_the_sheet(self):
+        # «Macca» — кириллическая М с латинскими буквами внутри.
+        verdict = drawing_genre.gate_stamp(
+            {0: self.ASSEMBLY_STAMP, 90: self.NOISE, 180: self.NOISE, 270: self.NOISE}
+        )
+        assert verdict["demote"] is False
+        assert verdict["title_block_form1"] is True
+        assert verdict["turn"] == 0
+
+    def test_passport_demoted_by_document_code(self):
+        verdict = drawing_genre.gate_stamp(
+            {0: self.NOISE, 90: self.PASSPORT_TEXT, 180: self.NOISE, 270: self.NOISE}
+        )
+        assert verdict["demote"] is True
+        assert verdict["turn"] == 90
+        assert verdict["text_designation"] is True
+
+    def test_nothing_readable_is_never_demoted(self):
+        verdict = drawing_genre.gate_stamp({t: self.NOISE for t in (0, 90, 180, 270)})
+        assert verdict["judgeable"] is False
+        assert verdict["demote"] is False
+        assert verdict["turn"] is None
+
+    def test_empty_read_is_never_demoted(self):
+        assert drawing_genre.gate_stamp({})["demote"] is False
+        assert drawing_genre.gate_stamp({0: "", 90: ""})["demote"] is False
+
+    def test_unread_stamp_of_a_real_sheet_is_not_demoted(self):
+        # Настоящий лист, у которого подписи граф распознавание не взяло:
+        # текст прочитан, признаков чертежа в нём нет — и всё равно жанр не
+        # снимается. Снятие по отсутствию признаков убрало на корпусе 59
+        # настоящих сборочных чертежей из 65, поэтому на скане решает только
+        # положительный признак документа.
+        unread = ("Разраб Прохоров 27.01.20\n"
+                  "Проверил Постнов 28.01.20\n"
+                  "Н контр Домрачева 29.01.20\n"
+                  "Копировал Формат A3\n")
+        verdict = drawing_genre.gate_stamp({0: unread})
+        assert drawing_genre.readable_words(unread) >= drawing_genre.MIN_WORDS_READABLE
+        assert verdict["weight"] == 0
+        assert verdict["demote"] is False
+
+    def test_best_orientation_wins(self):
+        # Ориентация выбирается самая благоприятная для чертежа: ошибиться
+        # поворотом и снять из-за этого жанр с настоящего листа нельзя.
+        verdict = drawing_genre.gate_stamp(
+            {0: self.PASSPORT_TEXT, 180: self.ASSEMBLY_STAMP}
+        )
+        assert verdict["demote"] is False
+        assert verdict["turn"] == 180
+
+    def test_labels_alone_are_enough(self):
+        # Разборчиво прочитанный штамп — это и есть подписи граф с
+        # обозначением; отбросить такую ориентацию по счётчику слов значило
+        # бы снять жанр с настоящего листа из-за нехватки текста вокруг.
+        verdict = drawing_genre.gate_stamp({0: "Лит. Macca Масштаб"})
+        assert verdict["demote"] is False
+        assert verdict["title_block_form1"] is True
+
+    def test_composite_designation_code_is_read(self):
+        # «ТАДУ 302318.207.00 СБ»: номера исполнений через точку, код за ними.
+        evidence = drawing_genre.assess("ТАДУ 302318.207.00 СБ")
+        assert evidence.drawing_designation is True
+        assert drawing_genre.assess("ТАДУ 405210.001ТУ").text_designation is True
+
+
 class TestTextIsNotLost:
     """
     Снятый жанр не должен стоить ни одного символа. Лист, который перестал
