@@ -98,6 +98,8 @@ def _drop_nul(fragment: Fragment) -> None:
         content.text = content.text.replace("\x00", "")
     if fragment.section_title and "\x00" in fragment.section_title:
         fragment.section_title = fragment.section_title.replace("\x00", "")
+    if fragment.section_path:
+        fragment.section_path = _without_nul(fragment.section_path)
     if content.structured_drawing_fields:
         kept = []
         for field in content.structured_drawing_fields:

@@ -503,3 +503,13 @@ class TestNulCharacters:
         clean, _ = finalize_fragments([fragment(text="Текст фрагмента")], "doc-001", "f1")
         dirty, _ = finalize_fragments([fragment(text="Текст\x00 фрагмента")], "doc-001", "f1")
         assert clean[0].fragment_id == dirty[0].fragment_id
+
+    def test_nul_only_text_block_is_not_a_fragment(self):
+        blocks = [
+            text_block("\x00 \x00 \x00", order=0),
+            text_block("Текст после мусора достаточной длины.", order=1, section_title="Раздел\x00"),
+        ]
+        fragments = TextNormalizer().normalize(ParseResult(blocks=blocks), META)
+        assert [f.content.text for f in fragments] == ["Текст после мусора достаточной длины."]
+        assert "\x00" not in (fragments[0].section_title or "")
+        assert all("\x00" not in part for part in fragments[0].section_path)

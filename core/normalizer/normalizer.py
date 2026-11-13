@@ -115,8 +115,9 @@ class TextNormalizer:
             for item in items:
                 # Короткие строки не выбрасываются: в технической документации
                 # `POST /cart/add`, `race condition` или `Go:` — это и есть
-                # содержание, а не мусор. Отбрасываем только пустое.
-                if not item.text or not item.text.strip():
+                # содержание, а не мусор. Отбрасываем только пустое — в том числе
+                # строку из одних U+0000 (глифы текстового слоя без таблицы символов).
+                if not item.text or not item.text.replace("\x00", "").strip():
                     continue
 
                 anchor = item.blocks[0] if item.blocks else run[0]
