@@ -19,10 +19,12 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.config import settings
 from core.facts.extractor import extract_facts
 from core.models.contract import Fragment
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import apply_drawing_quality
+from core.providers import designation_repair, mixed_script
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +138,12 @@ def finalize_fragments(
 
     for order, fragment in enumerate(fragments, start=1):
         _drop_nul(fragment)
+        # До fragment_id и до извлечения фактов: факт и идентификатор должны
+        # считаться по тому тексту, который уйдёт в индекс.
+        if settings.SCAN_NO_MIXED_SCRIPT_WORDS and fragment.type == "text":
+            mixed_script.repair_fragment(fragment)
+        if settings.SCAN_DESIGNATION_REPAIR and fragment.type == "text":
+            designation_repair.repair_fragment(fragment)
         if fragment.type == "drawing":
             apply_drawing_quality(fragment)
         if fragment.provenance.source_unit_id is None:

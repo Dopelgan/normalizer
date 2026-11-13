@@ -76,6 +76,7 @@ from core.providers.vector_drawing import structure_ratio
 from core.drawing_quality import apply_drawing_quality
 from core.drawing_stale_sources import suppress_stale_sources
 from core.drawing_transcript import apply_transcripts
+from core.scan_text_rescan import poor_pages
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,7 @@ class DrawingProcessor:
     def process(
         self, image_ref: str, metadata: Dict[str, Any], page: int = 1,
         transcribe: bool = False, log_page: Optional[int] = None,
+        text_only: bool = False,
     ) -> Dict[str, Any]:
         """
         Возвращает:
@@ -163,28 +165,35 @@ class DrawingProcessor:
         payload["coordinate_reference"] = "deskewed_page"
         missing_regions: List[Dict[str, Any]] = []
 
-        pass_started = time.monotonic()
-        budget = settings.DRAWING_TIME_BUDGET
-        # Срок передаётся только когда лист и правда может читаться частями:
-        # с выключенным флагом вызов прохода остаётся в точности прежним.
-        #
-        # Из бюджета вычитается запас на проходы после чтения листа. Иначе
-        # дочитывание частями съедает бюджет, частям прохода «весь текст
-        # листа» времени не остаётся, и документ уходит человеку из-за
-        # transcript_tile — хотя человеку качество чтения листа не адресовано.
-        deadline_kwargs = (
-            {"until": started + budget - settings.DRAWING_SHEET_TILE_RESERVE}
-            if settings.DRAWING_SHEET_TILES and budget else {}
-        )
-        reading = self.qwen.read_sheet(
-            layout.image, hint=layout.hint(), **deadline_kwargs,
-        )
-        self._log_pass(
-            sheet, "лист целиком", pass_started,
-            self._sheet_produced(reading) if reading is not None else "лист не прочитан",
-        )
-        if reading is not None:
-            self._sheet_record(reading, payload)
+        # Перечитывание плохого скана (DRAWING_RESCAN_POOR_OCR_PAGES) просит
+        # у модели только текст страницы: надписи по категориям, штамп и
+        # таблицы на такой странице уже прочитаны своей ветвью, и второй раз
+        # платить за них временем незачем.
+        reading = None
+        if not text_only:
+            pass_started = time.monotonic()
+            budget = settings.DRAWING_TIME_BUDGET
+            # Срок передаётся только когда лист и правда может читаться частями:
+            # с выключенным флагом вызов прохода остаётся в точности прежним.
+            #
+            # Из бюджета вычитается запас на проходы после чтения листа. Иначе
+            # дочитывание частями съедает бюджет, частям прохода «весь текст
+            # листа» времени не остаётся, и документ уходит человеку из-за
+            # transcript_tile — хотя человеку качество чтения листа не адресовано.
+            deadline_kwargs = (
+                {"until": started + budget - settings.DRAWING_SHEET_TILE_RESERVE}
+                if settings.DRAWING_SHEET_TILES and budget else {}
+            )
+            reading = self.qwen.read_sheet(
+                layout.image, hint=layout.hint(), **deadline_kwargs,
+            )
+            self._log_pass(
+                sheet, "лист целиком", pass_started,
+                self._sheet_produced(reading) if reading is not None
+                else "лист не прочитан",
+            )
+            if reading is not None:
+                self._sheet_record(reading, payload)
         # Весь текст листа отдельным проходом (DRAWING_IMAGE_FULL_READ):
         # разметка надписей по категориям теряет штамп, графы, номер листа
         # и примечания, а без них лист нельзя найти ни по обозначению, ни
@@ -211,7 +220,7 @@ class DrawingProcessor:
 
         # Штамп важнее прочих таблиц: если времени хватит не на все области,
         # прочитан будет он.
-        regions = sorted(
+        regions = [] if text_only else sorted(
             layout.regions,
             key=lambda r: r.kind != drawing_vision.KIND_TITLE_BLOCK,
         )
@@ -498,6 +507,8 @@ class DrawingProcessor:
             for fragment in result:
                 fragment.review_required = True
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
+        if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
+            result.extend(self._rescan_poor_pages(result, metadata))
         if settings.DRAWING_TRANSCRIPT_FIXES_OCR:
             result = apply_transcripts(result)
         if settings.DRAWING_SUPPRESS_STALE_ON_FULL_READ:
@@ -505,6 +516,84 @@ class DrawingProcessor:
             # текст модели, и убирается как повтор, а не как расхождение.
             result = suppress_stale_sources(result)
         return result
+
+    # ------------------------------------------- перечитывание плохого скана
+    def _rescan_poor_pages(
+        self, fragments: List[Fragment], metadata: Dict[str, Any]
+    ) -> List[Fragment]:
+        """
+        Страницы, у которых распознавание испорчено, читаются моделью
+        (DRAWING_RESCAN_POOR_OCR_PAGES).
+
+        Берётся тот же проход «весь текст листа», которым читаются листы при
+        полном чтении, но без чтения надписей и областей: нужен только текст
+        страницы. Дальше абзацы распознавания правит существующий шаг
+        `core/drawing_transcript.py`, а повторы убирает
+        `core/drawing_stale_sources.py`.
+
+        Страница, текст которой модель уже переписала, повторно не читается.
+        """
+        source_uri = str(metadata.get("source_path") or "")
+        if not source_uri or not self.qwen.available:
+            return []
+        transcribed = {
+            int(fragment.position.page) for fragment in fragments
+            if fragment.type == "drawing" and fragment.position is not None
+            and (fragment.content.structured_payload or {}).get("transcript_line_count")
+        }
+        verdicts = poor_pages(
+            fragments, settings.DRAWING_RESCAN_OCR_SCORE,
+            settings.DRAWING_RESCAN_MIXED_SHARE,
+        )
+        pages = [page for page in verdicts if page not in transcribed]
+        if not pages:
+            return []
+        sheets: List[Fragment] = []
+        for page in pages[: settings.DRAWING_RESCAN_MAX_PAGES]:
+            left = deadline.remaining()
+            if left is not None and left < settings.VLM_TIMEOUT:
+                logger.warning(
+                    "Страница %d файла %s не перечитана: до срока задачи %.0f с",
+                    page, source_uri, left,
+                )
+                break
+            verdict = verdicts[page]
+            logger.info(
+                "Страница %d: распознавание испорчено (оценка %.2f, смешанных "
+                "слов %.0f%%, признаки %s) — текст читает модель",
+                page, verdict.score, verdict.mixed_share * 100,
+                ",".join(verdict.reasons),
+            )
+            try:
+                drawing_result = self.process(
+                    source_uri, metadata, page, transcribe=True,
+                    log_page=page, text_only=True,
+                )
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 — страница не роняет документ
+                logger.error("Перечитывание страницы %d файла %s не удалось: %s",
+                             page, source_uri, exc)
+                continue
+            if not (drawing_result.get("structured_payload") or {}).get(
+                    "transcript_line_count"):
+                continue
+            anchor = Fragment(
+                fragment_id=f"{metadata.get('doc_id') or 'doc'}-rescan-{page:03d}",
+                type="image",
+                content=Content(image_ref=source_uri),
+                position=Position(page=int(page), bbox=[0.0, 0.0, 1.0, 1.0], order=0),
+                confidence=0.0, completeness=0.0,
+                provenance=Provenance(method="vlm_full_page", strategy_level=7,
+                                      source="drawing"),
+            )
+            sheet = self.build_fragment(drawing_result, anchor, metadata)
+            if sheet is None:
+                continue
+            payload = sheet.content.structured_payload or {}
+            payload["rescan_reason"] = verdict.as_dict()
+            sheets.append(sheet)
+        return sheets
 
     # -------------------------------------------------- лист-картинка целиком
     def _sheet_drawings(
