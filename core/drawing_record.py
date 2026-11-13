@@ -19,6 +19,19 @@
 размеры с их родом — в `structured_drawing_fields`, таблицы листа — в
 `structured_payload["tables"]`. В текст записи они не попадали никогда.
 
+Чем это является и чем не является. Это правка **читаемости**, а не возврат
+потерянных данных, и путать их нельзя. Адаптер RAG
+(`super_rag/parser/adapter.py`, `_fragment_search_text`) у фрагмента, у
+которого `content.text` пуст, уже отдавал в индекс поля и весь
+`structured_payload` каноническим JSON под меткой `[DRAWING]` — то есть
+масса в поиске была, в виде JSON. Таких фрагментов большинство: 4687 из
+5110 на проде. Для них сборка JSON не дублирует, а **заменяет** его прозой
+(адаптер возвращает текст, едва он появился), и индексируемый текст
+становится короче примерно в двенадцать раз. У остальных 423 фрагментов
+текст листа есть, адаптер отдаёт только его, и JSON не отдавался никогда —
+вот там графы штампа в поиск действительно не попадали, и именно такие
+листы читал заказчик, когда забраковал запись.
+
 Что делает модуль. Собирает из того же фрагмента запись по частям, у каждой
 части — название, у каждого значения — то, чем оно является:
 
@@ -66,12 +79,19 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from core.models.contract import Fragment
-from core.providers.title_block import LABELS, canonical, label
+from core.providers.title_block import (
+    HANDWRITTEN_MARK, LABELS, canonical, label,
+)
 
 # Ключ в payload: сколько подписей граф без значения убрано из текста листа.
 DROPPED_KEY = "record_dropped_furniture"
 # Ключ в payload: запись собрана по частям (для отладки и замеров).
 COMPOSED_KEY = "record_composed"
+
+# Оговорка о непривязанных размерах. Одна на запись: областей видов в
+# разборе нет, и сказать это надо честно, но один раз.
+NO_VIEW_LINK = ("К какому виду или разрезу относится каждый размер, "
+                "запись чертежа не указывает.")
 
 # Графы основной надписи в том порядке, в котором их спрашивают.
 # Подписи берутся из `title_block.LABELS`: имя графы здесь и в разборе
@@ -120,17 +140,29 @@ _KIND_TITLES: Sequence[tuple] = (
     ("linear", "Линейные размеры"),
 )
 
-_DIAMETER_SIGN = "⌀"
+# Знак диаметра во всех начертаниях. Образец тот же, что в
+# `core/providers/drawing_text.py`: векторный путь складывает в поля то, что
+# прочитал, не приводя знак к одному виду, и «Ø57» иначе уходило бы в
+# линейные размеры.
+_DIAMETER_GLYPHS = re.compile(r"[Øøᴓ⌀ΦϕφФ]")
 _ANGLE_SIGN = re.compile(r"°")
+# Надпись сама говорит, что она за величина: предельное отклонение, знак
+# умножения размеров или названная единица.
+_MEASURED_SIGN = re.compile(r"[±]|\d\s*[xх×]\s*\d|[+\-]\s*\d|\d\s*(мм|mm|м\b|°)")
 # Название вида, разреза или сечения по ГОСТ 2.305 — целой строкой.
 # Либо парная буква («А-А», «Б—Б»), либо буква с масштабом в скобках
 # («Б(2:1)», «Г(2)»), либо строка со словом «вид»/«разрез»/«сечение».
 # Одиночная буква («A») видом не считается: на листе она и обозначение
 # места разреза, и номер исполнения — назвать её видом было бы догадкой.
 _VIEW_PAIR = re.compile(
-    r"^([А-ЯЁA-Z])\s*[-–—]\s*\1\s*(\(\s*[\d,.:]+\s*\))?$")
+    r"^([А-ЯЁA-Z])\s*[-–—]\s*\1\s*(\([^()]*\))?$")
+# Масштаб по ГОСТ 2.302 — всегда отношение, с двоеточием: «Б(2:1)», «A(1:4)».
+# Без двоеточия буква с числом видом не считается: «Б(4)» это номер
+# исполнения или позиции, и на настоящих листах таких «видов» набиралось по
+# восемнадцать штук. Это та же неоднозначность, из-за которой видом не
+# считается и одиночная буква.
 _VIEW_SCALED = re.compile(
-    r"^[А-ЯЁA-Z]\s*\(\s*[\d,.:]+\s*\)$")
+    r"^[А-ЯЁA-Z]\s*\(\s*\d+(?:[.,]\d+)?\s*:\s*\d+(?:[.,]\d+)?\s*\)$")
 _VIEW_WORD = re.compile(
     r"^(вид|разрез|сечение|развёртка|развертка)\b", re.IGNORECASE)
 # Строка-название вида не бывает длинной: «Вид на изделие со снятой…» —
@@ -157,6 +189,8 @@ _LABELS_FOLDED = (
 )
 # `kind` таблицы, которой разбор помечает сетку основной надписи.
 _TITLE_BLOCK_KIND = "title_block"
+# Чем разделяются два прочтения одной графы.
+_GRAPH_JOIN = "; "
 # Меньше стольких подписей граф — сеткой штампа таблица не считается:
 # на двух-трёх ячейках доля ничего не значит.
 _STAMP_GRID_MIN_LABELS = 3
@@ -194,6 +228,11 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
     """
     content = fragment.content
     payload = dict(content.structured_payload or {})
+    if payload.get(COMPOSED_KEY):
+        # Запись этого фрагмента уже собрана. Второй проход вложил бы
+        # сборку внутрь её же части «Надписи листа в порядке чтения», и
+        # заголовок перестал бы соответствовать тому, что под ним стоит.
+        return content.text
     fields = [
         {"category": f.category, "value": f.value, "tolerance": f.tolerance,
          "unit": f.unit}
@@ -203,10 +242,13 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
     kept, dropped = _without_furniture(lines)
 
     parts: List[str] = []
-    parts.extend(_stamp(payload))
-    parts.extend(_handwritten(payload))
-    parts.extend(_views(kept))
-    parts.extend(_dimensions(fields))
+    parts.extend(_stamp(payload, fields))
+    parts.extend(_handwritten(payload, fields))
+    # Оговорка про непривязанные размеры говорится один раз — в той из двух
+    # частей, которая встретится первой.
+    views = _views(kept, hedge=True)
+    parts.extend(views)
+    parts.extend(_dimensions(fields, hedge=not views))
     parts.extend(_positions(fields))
     parts.extend(_callouts(fields))
     parts.extend(_notes(fields))
@@ -226,7 +268,43 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
 
 # ----------------------------------------------------------------- части
 
-def _graphs(block: Any) -> Dict[str, str]:
+def _corrected(fields: Sequence[Dict[str, Any]]) -> Dict[tuple, str]:
+    """
+    Исправленные значения граф штампа, взятые из полей фрагмента.
+
+    Зачем. Разбор штампа кладёт в `structured_payload["title_block"]` ответ
+    модели как есть, а `drawing_text.normalize` применяет только к тем
+    значениям, которые уходят в `structured_drawing_fields` (там графа
+    записана как «Подпись: значение»). Если собирать запись по payload,
+    заказчик увидит менее исправленную копию — с гомоглифами в обозначении
+    и посадке, — тогда как исправленная лежит рядом. Поэтому значение
+    берётся из поля, а payload остаётся запасным источником для граф,
+    которых в полях нет (поле могло не пройти `looks_like_text`).
+
+    Ключ — (каноническое имя графы, рукописная ли): одна и та же графа
+    бывает прочитана и печатной в штампе, и рукописной в боковой колонке, и
+    это два разных значения.
+    """
+    out: Dict[tuple, str] = {}
+    for field in fields:
+        if field.get("category") not in ("title_block", "material"):
+            continue
+        value = _clean(field.get("value"))
+        name, _, text = value.partition(":")
+        text = _clean(text)
+        if not text or not _clean(name):
+            continue
+        by_hand = text.endswith(f"({HANDWRITTEN_MARK})")
+        if by_hand:
+            text = _clean(text[: -len(f"({HANDWRITTEN_MARK})")])
+        key = canonical(name) or _fold(name)
+        if text and (key, by_hand) not in out:
+            out[(key, by_hand)] = text
+    return out
+
+
+def _graphs(block: Any, corrected: Dict[tuple, str],
+            by_hand: bool) -> Dict[str, str]:
     """
     Графы штампа с приведёнными именами.
 
@@ -245,19 +323,23 @@ def _graphs(block: Any) -> Dict[str, str]:
         if not value:
             continue
         key = canonical(str(raw_key)) or str(raw_key)
+        # Исправленная копия того же значения, если она есть.
+        value = corrected.get((key, by_hand), value)
         if key in out:
             # Две записи одной графы: вторая дописывается, а не затирает
-            # первую.
-            if value not in out[key]:
-                out[key] = f"{out[key]}; {value}"
+            # первую. Сравнение точное: значение «2,7» не считается уже
+            # сказанным только потому, что входит в «12,75».
+            if value not in out[key].split(_GRAPH_JOIN):
+                out[key] = f"{out[key]}{_GRAPH_JOIN}{value}"
             continue
         out[key] = value
     return out
 
 
-def _stamp(payload: Dict[str, Any]) -> List[str]:
+def _stamp(payload: Dict[str, Any],
+           fields: Sequence[Dict[str, Any]]) -> List[str]:
     """Основная надпись: графа со своим значением, в порядке ГОСТ 2.104."""
-    block = _graphs(payload.get("title_block"))
+    block = _graphs(payload.get("title_block"), _corrected(fields), by_hand=False)
     if not block:
         return []
     said = [
@@ -287,9 +369,11 @@ def _stamp(payload: Dict[str, Any]) -> List[str]:
     return ["\n".join(body)]
 
 
-def _handwritten(payload: Dict[str, Any]) -> List[str]:
+def _handwritten(payload: Dict[str, Any],
+                 fields: Sequence[Dict[str, Any]]) -> List[str]:
     """Графы, заполненные от руки: с оговоркой о надёжности чтения."""
-    hand = _graphs(payload.get("title_block_handwritten"))
+    hand = _graphs(payload.get("title_block_handwritten"), _corrected(fields),
+                   by_hand=True)
     if not hand:
         return []
     said = [f"{label(key)} — {hand[key]}." for key in _HAND_ORDER if key in hand]
@@ -303,7 +387,7 @@ def _handwritten(payload: Dict[str, Any]) -> List[str]:
             + " ".join(said)]
 
 
-def _views(lines: Sequence[str]) -> List[str]:
+def _views(lines: Sequence[str], hedge: bool) -> List[str]:
     """Виды, разрезы и сечения, названные на листе, — их названиями."""
     found: List[str] = []
     for line in lines:
@@ -315,13 +399,11 @@ def _views(lines: Sequence[str]) -> List[str]:
             found.append(name)
     if not found:
         return []
-    return ["Виды, разрезы и сечения, названные на листе: "
-            + "; ".join(found)
-            + ".\nК какому из них относится каждый размер, запись чертежа "
-              "не указывает."]
+    said = "Виды, разрезы и сечения, названные на листе: " + "; ".join(found) + "."
+    return [said + ("\n" + NO_VIEW_LINK if hedge else "")]
 
 
-def _dimensions(fields: Sequence[Dict[str, Any]]) -> List[str]:
+def _dimensions(fields: Sequence[Dict[str, Any]], hedge: bool) -> List[str]:
     """Размеры по роду величины: число всегда при том, чем оно является."""
     buckets: Dict[str, List[str]] = {kind: [] for kind, _ in _KIND_TITLES}
     for field in fields:
@@ -337,9 +419,10 @@ def _dimensions(fields: Sequence[Dict[str, Any]]) -> List[str]:
     ]
     if not said:
         return []
-    return ["Размеры и обозначения величин на листе. Перечислены по роду "
-            "величины: к какому виду относится каждый размер, запись "
-            "чертежа не указывает.\n" + "\n".join(said)]
+    head = "Размеры и обозначения величин на листе, по роду величины."
+    if hedge:
+        head += " " + NO_VIEW_LINK
+    return [head + "\n" + "\n".join(said)]
 
 
 def _positions(fields: Sequence[Dict[str, Any]]) -> List[str]:
@@ -361,11 +444,22 @@ def _callouts(fields: Sequence[Dict[str, Any]]) -> List[str]:
 
 
 def _notes(fields: Sequence[Dict[str, Any]]) -> List[str]:
-    """Технические требования и примечания — как они написаны на листе."""
+    """
+    Прочий текст листа — как он написан.
+
+    Заголовок нарочно не называет это техническими требованиями, хотя чаще
+    всего они тут и лежат. Категория `note` у разбора — это «не
+    классифицировано» с уверенностью 0,4 (`vector_drawing.classify`), и в
+    неё попадает что угодно: пункты требований, строки спецификации,
+    английский перечень изделий, а на листах, которые чертежом не являются
+    вовсе, — текст документа СМК целиком. Назвать такое «техническими
+    требованиями листа» значило бы утверждать то, чего данные не говорят.
+    Нумерованные пункты и так видны тем, что они нумерованные.
+    """
     notes = _values(fields, "note")
     if not notes:
         return []
-    return ["Технические требования и примечания листа.\n" + "\n".join(notes)]
+    return ["Текст и примечания листа.\n" + "\n".join(notes)]
 
 
 def _tables(payload: Dict[str, Any]) -> List[str]:
@@ -435,7 +529,18 @@ def _without_furniture(lines: Sequence[str]) -> tuple:
 
 
 def _kind_of(field: Dict[str, Any]) -> Optional[str]:
-    """Род величины поля: по его категории, а при `size` — по самому знаку."""
+    """
+    Род величины поля: по его категории, а при `size` — по самому знаку.
+
+    `None` — поле в перечень родов не попадает. Так уходит голое число:
+    категорию `size` разбор ставит уже за то, что надпись похожа на число,
+    и в эту категорию попадают номера выносок и зон («3», «1», «7») и
+    буквенные обозначения без значения («L», «h», «Dp»). Назвать их
+    линейными размерами значило бы сказать неправду о том, что они
+    измеряют, — а запись затем и собирается, чтобы значение не стояло без
+    того, чем оно является. Такие надписи остаются в части «Надписи листа
+    в порядке чтения», где ничего не утверждается.
+    """
     category = field.get("category")
     if category == "radius":
         return "radius"
@@ -448,11 +553,35 @@ def _kind_of(field: Dict[str, Any]) -> Optional[str]:
     if category != "size":
         return None
     value = str(field.get("value") or "")
-    if _DIAMETER_SIGN in value:
+    if _DIAMETER_GLYPHS.search(value):
         return "diameter"
     if _ANGLE_SIGN.search(value):
         return "angle"
-    return "linear"
+    return "linear" if _says_what_it_measures(field, value) else None
+
+
+def _says_what_it_measures(field: Dict[str, Any], value: str) -> bool:
+    """
+    Говорит ли надпись сама, что она за величина.
+
+    Достаточно любого из: предельное отклонение в самой надписи или
+    отдельной графой, знак умножения размеров («⌀32x2,5», «18x2,5»),
+    названная в самой надписи единица. Голая цифра — не говорит.
+
+    Поле `unit` признаком не считается, хотя и выглядит им: разбор
+    выводит его из категории, а не читает с листа
+    (`vector_drawing.extract_unit` отдаёт «мм» любому числу категории
+    `size`). Поэтому единица принимается только тогда, когда она есть в
+    самой надписи: «0,5 кг» — названа, «3» с выведенными «мм» — нет.
+    """
+    if not any(character.isdigit() for character in value):
+        return False
+    if _clean(field.get("tolerance")):
+        return True
+    unit = _clean(field.get("unit"))
+    if unit and unit in value:
+        return True
+    return bool(_MEASURED_SIGN.search(value))
 
 
 def _with_tolerance(field: Dict[str, Any]) -> str:
@@ -462,9 +591,14 @@ def _with_tolerance(field: Dict[str, Any]) -> str:
     """
     value = _clean(field.get("value"))
     tolerance = _clean(field.get("tolerance"))
-    if value and tolerance and tolerance not in value:
-        return f"{value} (допуск {tolerance})"
-    return value
+    if not (value and tolerance):
+        return value
+    # Отклонение уже внутри значения — второй раз не называется. Но голая
+    # цифра совпадает с чем угодно: допуск «2» входит в «⌀200», и отклонение
+    # пропало бы молча. Поглощённым считается только отклонение со знаком.
+    if tolerance in value and not tolerance.isdigit():
+        return value
+    return f"{value} (допуск {tolerance})"
 
 
 def _values(fields: Sequence[Dict[str, Any]], category: str) -> List[str]:

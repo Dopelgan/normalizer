@@ -8,14 +8,14 @@
 чём заказчик её и забраковал.
 """
 
-from pathlib import Path
-
 import pytest
 
 from core import drawing_record
 from core.config import settings
 from core.contract_finalize import finalize_fragments
 from core.ladder import drawing_route
+from core.models.parse_result import ParsedBlock, ParseResult
+from core.normalizer import TextNormalizer
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 
 # Настоящий текст записи листа СМ1638.11.05.00.00.00 СБ — тот самый
@@ -184,6 +184,29 @@ class TestValuesVerbatim:
         drawing_record.apply([fragment])
         assert "⌀200 (допуск ±2)" in fragment.content.text
 
+    def test_tolerance_already_inside_the_value_is_not_repeated(self, composed):
+        fragment = _fragment("", fields=[
+            {"category": "size", "value": "⌀200±2", "tolerance": "±2"},
+        ])
+        drawing_record.apply([fragment])
+        assert "допуск" not in fragment.content.text
+
+    def test_bare_digit_tolerance_is_not_swallowed_by_the_value(self, composed):
+        """Допуск «2» входит в «⌀200» как подстрока, но назван не был."""
+        fragment = _fragment("", fields=[
+            {"category": "size", "value": "⌀200", "tolerance": "2"},
+        ])
+        drawing_record.apply([fragment])
+        assert "⌀200 (допуск 2)" in fragment.content.text
+
+    def test_second_graph_reading_is_not_swallowed_as_a_substring(self, composed):
+        """«2,7» не считается сказанным потому, что входит в «12,75»."""
+        fragment = _fragment("", payload={"title_block": {
+            "mass": "12,75", "масса": "2,7",
+        }})
+        drawing_record.apply([fragment])
+        assert "Масса — 12,75; 2,7." in fragment.content.text
+
 
 # ------------------------------------------------------------- основная надпись
 class TestStamp:
@@ -232,6 +255,36 @@ class TestStamp:
         }})
         drawing_record.apply([fragment])
         assert "Масса — 2,7; 2,75." in fragment.content.text
+
+    def test_corrected_value_is_preferred_over_the_raw_one(self, composed):
+        """
+        Разбор кладёт в payload ответ модели как есть, а `drawing_text`
+        применяет только к значениям полей («Обозначение: …»). Заказчику
+        надо показать исправленную копию, а не ту, что рядом с ней.
+        """
+        fragment = _fragment("", fields=[
+            {"category": "title_block", "value": "Обозначение: ТАДУ 421451.001"},
+        ], payload={"title_block": {"designation": "ТАДУ 421451001"}})
+        drawing_record.apply([fragment])
+        assert "Обозначение — ТАДУ 421451.001." in fragment.content.text
+        assert "ТАДУ 421451001" not in fragment.content.text
+
+    def test_graph_without_a_corrected_copy_falls_back_to_payload(self, composed):
+        fragment = _fragment("", fields=[], payload={
+            "title_block": {"mass": "26,02"}})
+        drawing_record.apply([fragment])
+        assert "Масса — 26,02." in fragment.content.text
+
+    def test_handwritten_takes_the_handwritten_correction(self, composed):
+        """
+        Одна графа бывает прочитана и печатной в штампе, и рукописной в
+        боковой колонке — это два разных значения, и путать их нельзя.
+        """
+        fragment = _fragment("", fields=[
+            {"category": "title_block", "value": "Инв. № подл.: 1012-02 (рукописно)"},
+        ], payload={"title_block_handwritten": {"inventory": "1012-O2"}})
+        drawing_record.apply([fragment])
+        assert "Инв. № подл. — 1012-02." in fragment.content.text
 
     def test_unknown_graph_is_not_dropped(self, composed):
         fragment = _fragment("", payload={"title_block": {"custom_graph": "ВД005"}})
@@ -303,6 +356,44 @@ class TestViews:
         assert "Разрез клапанов поз.6 и 7" in fragment.content.text.split(
             "Надписи листа в порядке чтения.")[0]
 
+    @pytest.mark.parametrize("line", ["Б(4)", "Т(5)", "А(4)", "Д(4)", "Ц(4)"])
+    def test_letter_with_a_bare_number_is_not_a_view(self, composed, line):
+        """
+        Масштаб по ГОСТ 2.302 — отношение, с двоеточием. «Б(4)» — номер
+        исполнения или позиции; на настоящих листах таких «видов»
+        набиралось по восемнадцать на один лист.
+        """
+        fragment = _fragment(line + "\n25")
+        drawing_record.apply([fragment])
+        assert "Виды, разрезы и сечения" not in fragment.content.text
+
+    @pytest.mark.parametrize("line", ["Б(2:1)", "A(1:4)", "Г(1:2,5)"])
+    def test_letter_with_a_ratio_is_a_view(self, composed, line):
+        fragment = _fragment(line + "\n25")
+        drawing_record.apply([fragment])
+        assert line in fragment.content.text.split(
+            "Надписи листа в порядке чтения.")[0]
+
+    def test_paired_letter_is_a_view_with_or_without_scale(self, composed):
+        fragment = _fragment("А-А\nГ-Г(1:1)\nВ-В (2)")
+        drawing_record.apply([fragment])
+        head = fragment.content.text.split("Надписи листа в порядке чтения.")[0]
+        assert "А-А" in head and "Г-Г(1:1)" in head and "В-В (2)" in head
+
+    def test_the_hedge_is_said_once(self, composed):
+        fragment = _fragment(SM1638_TEXT, fields=[
+            {"category": "size", "value": "⌀8,5"},
+        ])
+        drawing_record.apply([fragment])
+        assert fragment.content.text.count(drawing_record.NO_VIEW_LINK) == 1
+
+    def test_the_hedge_is_said_when_there_are_no_named_views(self, composed):
+        fragment = _fragment("25", fields=[
+            {"category": "size", "value": "⌀8,5"},
+        ])
+        drawing_record.apply([fragment])
+        assert fragment.content.text.count(drawing_record.NO_VIEW_LINK) == 1
+
     def test_bare_letter_is_not_called_a_view(self, composed):
         """
         «A» на листе — и место разреза, и номер исполнения. Назвать её видом
@@ -318,8 +409,7 @@ class TestViews:
         """Запись честно говорит, что размер к виду не привязан."""
         fragment = _fragment(SM1638_TEXT)
         drawing_record.apply([fragment])
-        assert ("К какому из них относится каждый размер, запись чертежа "
-                "не указывает." in fragment.content.text)
+        assert drawing_record.NO_VIEW_LINK in fragment.content.text
 
 
 # ------------------------------------------------------------------- размеры
@@ -327,7 +417,7 @@ class TestDimensions:
     def test_values_are_grouped_by_what_they_are(self, composed):
         fragment = _fragment("", fields=[
             {"category": "size", "value": "⌀57"},
-            {"category": "size", "value": "100"},
+            {"category": "size", "value": "100±10"},
             {"category": "size", "value": "35°"},
             {"category": "radius", "value": "R65"},
             {"category": "thread", "value": "M24x1,5"},
@@ -337,12 +427,65 @@ class TestDimensions:
         drawing_record.apply([fragment])
         record = fragment.content.text
         assert "Диаметры — ⌀57." in record
-        assert "Линейные размеры — 100." in record
+        assert "Линейные размеры — 100±10." in record
         assert "Углы — 35°." in record
         assert "Радиусы — R65." in record
         assert "Резьба — M24x1,5." in record
         assert "Шероховатость — Ra 1,6." in record
         assert "Допуски и посадки — 20H7." in record
+
+    @pytest.mark.parametrize("value", ["3", "1", "7", "10", "25"])
+    def test_bare_number_is_not_announced_as_a_dimension(self, composed, value):
+        """
+        Категорию `size` разбор ставит уже за то, что надпись похожа на
+        число: так в неё попадают номера выносок и зон. Назвать их
+        линейными размерами — сказать неправду о том, что они измеряют.
+
+        `unit` здесь заполнен так, как его заполняет разбор: «мм» он
+        выводит из категории любому числу, с листа не читая. Признаком
+        он поэтому не считается.
+        """
+        fragment = _fragment("", fields=[
+            {"category": "size", "value": value, "unit": "мм"}])
+        drawing_record.apply([fragment])
+        assert "Линейные размеры" not in (fragment.content.text or "")
+
+    @pytest.mark.parametrize("value", ["L", "h", "d", "Dp", "Dn"])
+    def test_letter_placeholder_is_not_announced_as_a_dimension(self, composed, value):
+        fragment = _fragment("", fields=[{"category": "size", "value": value}])
+        drawing_record.apply([fragment])
+        assert "Линейные размеры" not in (fragment.content.text or "")
+
+    @pytest.mark.parametrize("field,expected", [
+        ({"category": "size", "value": "3±0,5"}, "3±0,5"),
+        ({"category": "size", "value": "100±10"}, "100±10"),
+        ({"category": "size", "value": "18x2,5"}, "18x2,5"),
+        ({"category": "size", "value": "1737 мм", "unit": "мм"}, "1737 мм"),
+        ({"category": "size", "value": "250", "tolerance": "±2"}, "250"),
+    ])
+    def test_dimension_that_says_what_it_is_stays(self, composed, field, expected):
+        fragment = _fragment("", fields=[field])
+        drawing_record.apply([fragment])
+        assert expected in fragment.content.text
+        assert "Линейные размеры" in fragment.content.text
+
+    def test_bare_number_still_reaches_the_record(self, composed):
+        """Из перечня родов оно ушло, из записи — нет."""
+        fragment = _fragment("3\n1\n7", fields=[
+            {"category": "size", "value": "3"},
+        ])
+        drawing_record.apply([fragment])
+        assert "\n3\n1\n7" in fragment.content.text
+
+    @pytest.mark.parametrize("value", ["Ø57", "ø44", "Φ20", "φ8,5", "⌀10"])
+    def test_every_diameter_glyph_is_a_diameter(self, composed, value):
+        """
+        Векторный путь кладёт в поля то, что прочитал, знак к одному виду
+        не приводя: «Ø57» уходило в линейные размеры.
+        """
+        fragment = _fragment("", fields=[{"category": "size", "value": value}])
+        drawing_record.apply([fragment])
+        assert f"Диаметры — {value}." in fragment.content.text
 
     def test_repeated_reading_is_said_once(self, composed):
         fragment = _fragment("", fields=[
@@ -377,8 +520,22 @@ class TestDimensions:
         ])
         drawing_record.apply([fragment])
         record = fragment.content.text
-        assert "Технические требования и примечания листа." in record
+        assert "Текст и примечания листа." in record
         assert "1. Сварка аргонодуговая по ГОСТ 14771-76." in record
+
+    def test_notes_are_not_called_technical_requirements(self, composed):
+        """
+        Категория `note` — это «не классифицировано» с уверенностью 0,4. В
+        настоящих записях под ней лежали строки спецификации и целый текст
+        документа СМК; заголовок «технические требования листа» был бы
+        неправдой.
+        """
+        fragment = _fragment("", fields=[
+            {"category": "note",
+             "value": "2 Выходные данные анализа СМК включают в себя"},
+        ])
+        drawing_record.apply([fragment])
+        assert "Технические требования" not in fragment.content.text
 
 
 # ------------------------------------------------------------------- таблицы
@@ -486,22 +643,95 @@ class TestPipeline:
 
     def test_payload_says_the_record_was_composed(self, composed):
         fragment = _fragment(TADU_TEXT, payload={"title_block": TADU_STAMP})
-        finalize_fragments([fragment], "doc-1", extract=False)
+        finalize_fragments([fragment], "doc-1")
         assert fragment.content.structured_payload[drawing_record.COMPOSED_KEY] is True
 
-    def test_route_decision_is_made_before_the_record_is_composed(self):
+    def _run_pipeline(self):
         """
-        Сборка раздувает число символов `content.text`, а по нему
-        `core/ladder/drawing_route.volume` сравнивает чертёжный разбор с
-        распознаванием. Сравнение обязано идти по прежнему тексту, иначе
-        флаг начнёт менять выбор маршрута на реальных листах. Защита —
-        только порядок вызовов в оркестраторе, поэтому порядок проверяется.
+        Настоящий порядок стадий оркестратора: нормализация (она сама
+        финализирует с `extract=False`) -> сверка маршрута -> финализация
+        с фактами. Чертёж здесь векторный: у такого фрагмента `content.text`
+        нет, и именно на нём видно, собралась ли запись раньше времени.
         """
-        source = (Path(__file__).resolve().parents[2]
-                  / "ingest" / "tasks.py").read_text(encoding="utf-8")
-        settle = source.index("drawing_route.settle(")
-        finalize = source.index("finalize_fragments(fragments")
-        assert settle < finalize
+        block = ParsedBlock(
+            type="drawing", page=1, bbox=[0.0, 0.0, 1.0, 1.0], order=1,
+            image_ref="s3://bucket/sheet.pdf",
+            drawing_fields=[
+                {"category": "size", "value": "⌀57", "confidence": 0.9},
+                {"category": "position", "value": "17", "confidence": 0.9},
+            ],
+        )
+        parse_result = ParseResult(blocks=[block], parser_name="vector_drawing")
+        normalizer = TextNormalizer()
+        fragments, _ = normalizer.normalize_with_flags(
+            parse_result, {"doc_id": "doc-1"})
+        return normalizer, parse_result, fragments
+
+    def test_record_is_not_composed_at_the_normalize_stage(self, composed):
+        """
+        `finalize_fragments` вызывается дважды: нормализатор зовёт её с
+        `extract=False` ещё до ветки чертежей и до сверки маршрута. Там
+        собирать нельзя — иначе собранная запись попала бы в сверку.
+        """
+        _, _, fragments = self._run_pipeline()
+        drawing = next(f for f in fragments if f.type == "drawing")
+        assert drawing.content.text is None
+        assert drawing_record.COMPOSED_KEY not in (
+            drawing.content.structured_payload or {})
+
+    def test_route_volume_sees_the_text_the_parse_produced(self, composed):
+        """
+        Объём для сверки «чертёж против OCR» считается по `content.text`.
+        На стадии сверки текста у векторного чертежа нет, и сборка не
+        должна была его создать: иначе флаг меняет исход сверки.
+        """
+        _, parse_result, fragments = self._run_pipeline()
+        drawing = next(f for f in fragments if f.type == "drawing")
+        before = drawing_route.volume(fragments).chars
+        # Сверка на этом месте и происходит (ingest/tasks.py).
+        drawing_route.settle(fragments, parse_result, {}, TextNormalizer())
+        # Объём тот же, и текста у векторного чертежа по-прежнему нет:
+        # сборка его не создала. Ноль здесь не ждём — объём считает и поля.
+        assert drawing_route.volume(fragments).chars == before
+        assert drawing.content.text is None
+
+    def test_record_is_composed_once_after_the_drawing_branch(self, composed):
+        """
+        Сборка идёт на финализации с фактами — после ветки чертежей,
+        которая к этому времени положила в запись текст листа.
+        """
+        _, _, fragments = self._run_pipeline()
+        drawing = next(f for f in fragments if f.type == "drawing")
+        drawing.content.text = TADU_TEXT          # что делает ветка чертежей
+        drawing.content.structured_payload["title_block"] = TADU_STAMP
+        finalize_fragments(fragments, "doc-1")
+        record = drawing.content.text
+        assert "Масса — 26,02" in record
+        assert record.count("Надписи листа в порядке чтения.") == 1
+
+    def test_second_finalisation_changes_nothing(self, composed):
+        """
+        Идемпотентность. Второй проход вкладывал сборку внутрь её же части
+        «Надписи листа в порядке чтения»: заголовок переставал отвечать
+        тому, что под ним, а запись почти удваивалась.
+        """
+        _, _, fragments = self._run_pipeline()
+        drawing = next(f for f in fragments if f.type == "drawing")
+        drawing.content.text = TADU_TEXT
+        drawing.content.structured_payload["title_block"] = TADU_STAMP
+        finalize_fragments(fragments, "doc-1")
+        once = drawing.content.text
+        finalize_fragments(fragments, "doc-1")
+        assert drawing.content.text == once
+
+    def test_reading_order_part_holds_no_composed_part(self, composed):
+        """Под заголовком «Надписи листа…» стоят строки листа, и только они."""
+        fragment = _fragment(TADU_TEXT, payload={"title_block": TADU_STAMP})
+        drawing_record.apply([fragment])
+        drawing_record.apply([fragment])
+        tail = fragment.content.text.split("Надписи листа в порядке чтения.")[1]
+        assert "Основная надпись листа." not in tail
+        assert drawing_record.NO_VIEW_LINK not in tail
 
     def test_composition_would_change_the_volume_if_it_ran_too_early(self, composed):
         """
