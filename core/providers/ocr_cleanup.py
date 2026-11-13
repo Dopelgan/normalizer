@@ -36,7 +36,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from celery.exceptions import SoftTimeLimitExceeded
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
