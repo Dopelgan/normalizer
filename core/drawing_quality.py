@@ -39,9 +39,25 @@ def apply_drawing_quality(fragment):
 _LOSS_WARNINGS = ("DRAWING_NOT_RECOGNIZED", "DRAWING_SKIPPED_NO_TIME", "DRAWING_SHEETS_SKIPPED")
 
 
-def _drawing_lost(fragment):
-    return bool(fragment.missing_regions) or any(
+def _drawing_lost(fragment, transcribed_pages=frozenset()):
+    # Область, которую модель не прочитала отдельно, не потеряна, если весь
+    # текст её листа переписан проходом полного чтения (DRAWING_IMAGE_FULL_READ).
+    unread = [region for region in fragment.missing_regions
+              if region.get("page") not in transcribed_pages]
+    return bool(unread) or any(
         warning.startswith(_LOSS_WARNINGS) for warning in fragment.warnings
+    )
+
+
+def _transcribed_pages(drawings):
+    """Страницы, весь текст которых переписан моделью."""
+    if not settings.DRAWING_IMAGE_FULL_READ:
+        return frozenset()
+    return frozenset(
+        fragment.position.page for fragment in drawings
+        if fragment.position is not None
+        and (fragment.content.structured_payload or {}).get("transcript_line_count")
+        and (fragment.content.text or "").strip()
     )
 
 
@@ -52,7 +68,8 @@ def document_quality(fragments):
     if settings.DRAWING_UNMEASURED_NOT_PARTIAL:
         # Неизмеренная полнота чтения — повод проверить фрагмент, но не
         # потеря страницы: документ partial только при реальной потере.
-        drawing_partial = any(_drawing_lost(fragment) for fragment in drawings)
+        covered = _transcribed_pages(drawings)
+        drawing_partial = any(_drawing_lost(fragment, covered) for fragment in drawings)
     else:
         drawing_partial = any(fragment.review_required for fragment in drawings)
     return bool(drawing_partial
