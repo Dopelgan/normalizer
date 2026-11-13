@@ -162,14 +162,25 @@ class DrawingProcessor:
         payload: Dict[str, Any] = {"layout": layout.as_dict(), "tables": []}
         payload["coordinate_reference"] = "deskewed_page"
         missing_regions: List[Dict[str, Any]] = []
+        warnings: List[str] = []
 
         pass_started = time.monotonic()
-        reading = self.qwen.read_sheet(layout.image, hint=layout.hint())
+        budget = settings.DRAWING_TIME_BUDGET
+        # Срок передаётся только когда лист и правда может читаться частями:
+        # с выключенным флагом вызов прохода остаётся в точности прежним.
+        deadline_kwargs = (
+            {"until": started + budget}
+            if settings.DRAWING_SHEET_TILES and budget else {}
+        )
+        reading = self.qwen.read_sheet(
+            layout.image, hint=layout.hint(), **deadline_kwargs,
+        )
         self._log_pass(
             sheet, "лист целиком", pass_started,
-            ("надписей %d" % len(reading.annotations)) if reading is not None
-            else "лист не прочитан",
+            self._sheet_produced(reading) if reading is not None else "лист не прочитан",
         )
+        if reading is not None:
+            self._sheet_cut(reading, payload, missing_regions, warnings)
         # Весь текст листа отдельным проходом (DRAWING_IMAGE_FULL_READ):
         # разметка надписей по категориям теряет штамп, графы, номер листа
         # и примечания, а без них лист нельзя найти ни по обозначению, ни
@@ -269,10 +280,51 @@ class DrawingProcessor:
                 "whole_sheet": {"coverage": None, "reason": "not_independently_measured"},
             },
             "missing_regions": missing_regions,
-            "warnings": ["DRAWING_COMPLETENESS_UNKNOWN"],
+            "warnings": ["DRAWING_COMPLETENESS_UNKNOWN"] + warnings,
             "mode": mode,
             "payload": payload,
         }
+
+    # ------------------------------------------------- оборванный ответ листа
+    @staticmethod
+    def _sheet_produced(reading) -> str:
+        """Что дал проход «лист целиком» — для строки лога."""
+        produced = "надписей %d" % len(reading.annotations)
+        if reading.tiles:
+            produced += ", частей %d" % reading.tiles
+        if reading.cut and not reading.tiles:
+            produced += ", ответ оборван"
+        if reading.failed:
+            produced += ", не прочитано частей %d" % len(reading.failed)
+        return produced
+
+    @staticmethod
+    def _sheet_cut(reading, payload, missing_regions, warnings) -> None:
+        """
+        Оборванный ответ прохода «лист целиком» — видимая потеря, а не успех
+        (DRAWING_SHEET_CUT_VISIBLE). Лист, дочитанный частями полностью,
+        потерей не считается: хвост списка надписей прочитан. Лист, который
+        дочитать не удалось (флаг частей выключен, часть не ответила или
+        оборвалась снова), получает пометку и непрочитанные области — и
+        документ уходит человеку как разобранный не полностью
+        (core/drawing_quality.py).
+        """
+        if reading.tiles:
+            payload["sheet_tiles"] = reading.tiles
+        if not reading.cut or not settings.DRAWING_SHEET_CUT_VISIBLE:
+            return
+        payload["sheet_answer_cut"] = True
+        if reading.complete:
+            return
+        payload["sheet_annotations_complete"] = False
+        warnings.append("DRAWING_SHEET_ANSWER_CUT")
+        # Части листа, которые не дочитаны, называются поимённо; если частями
+        # лист не читался вовсе, недочитан он весь.
+        boxes = reading.failed or [[0.0, 0.0, 1.0, 1.0]]
+        missing_regions.extend(
+            {"kind": "sheet_tile", "bbox": box, "reason": "sheet_answer_cut"}
+            for box in boxes
+        )
 
     # ------------------------------------------------------------------- лог
     # Доказательство работы модели на чертеже читается прямо из лога: по
