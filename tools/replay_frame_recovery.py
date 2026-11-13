@@ -139,6 +139,7 @@ def replay(row: Dict[str, str], by_ref, by_src) -> Dict[str, Any]:
         result[name] = {"frame": frame, "source": report.get("source"),
                         "format_mm": report.get("format_mm"),
                         "format_certain": report.get("format_certain"),
+                        "format_options": report.get("format_options"),
                         "refused": report.get("refused")}
     return result
 
@@ -248,7 +249,8 @@ def export_csv(paths: Iterable[str], destination: str) -> None:
                "angle", "turn", "stamp_found"]
     for name, _ in MECHANISMS:
         columns += ["%s_frame" % name, "%s_format_mm" % name,
-                    "%s_format_certain" % name, "%s_refused" % name]
+                    "%s_format_certain" % name, "%s_format_options" % name,
+                    "%s_refused" % name]
 
     with open(destination, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -267,6 +269,9 @@ def export_csv(paths: Iterable[str], destination: str) -> None:
                     outcome.get("format_mm") or "",
                     "" if outcome.get("format_certain") is None
                     else int(outcome["format_certain"]),
+                    # Самый вероятный формат — первым, как и в отчёте разбора.
+                    " ".join(sorted(outcome.get("format_options") or [],
+                                    key=lambda mm: mm != outcome.get("format_mm"))),
                     "; ".join("%s: %s" % (key, value) for key, value in refused.items()),
                 ]
             writer.writerow(row)

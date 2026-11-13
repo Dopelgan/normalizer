@@ -272,6 +272,66 @@ class TestScanMargin:
             chosen, why = vision._format_of(box_w, box_h, width, height, 0.02)
             assert chosen == paper, (paper, chosen, why)
 
+    @staticmethod
+    def _sheet_with_margin(paper, margin_mm):
+        """Рамка `paper` посреди картинки с полем скана `margin_mm` вокруг листа."""
+        sheet = vision._sheet_of(paper)
+        full_w, full_h = sheet[0] + 2 * margin_mm, sheet[1] + 2 * margin_mm
+        scale = 1000.0 / full_w
+        width, height = int(full_w * scale), int(full_h * scale)
+        box_w, box_h = paper[0] * scale, paper[1] * scale
+        left, top = (width - box_w) / 2 / width, (height - box_h) / 2 / height
+        return [left, top, 1 - left, 1 - top], (height, width), box_w, box_h
+
+    @pytest.mark.parametrize("paper", vision._FRAMES_MM)
+    @pytest.mark.parametrize("margin_mm", [0, 2, 3, 4, 8, 15, 30])
+    def test_a_wrong_label_is_never_called_certain(self, paper, margin_mm):
+        """
+        Главное про ярлык формата: ошибиться он может, соврать уверенно — нет.
+
+        Поле ГОСТ задано в миллиметрах, поэтому у крупного листа рамка
+        занимает большую долю своего листа (A4 альбомный 0,933, A3 0,940,
+        A2 0,958, A1 0,970, A0 0,975). Поле скана наблюдаемую долю только
+        занижает, и ярлык съезжает вниз по ряду: A2 на A3 с 3 мм и на A4
+        альбомный с 8 мм, A1 с 4 мм, A0 с 2 мм. Рамка при этом остаётся
+        верной — проверяется, что такой съехавший ярлык не объявляется
+        определённым.
+        """
+        frame, shape, box_w, box_h = self._sheet_with_margin(paper, margin_mm)
+        height, width = shape
+        chosen, why = vision._format_of(
+            box_w, box_h, width, height,
+            vision._format_tolerance(box_w, box_h, shape))
+        assert chosen is not None, why
+        options = vision._format_options(frame, shape)
+        # Истинный формат объяснить картинку обязан всегда.
+        assert tuple(paper) in options, (paper, margin_mm, options)
+        if chosen != tuple(paper):
+            assert len(options) > 1, (paper, margin_mm, chosen)
+            assert vision._format_certain(frame, shape) is False
+
+    @pytest.mark.parametrize("margin_mm", [0, 3, 8, 15])
+    def test_degenerate_cluster_is_never_certain(self, margin_mm):
+        """
+        A0, A4 альбомный и A1 отличаются по пропорции на 0,3 %, а поле скана
+        неизвестно: A1 с полем 17 мм даёт ровно то же, что A4 альбомный без
+        поля. Такие листы по картинке не различимы, и ни один из них не
+        может быть объявлен определённым.
+        """
+        for paper in ((1159, 818), (277, 195), (816, 574)):
+            frame, shape, _, _ = self._sheet_with_margin(paper, margin_mm)
+            assert vision._format_certain(frame, shape) is False, (paper, margin_mm)
+
+    def test_an_isolated_aspect_stays_certain(self):
+        """
+        A4 книжный пропорцию ни с кем не делит (ближайший сосед в 2,9 %),
+        поэтому его формат определён при любом поле скана.
+        """
+        for margin_mm in (0, 3, 8, 15, 30):
+            frame, shape, _, _ = self._sheet_with_margin((185, 287), margin_mm)
+            assert vision._format_options(frame, shape) == [(185, 287)]
+            assert vision._format_certain(frame, shape) is True
+
     def test_size_no_longer_refuses_a_format(self, data):
         """
         Доля листа только упорядочивает форматы. Настоящая рамка с полем
@@ -307,24 +367,29 @@ class TestRefusalReport:
     def test_default_is_used_when_no_candidate_was_judged(self):
         assert vision._Refusals().summary("сторон не нашлось") == "сторон не нашлось"
 
-    def test_format_is_marked_uncertain_when_the_sheet_is_cropped(self, data):
+    def test_real_sheet_format_is_among_the_options(self, data):
         """
-        Рамка, упирающаяся в край картинки: поля листа в кадре нет, и формат
-        по доле не разделить. Сама рамка верна, ярлык — под сомнением.
+        На настоящих листах формат рамки — A3. Однозначно он не определён
+        (A2 с полем скана в несколько миллиметров даёт ту же картинку), но
+        истинный формат обязан остаться среди возможных, и самым вероятным.
         """
         shape = data["mask_shape"]
-        assert vision._format_certain(data["frame_after"], shape) is True
+        options = vision._format_options(data["frame_after"], shape)
+        assert (395, 287) in options
+        assert data["format_mm"] == "395x287"
+
+    def test_cropped_sheet_loses_the_size_argument(self, data):
+        """
+        Рамка, упирающаяся в край картинки: поля листа в кадре нет, доля
+        формат не ограничивает, и возможных форматов становится только
+        больше.
+        """
+        shape = data["mask_shape"]
+        inside = vision._format_options(data["frame_after"], shape)
         touching = list(data["frame_after"])
         touching[2] = 0.9999
+        assert len(vision._format_options(touching, shape)) >= len(inside)
         assert vision._format_certain(touching, shape) is False
-
-    def test_recovered_frame_of_a_real_sheet_has_a_certain_format(self, data):
-        height, width = data["mask_shape"]
-        box, _ = vision._frame_by_sides(
-            real.lines(data, "stitched_h"), real.lines(data, "stitched_v"),
-            real.Mask((height, width)), whole_sheet=True,
-        )
-        assert vision._format_certain(box, (height, width)) is True
 
     def test_mask_failure_is_recorded(self, flags, monkeypatch):
         flags(stitch=True, four_sides=True, from_title_block=True)

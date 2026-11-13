@@ -744,36 +744,78 @@ def _recover_frame(image, regions: Sequence[Region], signals: Dict[str, Any]) ->
         if frame is None:
             report["refused"][source] = detail
             continue
+        options = _format_options(frame, mask.shape)
         report["source"] = source
         report["format_mm"] = detail
-        report["format_certain"] = _format_certain(frame, mask.shape)
+        report["format_certain"] = len(options) == 1
+        if len(options) > 1:
+            # Не голое «не уверены»: какими форматами рамка ещё может быть.
+            # Первым идёт самый вероятный — тот же, что в `format_mm`.
+            report["format_options"] = [detail] + [
+                "%dx%d" % mm for mm in options if "%dx%d" % mm != detail
+            ]
         signals["inner_frame"] = frame
         logger.info(
             "Рамка листа восстановлена (%s): %s, формат рамки %s мм%s",
             source, frame, detail,
-            "" if report["format_certain"] else " (формат не подтверждён: лист обрезан по рамке)",
+            "" if len(options) == 1 else " (формат не определён, подходят также %s)"
+            % ", ".join("%dx%d" % mm for mm in options if "%dx%d" % mm != detail),
         )
         return frame
     return None
 
 
-def _format_certain(frame: Sequence[float], shape: Tuple[int, int]) -> bool:
+def _format_options(
+    frame: Sequence[float], shape: Tuple[int, int],
+) -> List[Tuple[int, int]]:
     """
-    Можно ли верить ярлыку формата у найденной рамки.
+    Все форматы ГОСТ 2.301, которыми найденная рамка может оказаться. Пусто —
+    пропорция не отвечает ни одному; один — формат определён; несколько —
+    ярлык в `format_mm` лишь самый вероятный из них.
 
-    Пропорция у горизонтальных форматов почти вырождена, и разделяет их
-    только занятая доля картинки. Когда рамка упирается в край картинки,
-    собственного поля листа (5 мм по ГОСТ 2.301, 20 мм слева) в кадре нет:
-    скан обрезан по рамке, доля ничего не говорит, и формат может оказаться
-    соседним по ряду. Сама рамка при этом верна — ярлык нет.
+    Рассуждение то же, что и в `_fills`, доведённое до конца. Картинка — не
+    лист: вокруг листа лежит поле скана неизвестной ширины, и доля картинки,
+    занятая рамкой, от этого поля только *убывает*. Значит у настоящего
+    формата номинальная доля не меньше наблюдаемой, и подходит всякий формат,
+    чья пропорция сходится, а номинальная доля не ниже той, что видно.
 
-    На корпусе это 3 листа из 22 восстановленных: рамка у всех трёх легла
-    точно на линию, а формат у двух оказался на шаг больше настоящего.
+    Отсеивает это снизу: формат, у которого рамка на своём листе прилегает к
+    краю *слабее*, чем видно на картинке, невозможен — поле скана такую долю
+    не поднимет. А вот сверху отсечь нечем, и это не осторожность, а факт:
+    A1 с полем 17 мм даёт ровно ту же долю, что A4 альбомный без поля, при
+    совпадающей до 0,1 % пропорции (1,4216 против 1,4205). Такие листы по
+    картинке не различимы вовсе.
+
+    Поэтому «формат определён» — редкость: на деле это листы, у которых
+    пропорция изолирует единственный формат (A4 книжный, ближайший сосед в
+    2,9 %). У горизонтальных форматов пропорции сходятся в доли процента, и
+    честный ответ там — список.
     """
     height, width = shape
-    edge = (2 * _reach(min(height, width)) + 1) / min(height, width)
     left, top, right, bottom = (float(value) for value in frame)
-    return min(left, top, 1.0 - right, 1.0 - bottom) > edge
+    box_w, box_h = (right - left) * width, (bottom - top) * height
+    if box_w <= 0 or box_h <= 0:
+        return []
+
+    # Рамка упирается в край картинки: поля листа в кадре нет, доля не
+    # ограничивает формат ничем, остаётся одна пропорция.
+    slack = (2 * _reach(min(height, width)) + 1)
+    share_w, share_h = box_w / width, box_h / height
+    if min(left, top, 1.0 - right, 1.0 - bottom) <= slack / min(height, width):
+        share_w = share_h = 0.0
+
+    close = _close_formats(box_w / box_h, _format_tolerance(box_w, box_h, shape))
+    return [mm for mm in close
+            if _share(mm)[0] >= share_w - slack / width
+            and _share(mm)[1] >= share_h - slack / height]
+
+
+def _format_certain(frame: Sequence[float], shape: Tuple[int, int]) -> bool:
+    """
+    Определён ли формат найденной рамки однозначно. Сама рамка верна в любом
+    случае — она собрана из найденных линий; под сомнением только ярлык.
+    """
+    return len(_format_options(frame, shape)) == 1
 
 
 def _thin_line_mask(image):
@@ -897,6 +939,21 @@ def _share(paper: Tuple[int, int]) -> Tuple[float, float]:
     return paper[0] / sheet[0], paper[1] / sheet[1]
 
 
+def _format_tolerance(box_w: float, box_h: float, shape: Tuple[int, int]) -> float:
+    """
+    Погрешность пропорции: каждая из двух сторон прямоугольника известна с
+    точностью до полосы, которой сшиваются куски линии.
+    """
+    height, width = shape
+    return 2.0 * (2 * _reach(min(height, width)) + 1) / min(box_w, box_h)
+
+
+def _close_formats(aspect: float, tolerance: float) -> List[Tuple[int, int]]:
+    """Форматы ГОСТ 2.301, чья пропорция сходится с `aspect` в пределах допуска."""
+    return [mm for mm in _FRAMES_MM
+            if abs(mm[0] / mm[1] - aspect) <= tolerance * mm[0] / mm[1]]
+
+
 def _fills(share_w: float, share_h: float, paper: Tuple[int, int]) -> bool:
     """
     Может ли рамка `paper` занимать на картинке долю `share_w`×`share_h`.
@@ -946,7 +1003,7 @@ def _format_of(
     вырезки штампа).
     """
     aspect = box_w / box_h
-    close = [mm for mm in _FRAMES_MM if abs(mm[0] / mm[1] - aspect) <= tolerance * mm[0] / mm[1]]
+    close = _close_formats(aspect, tolerance)
     if not close:
         return None, "пропорция не отвечает формату ГОСТ 2.301"
     fitting = [mm for mm in close if _fills(box_w / width, box_h / height, mm)]
@@ -984,6 +1041,14 @@ def _rejected(
     за угол, означает, что это графа штампа или край таблицы, а не рамка.
     Исключение одно — левая сторона: под колонку дополнительных граф
     (12 мм по ГОСТ 2.104) уходят её собственные линии и нижняя линия рамки.
+
+    Важно: масштаб мм/пиксель берётся из `paper`, то есть из *ярлыка*
+    формата, а он у крупных листов может оказаться на шаг меньше истинного
+    (см. `_format_certain`). Ярлык поменьше завышает масштаб и тем самым
+    *ослабляет* эту проверку: у A1, принятого за A4 альбомный, масштаб
+    завышен в 2,95 раза, и допуск в 5 мм ведёт себя как 14,7 мм. То есть
+    ошибка ярлыка делает проверку мягче, а не строже — на тех самых листах,
+    на которых ярлык и врёт.
     """
     left, top, right, bottom = box
     width = mask.shape[1]
@@ -1095,7 +1160,6 @@ def _frame_by_sides(
     if missing:
         return None, "нет линии у края: " + ", ".join(missing)
 
-    tolerance_px = 2.0 * (2 * _reach(min(height, width)) + 1)
     best: Optional[Tuple[float, List[float], Tuple[int, int]]] = None
     refused = _Refusals()
     for top in sides["верх"]:
@@ -1113,7 +1177,8 @@ def _frame_by_sides(
                         refused.add("сторона прочерчена меньше чем наполовину")
                         continue
                     paper, why = _format_of(
-                        box_w, box_h, width, height, tolerance_px / min(box_w, box_h))
+                        box_w, box_h, width, height,
+                        _format_tolerance(box_w, box_h, mask.shape))
                     if paper is None:
                         refused.add(why)
                         continue
@@ -1122,6 +1187,14 @@ def _frame_by_sides(
                     if why:
                         refused.add(why)
                         continue
+                    # Из подходящих берётся внутренний. Правило рассчитано на
+                    # одну пару: рамка по ГОСТ и обрез листа вокруг неё,
+                    # между ними поле листа. На концентрической обводке с
+                    # пропорцией формата (вложенный прямоугольник, все четыре
+                    # стороны которого тоже попали в краевые полосы) оно
+                    # выберет внутреннюю, а не рамку. В корпусе такой формы не
+                    # встретилось; если встретится — различать придётся не
+                    # площадью, а расстоянием между сторонами в миллиметрах.
                     area = box_w * box_h
                     if best is None or area < best[0]:
                         best = (area, [left[0] / width, top[0] / height,
