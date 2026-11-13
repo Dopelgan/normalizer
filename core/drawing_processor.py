@@ -264,6 +264,14 @@ class DrawingProcessor:
             # Один размер, прочитанный и на листе целиком, и на вырезке вида:
             # остаётся прочтение со знаком «±» и со справочной звёздочкой.
             fields = dimension_fidelity.merge_readings(fields)
+            if _category_strict():
+                # Тот же размер, прочитанный проходом по надписям и
+                # транскрипцией листа: «±» теряется в одном проходе и
+                # остаётся в другом («1087±3» против «1087+3»), а
+                # merge_readings сравнивает только поля между собой.
+                dimension_fidelity.adopt_transcript_signs(
+                    fields, payload.get("transcript_lines")
+                )
         mode = MODE_VISION_VLM if (self.vision_enabled and layout.regions) else MODE_SHEET_ONLY
         if not fields and not payload["tables"] and not payload.get("transcript_lines"):
             self._log_sheet(image_ref, sheet, MODE_NONE, 0, len(lines or []),
@@ -913,7 +921,7 @@ class DrawingProcessor:
 
             claimed = str(annotation.get("category") or "").strip().lower()
             by_rules, _ = vector_drawing.classify(text)
-            category, confidence = _reconcile(claimed, by_rules)
+            category, confidence = _reconcile(claimed, by_rules, text)
             fields.append(_field(
                 category=category,
                 text=text,
@@ -1032,12 +1040,53 @@ def _field(
     }
 
 
-def _reconcile(claimed: str, by_rules: str) -> tuple:
+def _category_strict() -> bool:
+    """
+    Строгая категория поля (`DRAWING_FIELD_CATEGORY_STRICT`).
+
+    Настройку и обе вспомогательные функции — `decisive_category` и
+    `adopt_transcript_signs` — приносит ветка точности категорий
+    (`fix/field-category-accuracy-20261114`). Здесь флаг читается через
+    `getattr` с умолчанием, как это делает `drawing_genre.enabled()`, и
+    ровно за этим: пока той ветки в дереве нет, поля в `Settings` нет тоже,
+    а прямое `settings.DRAWING_FIELD_CATEGORY_STRICT` подняло бы
+    AttributeError на каждом листе. Широкий `except Exception` в цикле
+    обогащения проглотил бы его и превратил бы каждый чертёж в
+    `DRAWING_NOT_RECOGNIZED` — то есть ровно в обратное тому, зачем этот
+    код написан.
+
+    Поэтому обе правки сидят строго внутри этой проверки: без своей ветки
+    они мертвы и порядок слияния безопасен в любую сторону. `extra="ignore"`
+    у `Settings` закрывает и случай, когда переменную окружения выставили
+    раньше, чем приехал код: неизвестное поле просто не появляется.
+    """
+    return bool(getattr(settings, "DRAWING_FIELD_CATEGORY_STRICT", False))
+
+
+def _reconcile(claimed: str, by_rules: str, text: str = "") -> tuple:
     """
     Категория поля: модель против правил. Правила детерминированы и знают
     ГОСТ, модель видит лист — поэтому спор решается не в чью-то пользу, а
     понижением уверенности.
     """
+    # Исключение — записи, у которых по ЕСКД другого прочтения нет
+    # (`vector_drawing.decisive_category`): на замере модель спорила с такой
+    # нотацией 27 раз и не была права ни разу, правила — 26 из 26.
+    #
+    # Возвращается ответ самой `decisive_category`, а не `by_rules`: в эту
+    # ветку и входят потому, что нотация ответила, и отдавать другое значит
+    # противоречить причине входа. Разойтись эти два ответа могут только на
+    # склеенном «№» с цифрой («2№3»: нотация говорит `position`, старый
+    # `classify` — `note`), и сварной шов под «Примечанием» тратит выдачу,
+    # не используя `position`, которую модель на этой нотации и заявляет.
+    # С включённым флагом `classify` сам спрашивает `decisive_category`
+    # первой, так что в собранном дереве эти ответы совпадают и выражение
+    # ничего не меняет; расхождение остаётся только там, где флаг выключен,
+    # а значит ветка недостижима.
+    if text and _category_strict():
+        decisive = vector_drawing.decisive_category(text)
+        if decisive is not None:
+            return decisive, _AGREED if claimed == decisive else _DISAGREED
     if claimed not in CATEGORIES:
         return by_rules, _MODEL_ONLY if by_rules != "note" else 0.4
     if claimed == by_rules:
