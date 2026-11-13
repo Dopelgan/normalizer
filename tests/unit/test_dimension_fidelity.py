@@ -351,6 +351,27 @@ class TestWeldMark:
     def test_valid_weld_mark_is_left_alone(self, text):
         assert df.repair(text) == text
 
+    @pytest.mark.parametrize("text", [
+        # Сторона низшего напряжения трансформатора по ГОСТ 2.710: «НН»,
+        # прочитанное латиницей. Правило шва не должно его забирать.
+        "T1-HH",
+        "Обмотка T1-HH 0,4 кВ",
+        "C1-HH", "H1-HH", "Y1-HH", "T2-Hн",
+    ])
+    def test_double_n_designation_is_not_a_weld_mark(self, text):
+        assert df.repair(text) == text
+
+    @pytest.mark.parametrize("text", [
+        # Буква в конце, которая с «п» не путается: это не обозначение шва,
+        # и выдумывать способ сварки нельзя.
+        "С1-ИНд",
+        "У1-ИНя",
+        "Т1-ИНx",
+        "Разъём C5-ИНa",
+    ])
+    def test_unknown_method_tail_is_left_alone(self, text):
+        assert df.repair(text) == text
+
 
 class TestCarefulLetters:
     """
