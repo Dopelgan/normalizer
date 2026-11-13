@@ -341,6 +341,32 @@ class TestStructuralProfile:
         assert first["fragments"][-1]["completeness"] is None
         assert first["fragments"][-1]["extracted_facts"][0]["confirmed"]
 
+    @pytest.mark.parametrize("missing,status", [([], "completed"),
+                                                ([{"kind": "table", "bbox": [0, 0, 1, 1], "reason": "region_not_read"}], "partial")])
+    def test_unmeasured_drawing_is_not_partial_under_flag(self, monkeypatch, missing, status):
+        from core.models.contract import DrawingField
+
+        def add_drawing(self, fragments, metadata):
+            return fragments + [Fragment(
+                fragment_id="", type="drawing",
+                content=Content(structured_drawing_fields=[DrawingField(
+                    category="size", value="20", confidence=0.5,
+                )]),
+                position=Position(page=1), confidence=0.5, completeness=None,
+                warnings=["DRAWING_COMPLETENESS_UNKNOWN"], missing_regions=missing,
+                provenance=Provenance(method="vision_plus_vlm", strategy_level=7, source="drawing"),
+            )]
+
+        monkeypatch.setattr(tasks.settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
+        monkeypatch.setattr(tasks.DrawingProcessor, "enrich_fragments", add_drawing)
+        name = f"unmeasured-{status}"
+        init_request_state(name, [f"file-{name}"])
+        process_document(name, f"file-{name}")
+        document = get_request_state(name)["documents"][0]
+        assert document["status"] == status
+        # Фрагмент остаётся на проверке: флаг меняет только статус документа.
+        assert document["fragments"][-1]["review_required"]
+
 
 class TestFailures:
     def test_missing_source_file(self, monkeypatch, temp_storage, task_db, fake_redis):
