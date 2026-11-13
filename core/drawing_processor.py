@@ -164,12 +164,27 @@ class DrawingProcessor:
         missing_regions: List[Dict[str, Any]] = []
 
         pass_started = time.monotonic()
-        reading = self.qwen.read_sheet(layout.image, hint=layout.hint())
+        budget = settings.DRAWING_TIME_BUDGET
+        # Срок передаётся только когда лист и правда может читаться частями:
+        # с выключенным флагом вызов прохода остаётся в точности прежним.
+        #
+        # Из бюджета вычитается запас на проходы после чтения листа. Иначе
+        # дочитывание частями съедает бюджет, частям прохода «весь текст
+        # листа» времени не остаётся, и документ уходит человеку из-за
+        # transcript_tile — хотя человеку качество чтения листа не адресовано.
+        deadline_kwargs = (
+            {"until": started + budget - settings.DRAWING_SHEET_TILE_RESERVE}
+            if settings.DRAWING_SHEET_TILES and budget else {}
+        )
+        reading = self.qwen.read_sheet(
+            layout.image, hint=layout.hint(), **deadline_kwargs,
+        )
         self._log_pass(
             sheet, "лист целиком", pass_started,
-            ("надписей %d" % len(reading.annotations)) if reading is not None
-            else "лист не прочитан",
+            self._sheet_produced(reading) if reading is not None else "лист не прочитан",
         )
+        if reading is not None:
+            self._sheet_record(reading, payload)
         # Весь текст листа отдельным проходом (DRAWING_IMAGE_FULL_READ):
         # разметка надписей по категориям теряет штамп, графы, номер листа
         # и примечания, а без них лист нельзя найти ни по обозначению, ни
@@ -273,6 +288,67 @@ class DrawingProcessor:
             "mode": mode,
             "payload": payload,
         }
+
+    # ------------------------------------------------- оборванный ответ листа
+    @staticmethod
+    def _sheet_produced(reading) -> str:
+        """Что дал проход «лист целиком» — для строки лога."""
+        produced = "надписей %d" % len(reading.annotations)
+        if reading.tiles:
+            produced += ", частей %d" % reading.tiles
+        if reading.cut and not reading.tiles:
+            produced += ", ответ оборван"
+        if reading.failed:
+            produced += ", не прочитано частей %d" % len(reading.failed)
+        if reading.lost:
+            produced += ", пропало элементов %d" % reading.lost
+        return produced
+
+    @staticmethod
+    def _sheet_record(reading, payload) -> None:
+        """
+        Что случилось с ответом прохода «лист целиком» — в payload листа.
+        Это наш учёт, а не повод позвать человека.
+
+        Человека зовут только за тем, чего он один и может решить: кластер,
+        имя, конфликт версий. Насколько хорошо прочитан лист — наша забота,
+        поэтому ни `warnings`, ни `missing_regions` здесь не появляются и
+        документ от обрыва ответа не становится partial: открыть такой
+        документ, найти его полным и получить вопрос «что с ним?» — чистый
+        расход для заказчика.
+
+        Но и `completed` при настоящей потере лист не изображает: своими
+        данными он говорит правду. `sheet_annotations_complete`=`false` —
+        прочтения потеряны; `sheet_reparse_candidate`=`true` — лист, который
+        имеет смысл перечитать машинно (вот это и есть правильное
+        автоматическое действие), с причиной в `sheet_reparse_reason`.
+
+        Ключи пишутся всегда и ни от какого флага не зависят: это факты о
+        разборе, а не эскалация. Под флагом учёт означал бы, что посчитать
+        обрывы можно только грепом по логам воркера — а считать их нужно по
+        сохранённым данным.
+        """
+        if reading.tiles:
+            payload["sheet_tiles"] = reading.tiles
+        if reading.cut:
+            payload["sheet_answer_cut"] = True
+        if reading.lost:
+            payload["sheet_annotations_lost"] = reading.lost
+        if reading.complete:
+            # Ответ обрывался, но лист дочитан: терять нечего и считать
+            # нечего. Такой лист в кандидаты на перечитывание не идёт.
+            return
+        payload["sheet_annotations_complete"] = False
+        payload["sheet_reparse_candidate"] = True
+        # Причина — та, что случилась: по ней видно, поможет ли перечитывание
+        # вообще и что менять, если не поможет.
+        if reading.failed:
+            payload["sheet_reparse_reason"] = "sheet_tiles_unread"
+            payload["sheet_unread_tiles"] = [list(box) for box in reading.failed]
+        elif reading.cut:
+            payload["sheet_reparse_reason"] = "sheet_answer_cut"
+        else:
+            payload["sheet_reparse_reason"] = "sheet_annotations_lost"
 
     # ------------------------------------------------------------------- лог
     # Доказательство работы модели на чертеже читается прямо из лога: по

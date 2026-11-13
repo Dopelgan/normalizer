@@ -238,11 +238,33 @@ _SMALL_PRINT_RULE = """- Запятую в десятичной дроби не 
 
 @dataclass
 class SheetReading:
-    """Прочитанный лист: надписи и род чертежа."""
+    """
+    Прочитанный лист: надписи и род чертежа. `cut` — ответ модели оборвался
+    на потолке токенов, и список надписей неполон. `tiles` — сколько частей
+    листа прочитано сверх самого листа (DRAWING_SHEET_TILES), `failed` —
+    части листа (доли стороны), надписи которых прочитать не удалось,
+    `lost` — сколько элементов списка не удалось превратить в надпись.
+    """
 
     sheet_type: str = "unknown"
     annotations: List[Dict[str, Any]] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
+    cut: bool = False
+    tiles: int = 0
+    failed: List[List[float]] = field(default_factory=list)
+    lost: int = 0
+
+    @property
+    def complete(self) -> bool:
+        """
+        Список надписей полон: либо ответ не обрывался, либо оборванный лист
+        дочитан частями и все части прочитаны, и ни один элемент списка не
+        пропал по виду. `cut` при этом остаётся правдой — она говорит, что
+        ответ по листу целиком не поместился, и это видно в логе и в payload.
+        """
+        if self.failed or self.lost:
+            return False
+        return not self.cut or bool(self.tiles)
 
 
 @dataclass
@@ -293,8 +315,28 @@ class QwenVisionClient:
         """Адрес задан. Доступность самого хоста проверяется вызовом."""
         return bool(self.endpoint)
 
-    def read_sheet(self, image, hint: str = "") -> Optional[SheetReading]:
-        """Лист целиком: надписи с их местами и род чертежа."""
+    def read_sheet(
+        self, image, hint: str = "", until: Optional[float] = None,
+    ) -> Optional[SheetReading]:
+        """
+        Лист целиком: надписи с их местами и род чертежа.
+
+        Плотный лист не помещается в потолок ответа: JSON обрывается посреди
+        списка надписей. С DRAWING_SHEET_TILES такой лист читается заново
+        частями с перекрытием, а списки надписей сливаются без повторов.
+        `until` — момент time.monotonic(), после которого части листа уже не
+        читаются (бюджет листа DRAWING_TIME_BUDGET).
+        """
+        prompt = self._sheet_prompt(hint)
+        if settings.DRAWING_SMALL_PRINT_CARE:
+            image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
+        whole = self._read_sheet_piece(image, prompt)
+        if whole is None or not whole.cut or not settings.DRAWING_SHEET_TILES:
+            return whole
+        return self._read_sheet_tiles(image, prompt, whole, until)
+
+    def _sheet_prompt(self, hint: str) -> str:
+        """Запрос прохода «лист целиком». Один и тот же для листа и частей."""
         prompt = _SHEET_PROMPT.format(
             categories=", ".join(CATEGORIES),
             hint=f"\n- Подсказка по разметке листа: {hint}" if hint else "",
@@ -303,18 +345,150 @@ class QwenVisionClient:
             prompt += _SIGN_RULE + _CAREFUL_LETTERS_RULE
         if settings.DRAWING_SMALL_PRINT_CARE:
             prompt += _SMALL_PRINT_RULE
-            image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
-        data = self._ask(image, prompt, settings.QWEN_SHEET_MAX_SIDE, list_key="annotations")
+        return prompt
+
+    @staticmethod
+    def _sheet_max_tokens() -> Optional[int]:
+        """
+        Потолок ответа прохода «лист целиком». Без флага — общий
+        QWEN_MAX_TOKENS, как и было.
+        """
+        if settings.DRAWING_SHEET_HIGH_TOKENS:
+            return settings.DRAWING_SHEET_MAX_TOKENS
+        return None
+
+    def _read_sheet_piece(self, image, prompt: str) -> Optional[SheetReading]:
+        """
+        Лист или его часть одним вызовом. `cut` — ответ оборвался: модель
+        упёрлась в потолок токенов или JSON не разобрался и надписи пришлось
+        спасать из оборванного текста. `None` — ответа нет вовсе.
+        """
+        if not self.available:
+            logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
+            return None
+        answer = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE,
+                                self._sheet_max_tokens())
+        if answer is None:
+            return None
+        content, finish = answer
+        data = extract_json(content)
+        cut = finish == "length"
+        if data is None or not isinstance(data.get("annotations"), list):
+            # Ответ оборван потолком токенов: целого объекта нет, и разбор
+            # находил первый вложенный — одну надпись вместо всего листа.
+            items = salvage_list(content, "annotations")
+            if items:
+                logger.warning("Ответ модели оборван: из списка %s спасено %d элементов",
+                               "annotations", len(items))
+                cut = True
+                salvaged: Dict[str, Any] = {"annotations": items}
+                kind = re.search(r'"sheet_type"\s*:\s*"([^"]*)"', content)
+                if kind:
+                    salvaged["sheet_type"] = kind.group(1)
+                data = salvaged
         if data is None:
+            logger.error("Модель вернула не-JSON (%d символов): %.200s", len(content), content)
             return None
         annotations = data.get("annotations")
         if not isinstance(annotations, list):
             logger.warning("Модель вернула JSON без списка annotations")
             annotations = []
+        readable, lost = as_annotations(annotations)
+        if lost:
+            # Вид элемента называется в логе: каким именно он был, по
+            # сохранённому ответу уже не узнать — сырые ответы модели нигде
+            # не хранятся, и разбирать следующий такой случай придётся
+            # отсюда.
+            logger.warning(
+                "Из списка annotations не прочитано %d элементов (%s): "
+                "прочтения на листе не найдены",
+                sum(lost.values()),
+                ", ".join(f"{name} — {count}" for name, count in sorted(lost.items())),
+            )
         return SheetReading(
             sheet_type=str(data.get("sheet_type") or "unknown"),
-            annotations=[_with_fixed_grade(a) for a in annotations if isinstance(a, dict)],
+            annotations=[_with_fixed_grade(a) for a in readable],
             raw=data,
+            cut=cut,
+            lost=sum(lost.values()),
+        )
+
+    def _read_sheet_tiles(
+        self, image, prompt: str, whole: SheetReading, until: Optional[float],
+    ) -> SheetReading:
+        """
+        Лист, ответ по которому оборвался, частями с перекрытием. Сетка та
+        же, что у прохода «весь текст листа» (`tile_boxes`): часть листа
+        меньше, надписей в ней меньше, и ответ по ней в потолок помещается.
+
+        Деления вглубь нет: часть, которая тоже оборвалась, и часть, на
+        которую не ответили или не осталось времени, записываются в `failed`
+        — лист честно недочитан. Так цена ограничена четырьмя вызовами, а не
+        растёт вчетверо на каждом уровне.
+        """
+        boxes = tile_boxes([0.0, 0.0, 1.0, 1.0], settings.DRAWING_SHEET_TILE_GRID,
+                           settings.DRAWING_SHEET_TILE_OVERLAP)
+        logger.warning(
+            "Надписи листа не поместились в ответ (%d до обрыва): лист "
+            "дочитывается %d частями", len(whole.annotations), len(boxes),
+        )
+        limit = threading.Semaphore(max(1, settings.DRAWING_TRANSCRIBE_TILE_PARALLEL))
+
+        def read(part):
+            # Срок проверяется после ожидания очереди: часть, дождавшаяся
+            # места, не должна начинать вызов, на который времени уже нет.
+            with limit:
+                left = deadline.remaining()
+                if left is not None and left < settings.VLM_TIMEOUT:
+                    return None
+                # Проверяется не «срок ещё не прошёл», а «вызов успеет
+                # закончиться до срока». Иначе часть, допущенная за секунду
+                # до срока, работает ещё до VLM_TIMEOUT и выносит проход
+                # листа далеко за свою долю бюджета — а за ней у прохода
+                # «весь текст листа» не остаётся времени на свои части, и
+                # документ уходит человеку. Сам HTTP-таймаут ограничивает и
+                # вызов, который vLLM выполняет не параллельно с другими, —
+                # поэтому срез по одному VLM_TIMEOUT ограничивает всю
+                # четвёрку частей, а не одну.
+                if until is not None and time.monotonic() + settings.VLM_TIMEOUT > until:
+                    return None
+                return self._read_sheet_piece(crop_box(image, part), prompt)
+
+        # Срок задачи хранится в contextvars: потоку нужна копия контекста.
+        with ThreadPoolExecutor(max_workers=len(boxes)) as pool:
+            futures = [pool.submit(contextvars.copy_context().run, read, part) for part in boxes]
+            answers = [future.result() for future in futures]
+
+        parts: List[List[Dict[str, Any]]] = []
+        failed: List[List[float]] = []
+        read_count, lost = 0, 0
+        for box, part in zip(boxes, answers):
+            if part is None:
+                failed.append([round(value, 4) for value in box])
+                continue
+            read_count += 1
+            lost += part.lost
+            parts.append([place_in_sheet(a, box) for a in part.annotations])
+            if part.cut:
+                failed.append([round(value, 4) for value in box])
+        # Части идут первыми — они покрывают весь лист; надписи оборванного
+        # ответа по листу добавляются, если такой надписи нет ни в одной
+        # части (надпись на стыке, которую обе части прочитали кусками).
+        merged = merge_annotations(parts + [whole.annotations])
+        logger.info(
+            "Надписи листа дочитаны частями: частей %d, не прочитано %d, надписей %d",
+            read_count, len(failed), len(merged),
+        )
+        return SheetReading(
+            sheet_type=whole.sheet_type,
+            annotations=merged,
+            raw=whole.raw,
+            cut=whole.cut,
+            tiles=read_count,
+            failed=failed,
+            # Непрочитанные по виду элементы листа дочитываются частями, а
+            # вот такие же элементы самих частей дочитывать уже нечем.
+            lost=lost,
         )
 
     def read_title_block(self, image) -> Optional[Dict[str, Any]]:
@@ -516,8 +690,12 @@ class QwenVisionClient:
     # ----------------------------------------------------------- внутреннее
     def _ask(
         self, image, prompt: str, max_side: int, max_tokens: Optional[int] = None,
-        list_key: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        """
+        Вызов, от которого ждут целый JSON-объект. Спасение оборванного
+        списка живёт в `_read_sheet_piece`: оно нужно только проходу «лист
+        целиком», и только там обрыв — это состояние, а не просто неудача.
+        """
         if not self.available:
             logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
             return None
@@ -526,18 +704,6 @@ class QwenVisionClient:
             return None
         content = answer[0]
         data = extract_json(content)
-        if list_key and (data is None or not isinstance(data.get(list_key), list)):
-            # Ответ оборван потолком токенов: целого объекта нет, и разбор
-            # находил первый вложенный — одну надпись вместо всего листа.
-            items = salvage_list(content, list_key)
-            if items:
-                logger.warning("Ответ модели оборван: из списка %s спасено %d элементов",
-                               list_key, len(items))
-                salvaged: Dict[str, Any] = {list_key: items}
-                kind = re.search(r'"sheet_type"\s*:\s*"([^"]*)"', content)
-                if kind:
-                    salvaged["sheet_type"] = kind.group(1)
-                return salvaged
         if data is None:
             logger.error("Модель вернула не-JSON (%d символов): %.200s", len(content), content)
         return data
@@ -785,6 +951,113 @@ def salvage_list(content: str, key: str) -> List[Any]:
     return items
 
 
+# Слова самой схемы ответа: имена категорий и значения `sheet_type`. Когда
+# модель бросает обёртку объекта, она перечисляет поля схемы по порядку
+# («size», «D80», [bbox], «note», «Stal 3»), и имя категории приходит
+# отдельной строкой наравне со прочтением.
+_SCHEMA_WORDS = frozenset(CATEGORIES) | {"detail", "assembly", "scheme", "unknown"}
+# Одинокое латинское слово строчными буквами без цифр — тоже слово схемы
+# («dimension», которого в CATEGORIES нет вовсе: модель придумала его сама).
+# На чертеже по ЕСКД прочтение — это русский текст, число, обозначение ГОСТ
+# или символ; «Ra», «M20», «H7», «IP65», «УХЛ4» под правило не попадают,
+# потому что в них есть цифры или заглавные буквы.
+_SCHEMA_LIKE = re.compile(r"^[a-z][a-z_]{2,19}$")
+
+
+def _is_schema_word(text: str) -> bool:
+    """Строка — слово схемы ответа, а не прочтение листа."""
+    return text.casefold() in _SCHEMA_WORDS or bool(_SCHEMA_LIKE.match(text))
+
+
+# Доля из bbox, пришедшая строкой: «0.1» в кавычках обходила отказ от чисел.
+# Дробь с точкой в пределах 0..1 — это координата: на чертеже по ЕСКД
+# десятичный разделитель запятая («0,32», «0,12» — настоящие прочтения с
+# листа-паспорта), поэтому запятая под правило не попадает, а целые числа
+# («110», «1») не попадают из-за требования точки.
+def _is_bbox_fraction(text: str) -> bool:
+    if "." not in text:
+        return False
+    try:
+        value = float(text)
+    except ValueError:
+        return False
+    return 0.0 <= value <= 1.0
+
+
+def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Элементы списка `annotations` в надписи. Возвращает надписи и счётчик
+    видов, которые надписью стать не смогли.
+
+    Раньше здесь стоял `isinstance(a, dict)`, и всё, что не объект,
+    выбрасывалось молча: на листе-паспорте из 108 спасённых элементов до
+    разбора дошли 24, а 83 прочтения исчезли без следа — ровно та потеря,
+    которую мы и ищем. Виды элементов перечислены не наугад: `salvage_list`
+    отдаёт то, что возвращает `json.JSONDecoder.raw_decode`, то есть объект,
+    массив, строку, число, `true`/`false`/`null` — других не бывает.
+
+    * объект — надпись, как и прежде;
+    * строка — надпись без места: модель бросила обёртку объекта и
+      перечисляет значения подряд. Текст на листе есть, и терять его
+      незачем; места нет, поэтому разбор поставит ему рамку всего листа, а
+      категорию определят правила ГОСТ (уверенность ниже, чем у надписи с
+      категорией от модели, — так и должно быть);
+    * массив — либо надписи вложенным списком, либо строка таблицы
+      («Термометр», «2 шт.»): объекты из него разбираются как надписи,
+      строки — как строки;
+    * число, `true`/`false`/`null` — надписью не становятся. Отдельное
+      число в ответе — это почти всегда доля из `bbox`, а не прочтение, и
+      превращать «0.52» в надпись листа значит сорить в индексе.
+
+    Надписью не становятся и две разновидности строк, иначе в индекс
+    попадает мусор от той же поломки, которую мы и чиним:
+
+    * слово самой схемы ответа. Поля схемы идут по порядку
+      `{category, value, bbox}`, и, бросив обёртку, модель перечисляет их
+      все: «size», «D80», [bbox], «note», «Stal 3». «size» и «note» —
+      разметка, а не прочтение, но `looks_like_text` их пропускает, и они
+      доходили до индекса полями;
+    * доля из `bbox`, пришедшая строкой: «0.1» в кавычках обходила отказ
+      от чисел.
+
+    Обе разновидности считаются потерянными, а не выбрасываются: счётчик
+    виден в логе и в payload, поэтому если правило начнёт отказывать
+    настоящим прочтениям, это будет заметно по числу, а не по тишине.
+    """
+    annotations: List[Dict[str, Any]] = []
+    lost: Dict[str, int] = {}
+
+    def take(item: Any, depth: int = 0) -> None:
+        if isinstance(item, dict):
+            annotations.append(item)
+            return
+        if isinstance(item, str):
+            text = item.strip()
+            if not text:
+                lost["пустая строка"] = lost.get("пустая строка", 0) + 1
+            elif _is_schema_word(text):
+                lost["слово схемы"] = lost.get("слово схемы", 0) + 1
+            elif _is_bbox_fraction(text):
+                lost["доля bbox строкой"] = lost.get("доля bbox строкой", 0) + 1
+            else:
+                annotations.append({"category": "", "value": text})
+            return
+        # Вложенность глубже пары уровней — это уже не разметка листа.
+        if isinstance(item, (list, tuple)) and depth < 2:
+            if not item:
+                lost["пустой массив"] = lost.get("пустой массив", 0) + 1
+                return
+            for inner in item:
+                take(inner, depth + 1)
+            return
+        name = "массив" if isinstance(item, (list, tuple)) else type(item).__name__
+        lost[name] = lost.get(name, 0) + 1
+
+    for item in items:
+        take(item)
+    return annotations, lost
+
+
 def _content_of(payload: Dict[str, Any]) -> Optional[str]:
     choices = payload.get("choices") or []
     if not choices:
@@ -894,6 +1167,88 @@ def crop_box(image, box: Sequence[float]):
 
 def _line_key(line: str) -> str:
     return " ".join(line.split()).casefold()
+
+
+def place_in_sheet(annotation: Dict[str, Any], box: Sequence[float]) -> Dict[str, Any]:
+    """
+    bbox надписи из долей части листа в доли всего листа. Модель отвечает в
+    долях присланной картинки, а прислана ей была часть: без переноса все
+    надписи частей легли бы на лист как попало, и место надписи врало бы.
+
+    Ответ в пикселях (координаты заметно больше 1) не переносится: такой
+    bbox всё равно отбрасывается при разборе, и домножать его не на что.
+    """
+    bbox = annotation.get("bbox")
+    if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+        return annotation
+    try:
+        coords = [float(value) for value in bbox]
+    except (TypeError, ValueError):
+        return annotation
+    if max(coords) > 1.5:
+        return annotation
+    left, top, right, bottom = (float(value) for value in box)
+    width, height = right - left, bottom - top
+    x1, y1, x2, y2 = coords
+    return {**annotation, "bbox": [
+        round(left + x1 * width, 4), round(top + y1 * height, 4),
+        round(left + x2 * width, 4), round(top + y2 * height, 4),
+    ]}
+
+
+def _centre(bbox: Any) -> Tuple[float, float]:
+    """Середина bbox в долях листа. Нет координат — середина листа."""
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        try:
+            x1, y1, x2, y2 = (float(value) for value in bbox)
+        except (TypeError, ValueError):
+            return 0.5, 0.5
+        if max(x1, y1, x2, y2) <= 1.5:
+            return (x1 + x2) / 2, (y1 + y2) / 2
+    return 0.5, 0.5
+
+
+def merge_annotations(
+    parts: Sequence[Sequence[Dict[str, Any]]], near: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Надписи частей листа в один список без повторов из перекрытия.
+
+    Повтор — это та же надпись, прочитанная двумя перекрывшимися частями:
+    тот же текст и то же место. Поэтому ключ — текст плюс место, а не один
+    текст: «⌀8» стоит у каждого отверстия, и восемь таких надписей на листе
+    — восемь размеров, а не один. Надпись считается той же, если её
+    середина ближе `near` доли стороны листа к уже добавленной: координаты
+    от модели приблизительны, и точного совпадения у двух частей не бывает.
+
+    Осторожно на будущее. Порог `near` может схлопнуть и две настоящие
+    надписи с одним текстом, стоящие ближе этой доли друг к другу (по
+    умолчанию 0.05 стороны). Сегодня это не теряет данных: ниже по конвейеру
+    `_deduplicate` в core/drawing_processor.py сводит поля по паре
+    («категория», «значение») вообще без координат, и такие надписи
+    схлопнулись бы всё равно — разница видна только в счётчиках лога. Но
+    если `_deduplicate` когда-нибудь станет учитывать место, это окно
+    превратится в настоящую потерю, и притом без счётчика: здесь надпись
+    отбрасывается молча, а не попадает в `lost`. Тогда порог нужно
+    пересмотреть вместе с тем изменением.
+    """
+    if near is None:
+        near = settings.DRAWING_SHEET_TILE_NEAR
+    near = max(0.0, float(near))
+    emitted: Dict[str, List[Tuple[float, float]]] = {}
+    merged: List[Dict[str, Any]] = []
+    for part in parts:
+        for annotation in part:
+            if not isinstance(annotation, dict):
+                continue
+            text = _line_key(str(annotation.get("value") or ""))
+            spot = _centre(annotation.get("bbox"))
+            seen = emitted.setdefault(text, [])
+            if any(abs(spot[0] - x) <= near and abs(spot[1] - y) <= near for x, y in seen):
+                continue
+            seen.append(spot)
+            merged.append(annotation)
+    return merged
 
 
 def merge_lines(parts: Sequence[Sequence[str]]) -> List[str]:

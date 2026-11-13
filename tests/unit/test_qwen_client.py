@@ -124,17 +124,39 @@ class TestRequest:
 
 class TestSheetReading:
     def test_annotations_are_returned(self):
+        """
+        Строка в списке надписей — не мусор, а прочтение без места: на
+        плотном листе модель бросает обёртку объекта и перечисляет значения
+        подряд. Раньше такие строки выбрасывались здесь (`isinstance(a,
+        dict)`), и на настоящем листе-паспорте так пропали 83 прочтения из
+        108. Читается ли строка как надпись чертежа, решают правила разбора
+        дальше (`drawing_text.looks_like_text`), а не вид элемента JSON.
+        """
         payload = {
             "sheet_type": "detail",
             "annotations": [
                 {"category": "size", "value": "⌀44H7", "bbox": [0.1, 0.2, 0.2, 0.3]},
-                "мусор, который не словарь",
+                "2.13 Степень защиты по ГОСТ 14254-2015",
             ],
         }
         reading = client(FakeSession(FakeResponse(answer(payload)))).read_sheet(picture())
 
         assert reading.sheet_type == "detail"
+        assert [a["value"] for a in reading.annotations] == [
+            "⌀44H7", "2.13 Степень защиты по ГОСТ 14254-2015",
+        ]
+        assert reading.lost == 0
+
+    def test_an_element_that_is_no_reading_is_counted_not_dropped(self):
+        """Доля из bbox отдельным элементом в надпись не превращается."""
+        payload = {"annotations": [
+            {"category": "size", "value": "⌀44H7", "bbox": [0.1, 0.2, 0.2, 0.3]},
+            0.52, None,
+        ]}
+        reading = client(FakeSession(FakeResponse(answer(payload)))).read_sheet(picture())
+
         assert [a["value"] for a in reading.annotations] == ["⌀44H7"]
+        assert reading.lost == 2 and reading.complete is False
 
     def test_json_in_markdown_fence_is_understood(self):
         fenced = "```json\n{\"annotations\": [{\"value\": \"20\"}]}\n```"
