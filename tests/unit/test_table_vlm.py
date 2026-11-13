@@ -51,8 +51,21 @@ class TestReconcileHook:
         table = next(b for b in blocks if b.type == "table")
         assert table.table_data["rows"] == QWEN_TABLE["rows"]
         assert table.method == "vlm_escalation"
-        # Обрывки строк слоя этой таблицы не уходят в индекс второй копией.
+        assert table.table_html is None
+        # Разметка формул из ячеек MinerU не уходит в индекс второй копией.
         assert not any(b.type == "formula" for b in blocks)
+
+    def test_lines_missing_from_model_table_are_kept(self):
+        def reader(b):
+            return {"headers": ["Формула"], "rows": [["x = x0 + vt"]], "total_row": None}
+
+        blocks, stats = reconcile_with_text_layer(
+            [table_block()], degrading_layer(), source=OCR_LAYER, table_reader=reader
+        )
+
+        texts = " ".join(b.text or "" for b in blocks if b.type == "text")
+        assert "Прямолинейное равномерное движение" in texts
+        assert stats.table_lines_kept >= 1
 
     def test_reader_refusal_keeps_old_degradation(self):
         blocks, stats = reconcile_with_text_layer(
@@ -101,8 +114,11 @@ def enabled(monkeypatch):
 
 
 class TestTableReader:
-    def test_disabled_by_default(self):
-        assert settings.TABLE_VLM_RETRY_ENABLED is False
+    def test_disabled_by_default(self, monkeypatch):
+        from core.config import Settings
+
+        assert Settings.model_fields["TABLE_VLM_RETRY_ENABLED"].default is False
+        monkeypatch.setattr(settings, "TABLE_VLM_RETRY_ENABLED", False)
         assert table_vlm.table_reader(png_bytes(), "png", client=FakeClient(QWEN_TABLE)) is None
 
     def test_unavailable_model_gives_no_reader(self, enabled):
@@ -157,13 +173,29 @@ class TestTableReader:
         reader = table_vlm.table_reader(png_bytes(), "png", client=Broken(QWEN_TABLE))
         assert reader(table_block()) is None
 
+    def test_soft_time_limit_is_not_swallowed(self, enabled):
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        class Slow(FakeClient):
+            def read_table(self, image):
+                raise SoftTimeLimitExceeded()
+
+        reader = table_vlm.table_reader(png_bytes(), "png", client=Slow(QWEN_TABLE))
+        with pytest.raises(SoftTimeLimitExceeded):
+            reader(table_block())
+
 
 class TestUpright:
     def test_rotates_by_confident_osd(self, monkeypatch):
         from core.providers import ocr_prepare
 
         monkeypatch.setattr(ocr_prepare, "osd_rotation", lambda gray: (90, 5.0))
-        assert table_vlm._upright(Image.new("RGB", (400, 300))).size == (300, 400)
+        image = Image.new("RGB", (400, 300), "white")
+        image.putpixel((0, 0), (255, 0, 0))  # левый верхний угол
+        upright = table_vlm._upright(image)
+        # Поворот на 90 по часовой: левый верхний угол уходит в правый верхний.
+        assert upright.size == (300, 400)
+        assert upright.getpixel((299, 0)) == (255, 0, 0)
 
     def test_keeps_image_on_unsure_osd(self, monkeypatch):
         from core.providers import ocr_prepare

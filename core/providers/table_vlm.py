@@ -19,6 +19,8 @@ import io
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from core import filetypes
 from core.config import settings
 from core.models.parse_result import ParsedBlock
@@ -59,6 +61,8 @@ def table_reader(file_bytes: Optional[bytes], file_type: str, client=None) -> Op
                 return None
             piece = _upright(_crop(page, block.bbox))
             table = client.read_table(piece)
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 — сбой перечитывания не роняет разбор
             logger.warning("Таблица на стр. %s не перечитана моделью: %s", block.page, exc)
             return None

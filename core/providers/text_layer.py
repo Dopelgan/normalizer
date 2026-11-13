@@ -1179,9 +1179,15 @@ def _fix_table(
             read = table_reader(block) if table_reader is not None else None
             if read:
                 block.table_data = read
+                # HTML от MinerU — та же разметка, что и в ячейках.
+                block.table_html = None
                 block.method = METHOD_VLM_TABLE
                 stats.vlm_tables += 1
-                return [], []
+                # Модель могла пропустить строку: строки слоя с настоящими
+                # словами, которых в её таблице нет, возвращаются текстом.
+                kept = _lines_with_new_words(matched, block)
+                stats.table_lines_kept += len(kept)
+                return [], kept
             stats.degraded_tables += 1
             return table_from_lines.degrade(block, matched), []
         stats.repaired_tables += 1
