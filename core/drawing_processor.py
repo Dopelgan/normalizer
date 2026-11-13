@@ -167,8 +167,13 @@ class DrawingProcessor:
         budget = settings.DRAWING_TIME_BUDGET
         # Срок передаётся только когда лист и правда может читаться частями:
         # с выключенным флагом вызов прохода остаётся в точности прежним.
+        #
+        # Из бюджета вычитается запас на проходы после чтения листа. Иначе
+        # дочитывание частями съедает бюджет, частям прохода «весь текст
+        # листа» времени не остаётся, и документ уходит человеку из-за
+        # transcript_tile — хотя человеку качество чтения листа не адресовано.
         deadline_kwargs = (
-            {"until": started + budget}
+            {"until": started + budget - settings.DRAWING_SHEET_TILE_RESERVE}
             if settings.DRAWING_SHEET_TILES and budget else {}
         )
         reading = self.qwen.read_sheet(

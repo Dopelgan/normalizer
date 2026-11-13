@@ -15,6 +15,7 @@ DRAWING_SHEET_TILES) и учёт потерянных прочтений.
 import base64
 import io
 import json
+import time
 
 import pytest
 import requests
@@ -490,6 +491,29 @@ class TestReadingInParts:
         assert len(model.tile_calls) == 0
         assert len(reading.failed) == 4 and not reading.complete
 
+    def test_a_part_is_admitted_only_if_it_can_finish_in_time(
+        self, tiles, monkeypatch,
+    ):
+        """
+        Срок — это «успеет закончиться», а не «ещё не прошёл». Часть,
+        допущенная за секунду до срока, работала бы ещё до VLM_TIMEOUT и
+        вынесла бы проход листа далеко за его долю бюджета.
+        """
+        import time as clock
+        monkeypatch.setattr(settings, "VLM_TIMEOUT", 180)
+        model = SheetModel(capacity=10)
+        # Срок ещё не прошёл, но на вызов длиной VLM_TIMEOUT времени нет.
+        reading = client(model).read_sheet(quartered(), until=clock.monotonic() + 10)
+        assert len(model.tile_calls) == 0
+        assert len(reading.failed) == 4
+
+    def test_a_part_with_room_to_finish_is_read(self, tiles, monkeypatch):
+        import time as clock
+        monkeypatch.setattr(settings, "VLM_TIMEOUT", 1)
+        model = SheetModel(capacity=10)
+        reading = client(model).read_sheet(quartered(), until=clock.monotonic() + 600)
+        assert len(model.tile_calls) == 4 and reading.complete
+
 
 # ------------------------------------------------------- видимость обрыва
 def processor(model, monkeypatch):
@@ -673,6 +697,110 @@ class TestNobodyIsCalledForParseQuality:
         after = built(SheetModel(capacity=10), monkeypatch)
         assert len(after.content.structured_drawing_fields) > len(
             before.content.structured_drawing_fields)
+
+
+# --------------------------------------------- бюджет листа и каскад к человеку
+class TestTheBudgetCascadeToAHuman:
+    """
+    Проходы этой ветки идут ДО цикла областей и ДО прохода «весь текст
+    листа», и своих пометок потери они не ставят. Но бюджет листа — общий,
+    и съеденный бюджет роняет документ человеку чужими руками: частям
+    прохода «весь текст листа» не остаётся времени, и тогда
+    `transcript_complete`=false плюс области `kind`=`transcript_tile`,
+    которые считаются потерей всегда. Отсюда запас
+    DRAWING_SHEET_TILE_RESERVE.
+    """
+
+    @staticmethod
+    def fragment_with(regions, payload):
+        """Фрагмент листа так, как его собирает разбор, без вызовов модели."""
+        worker = DrawingProcessor(storage=object(), qwen=object())
+        result = {
+            "parsed_fields": [{
+                "category": "size", "value": "110", "tolerance": None,
+                "nature": "executive", "unit": "", "confidence": 0.8,
+                "bbox": [0, 0, 1, 1], "source_of_tolerance": "unknown",
+                "provenance": "detected_from_annotation",
+            }],
+            "avg_confidence": 0.8, "completeness": None, "structure_score": 1.0,
+            "completeness_mechanisms": {}, "mode": "vision_vlm",
+            "warnings": ["DRAWING_COMPLETENESS_UNKNOWN"],
+            "missing_regions": regions, "payload": payload,
+        }
+        return worker.build_fragment(result, source_fragment(), {})
+
+    def test_a_skipped_region_alone_does_not_reach_a_human(self, monkeypatch):
+        """
+        Область, пропущенную по бюджету, покрывает переписанный текст листа:
+        `page` у неё проставляется, и потерей она не считается.
+        """
+        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
+        monkeypatch.setattr(settings, "DRAWING_IMAGE_FULL_READ", True)
+        fragment = self.fragment_with(
+            [{"kind": "table", "bbox": [0, 0, 1, 1], "reason": "time_budget"}],
+            {"transcript_lines": ["строка 1", "строка 2"]},
+        )
+        assert [r["page"] for r in fragment.missing_regions] == [1]
+        assert document_quality([fragment])[0] is False
+
+    def test_a_starved_transcript_does_reach_a_human(self, monkeypatch):
+        """
+        Вот он, каскад: если бюджета не хватило и частям прохода «весь текст
+        листа», документ становится partial и уходит человеку. Своих пометок
+        эта ветка не ставит — хватает чужих.
+        """
+        monkeypatch.setattr(settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
+        monkeypatch.setattr(settings, "DRAWING_IMAGE_FULL_READ", True)
+        fragment = self.fragment_with(
+            [{"kind": "table", "bbox": [0, 0, 1, 1], "reason": "time_budget"},
+             {"kind": "transcript_tile", "bbox": [0, 0, 0.5, 0.5], "reason": "time_budget"}],
+            {"transcript_lines": ["строка 1"], "transcript_complete": False},
+        )
+        assert document_quality([fragment])[0] is True
+
+    def test_the_reserve_is_kept_out_of_the_tiling_deadline(self, monkeypatch):
+        """
+        Дочитывание частями получает не весь бюджет, а бюджет минус запас:
+        остаток принадлежит проходам после чтения листа.
+        """
+        monkeypatch.setattr(settings, "DRAWING_SHEET_TILES", True)
+        monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 420)
+        monkeypatch.setattr(settings, "DRAWING_SHEET_TILE_RESERVE", 120)
+        seen = {}
+
+        class Spy:
+            model = "fake-vl"
+            available = True
+
+            def read_sheet(self, image, hint="", until=None):
+                seen["until"] = until
+                return None
+
+        worker = DrawingProcessor(storage=object(), qwen=Spy())
+        worker.vision_enabled = False
+        monkeypatch.setattr(worker, "_open", lambda ref, page=1: quartered())
+        started = time.monotonic()
+        worker.process("sheet.jpg", {}, page=1)
+        # Срок — не позже чем бюджет минус запас от начала разбора листа.
+        assert seen["until"] <= started + 420 - 120 + 1
+
+    def test_without_tiling_the_deadline_is_not_passed_at_all(self, monkeypatch):
+        """Выключенный флаг — вызов прохода в точности прежний."""
+        seen = {}
+
+        class Spy:
+            model = "fake-vl"
+            available = True
+
+            def read_sheet(self, image, hint=""):
+                seen["called"] = True
+                return None
+
+        worker = DrawingProcessor(storage=object(), qwen=Spy())
+        worker.vision_enabled = False
+        monkeypatch.setattr(worker, "_open", lambda ref, page=1: quartered())
+        worker.process("sheet.jpg", {}, page=1)
+        assert seen["called"] is True
 
 
 # ----------------------------------------------------------- виды листов
