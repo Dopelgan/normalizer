@@ -68,6 +68,29 @@ IMAGE_EXTENSIONS = {"." + ext for ext in filetypes.IMAGE_EXTENSIONS}
 # Режим сегментации Tesseract: страница связного текста.
 PSM_BLOCK = 6
 
+
+def _page_psm() -> int:
+    """
+    Режим сегментации страницы для полного OCR.
+
+    По умолчанию — `PSM_BLOCK`, то есть «страница это один однородный
+    блок». Чертёжный лист однородным блоком не является: в режиме 6
+    строка идёт через весь лист (см. `group_lines` ниже), и подпись
+    размера из левого угла попадает в одну строку с графой штампа. Замер
+    (`ocr-psm-eval-20261114`): переход на 3 снижает ошибку на символ
+    эталонного блока внутри листа с 0,636 до 0,235 на техтребованиях и с
+    0,678 до 0,304 на таблице, и времени не стоит. Значение вынесено в
+    `OCR_PSM`, чтобы менять его без правки кода; при незаданной настройке
+    лист читается ровно как раньше.
+    """
+    psm = getattr(settings, "OCR_PSM", PSM_BLOCK)
+    try:
+        psm = int(psm)
+    except (TypeError, ValueError):
+        return PSM_BLOCK
+    return psm if psm > 0 else PSM_BLOCK
+
+
 # Уверенность, которая ставится, когда Tesseract не отдал разбивку по словам
 # и измерить нечего. Это не оценка качества, а признак «не измерено».
 UNMEASURED_CONFIDENCE = 0.5
@@ -228,7 +251,7 @@ class TesseractFallbackProvider:
         try:
             images = self._images_of(local_path, file_type)
             pages: Dict[int, List[TextLine]] = {}
-            for page_num, ocr_lines in self._map_pages(images, lambda image, _: self.ocr_lines(image)):
+            for page_num, ocr_lines in self._map_pages(images, lambda image, _: self.ocr_lines(image, _page_psm())):
                 lines = [_text_line(line, page_num) for line in ocr_lines if line.text.strip()]
                 if lines:
                     pages[page_num] = lines
@@ -415,7 +438,7 @@ class TesseractFallbackProvider:
         строках растворялся в среднем по абзацам. Координаты и уверенность
         по строкам у Tesseract есть — их незачем было выбрасывать.
         """
-        lines = self.ocr_lines(image)
+        lines = self.ocr_lines(image, _page_psm())
         if lines:
             blocks: List[ParsedBlock] = []
             as_text_lines = [_text_line(l, page) for l in lines if l.text.strip()]
@@ -627,7 +650,7 @@ class TesseractFallbackProvider:
         try:
             return pytesseract.image_to_string(
                 image, lang=self.lang,
-                config=f"--psm 6{ocr_model.tessdata_option()}",
+                config=f"--psm {_page_psm()}{ocr_model.tessdata_option()}",
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("Ошибка OCR: %s", exc)
