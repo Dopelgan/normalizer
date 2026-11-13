@@ -39,35 +39,44 @@ def strict(monkeypatch):
     monkeypatch.setattr(drawing_processor, "_category_strict", lambda: True)
 
 
+# Настройку и обе функции приносит ветка точности категорий. До её слияния
+# их здесь нет, после — есть, и проверки на отсутствие верны только до.
+PAIRED = hasattr(settings, "DRAWING_FIELD_CATEGORY_STRICT")
+
+
 class TestSafeWithoutItsOwnBranch:
     """
-    Ни настройки, ни вспомогательных функций в этом дереве нет. Прямое
-    обращение к настройке подняло бы AttributeError на каждом листе, а
-    широкий `except Exception` в обогащении превратил бы каждый чертёж в
-    `DRAWING_NOT_RECOGNIZED`.
+    Пока чужой ветки в дереве нет, обе правки обязаны быть мертвы и ничего
+    не ронять. Прямое обращение к настройке подняло бы AttributeError на
+    каждом листе, а широкий `except Exception` в обогащении превратил бы
+    каждый чертёж в `DRAWING_NOT_RECOGNIZED`.
     """
 
+    def test_reading_the_setting_never_raises(self):
+        """Главное свойство: читатель отвечает, а не падает, в любом дереве."""
+        assert _category_strict() in (True, False)
+
+    @pytest.mark.skipif(PAIRED, reason="ветка точности категорий уже в дереве")
     def test_the_setting_is_absent_here(self):
         assert not hasattr(settings, "DRAWING_FIELD_CATEGORY_STRICT")
 
-    def test_and_it_cannot_even_be_set_by_accident(self):
-        """pydantic отказывается заводить неизвестное поле на запись."""
-        with pytest.raises((ValueError, AttributeError)):
-            settings.DRAWING_FIELD_CATEGORY_STRICT = True
-
-    def test_and_reading_it_is_still_safe(self):
-        assert _category_strict() is False
-
+    @pytest.mark.skipif(PAIRED, reason="ветка точности категорий уже в дереве")
     def test_the_helpers_are_absent_here_too(self):
         assert not hasattr(dimension_fidelity, "adopt_transcript_signs")
         assert not hasattr(vector_drawing, "decisive_category")
 
-    def test_reconcile_works_as_before(self):
+    @pytest.mark.skipif(PAIRED, reason="ветка точности категорий уже в дереве")
+    def test_both_patches_are_dead_without_it(self):
+        assert _category_strict() is False
+
+    def test_reconcile_works_as_before_with_the_flag_off(self, monkeypatch):
         """Старое поведение: спор отдан модели, понижена уверенность."""
+        monkeypatch.setattr(drawing_processor, "_category_strict", lambda: False)
         assert _reconcile("thread", "size", "⌀32x2,5") == ("thread", 0.6)
         assert _reconcile("size", "size", "⌀32x2,5") == ("size", 0.9)
 
-    def test_the_new_argument_is_optional(self):
+    def test_the_new_argument_is_optional(self, monkeypatch):
+        monkeypatch.setattr(drawing_processor, "_category_strict", lambda: False)
         assert _reconcile("size", "size") == ("size", 0.9)
 
 
@@ -91,6 +100,22 @@ class TestDecisiveNotationWiring:
         self.decisive(monkeypatch, {"Ra 6,3": "roughness"})
         assert _reconcile("roughness", "roughness", "Ra 6,3") == ("roughness", 0.9)
 
+    def test_the_patch_returns_the_rules_answer_not_the_decisive_one(
+        self, monkeypatch, strict,
+    ):
+        """
+        Зафиксировано нарочно. Правка возвращает `by_rules`, то есть ответ
+        `vector_drawing.classify`, а не ответ `decisive_category`. На четырёх
+        нотациях из пяти они совпадают (⌀ -> size, Ra/Rz -> roughness,
+        «M…×…» -> thread, «R»+число -> radius), и разницы нет. Расходятся они
+        на склеенной пометке «№» с цифрой: `decisive_category("2№3")` даёт
+        `position`, а `classify("2№3")` — `note`. Значит «2№3» перестаёт
+        стоять под «Резьба» (это и была порча), но встаёт под «Примечание», а
+        не под «Позиция». Если это решат менять, здесь и сломается.
+        """
+        self.decisive(monkeypatch, {"2№3": "position"})
+        assert _reconcile("thread", "note", "2№3") == ("note", 0.6)
+
     def test_a_judgement_call_is_left_to_the_model(self, monkeypatch, strict):
         """Там, где нотация молчит, спор остаётся спором — как и раньше."""
         self.decisive(monkeypatch, {})
@@ -108,6 +133,7 @@ class TestDecisiveNotationWiring:
         assert "⌀32x2,5" in seen
 
     def test_flag_off_does_not_consult_the_notation(self, monkeypatch):
+        monkeypatch.setattr(drawing_processor, "_category_strict", lambda: False)
         called = []
         monkeypatch.setattr(vector_drawing, "decisive_category",
                             lambda text: called.append(text) or "size", raising=False)
@@ -166,6 +192,7 @@ class TestTranscriptSignsWiring:
         assert calls[0][0] is result["parsed_fields"]
 
     def test_flag_off_hands_nothing_over(self, monkeypatch):
+        monkeypatch.setattr(drawing_processor, "_category_strict", lambda: False)
         calls = []
         worker = self.worker(monkeypatch, calls)
         worker.process("sheet.jpg", {}, page=1, transcribe=True)
