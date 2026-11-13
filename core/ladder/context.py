@@ -264,8 +264,17 @@ def classify(context: DocumentContext) -> Classification:
         signals["raster_kind"] = verdict.kind
         signals["raster_kind_confidence"] = round(verdict.confidence, 3)
         signals["raster_kind_reason"] = verdict.reason
+        genre = _genre_of_raster(verdict)
+        # Жанровый гейт на листе-картинке: текста в файле нет, поэтому
+        # признаки чертежа читаются с самой основной надписи.
+        if genre == GENRE_DRAWING and image is not None:
+            gate = _stamp_gate(image)
+            if gate is not None:
+                signals["genre_gate"] = gate
+                if gate["demote"]:
+                    genre = GENRE_UNKNOWN
         return Classification(
-            source=SOURCE_RASTER, genre=_genre_of_raster(verdict),
+            source=SOURCE_RASTER, genre=genre,
             raster_quality=quality, signals=signals,
         )
 
@@ -304,6 +313,15 @@ def _classify_pdf(context: DocumentContext) -> Classification:
     drawing_pages = [p for p, v in verdicts.items() if v.is_drawing]
     signals["drawing_pages"] = drawing_pages
     signals["page_count"] = len(verdicts)
+    # Решение жанрового гейта — в признаках классификации: оно должно быть
+    # счётным снаружи, и ровно это, без разбора признаков по страницам.
+    gated = {p: v.signals["genre_gate"] for p, v in verdicts.items()
+             if "genre_gate" in v.signals}
+    if gated:
+        signals["genre_gate"] = {
+            "demoted_pages": sorted(p for p, g in gated.items() if g["demote"]),
+            "kept_pages": sorted(p for p, g in gated.items() if not g["demote"]),
+        }
     share = len(drawing_pages) / len(verdicts) if verdicts else 0.0
     signals["drawing_share"] = round(share, 3)
     mostly_drawings = share >= _DRAWING_GENRE_SHARE
@@ -354,6 +372,46 @@ def _classify_pdf(context: DocumentContext) -> Classification:
 _RASTER_DRAWING_PAGES = 8
 
 
+# Разрешение, в котором читается штамп. Подпись графы по ГОСТ 2.304 — кегль
+# 3,5 мм; на 200 т/д это 28 пикселей, что Tesseract читает, а на 100 т/д —
+# 14, и не читает. Совпадает с `DRAWING_RENDER_DPI`, которым лист рендерится
+# для модели, поэтому новых величин здесь не заводится.
+_STAMP_DPI = 200
+
+
+def _render(document, index):
+    """Страница PDF растром в разрешении чтения штампа. `None` — не вышло."""
+    try:
+        from PIL import Image
+
+        pixmap = document[index].get_pixmap(dpi=_STAMP_DPI)
+        return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Страница %d не отрендерена для чтения штампа: %s", index + 1, exc)
+        return None
+
+
+def _stamp_gate(image):
+    """
+    Решение жанрового гейта по распознанной основной надписи листа.
+    `None` — гейт или распознавание штампа выключены.
+    """
+    from core.providers import drawing_genre
+
+    if image is None:
+        return None
+    if not (drawing_genre.enabled() and drawing_genre.stamp_ocr_enabled()):
+        return None
+    try:
+        texts = drawing_genre.stamp_texts(image)
+    except Exception as exc:  # noqa: BLE001 — неудача распознавания не решает жанр
+        logger.warning("Штамп листа не прочитан: %s", type(exc).__name__)
+        return None
+    if not texts:
+        return None
+    return drawing_genre.gate_stamp(texts)
+
+
 def _raster_drawing_pages(data: bytes):
     """Номера чертёжных листов среди первых страниц скана и число проверенных."""
     try:
@@ -367,13 +425,38 @@ def _raster_drawing_pages(data: bytes):
     except Exception as exc:  # noqa: BLE001
         logger.debug("Скан не открылся для поиска чертежей: %s", exc)
         return [], 0
+    from core.providers import drawing_genre
+
     pages = []
+    gate_on = drawing_genre.enabled()
     try:
         checked = min(document.page_count, _RASTER_DRAWING_PAGES)
         for index in range(checked):
             png = document[index].get_pixmap(dpi=100).tobytes("png")
-            if raster_drawing.analyse(png).is_drawing:
-                pages.append(index + 1)
+            if not raster_drawing.analyse(png).is_drawing:
+                continue
+            # Жанровый гейт: у гибридного скана (напечатанный лист с
+            # текстовым слоем от исходного вывода или от прежнего
+            # распознавания) текст страницы читается и здесь, и лист в
+            # рамке без признаков чертежа чертежом не становится. Если
+            # текста на странице нет, гейт молчит: положительные признаки
+            # взять неоткуда, и решает геометрия, как раньше.
+            if gate_on:
+                try:
+                    text = document[index].get_text("text") or ""
+                except Exception:  # noqa: BLE001
+                    text = ""
+                if drawing_genre.gate(text)["demote"]:
+                    continue
+                # Текста в файле нет — признаки читаются с самого штампа
+                # (DRAWING_GENRE_GATE_STAMP_OCR). Страница рендерится ещё
+                # раз, в рабочем разрешении чертежей: подписи граф кеглем
+                # 3,5 мм на 100 т/д не читаются.
+                if not text.strip():
+                    gate = _stamp_gate(_render(document, index))
+                    if gate is not None and gate["demote"]:
+                        continue
+            pages.append(index + 1)
     finally:
         document.close()
     return pages, checked
