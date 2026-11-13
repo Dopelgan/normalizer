@@ -496,5 +496,6 @@ deskewed_page`); при `turn != 0` они не совпадают с исход
 - `RASTER_FRAME_THIN_LINES` — растровый детектор может назвать чертежом лист, который прежде шёл страницей текста;
   в `classification.signals` такого листа — `thin_line_frame`, `thin_line_rules`. Жанр документа и, значит,
   маршрут разбора и предлагаемый гриф у таких листов меняются;
-- `DRAWING_MATERIAL_NO_TOLERANCE` — у поля `material` `tolerance` = `null`, `source_of_tolerance` = `unknown`.
+- `DRAWING_MATERIAL_NO_TOLERANCE` — у поля `material`, прочитанного Qwen-VL, `tolerance` = `null`,
+  `source_of_tolerance` = `unknown` (векторный разбор PDF не затронут).
 
