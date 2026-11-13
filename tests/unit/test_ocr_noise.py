@@ -335,3 +335,25 @@ def test_recovered_repeat_of_mineru_text_dropped():
     assert [b.text[:10] for b in kept] == [
         MINERU_NOTES[:10], "Маркироват", "a С» 125) ",
     ]
+
+
+def test_recovered_english_text_kept_on_english_page():
+    # Английский скан: в восстановленном блоке нет русских слов, но это
+    # текст, которого у MinerU нет, а не графика чертежа.
+    from core.providers.mineru_parser import drop_repeated_recovered_blocks
+    from core.providers.text_layer import METHOD_OCR_LAYER_RECOVERED as REC
+
+    english = (
+        "The pump shall be installed on a rigid foundation and aligned before start-up. "
+        "Check the rotation direction and the oil level in the bearing housing. "
+        "Operating temperature must not exceed the limits given in the data sheet. "
+        "Replace the mechanical seal if leakage is visible after the first hour of operation."
+    )
+    assert len("".join(english.split())) >= 200
+    blocks = [
+        _block(english, "mineru_ocr"),
+        _block("Warranty does not cover damage caused by improper storage", REC),
+    ]
+    kept, dropped = drop_repeated_recovered_blocks(blocks, 0.6)
+    assert dropped == 0
+    assert len(kept) == 2

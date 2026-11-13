@@ -109,6 +109,7 @@ def drop_low_confidence_lines(
     return replace(layer, pages=pages)
 
 _RUS_WORD_RE = re.compile(r"[А-Яа-яЁё]{4,}")
+_LAT_WORD_RE = re.compile(r"[A-Za-z]{4,}")
 # Основа слова для сравнения копий: окончания у Tesseract и MinerU расходятся
 # («определятся» / «определяются»), начало слова — реже.
 _STEM = 5
@@ -128,11 +129,18 @@ def drop_repeated_recovered_blocks(
     `drop_low_confidence_lines`): там восстановленный блок либо повторяет
     этот текст хуже, либо собран из графики («a С» 125) \/ R263»). Блок
     уходит, если в нём нет ни одного русского слова или доля его слов, чья
-    основа есть в тексте MinerU страницы, не ниже `min_share`. На странице
-    без текста MinerU слой — единственный источник и не трогается.
+    основа есть в тексте MinerU страницы, не ниже `min_share`. Правило «нет
+    русского слова» — только на русской странице (русских слов у MinerU не
+    меньше латинских): на английском скане такой блок — недостающий текст.
+    На странице без текста MinerU слой — единственный источник и не трогается.
     """
     page_chars: Dict[int, int] = {}
     page_stems: Dict[int, set] = {}
+    # Русских и латинских слов в тексте MinerU страницы: правило «нет
+    # русского слова — графика» верно только для русской страницы. На
+    # английском скане восстановленный блок — текст, которого у MinerU нет.
+    page_rus: Dict[int, int] = {}
+    page_lat: Dict[int, int] = {}
     for b in blocks:
         if b.method == METHOD_OCR_LAYER_RECOVERED:
             continue
@@ -143,7 +151,10 @@ def drop_repeated_recovered_blocks(
                 cells.extend(str(c) for c in row)
             text = " ".join(cells)
         if b.type in _TEXTISH or b.type == "table":
-            page_stems.setdefault(b.page, set()).update(_stems(text))
+            stems = _stems(text)
+            page_stems.setdefault(b.page, set()).update(stems)
+            page_rus[b.page] = page_rus.get(b.page, 0) + len(stems)
+            page_lat[b.page] = page_lat.get(b.page, 0) + len(_LAT_WORD_RE.findall(text))
         if b.type in _TEXTISH and b.text:
             page_chars[b.page] = page_chars.get(b.page, 0) + len("".join(b.text.split()))
     kept: List[ParsedBlock] = []
@@ -153,7 +164,10 @@ def drop_repeated_recovered_blocks(
                 and page_chars.get(b.page, 0) >= _MINERU_PAGE_TEXT_CHARS):
             stems = _stems(b.text or "")
             known = page_stems.get(b.page, set())
-            if not stems or sum(s in known for s in stems) >= min_share * len(stems):
+            russian_page = page_rus.get(b.page, 0) > 0 and (
+                page_rus.get(b.page, 0) >= page_lat.get(b.page, 0))
+            if ((not stems and russian_page)
+                    or (stems and sum(s in known for s in stems) >= min_share * len(stems))):
                 dropped += 1
                 continue
         kept.append(b)
