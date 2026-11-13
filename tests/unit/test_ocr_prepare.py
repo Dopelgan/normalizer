@@ -274,3 +274,99 @@ class TestOsdRotation:
         monkeypatch.setattr(pytesseract, "image_to_osd", broken)
         assert osd_rotation(Image.new("L", (10, 10), 255)) is None
         assert _orientation(Image.new("L", (10, 10), 255)) == 0
+
+
+class TestLineRemovalGuards:
+    """
+    Предохранители снятия линий: отказ, защита штрихов, устойчивый порог.
+
+    Снятие линий задумано под скан таблицы с сеткой, а на чертёжном листе
+    отнимает больше, чем даёт (замер — `ocr-prepare-eval-20261114`). Все
+    три настройки по умолчанию выключены, и при выключенных подготовка
+    работает ровно как раньше — это здесь и проверяется.
+    """
+
+    @staticmethod
+    def _sheet_with_grid_and_text():
+        """Лист с длинной тонкой линией и буквой, лежащей на этой линии."""
+        image = Image.new("L", (900, 600), 255)
+        draw = ImageDraw.Draw(image)
+        # Линия рамки: длинная (больше 6 % ширины) и тонкая (2 px).
+        draw.rectangle([40, 300, 860, 301], fill=0)
+        # Вертикальный штрих, проходящий через линию насквозь.
+        draw.rectangle([400, 240, 403, 360], fill=0)
+        # Немного текста, чтобы лист не был пустым.
+        draw.text((60, 80), "ПРОТОКОЛ 12-345", fill=0)
+        return image
+
+    def _prepared(self, monkeypatch, **overrides):
+        monkeypatch.setattr("core.providers.ocr_prepare._orientation", lambda _: 0)
+        monkeypatch.setattr("core.providers.ocr_prepare._skew_angle", lambda *a: 0.0)
+        for name, value in overrides.items():
+            monkeypatch.setattr(settings, name, value)
+        return prepare_page(self._sheet_with_grid_and_text())
+
+    def test_flags_off_prepare_unchanged(self, monkeypatch):
+        """С выключенными настройками — тот же лист и те же снятые пиксели."""
+        before = self._prepared(monkeypatch)
+        after = self._prepared(
+            monkeypatch,
+            OCR_LINE_REMOVAL_SKIP=False,
+            OCR_LINE_STROKE_GUARD=False,
+            OCR_OTSU_THRESHOLD_STEP=0,
+        )
+        assert after.removed_line_pixels == before.removed_line_pixels
+        assert np.array_equal(np.asarray(after.image), np.asarray(before.image))
+        assert before.removed_line_pixels > 0  # линия действительно снималась
+
+    def test_skip_setting_removes_nothing(self, monkeypatch):
+        page = self._prepared(monkeypatch, OCR_LINE_REMOVAL_SKIP=True)
+        assert page.removed_line_pixels == 0
+
+    def test_keep_lines_argument_removes_nothing(self, monkeypatch):
+        monkeypatch.setattr("core.providers.ocr_prepare._orientation", lambda _: 0)
+        monkeypatch.setattr("core.providers.ocr_prepare._skew_angle", lambda *a: 0.0)
+        page = prepare_page(self._sheet_with_grid_and_text(), keep_lines=True)
+        assert page.removed_line_pixels == 0
+
+    def test_guard_keeps_the_stroke_that_crosses_the_line(self, monkeypatch):
+        """
+        Штрих, лежащий на линии, вместе с линией не пропадает.
+
+        Без защиты пиксели линии под штрихом закрашиваются белым, и штрих
+        разрывается. С защитой столбец штриха остаётся.
+        """
+        plain = self._prepared(monkeypatch)
+        guarded = self._prepared(
+            monkeypatch, OCR_LINE_STROKE_GUARD=True, OCR_LINE_STROKE_GUARD_REACH=4
+        )
+        assert guarded.removed_line_pixels < plain.removed_line_pixels
+        column = 401
+        plain_px = np.asarray(plain.image)
+        guarded_px = np.asarray(guarded.image)
+        # Разрыв штриха на линии: без защиты белое, с защитой чернила.
+        assert plain_px[300, column] == 255
+        assert guarded_px[300, column] < 128
+
+    def test_threshold_step_makes_otsu_stable(self):
+        """
+        Порог, округлённый до кратного, не прыгает от 0,2 % изменения размера.
+
+        На настоящих листах сдвиг длинной стороны 3507 → 3500 px двигал
+        порог ровно на уровень (151 → 152), а с ним — маску линий.
+        """
+        from core.providers.ocr_line_guard import quantise
+
+        assert quantise(151, 0) == 151  # выключено — как было
+        assert quantise(151, 8) == quantise(152, 8)
+        assert quantise(149, 8) == quantise(150, 8)
+        assert 0 <= quantise(254, 8) <= 255
+
+    def test_guard_leaves_a_lonely_line_alone(self):
+        """У одинокой линии сетки защищать нечего — она снимается целиком."""
+        from core.providers.ocr_line_guard import stroke_guard
+
+        black = np.zeros((40, 400), dtype=bool)
+        black[20, 10:390] = True
+        lines = black.copy()
+        assert stroke_guard(black, lines, 4).sum() == lines.sum()
