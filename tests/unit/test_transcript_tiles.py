@@ -274,6 +274,29 @@ class TestTranscribeSheet:
         assert all(line in transcript.lines for line in ALL_LINES)
         assert "QF31" not in transcript.lines and "QF30" in transcript.lines
 
+    def test_whole_reply_with_real_terminal_row_is_kept(self, tiles):
+        class Terminals(TruncatingModel):
+            def post(self, url, json=None, headers=None, timeout=None):
+                self.calls.append([])
+                return Response(reply(_json(["XT1"] + [f"X1:{n}" for n in range(1, 49)])))
+        model = Terminals()
+        transcript = client(model).transcribe_sheet(quartered())
+        assert transcript.complete and transcript.tiles == 0
+        assert len(transcript.lines) == 49 and len(model.calls) == 1
+
+    def test_cut_reply_counting_short_is_trimmed(self, tiles):
+        class CutCount(TruncatingModel):
+            def post(self, url, json=None, headers=None, timeout=None):
+                parts = shown_parts(json)
+                self.calls.append(parts)
+                if len(parts) == 4:
+                    head = '{"lines": ["ТАДУ", ' + ", ".join(f'"QF{n}"' for n in range(1, 60))
+                    return Response(reply(head + ', "QF6', finish="length"))
+                return Response(reply(_json([line for name in parts for line in TEXT[name]])))
+        transcript = client(CutCount()).transcribe_sheet(quartered())
+        assert "QF30" in transcript.lines and "QF31" not in transcript.lines
+        assert transcript.complete
+
     def test_wrong_shape_is_not_tiled(self, tiles):
         class Shapeless(TruncatingModel):
             def post(self, url, json=None, headers=None, timeout=None):

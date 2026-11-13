@@ -372,7 +372,10 @@ class QwenVisionClient:
             lines, cut = _clean_lines(data["lines"]), False
         else:
             lines, cut = salvage_lines(content), True
-        start = counting_run(lines)
+        # Целый ответ с длинным рядом номеров бывает и настоящим (ряд клемм
+        # «X1:1» … «X1:48»): счётом он считается, только если ряд невероятно
+        # длинный для листа; у оборванного ответа порог обычный.
+        start = counting_run(lines, _COUNT_RUN if cut else _COUNT_RUN_WHOLE)
         if start is not None:
             # Модель сбилась на счёт («QF1», «QF2», … «QF1000»): хвост счёта —
             # выдумка, а не текст листа. Ответ считается оборванным на нём,
@@ -627,11 +630,12 @@ def salvage_lines(content: str) -> List[str]:
 # счёт. На схеме ряд клемм бывает длинным, но в одной части листа столько
 # подписей подряд не стоит; настоящие строки дочитает часть меньше.
 _COUNT_RUN = 30
+_COUNT_RUN_WHOLE = 200
 _NUMBERED = re.compile(r"^(.*?)(\d+)$")
 
 
-def counting_run(lines: Sequence[str]) -> Optional[int]:
-    """Начало счёта длиной больше _COUNT_RUN строк или None."""
+def counting_run(lines: Sequence[str], limit: int = _COUNT_RUN) -> Optional[int]:
+    """Начало счёта длиной больше `limit` строк или None."""
     start, length, previous = 0, 0, None
     for index, line in enumerate(lines):
         match = _NUMBERED.match(line)
@@ -641,7 +645,7 @@ def counting_run(lines: Sequence[str]) -> Optional[int]:
             length += 1
         else:
             start, length = index, 1 if current else 0
-        if length > _COUNT_RUN:
+        if length > limit:
             return start
         previous = current
     return None
