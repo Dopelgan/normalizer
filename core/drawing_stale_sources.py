@@ -14,15 +14,15 @@ aera = pian HM 2XIBHIOT [OCT»). В поиске они спорят с чтен
 трёх:
 
 * **убрать как повтор** — всё содержимое блока есть у модели: каждая его
-  значимая лексема нашлась среди лексем модели в том же написании и с теми же
-  цифрами («Ra 6,3» у MinerU и «Ra 6,3» у модели);
-* **убрать как шум распознавания** — в блоке нет ни одного русского слова и ни
-  одного правильно записанного значения, которых нет у модели, а почти все его
-  лексемы — обрывки (одиночные латинские буквы, латиница вперемешку с
-  кириллицей, «слова» без гласных). Только на русском листе, текст которого
-  переписан целиком и без недочитанных частей;
-* **оставить** — во всех остальных случаях. Лексема, которой у модели нет,
-  оставляет блок на месте всегда: модель могла её не прочитать.
+  лексема нашлась среди лексем модели в том же написании и с теми же цифрами
+  («Ra 6,3» у MinerU и «Ra 6,3» у модели);
+* **убрать как шум распознавания** — ни одной лексемы, которой у модели нет,
+  кроме обрывков (одиночные буквы, латинские «слова» на русском листе, смесь
+  алфавитов), и обрывков в блоке не меньше 0,6. Только абзац, только на
+  русском листе, текст которого переписан целиком и без недочитанных частей;
+* **оставить** — во всех остальных случаях. Слово, значение, марка или код,
+  которых у модели нет, оставляют блок на месте всегда: модель могла их не
+  прочитать («Ст3сп5», «ВВГнг», «Св-04Х19Н11М3» обрывками не считаются).
 
 Если цифры расходятся («7:1» против «1:1», «M24×15» против «M24x1,5»),
 остаются оба чтения: блок сохраняется, а чтение модели кладётся рядом —
@@ -51,12 +51,13 @@ PAYLOAD_KEY = "stale_sources"
 VARIANTS_KEY = "vlm_transcript_variants"
 REASON_DUPLICATE = "duplicate"
 REASON_NOISE = "ocr_noise"
+REASON_VARIANT = "digits_differ"
 
 # Методы, записи которых считаются устаревшими рядом с чтением модели: это
 # распознавание растра. Текстовый слой (`text_layer`) и таблицы, прочитанные
 # самой моделью (`vlm_escalation`), сюда не входят.
-_STALE_TEXT_METHODS = ("mineru_ocr", "ocr_layer", "ocr_layer_recovered", "tesseract")
-_STALE_TABLE_METHODS = ("mineru_table", "ocr_layer", "ocr_layer_recovered", "tesseract")
+_STALE_TEXT_METHODS = ("mineru_ocr", "ocr_layer", "tesseract")
+_STALE_TABLE_METHODS = ("mineru_table", "ocr_layer", "tesseract")
 
 # Лексема: буквы и цифры, склеенные разделителями значения («1:1», «6,3»,
 # «М24х1,5», «687000.001.001», «2246-70»).
@@ -65,7 +66,7 @@ _TOKEN = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+(?:[.,:/\-×][A-Za-zА-Яа-яЁ
 _LOOKALIKE = str.maketrans("abcehkmoptxyё", "авсенкмортхуе")
 _VOWELS = set("аеиоуыэюяё")
 # Знак умножения резьбы приводится к той же букве, что латинская «x».
-_TIMES = {"×": "х", "х": "х"}
+_TIMES_SIGN = "×"
 
 # Повтор убирается только у блока хотя бы из столькых лексем.
 _MIN_DUPLICATE_TOKENS = 2
@@ -148,6 +149,8 @@ def _structured_texts(fragment: Fragment) -> List[str]:
     for name, value in (payload.get("title_block") or {}).items():
         texts.append(f"{name} {value}")
     for table in payload.get("tables") or []:
+        texts.append(str(table.get("title") or ""))
+        texts.extend(str(header) for header in table.get("headers") or [])
         for row in table.get("rows") or []:
             cells = row.values() if isinstance(row, dict) else row
             texts.extend(str(cell) for cell in (cells or []))
@@ -168,36 +171,42 @@ def _decide(fragment: Fragment, sheet: _Sheet) -> Tuple[str, Dict[str, Any]]:
     tokens = _tokens(_block_text(fragment))
     if not tokens:
         return "keep", {}
-    unique: List[str] = []
+    unique: List[str] = []   # своё содержимое, которого у модели нет
+    scraps: List[str] = []   # обрывки, которых у модели нет
     variants: List[Dict[str, str]] = []
-    kinds: List[str] = []
+    garbage = 0
     for token in tokens:
         kind = _kind(token)
-        kinds.append(kind)
+        garbage += int(kind == "garbage")
         if _key(token) in sheet.tokens:
             continue
         model = _variant(token, sheet.tokens)
         if model is not None:
             variants.append({"block": token, "model": model})
-            continue
-        if kind != "garbage":
+        elif kind == "garbage":
+            scraps.append(token)
+        else:
             unique.append(token)
     if variants:
         # Цифры расходятся: кто прав — неизвестно, остаются оба чтения.
-        return "mark", {"reason": "digits_differ", "variants": variants}
-    if unique:
-        return "keep", {}
-    meaningful = [kind for kind in kinds if kind != "garbage"]
-    if len(tokens) >= _MIN_DUPLICATE_TOKENS and meaningful:
+        return "mark", {"reason": REASON_VARIANT, "variants": variants}
+    if not unique and not scraps:
+        # Всё содержимое блока нашлось у модели в том же написании.
+        if len(tokens) < _MIN_DUPLICATE_TOKENS:
+            return "keep", {}
         if fragment.type == "table" and not sheet.has_tables:
             # Строение таблицы строками текста не передаётся: без своей
             # таблицы модели убирать таблицу нельзя.
             return "keep", {}
         return "drop", {"reason": REASON_DUPLICATE}
-    garbage = len(kinds) - len(meaningful)
+    if unique:
+        # Слово, значение или обозначение, которого у модели нет: модель
+        # могла его не прочитать, и блок остаётся на месте.
+        return "keep", {}
+    # У модели нет только обрывков: это шум распознавания, а не содержимое.
     if (fragment.type == "text" and sheet.complete and sheet.russian
             and len(tokens) >= _MIN_NOISE_TOKENS
-            and garbage / len(kinds) >= _MIN_NOISE_SHARE):
+            and garbage / len(tokens) >= _MIN_NOISE_SHARE):
         return "drop", {"reason": REASON_NOISE}
     return "keep", {}
 
@@ -229,10 +238,18 @@ def _mark(fragment: Fragment, detail: Dict[str, Any]) -> None:
 
 
 def _note(sheet: _Sheet, kind: str, fragment: Fragment, detail: Dict[str, Any]) -> None:
-    """Запись о решении у фрагмента листа: что убрано и почему."""
+    """
+    Запись о решении у фрагмента листа: что убрано или помечено и почему.
+
+    Повторный вызов на тех же фрагментах не удваивает записи: тот же разбор
+    должен давать тот же результат.
+    """
     payload = dict(sheet.fragment.content.structured_payload or {})
-    notes = dict(payload.get(PAYLOAD_KEY) or {})
+    notes = {name: list(records) for name, records in (payload.get(PAYLOAD_KEY) or {}).items()}
     record: Dict[str, Any] = {
+        # Идентификатор уже стабильный: его проставляет нормализатор до ветки
+        # чертежей, а пометка варианта содержимое фрагмента не меняет, поэтому
+        # после финализации контракта он тот же (core/contract_finalize.py).
         "fragment_id": fragment.fragment_id,
         "type": fragment.type,
         "method": fragment.provenance.method,
@@ -240,10 +257,13 @@ def _note(sheet: _Sheet, kind: str, fragment: Fragment, detail: Dict[str, Any]) 
     }
     if detail.get("variants"):
         record["variants"] = detail["variants"]
-    notes.setdefault(kind, []).append(record)
+    records = notes.setdefault(kind, [])
+    if record not in records:
+        records.append(record)
     payload[PAYLOAD_KEY] = notes
     sheet.fragment.content.structured_payload = payload
-    sheet.fragment.warnings = list(dict.fromkeys(sheet.fragment.warnings + [WARNING]))
+    if kind == "dropped":
+        sheet.fragment.warnings = list(dict.fromkeys(sheet.fragment.warnings + [WARNING]))
 
 
 # ------------------------------------------------------------------ лексемы
@@ -258,9 +278,7 @@ def _key(token: str) -> str:
     одно и то же, знак умножения — та же буква, что «x», неразличимые буквы
     чертёжного шрифта сведены к кириллице.
     """
-    lowered = token.lower()
-    for sign, replacement in _TIMES.items():
-        lowered = lowered.replace(sign, replacement)
+    lowered = token.lower().replace(_TIMES_SIGN, "x")
     return lowered.translate(_LOOKALIKE).replace(",", ".")
 
 
@@ -277,9 +295,22 @@ def _mask(token: str) -> str:
     return re.sub(r"\d", "N", _key(token))
 
 
+def _cyrillic(char: str) -> bool:
+    return "а" <= char <= "я" or char == "ё"
+
+
 def _kind(token: str) -> str:
     """
-    word — русское слово, value — записанное значение, garbage — обрывок.
+    Что это за лексема:
+
+    * `value` — записанное значение: «6,3», «M24x1,5», «p.1.1», «20»;
+    * `word` — русское слово;
+    * `code` — марка, код или обозначение: «Ст3сп5», «ВВГнг», «Св-04Х19Н11М3»;
+    * `garbage` — обрывок распознавания: одиночная буква, латинское «слово»
+      на русском листе («aera», «[OCT», «2XIBHIOT»), смесь алфавитов.
+
+    Обрывком лексема становится только по своему виду; убирают блок не по
+    этому разбору, а по тому, нашлась ли лексема у модели.
 
     Алфавит берётся как в документе: латинское «[OCT» — обрывок «ГОСТ», а не
     русское слово, хотя для сравнения его буквы и сводятся к кириллице.
@@ -287,14 +318,22 @@ def _kind(token: str) -> str:
     lowered = token.lower()
     letters = "".join(char for char in lowered if char.isalpha())
     digits = _digits(token)
-    cyrillic = sum(1 for char in letters if "а" <= char <= "я" or char == "ё")
-    if (len(letters) >= _MIN_WORD_LETTERS and cyrillic == len(letters)
-            and any(char in _VOWELS for char in letters)):
-        return "word"
+    cyrillic = sum(1 for char in letters if _cyrillic(char))
+    # Значение: цифры и при них не больше пары букв единицы или обозначения
+    # резьбы. Латиница здесь обычна («Ra 1,6», «M24x1,5»).
     if (digits and len(letters) <= _MAX_VALUE_LETTERS
             and cyrillic in (0, len(letters))
             and len(digits) / (len(letters) + len(digits)) >= _MIN_VALUE_DIGIT_SHARE):
         return "value"
+    if cyrillic != len(letters):
+        # Латинские буквы или смесь алфавитов там, где это не значение.
+        return "garbage"
+    if len(letters) >= _MIN_WORD_LETTERS and any(char in _VOWELS for char in letters):
+        return "word"
+    if letters and (digits or len(letters) >= _MIN_WORD_LETTERS):
+        # Марка и код выглядят как слово без гласных или буквы с цифрами:
+        # «ВВГнг», «Ст3сп5». Такого у модели может не быть вовсе.
+        return "code"
     return "garbage"
 
 
@@ -331,5 +370,5 @@ def _russian(text: str) -> bool:
     letters = [char for char in text.lower() if char.isalpha()]
     if not letters:
         return False
-    cyrillic = sum(1 for char in letters if "а" <= char <= "я")
+    cyrillic = sum(1 for char in letters if _cyrillic(char))
     return cyrillic / len(letters) >= _MIN_RUSSIAN_SHARE

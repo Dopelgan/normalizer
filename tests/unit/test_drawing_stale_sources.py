@@ -149,7 +149,8 @@ class TestDigitsDiffer:
         marked = model.content.structured_payload[PAYLOAD_KEY]["marked"]
         assert marked[0]["fragment_id"] == stale.fragment_id
         assert marked[0]["reason"] == "digits_differ"
-        assert WARNING in model.warnings
+        # Ничего не убрано: предупреждение об уборке лист не получает.
+        assert WARNING not in model.warnings
 
 
 class TestDropped:
@@ -182,8 +183,20 @@ class TestDropped:
         assert len(out) == 2
 
     def test_short_block_is_not_dropped_as_noise(self):
-        out = suppress_stale_sources([sheet(), paragraph("[OCT 2246")])
+        # Три обрывка: до предела числа лексем не дотягивает, абзац остаётся.
+        out = suppress_stale_sources([sheet(), paragraph("o a ni")])
         assert len(out) == 2
+        # Четвёртый обрывок — и абзац уже шум.
+        assert len(suppress_stale_sources([sheet(), paragraph("o a ni aera")])) == 1
+
+    def test_garbage_heavy_block_with_a_repeated_value_is_dropped_as_noise(self):
+        # Повтором такой блок не называется: его обрывков у модели нет.
+        stale = paragraph("Ra 6,3 o ni aera")
+        out = suppress_stale_sources([sheet(), stale])
+        assert len(out) == 1
+        assert out[0].content.structured_payload[PAYLOAD_KEY]["dropped"][0]["reason"] == REASON_NOISE
+        # На недочитанном листе такой блок остаётся.
+        assert len(suppress_stale_sources([sheet(complete=False), paragraph("Ra 6,3 o ni aera")])) == 2
 
 
 class TestKept:
@@ -215,7 +228,7 @@ class TestKept:
         assert len(out) == 2
 
     def test_text_layer_and_model_tables_are_not_stale(self):
-        vector = paragraph("Шероховатость неуказанных поверхностей Ra 6,3", method="text_layer")
+        vector = paragraph("Шероховатость неуказанных поверхностей Ra 6,3", method="text_layer_extraction")
         model_table = table([["Масса", "Масштаб"], ["0,42", "1:1"]], method="vlm_escalation")
         out = suppress_stale_sources([sheet(), vector, model_table])
         assert len(out) == 3
@@ -227,12 +240,77 @@ class TestKept:
                  table([["1", "Прокладка ТАДУ 754152.003", "2"]], order=8)]
         before = tokens_of([sheet(), *stale])
         after = tokens_of(suppress_stale_sources([sheet(), *stale]))
-        # Из набора лексем ушли только обрывки распознавания: ни слова,
-        # ни значения не потеряно.
-        from core.drawing_stale_sources import _kind
-        lost = [before[key] for key in set(before) - set(after)]
-        assert lost and all(_kind(token) == "garbage" for token in lost)
-        assert {"таду", "754152.003", "6.3", "1:1", "7:1", "прокладка"} <= set(after)
+        # Ушли только обрывки шумного абзаца, перечисленные здесь поимённо.
+        assert set(before) - set(after) == {"ni", "аеrа", "рiаn", "нм", "2хiвнiот", "ост", "о", "а"}
+        assert {"таду", "754152.003", "6.3", "1:1", "7:1", "прокладка", "шероховатость"} <= set(after)
+
+
+class TestMarksAndCodes:
+    def test_grade_absent_from_the_model_keeps_the_block(self):
+        # Марка стали, проволоки, кабеля: модель могла её не прочитать.
+        for value in ("Ст3сп5", "ВВГнг", "Св-04Х19Н11М3"):
+            stale = paragraph(f"Материал {value}")
+            out = suppress_stale_sources([sheet(), stale])
+            assert len(out) == 2, value
+            assert not stale.warnings, value
+
+    def test_designation_absent_from_the_model_keeps_the_table(self):
+        stale = table([["Материал", "Ст3сп5 ГОСТ 380-2005"]])
+        assert len(suppress_stale_sources([sheet(), stale])) == 2
+
+
+class TestWithParagraphFix:
+    def test_paragraph_rewritten_by_the_model_is_dropped_as_a_repeat(self):
+        # Правка абзацев подставила текст модели: теперь это повтор.
+        from core.drawing_transcript import apply_transcripts
+        stale = paragraph("Шероховатость неукозанных поверхностей Ра 63")
+        fixed = apply_transcripts([sheet(), stale])
+        out = suppress_stale_sources(fixed)
+        assert len(out) == 1
+        assert out[0].content.structured_payload[PAYLOAD_KEY]["dropped"][0]["reason"] == REASON_DUPLICATE
+
+    def test_paragraph_with_a_variant_line_added_by_the_fix_is_kept(self):
+        from core.drawing_transcript import apply_transcripts
+        lines = ["4. Сварочная проволока Св-04Х19Н11М3 ГОСТ 2246-70 по всему шву"]
+        stale = paragraph("4. Сворочная проволока Св-04х19н1им3 ГОСТ 2246-70 по всему шву")
+        out = suppress_stale_sources(apply_transcripts([sheet(lines=lines), stale]))
+        assert len(out) == 2 and "Св-04х19н1им3" in out[1].content.text
+
+
+class TestRepeatable:
+    def test_second_run_changes_nothing(self):
+        stale = [paragraph(NOISE), table([["Масса", "Масштаб"], ["0,42", "7:1"]])]
+        model = sheet()
+        once = suppress_stale_sources([model, *stale])
+        twice = suppress_stale_sources(once)
+        assert [f.fragment_id for f in once] == [f.fragment_id for f in twice]
+        assert model.content.structured_payload[PAYLOAD_KEY] == {
+            "dropped": [{"fragment_id": stale[0].fragment_id, "type": "text", "method": "ocr_layer",
+                         "reason": REASON_NOISE}],
+            "marked": [{"fragment_id": stale[1].fragment_id, "type": "table", "method": "mineru_table",
+                        "reason": "digits_differ", "variants": [{"block": "7:1", "model": "1:1"}]}],
+        }
+        assert model.warnings.count(WARNING) == 1
+        assert stale[1].warnings.count(VARIANT_WARNING) == 1
+
+
+class TestDegenerate:
+    def test_table_without_data_and_empty_blocks_are_kept(self):
+        empty = Fragment(
+            fragment_id="doc-1-t1-9", type="table", content=Content(table_data=None),
+            position=Position(page=1, bbox=[0, 0, 1, 1], order=9),
+            confidence=0.5, completeness=1.0,
+            provenance=Provenance(method="mineru_table", strategy_level=5, source="scanned_pdf"),
+        )
+        rows = table([[None, ""], ["", "  "]], order=10)
+        out = suppress_stale_sources([sheet(), empty, rows, paragraph("")])
+        assert len(out) == 4
+
+    def test_two_sheets_keep_their_own_records(self):
+        out = suppress_stale_sources(
+            [sheet(page=1), sheet(page=2), paragraph(NOISE, page=1), paragraph(NOISE, page=2)])
+        assert len(out) == 2
+        assert all(f.content.structured_payload[PAYLOAD_KEY]["dropped"] for f in out)
 
 
 class TestFlag:
