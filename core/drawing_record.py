@@ -340,21 +340,30 @@ def _part_index(parts: Sequence[tuple]) -> List[Dict[str, Any]]:
     """
     index: List[Dict[str, Any]] = []
     cursor = 0
-    for kind, body in parts:
+    last = len(parts) - 1
+    for position, (kind, body) in enumerate(parts):
         title, _, _ = body.partition("\n")
         breaks: List[int] = []
         offset = 0
         for line in body.split("\n")[:-1]:
             offset += len(line) + 1
             breaks.append(cursor + offset)
+        # Пустая строка между частями отдаётся предыдущей части, чтобы
+        # `end` одной равнялся `start` следующей. Части обязаны идти
+        # подряд и без зазоров: чанкер проверяет разметку целиком и при
+        # любом несоответствии молча возвращается к прежнему способу
+        # резать — граница, которая не держится, может потерять текст.
+        # С зазором в два символа отвергалась вся разметка, и улучшение
+        # не доезжало до прода вовсе.
+        width = len(body) + (0 if position == last else len(_JOIN))
         index.append({
             "kind": kind,
             "title": title,
             "start": cursor,
-            "end": cursor + len(body),
+            "end": cursor + width,
             "breaks": breaks,
         })
-        cursor += len(body) + len(_JOIN)
+        cursor += width
     return index
 
 

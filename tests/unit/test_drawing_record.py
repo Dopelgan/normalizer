@@ -759,17 +759,37 @@ class TestChunkability:
         return fragment
 
     def test_offsets_reconstruct_the_record_exactly(self, composed):
+        """
+        Склейка частей подряд, без разделителя, даёт запись посимвольно.
+
+        Прежняя проверка склеивала через «\\n\\n» и потому не замечала
+        зазора в два символа на каждой границе: по ней разметка выглядела
+        верной, а чанкер отвергал её целиком и резал запись по-старому.
+        Проверять надо то же, что проверяет он.
+        """
         fragment = self._composed()
         text = fragment.content.text
         parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
-        assert "\n\n".join(text[p["start"]:p["end"]] for p in parts) == text
+        assert "".join(text[p["start"]:p["end"]] for p in parts) == text
 
-    def test_parts_do_not_overlap_and_run_in_order(self, composed):
+    def test_parts_touch_and_cover_the_whole_record(self, composed):
+        """
+        Договор чанкера: части идут подряд, соприкасаются и покрывают запись
+        от нуля до конца. Любое несоответствие — и разметка не применяется.
+        """
         fragment = self._composed()
+        text = fragment.content.text
         parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
         assert parts[0]["start"] == 0
+        assert parts[-1]["end"] == len(text)
         for earlier, later in zip(parts, parts[1:]):
-            assert earlier["end"] < later["start"]
+            assert earlier["end"] == later["start"]
+
+    def test_parts_run_in_order_without_overlapping(self, composed):
+        fragment = self._composed()
+        parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
+        for earlier, later in zip(parts, parts[1:]):
+            assert earlier["start"] < earlier["end"] <= later["start"]
 
     def test_title_is_the_first_line_of_its_part(self, composed):
         fragment = self._composed()
@@ -816,12 +836,17 @@ class TestChunkability:
         assert "Масса — 26,02" in fragment.content.text[:1280]
 
     def test_parts_are_separated_by_a_blank_line(self, composed):
-        """Чанкер, который разметку не читает, а абзацы различает, тоже попадёт."""
+        """
+        Чанкер, который разметку не читает, а абзацы различает, тоже попадёт
+        в границу. Пустая строка принадлежит предыдущей части — иначе между
+        частями был бы зазор, и разметку отвергли бы целиком.
+        """
         fragment = self._composed()
         text = fragment.content.text
         parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
-        for earlier, later in zip(parts, parts[1:]):
-            assert text[earlier["end"]:later["start"]] == "\n\n"
+        for part in parts[:-1]:
+            assert text[part["start"]:part["end"]].endswith("\n\n")
+        assert not text[parts[-1]["start"]:parts[-1]["end"]].endswith("\n")
 
     def test_context_names_the_sheet_and_is_not_repeated_in_the_prose(self, composed):
         """
