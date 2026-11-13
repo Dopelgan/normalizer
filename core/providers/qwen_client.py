@@ -29,16 +29,19 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import io
 import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
+from core import deadline
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -162,6 +165,28 @@ class SheetReading:
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class Transcript:
+    """
+    Весь текст листа. `failed` — части листа (доли стороны: лево, верх,
+    право, низ) и причина, по которой их текст не прочитан целиком.
+    """
+
+    lines: List[str]
+    tiles: int = 0
+    failed: List[Tuple[List[float], str]] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.failed
+
+
+# Причины, по которым часть листа не прочитана целиком.
+TILE_CUT = "transcript_cut"            # ответ оборвался на потолке токенов
+TILE_NOT_READ = "transcript_not_read"  # модель не ответила
+TILE_NO_TIME = "time_budget"           # до срока задачи вызов не уложится
+
+
 class QwenVisionClient:
     """HTTP-клиент к Qwen3-VL. Все методы возвращают `None` при неудаче."""
 
@@ -243,8 +268,97 @@ class QwenVisionClient:
         if not isinstance(lines, list):
             logger.warning("Модель вернула JSON без списка lines")
             return None
-        return [str(line).strip() for line in lines
-                if isinstance(line, (str, int, float)) and str(line).strip()]
+        return _clean_lines(lines)
+
+    def transcribe_sheet(self, image) -> Optional[Transcript]:
+        """
+        Весь текст листа с дочитыванием частями (DRAWING_TRANSCRIBE_TILES).
+
+        Плотная схема не помещается в потолок ответа: JSON обрывается. Строки,
+        которые модель успела вернуть, не выбрасываются, а лист читается
+        заново частями с перекрытием; оборванная часть делится ещё раз.
+        `None` — модель не ответила на лист вовсе.
+        """
+        lines, cut = self._transcribe_piece(image)
+        if lines is None:
+            return None
+        if not cut:
+            return Transcript(lines=lines)
+        logger.warning(
+            "Текст листа не поместился в ответ (%d строк до обрыва): лист "
+            "дочитывается частями", len(lines),
+        )
+        limit = threading.Semaphore(max(1, settings.DRAWING_TRANSCRIBE_TILE_PARALLEL))
+        failed: List[Tuple[List[float], str]] = []
+        parts, counted = self._read_tiles(image, [0.0, 0.0, 1.0, 1.0], 1, limit, failed)
+        # Части идут первыми — они покрывают весь лист; строки оборванного
+        # ответа добавляются, если их нет ни в одной части (строка на стыке,
+        # которую обе части прочитали лишь кусками).
+        merged = merge_lines(parts + [lines])
+        logger.info(
+            "Лист дочитан частями: частей %d, не прочитано %d, строк %d",
+            counted, len(failed), len(merged),
+        )
+        return Transcript(lines=merged, tiles=counted, failed=failed)
+
+    def _read_tiles(self, image, box, depth, limit, failed):
+        """
+        Часть листа `box` сеткой GRID x GRID. Возвращает списки строк частей
+        в порядке чтения и число прочитанных частей. Оборванная часть
+        делится дальше, пока не исчерпана глубина; на последнем уровне её
+        строки сохраняются, а сама она записывается в `failed`.
+        """
+        boxes = tile_boxes(box, settings.DRAWING_TRANSCRIBE_TILE_GRID,
+                           settings.DRAWING_TRANSCRIBE_TILE_OVERLAP)
+
+        def read(part):
+            left = deadline.remaining()
+            if left is not None and left < settings.VLM_TIMEOUT:
+                return None, TILE_NO_TIME
+            with limit:
+                lines, cut = self._transcribe_piece(crop_box(image, part))
+            if lines is None:
+                return None, TILE_NOT_READ
+            return lines, (TILE_CUT if cut else None)
+
+        # Срок задачи хранится в contextvars: потоку нужна копия контекста.
+        with ThreadPoolExecutor(max_workers=len(boxes)) as pool:
+            futures = [pool.submit(contextvars.copy_context().run, read, part) for part in boxes]
+            answers = [future.result() for future in futures]
+
+        result: List[List[str]] = []
+        counted = 0
+        for part, (lines, problem) in zip(boxes, answers):
+            counted += 1
+            if problem == TILE_CUT and depth < settings.DRAWING_TRANSCRIBE_TILE_DEPTH:
+                inner, inner_count = self._read_tiles(image, part, depth + 1, limit, failed)
+                result.extend(inner)
+                result.append(lines)
+                counted += inner_count
+                continue
+            if problem is not None:
+                failed.append(([round(value, 4) for value in part], problem))
+            if lines:
+                result.append(lines)
+        return result, counted
+
+    def _transcribe_piece(self, image) -> Tuple[Optional[List[str]], bool]:
+        """
+        Строки листа или его части и признак обрыва. Обрыв — ответ упёрся в
+        потолок токенов или не разобрался как JSON; тогда возвращаются
+        строки, которые модель успела закончить. `(None, False)` — ответа нет.
+        """
+        answer = self._ask_text(
+            image, _TRANSCRIBE_PROMPT, settings.DRAWING_TRANSCRIBE_MAX_SIDE,
+            max_tokens=settings.DRAWING_TRANSCRIBE_MAX_TOKENS,
+        )
+        if answer is None:
+            return None, False
+        content, finish = answer
+        data = extract_json(content)
+        if data is not None and finish != "length" and isinstance(data.get("lines"), list):
+            return _clean_lines(data["lines"]), False
+        return salvage_lines(content), True
 
     def health(self) -> bool:
         """Отвечает ли хост модели. Нужна для приёмки и для понятного лога."""
@@ -261,6 +375,19 @@ class QwenVisionClient:
     def _ask(
         self, image, prompt: str, max_side: int, max_tokens: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
+        answer = self._ask_text(image, prompt, max_side, max_tokens)
+        if answer is None:
+            return None
+        content = answer[0]
+        data = extract_json(content)
+        if data is None:
+            logger.error("Модель вернула не-JSON (%d символов): %.200s", len(content), content)
+        return data
+
+    def _ask_text(
+        self, image, prompt: str, max_side: int, max_tokens: Optional[int] = None,
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        """Текст ответа и finish_reason («length» — упёрся в потолок токенов)."""
         if not self.available:
             logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
             return None
@@ -281,16 +408,15 @@ class QwenVisionClient:
                 ]},
             ],
         }
-        content = self._post(body)
+        payload = self._post(body)
+        if payload is None:
+            return None
+        content = _content_of(payload)
         if content is None:
             return None
+        return content, _finish_of(payload)
 
-        data = extract_json(content)
-        if data is None:
-            logger.error("Модель вернула не-JSON (%d символов): %.200s", len(content), content)
-        return data
-
-    def _post(self, body: Dict[str, Any]) -> Optional[str]:
+    def _post(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Ответ модели текстом. Повторяется только то, что имеет смысл
         повторять: обрыв связи, таймаут и 5xx (vLLM отвечает так, пока
@@ -331,10 +457,14 @@ class QwenVisionClient:
                 return None
 
             try:
-                return _content_of(response.json())
+                payload = response.json()
             except ValueError as exc:
                 logger.error("Qwen вернул не-JSON на уровне протокола: %s", exc)
                 return None
+            if not isinstance(payload, dict):
+                logger.error("Qwen вернул ответ не того вида: %.200s", payload)
+                return None
+            return payload
         return None
 
     def _log_attempt(self, reason: Any, attempt: int, last: bool) -> None:
@@ -430,6 +560,100 @@ def _content_of(payload: Dict[str, Any]) -> Optional[str]:
         logger.error("Ответ модели пуст")
         return None
     return str(content)
+
+
+def _finish_of(payload: Dict[str, Any]) -> Optional[str]:
+    choices = payload.get("choices") or []
+    first = choices[0] if choices and isinstance(choices[0], dict) else {}
+    reason = first.get("finish_reason")
+    return str(reason) if reason else None
+
+
+def _clean_lines(lines: Sequence[Any]) -> List[str]:
+    return [str(line).strip() for line in lines
+            if isinstance(line, (str, int, float)) and str(line).strip()]
+
+
+def salvage_lines(content: str) -> List[str]:
+    """
+    Законченные элементы `lines` из оборванного ответа
+    `{"lines": ["…", "…", "незаконч`. Строка, на которой ответ оборвался,
+    отбрасывается: её дочитает часть листа.
+    """
+    if not content:
+        return []
+    key = content.find('"lines"')
+    start = content.find("[", key) if key != -1 else -1
+    if start == -1:
+        return []
+    decoder = json.JSONDecoder()
+    position, found = start + 1, []
+    while True:
+        while position < len(content) and content[position] in " \t\r\n,":
+            position += 1
+        if position >= len(content) or content[position] == "]":
+            break
+        try:
+            value, position = decoder.raw_decode(content, position)
+        except ValueError:
+            break
+        found.append(value)
+    return _clean_lines(found)
+
+
+def tile_boxes(box: Sequence[float], grid: int, overlap: float) -> List[List[float]]:
+    """
+    Сетка grid x grid внутри `box` (доли листа) в порядке чтения: сверху
+    вниз, слева направо. Соседние части перекрываются на `overlap` доли
+    стороны всего листа, чтобы строка на стыке целиком попала хотя бы в одну.
+    """
+    grid = max(2, int(grid))
+    x1, y1, x2, y2 = (float(value) for value in box)
+    step_x, step_y = (x2 - x1) / grid, (y2 - y1) / grid
+    half = max(0.0, float(overlap)) / 2
+    boxes = []
+    for row in range(grid):
+        for column in range(grid):
+            boxes.append([
+                max(x1, x1 + column * step_x - half),
+                max(y1, y1 + row * step_y - half),
+                min(x2, x1 + (column + 1) * step_x + half),
+                min(y2, y1 + (row + 1) * step_y + half),
+            ])
+    return boxes
+
+
+def crop_box(image, box: Sequence[float]):
+    """Часть картинки по долям стороны, в исходном разрешении."""
+    width, height = image.size
+    left, top = int(box[0] * width), int(box[1] * height)
+    right = max(left + 1, int(round(box[2] * width)))
+    bottom = max(top + 1, int(round(box[3] * height)))
+    return image.crop((left, top, right, bottom))
+
+
+def _line_key(line: str) -> str:
+    return " ".join(line.split()).casefold()
+
+
+def merge_lines(parts: Sequence[Sequence[str]]) -> List[str]:
+    """
+    Слияние строк частей листа без повторов из перекрытия. Строка части
+    добавляется, если в этой части она встречается чаще, чем уже добавлено:
+    повтор внутри одной части (две клеммы «XT1» на схеме) сохраняется, а
+    та же строка из соседней части, видевшей перекрытие, — нет.
+    """
+    emitted: Dict[str, int] = {}
+    merged: List[str] = []
+    for part in parts:
+        seen: Dict[str, int] = {}
+        for line in part:
+            key = _line_key(line)
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] > emitted.get(key, 0):
+                emitted[key] = seen[key]
+                merged.append(line)
+    return merged
 
 
 def _string_rows(rows: Any) -> List[List[str]]:

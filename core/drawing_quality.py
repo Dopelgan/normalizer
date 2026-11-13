@@ -57,6 +57,9 @@ def _transcribed_pages(drawings):
         fragment.position.page for fragment in drawings
         if fragment.position is not None
         and (fragment.content.structured_payload or {}).get("transcript_line_count")
+        # Лист, часть которого не дочитана (DRAWING_TRANSCRIBE_TILES), не
+        # переписан целиком: его непрочитанные области остаются потерей.
+        and (fragment.content.structured_payload or {}).get("transcript_complete") is not False
         and (fragment.content.text or "").strip()
     )
 

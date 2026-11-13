@@ -152,7 +152,7 @@ class DrawingProcessor:
         # разметка надписей по категориям теряет штамп, графы, номер листа
         # и примечания, а без них лист нельзя найти ни по обозначению, ни
         # по требованиям.
-        lines = self.qwen.transcribe(layout.image) if transcribe else None
+        lines = self._transcribe(layout.image, payload, missing_regions) if transcribe else None
         if lines:
             payload["transcript_lines"] = lines
         if reading is None and not lines:
@@ -453,6 +453,28 @@ class DrawingProcessor:
         if not data:
             return False
         return raster_drawing.analyse(data).is_drawing
+
+    def _transcribe(self, image, payload, missing_regions) -> Optional[List[str]]:
+        """
+        Весь текст листа. С DRAWING_TRANSCRIBE_TILES плотный лист, текст
+        которого не помещается в один ответ, дочитывается частями; часть,
+        которую прочитать не удалось, — непрочитанная область листа, и лист
+        не считается переписанным целиком (core/drawing_quality.py).
+        """
+        if not settings.DRAWING_TRANSCRIBE_TILES:
+            return self.qwen.transcribe(image)
+        transcript = self.qwen.transcribe_sheet(image)
+        if transcript is None:
+            return None
+        if transcript.tiles:
+            payload["transcript_tiles"] = transcript.tiles
+        if not transcript.complete:
+            payload["transcript_complete"] = False
+            missing_regions.extend(
+                {"kind": "transcript_tile", "bbox": box, "reason": reason}
+                for box, reason in transcript.failed
+            )
+        return transcript.lines
 
     def _out_of_time(self, started: float) -> bool:
         budget = settings.DRAWING_TIME_BUDGET

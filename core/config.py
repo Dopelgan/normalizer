@@ -164,6 +164,20 @@ class Settings(BaseSettings):
     # мелкий текст граф и примечаний на A3 при 2000 px не читается.
     DRAWING_TRANSCRIBE_MAX_SIDE: int = 2800
     DRAWING_TRANSCRIBE_MAX_TOKENS: int = 8192
+    # Плотный лист (электросхема, табличка) не помещается в потолок ответа:
+    # ответ обрывается и раньше пропадал целиком как «не-JSON». С флагом
+    # строки оборванного ответа сохраняются, а лист дочитывается частями
+    # (сетка GRID x GRID с перекрытием OVERLAP доли стороны); часть, которая
+    # сама оборвалась, делится ещё раз, пока глубина не достигнет DEPTH.
+    # Строки частей сливаются без повторов из перекрытия. Часть, которую
+    # прочитать не удалось, — непрочитанная область листа, и документ
+    # partial (core/providers/qwen_client.py). По умолчанию выключено.
+    DRAWING_TRANSCRIBE_TILES: bool = False
+    DRAWING_TRANSCRIBE_TILE_GRID: int = 2
+    DRAWING_TRANSCRIBE_TILE_OVERLAP: float = 0.06
+    DRAWING_TRANSCRIBE_TILE_DEPTH: int = 2
+    # Сколько частей листа читается одновременно (vLLM --max-num-seqs 16).
+    DRAWING_TRANSCRIBE_TILE_PARALLEL: int = 4
     # Скан чертежа в PDF: лист, на котором MinerU не нарезал ни одной
     # картинки (повёрнутый лист, лист-таблица), читается Qwen-VL целиком, даже
     # если на других листах документа фрагменты drawing уже есть. Раньше один
