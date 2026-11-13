@@ -1,5 +1,6 @@
 """Признаки качества для отбора RAG, без повышения оценок распознавания."""
 
+from core.config import settings
 from core.processing_contract import DRAWING_MIN_COMPLETENESS, DRAWING_MIN_FACT_CONFIDENCE
 
 
@@ -34,9 +35,42 @@ def apply_drawing_quality(fragment):
         fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_COMPLETENESS_UNKNOWN"]))
 
 
+# Пометки реальной потери листа: с ними документ partial при любом флаге.
+_LOSS_WARNINGS = ("DRAWING_NOT_RECOGNIZED", "DRAWING_SKIPPED_NO_TIME", "DRAWING_SHEETS_SKIPPED")
+
+
+def _drawing_lost(fragment, transcribed_pages=frozenset()):
+    # Область, которую модель не прочитала отдельно, не потеряна, если весь
+    # текст её листа переписан проходом полного чтения (DRAWING_IMAGE_FULL_READ).
+    unread = [region for region in fragment.missing_regions
+              if region.get("page") not in transcribed_pages]
+    return bool(unread) or any(
+        warning.startswith(_LOSS_WARNINGS) for warning in fragment.warnings
+    )
+
+
+def _transcribed_pages(drawings):
+    """Страницы, весь текст которых переписан моделью."""
+    if not settings.DRAWING_IMAGE_FULL_READ:
+        return frozenset()
+    return frozenset(
+        fragment.position.page for fragment in drawings
+        if fragment.position is not None
+        and (fragment.content.structured_payload or {}).get("transcript_line_count")
+        and (fragment.content.text or "").strip()
+    )
+
+
 def document_quality(fragments):
     """Один результат используется при первой выдаче и сохраняется в БД."""
     drawings = [fragment for fragment in fragments if fragment.type == "drawing"]
     warnings = list(dict.fromkeys(w for fragment in fragments for w in fragment.warnings))
-    return bool(any(fragment.review_required for fragment in drawings)
+    if settings.DRAWING_UNMEASURED_NOT_PARTIAL:
+        # Неизмеренная полнота чтения — повод проверить фрагмент, но не
+        # потеря страницы: документ partial только при реальной потере.
+        covered = _transcribed_pages(drawings)
+        drawing_partial = any(_drawing_lost(fragment, covered) for fragment in drawings)
+    else:
+        drawing_partial = any(fragment.review_required for fragment in drawings)
+    return bool(drawing_partial
                 or any("DRAWING_NOT_RECOGNIZED" in f.warnings for f in fragments)), warnings

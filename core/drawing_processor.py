@@ -117,7 +117,8 @@ class DrawingProcessor:
 
     # ------------------------------------------------------------- публичное
     def process(
-        self, image_ref: str, metadata: Dict[str, Any], page: int = 1
+        self, image_ref: str, metadata: Dict[str, Any], page: int = 1,
+        transcribe: bool = False,
     ) -> Dict[str, Any]:
         """
         Возвращает:
@@ -147,11 +148,19 @@ class DrawingProcessor:
         missing_regions: List[Dict[str, Any]] = []
 
         reading = self.qwen.read_sheet(layout.image, hint=layout.hint())
-        if reading is None:
+        # Весь текст листа отдельным проходом (DRAWING_IMAGE_FULL_READ):
+        # разметка надписей по категориям теряет штамп, графы, номер листа
+        # и примечания, а без них лист нельзя найти ни по обозначению, ни
+        # по требованиям.
+        lines = self.qwen.transcribe(layout.image) if transcribe else None
+        if lines:
+            payload["transcript_lines"] = lines
+        if reading is None and not lines:
             logger.error("Модель не прочитала лист %s", image_ref)
             return _empty(MODE_NONE)
-        payload["sheet_type"] = reading.sheet_type
-        fields.extend(self._fields_from_annotations(reading.annotations))
+        if reading is not None:
+            payload["sheet_type"] = reading.sheet_type
+            fields.extend(self._fields_from_annotations(reading.annotations))
 
         # Штамп важнее прочих таблиц: если времени хватит не на все области,
         # прочитан будет он.
@@ -182,7 +191,7 @@ class DrawingProcessor:
 
         fields = _deduplicate(fields)
         mode = MODE_VISION_VLM if (self.vision_enabled and layout.regions) else MODE_SHEET_ONLY
-        if not fields and not payload["tables"]:
+        if not fields and not payload["tables"] and not payload.get("transcript_lines"):
             return _empty(MODE_NONE)
 
         payload["regions_read"] = regions_read
@@ -220,7 +229,12 @@ class DrawingProcessor:
         """Строит фрагмент типа `drawing` на месте фрагмента-изображения."""
         fields = drawing_result.get("parsed_fields") or []
         payload = dict(drawing_result.get("payload") or {})
-        if not fields and not payload.get("tables"):
+        # Текст листа идёт в content.text, а в payload остаётся только число
+        # строк: иначе потребитель индексировал бы его дважды.
+        transcript = payload.pop("transcript_lines", None) or []
+        if transcript:
+            payload["transcript_line_count"] = len(transcript)
+        if not fields and not payload.get("tables") and not transcript:
             return None
 
         mode = drawing_result.get("mode", MODE_SHEET_ONLY)
@@ -233,6 +247,8 @@ class DrawingProcessor:
             fragment_id=source.fragment_id,
             type="drawing",
             content=Content(
+                # Переписанный текст листа — то, по чему лист находят поиском.
+                text="\n".join(transcript) or None,
                 image_ref=source.content.image_ref,
                 structured_drawing_fields=[DrawingField(**f) for f in fields],
                 structured_payload=payload,
@@ -328,9 +344,13 @@ class DrawingProcessor:
         лестницы), а не только файл как одна картинка: раньше PDF не
         открывался как растр, и ветка молча возвращала пустой результат.
         """
-        if any(fragment.type == "drawing" for fragment in fragments):
+        full_read = self._full_read_image(metadata)
+        # Нарезанные MinerU картинки листа — это виды, а не лист: штамп,
+        # номер листа и примечания остаются за ними. При полном чтении
+        # картинки лист читается целиком и в этом случае.
+        if not full_read and any(fragment.type == "drawing" for fragment in fragments):
             return []
-        if not self._source_is_raster_drawing(metadata):
+        if not full_read and not self._source_is_raster_drawing(metadata):
             return []
 
         source_uri = str(metadata.get("source_path") or "")
@@ -349,7 +369,7 @@ class DrawingProcessor:
                 skipped = pages[index:]
                 break
             try:
-                drawing_result = self.process(source_uri, metadata, page)
+                drawing_result = self.process(source_uri, metadata, page, transcribe=full_read)
             except SoftTimeLimitExceeded:
                 raise
             except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
@@ -375,6 +395,27 @@ class DrawingProcessor:
             sheets[0].review_required = True
             sheets[0].warnings = list(dict.fromkeys(sheets[0].warnings + [note]))
         return sheets
+
+    def _full_read_image(self, metadata: Dict[str, Any]) -> bool:
+        """
+        Лист-картинка читается целиком со всем текстом
+        (DRAWING_IMAGE_FULL_READ): по классификации это растровый чертёж,
+        либо лестница назвала лист текстом, но растровый детектор видит на
+        нём рамку формата (лист со штампом, где MinerU нашёл только
+        таблицу: таблица и примечания дают много строк, и детектор зовёт
+        такой лист страницей текста, но рамка у него есть).
+        """
+        if not settings.DRAWING_IMAGE_FULL_READ:
+            return False
+        if not filetypes.is_image(str(metadata.get("file_type") or "")):
+            return False
+        if self._source_is_raster_drawing(metadata):
+            return True
+        data = self._read(str(metadata.get("source_path") or ""))
+        if not data:
+            return False
+        verdict = raster_drawing.analyse(data)
+        return verdict.is_drawing or bool(verdict.signals.get("frame"))
 
     def _source_is_raster_drawing(self, metadata: Dict[str, Any]) -> bool:
         """Растровый чертёж по классификации лестницы, иначе — по самому файлу."""

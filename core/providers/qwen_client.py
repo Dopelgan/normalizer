@@ -128,6 +128,31 @@ _TABLE_PROMPT = """На картинке — таблица, вырезанна�
 """
 
 
+_TRANSCRIBE_PROMPT = """Перепиши весь текст, который есть на листе. Верни JSON:
+
+{"lines": ["<строка текста как на листе>", "..."]}
+
+Правила:
+- Читай всё: основную надпись (штамп) со всеми графами и фамилиями,
+  обозначение и наименование, лист и листов, масштаб, массу, литеру,
+  строки изменений (изм., лист, № докум., дата), боковые графы
+  («Инв. № подл.», «Подп. и дата», «Перв. примен.» и их значения),
+  обозначение в верхнем углу (оно бывает перевёрнуто на 180°),
+  технические требования и характеристики, примечания, заголовки видов,
+  разрезов и рисунков, надписи у выносок, размеры, таблицы построчно,
+  надписи на изображённых табличках и бирках, «Копировал», «Формат».
+- Одна строка листа — один элемент lines, в порядке чтения: сверху вниз,
+  слева направо. Строку таблицы пиши одной строкой, ячейки через « | ».
+- Пиши как на листе: буквы, цифры, знаки ⌀ ± ° и индексы допусков,
+  знак допуска (+ или −) ставь тот, что на листе.
+- Обозначения переписывай со всеми точками и пробелами: «ТАДУ 421451.001 СБ»,
+  а не «ТАДУ 421451001 СБ».
+- Латиницу пиши латиницей, кириллицу кириллицей: коды KKS («30KUA70AX001»),
+  марки и английские надписи не переводи в кириллицу.
+- Рукописную подпись без читаемого текста пропускай. Ничего не додумывай.
+"""
+
+
 @dataclass
 class SheetReading:
     """Прочитанный лист: надписи и род чертежа."""
@@ -206,6 +231,21 @@ class QwenVisionClient:
             "rows": _string_rows(data.get("rows")),
         }
 
+    def transcribe(self, image) -> Optional[List[str]]:
+        """Весь текст листа строками: штамп, графы, примечания, таблицы."""
+        data = self._ask(
+            image, _TRANSCRIBE_PROMPT, settings.DRAWING_TRANSCRIBE_MAX_SIDE,
+            max_tokens=settings.DRAWING_TRANSCRIBE_MAX_TOKENS,
+        )
+        if data is None:
+            return None
+        lines = data.get("lines")
+        if not isinstance(lines, list):
+            logger.warning("Модель вернула JSON без списка lines")
+            return None
+        return [str(line).strip() for line in lines
+                if isinstance(line, (str, int, float)) and str(line).strip()]
+
     def health(self) -> bool:
         """Отвечает ли хост модели. Нужна для приёмки и для понятного лога."""
         if not self.available:
@@ -218,7 +258,9 @@ class QwenVisionClient:
             return False
 
     # ----------------------------------------------------------- внутреннее
-    def _ask(self, image, prompt: str, max_side: int) -> Optional[Dict[str, Any]]:
+    def _ask(
+        self, image, prompt: str, max_side: int, max_tokens: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         if not self.available:
             logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
             return None
@@ -229,7 +271,7 @@ class QwenVisionClient:
         body = {
             "model": self.model,
             "temperature": settings.QWEN_TEMPERATURE,
-            "max_tokens": settings.QWEN_MAX_TOKENS,
+            "max_tokens": max_tokens or settings.QWEN_MAX_TOKENS,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": _SYSTEM},

@@ -427,3 +427,18 @@ deskewed_page`); при `turn != 0` они не совпадают с исход
 таблицей; `OCR_TABLE_LINE_MIN_CONFIDENCE` — без повтора таблицы мусорными строками через сетку; `OCR_SPLIT_WIDE_GAPS` —
 разворот в две колонки читается по колонкам. В `text_layer_stats` растра добавлены `low_confidence_table_lines` и
 `word_fix` (`latin_words`, `confusion_words`, `junk_tokens`).
+
+## Полное чтение листов-картинок (13.11.2026)
+
+Схема и поля не меняются. Два флага, оба по умолчанию выключены (README, «Флаги разбора»):
+
+- `DRAWING_UNMEASURED_NOT_PARTIAL` — фрагмент `drawing` без измеренной полноты остаётся `review_required`, но
+  документ `partial` только при реальной потере (`missing_regions`, `DRAWING_NOT_RECOGNIZED`,
+  `DRAWING_SKIPPED_NO_TIME`, `DRAWING_SHEETS_SKIPPED`);
+- `DRAWING_IMAGE_FULL_READ` — у входа-картинки (JPG, PNG, TIFF) первым приходит фрагмент `drawing` всего листа, и
+  когда MinerU нарезал из листа виды (они остаются своими фрагментами), и когда лестница назвала лист текстом при
+  рамке чертежа. В его `content.text` — весь текст листа, переписанный Qwen-VL построчно (штамп, номер листа,
+  изменения, примечания, технические требования); `structured_payload.transcript_line_count` — число строк. Вместе с
+  первым флагом непрочитанная область на странице с переписанным текстом не делает документ `partial`.
+
+После включения у таких листов появляется новый фрагмент, у прочих `fragment_id` не меняются.
