@@ -58,6 +58,7 @@ from core.providers.vector_drawing import (
     extract_drawing_fields,
 )
 from core.providers.text_layer import (
+    METHOD_OCR_LAYER_RECOVERED,
     METHOD_PARSER_OCR,
     OCR_LAYER,
     TextLayer,
@@ -106,6 +107,60 @@ def drop_low_confidence_lines(
         logger.info("Слой распознавания: отброшено строк с уверенностью < %.2f: %d",
                     threshold, dropped)
     return replace(layer, pages=pages)
+
+_RUS_WORD_RE = re.compile(r"[А-Яа-яЁё]{4,}")
+# Основа слова для сравнения копий: окончания у Tesseract и MinerU расходятся
+# («определятся» / «определяются»), начало слова — реже.
+_STEM = 5
+
+
+def _stems(text: str) -> List[str]:
+    return [w.lower().replace("ё", "е")[:_STEM] for w in _RUS_WORD_RE.findall(text or "")]
+
+
+def drop_repeated_recovered_blocks(
+    blocks: List[ParsedBlock], min_share: float
+) -> Tuple[List[ParsedBlock], int]:
+    """
+    Блоки, восстановленные из слоя распознавания, без повторов текста MinerU.
+
+    Только на страницах, где у MinerU свой текст (как у
+    `drop_low_confidence_lines`): там восстановленный блок либо повторяет
+    этот текст хуже, либо собран из графики («a С» 125) \/ R263»). Блок
+    уходит, если в нём нет ни одного русского слова или доля его слов, чья
+    основа есть в тексте MinerU страницы, не ниже `min_share`. На странице
+    без текста MinerU слой — единственный источник и не трогается.
+    """
+    page_chars: Dict[int, int] = {}
+    page_stems: Dict[int, set] = {}
+    for b in blocks:
+        if b.method == METHOD_OCR_LAYER_RECOVERED:
+            continue
+        text = b.text or ""
+        if b.type == "table" and b.table_data:
+            cells = [str(h) for h in (b.table_data.get("headers") or [])]
+            for row in b.table_data.get("rows") or []:
+                cells.extend(str(c) for c in row)
+            text = " ".join(cells)
+        if b.type in _TEXTISH or b.type == "table":
+            page_stems.setdefault(b.page, set()).update(_stems(text))
+        if b.type in _TEXTISH and b.text:
+            page_chars[b.page] = page_chars.get(b.page, 0) + len("".join(b.text.split()))
+    kept: List[ParsedBlock] = []
+    dropped = 0
+    for b in blocks:
+        if (b.method == METHOD_OCR_LAYER_RECOVERED
+                and page_chars.get(b.page, 0) >= _MINERU_PAGE_TEXT_CHARS):
+            stems = _stems(b.text or "")
+            known = page_stems.get(b.page, set())
+            if not stems or sum(s in known for s in stems) >= min_share * len(stems):
+                dropped += 1
+                continue
+        kept.append(b)
+    if dropped:
+        logger.info("Слой распознавания: отброшено повторов текста MinerU: %d", dropped)
+    return kept, dropped
+
 
 # Типы блоков MinerU, которые сводятся к текстовому.
 _TEXTISH = {"text", "title", "paragraph", "list", "header", "footer", "index", "text_level"}
@@ -290,11 +345,18 @@ class MinerUParserProvider(DocumentParserProvider):
                 if vocab is not None:
                     # Ячейки таблиц и текст MinerU, не перекрытые слоем.
                     word_fix.add(ocr_cleanup.clean_blocks(blocks, vocab))
+                repeated = None
+                if settings.OCR_LAYER_DROP_REPEATED:
+                    blocks, repeated = drop_repeated_recovered_blocks(
+                        blocks, settings.OCR_LAYER_REPEAT_SHARE
+                    )
                 result.blocks = blocks
                 result.text_layer_chars = stats.layer_chars_by_page
                 result.text_layer_stats = {**stats.as_dict(), "layer": "ocr"}
                 if vocab is not None:
                     result.text_layer_stats["word_fix"] = word_fix.as_dict()
+                if repeated is not None:
+                    result.text_layer_stats["dropped_repeated"] = repeated
                 # Происхождение известно только здесь: слоя в файле не
                 # оказалось и текст собран распознаванием. До этой ветки
                 # `source_kind` ставился по расширению, и скан уезжал в

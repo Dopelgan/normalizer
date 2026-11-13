@@ -94,6 +94,16 @@ class Settings(BaseSettings):
     # выключено, значения на проде — в README, раздел «Флаги разбора».
     OCR_LAYER_DROP_LOW_CONFIDENCE: bool = False
     OCR_LAYER_MIN_LINE_CONFIDENCE: float = 0.4
+    # Блок, восстановленный из слоя распознавания на странице, где MinerU
+    # дал свой текст, отбрасывается, если он повторяет этот текст (доля
+    # русских слов, чья основа есть в тексте MinerU той же страницы, не ниже
+    # OCR_LAYER_REPEAT_SHARE) или в нём нет ни одного русского слова. На
+    # чертеже строка Tesseract идёт через графику и примечания сразу, не
+    # попадает ни в одну рамку MinerU и уходит в индекс второй, худшей копией
+    # примечаний («Cozobopa», «MEXHONOZUYECKUX»). Только растр; по умолчанию
+    # выключено (core/providers/mineru_parser.py).
+    OCR_LAYER_DROP_REPEATED: bool = False
+    OCR_LAYER_REPEAT_SHARE: float = 0.6
     # Шум распознавания растра (core/providers/ocr_cleanup.py и сшивка в
     # core/providers/text_layer.py). Все три по умолчанию выключены.
     # Выправка слов по словарю моделей Tesseract: латиница в русском слове
