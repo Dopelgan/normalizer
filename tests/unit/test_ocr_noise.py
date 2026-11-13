@@ -283,3 +283,55 @@ def test_continuation_frame_drops_unsure_lines():
         [head, empty], layer, source=OCR_LAYER, table_line_min_confidence=0.7)
     assert not [b for b in result if b.type == "text"]
     assert stats.low_confidence_table_lines == 1
+
+
+# --------------------------------------------- примечания чертежа (13.11)
+DRAWING_VOCAB = Vocabulary(
+    rus=frozenset("договора поставки масса изделия технологических операций".split()),
+    eng=frozenset("the".split()),
+)
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("условиям Cozobopa поставки", "условиям Договора поставки"),
+    ("6. Macca usdenua указана в схеме", "6. Масса изделия указана в схеме"),
+    ("при проведении MEXHONOZUYECKUX операций", "при проведении ТЕХНОЛОГИЧЕСКИХ операций"),
+])
+def test_drawing_note_italic_latin_fixed(raw, expected):
+    assert clean_text(raw, DRAWING_VOCAB)[0] == expected
+
+
+def _block(text, method, page=1, type_="text"):
+    return ParsedBlock(type=type_, text=text, page=page, bbox=[0, 0, 1, 1], order=0,
+                       confidence=0.9, method=method)
+
+
+MINERU_NOTES = (
+    "4. Размеры Х и У - габаритные размеры конечного изделия определяются условиями "
+    "договора поставки и указаны в условном обозначении коробки. 5. Координаты отверстий "
+    "и их количество определяется схемой размеров. 6. Масса изделия указана в схеме размеров. "
+    "7. Допускается замена материала и сортамента в соответствии с ведомостью замены."
+)
+
+
+def test_recovered_repeat_of_mineru_text_dropped():
+    from core.providers.mineru_parser import drop_repeated_recovered_blocks
+    from core.providers.text_layer import METHOD_OCR_LAYER_RECOVERED as REC
+
+    blocks = [
+        _block(MINERU_NOTES, "mineru_ocr"),
+        # Повтор примечаний строками через графику.
+        _block("$ \ < 4. Размеры Х u У - габаритные размеры конечного изделия "
+               "определятся условиям Cozobopa поставки и указаны в условнам обозначении", REC),
+        # Графика без единого русского слова.
+        _block("a С» 125) \/ R263 1\/) G", REC),
+        # Текст, которого у MinerU нет, остаётся.
+        _block("Маркировать шрифтом лазерным способом на технологической бирке", REC),
+        # Другая страница без текста MinerU — слой единственный источник.
+        _block("a С» 125) \/ R263", REC, page=2),
+    ]
+    kept, dropped = drop_repeated_recovered_blocks(blocks, 0.6)
+    assert dropped == 2
+    assert [b.text[:10] for b in kept] == [
+        MINERU_NOTES[:10], "Маркироват", "a С» 125) ",
+    ]

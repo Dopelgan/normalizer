@@ -427,3 +427,11 @@ deskewed_page`); при `turn != 0` они не совпадают с исход
 таблицей; `OCR_TABLE_LINE_MIN_CONFIDENCE` — без повтора таблицы мусорными строками через сетку; `OCR_SPLIT_WIDE_GAPS` —
 разворот в две колонки читается по колонкам. В `text_layer_stats` растра добавлены `low_confidence_table_lines` и
 `word_fix` (`latin_words`, `confusion_words`, `junk_tokens`).
+
+## Примечания чертежей на растре (13.11.2026)
+
+Контракт не меняется. `OCR_WORD_FIX_ENABLED` дополнительно читает курсив ГОСТ в примечаниях чертежей
+(«Cozobopa» — «Договора», «Macca usdenua» — «Масса изделия»). Новый флаг `OCR_LAYER_DROP_REPEATED`
+(по умолчанию выключен): на странице с текстом MinerU фрагменты `ocr_layer`, восстановленные из слоя
+распознавания и повторяющие этот текст или собранные из графики без русских слов, не выдаются. В
+`text_layer_stats` растра добавлен `dropped_repeated`.
