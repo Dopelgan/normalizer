@@ -46,6 +46,7 @@ from core.ladder.context import (
     SOURCE_RASTER,
     DocumentContext,
 )
+from core.providers.file_locator import FileLocator
 from core.providers.storage import StorageProvider, StorageProviderFactory
 
 logger = logging.getLogger(__name__)
@@ -123,9 +124,13 @@ class QualityGate:
         storage: Optional[StorageProvider] = None,
         known_hashes: Optional[Dict[str, str]] = None,
         known_fingerprints: Optional[List[Tuple[str, int]]] = None,
+        locator: Optional[FileLocator] = None,
     ):
         self.profile = profile or load_profile()
         self.storage = storage or StorageProviderFactory.default()
+        # Через него проверяется, жив ли двойник точного дубля: журнал
+        # решений об удалении файла ничего не знает.
+        self.locator = locator or FileLocator(self.storage)
         # Отпечатки и хеши уже принятого приходят снаружи: ходить в БД из
         # проверки не нужно, а тестировать так заметно проще.
         self.known_hashes = dict(known_hashes or {})
@@ -300,18 +305,50 @@ class QualityGate:
         """
         twin = self.known_hashes.get(file_hash)
         if twin and twin != s3_fileid:
-            return QualityVerdict(
-                REJECT,
-                f"Точный дубликат уже принятого файла {twin!r} "
-                f"(совпадает контрольная сумма).",
-                "QG-2", file_hash=file_hash,
-            )
+            verdict = self.twin_verdict(twin, file_hash)
+            if verdict is not None:
+                return verdict
 
         if fingerprint is None:
             fingerprint = _simhash(_text_sample(context))
         if fingerprint:
             self._near_duplicate(s3_fileid, fingerprint, warnings)
         return None
+
+    def twin_verdict(self, twin: str, file_hash: str) -> Optional[QualityVerdict]:
+        """
+        Вердикт по найденному двойнику с той же контрольной суммой.
+
+        Дубль — это вторая копия, а не просто совпавший хеш в журнале: если
+        принятый ранее файл с тех пор удалили, новая загрузка — единственная
+        копия, и отклонять её значит потерять документ (прод, 13.11:
+        «14Х17Н2 Шестигранник 32 Акт ВК…» после удаления первой загрузки).
+
+        Хранилище не ответило — ни отказа, ни молчаливого приёма: отказ
+        окончателен и на ложном основании теряет документ, а приём без
+        проверки пропускает дубль. Карантин оставляет решение человеку.
+        """
+        present = self.locator.is_present(twin)
+        if present is False:
+            logger.info(
+                "Двойник %s по хешу %s удалён из хранилища — не дубль",
+                twin, file_hash[:12],
+            )
+            return None
+        if present is None:
+            return QualityVerdict(
+                QUARANTINE,
+                f"Совпадает контрольная сумма с принятым ранее файлом {twin!r}, "
+                f"но хранилище не ответило, лежит ли он ещё на месте — "
+                f"нужно решение человека.",
+                "QG-2", file_hash=file_hash,
+            )
+        return QualityVerdict(
+            REJECT,
+            f"Точный дубликат уже принятого файла {twin!r} "
+            f"(совпадает контрольная сумма).",
+            "QG-2", file_hash=file_hash,
+        )
 
     def _near_duplicate(
         self, s3_fileid: str, fingerprint: int, warnings: List[str]

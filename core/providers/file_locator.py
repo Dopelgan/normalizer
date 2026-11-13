@@ -10,7 +10,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import unquote
 
 from core import filetypes
@@ -64,10 +64,7 @@ class FileLocator:
         if not fileid:
             raise SourceFileNotFound("Пустой s3_fileid")
 
-        candidates = [fileid]
-        if not os.path.splitext(fileid)[1]:
-            candidates += [fileid + ext for ext in settings.SOURCE_PROBE_EXTENSIONS]
-
+        candidates = self._candidates(fileid)
         for candidate in candidates:
             uri = self._build_uri(candidate)
             try:
@@ -88,6 +85,40 @@ class FileLocator:
             f"Файл для s3_fileid={s3_fileid!r} не найден "
             f"(префикс {settings.SOURCE_PREFIX!r}, проверено {len(candidates)} вариантов)"
         )
+
+    def is_present(self, s3_fileid: str) -> Optional[bool]:
+        """
+        Лежит ли файл в хранилище сейчас: True, False или None — «не знаю».
+
+        `locate` на сбое хранилища молча переходит к следующему варианту и
+        в конце говорит «не найден». Для поиска исходника это верно, а для
+        вопроса «жив ли двойник» — нет: сбой S3 превращался бы в «двойника
+        нет», и дубль проходил бы приём. Поэтому здесь сбой — отдельный ответ.
+        """
+        fileid = s3_fileid.strip().lstrip("/")
+        if not fileid:
+            return False
+        uris = [self._build_uri(candidate) for candidate in self._candidates(fileid)]
+        bucket = (settings.S3_ATTACHMENTS_BUCKET or "").strip()
+        if bucket and self.is_s3 and _ATTACHMENT_ID.fullmatch(fileid):
+            uris.append(f"s3://{bucket}/{fileid}")
+
+        unknown = False
+        for uri in uris:
+            try:
+                if self.storage.exists(uri):
+                    return True
+            except Exception as exc:  # noqa: BLE001 — сбой не равен отсутствию
+                logger.warning("Проверка %s не удалась: %s", uri, exc)
+                unknown = True
+        return None if unknown else False
+
+    def _candidates(self, fileid: str) -> List[str]:
+        """Ключи, под которыми может лежать файл: без расширения — перебор."""
+        candidates = [fileid]
+        if not os.path.splitext(fileid)[1]:
+            candidates += [fileid + ext for ext in settings.SOURCE_PROBE_EXTENSIONS]
+        return candidates
 
     def _locate_attachment(self, s3_fileid: str, fileid: str) -> Optional[LocatedFile]:
         """

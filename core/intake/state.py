@@ -117,6 +117,33 @@ def claim_content(file_hash: str, s3_fileid: str) -> Optional[str]:
     return owner if owner and owner != s3_fileid else None
 
 
+def take_over_content(file_hash: str, stale_owner: str, s3_fileid: str) -> Optional[str]:
+    """
+    Перехватить заявку у владельца, чьего файла больше нет.
+
+    Перезапись условная: если за это время заявку взял кто-то третий, она
+    остаётся за ним и возвращается его s3_fileid — двое одинаковых новых
+    файлов не должны пройти оба.
+    """
+    from redis.exceptions import WatchError
+
+    client = get_client()
+    key = _hash_key(file_hash)
+    with client.pipeline() as pipe:
+        try:
+            pipe.watch(key)
+            current = pipe.get(key)
+            if current not in (None, stale_owner, s3_fileid):
+                return current
+            pipe.multi()
+            pipe.set(key, s3_fileid, ex=settings.INTAKE_STATE_TTL_SECONDS)
+            pipe.execute()
+            return None
+        except WatchError:
+            current = client.get(key)
+            return current if current and current != s3_fileid else None
+
+
 def release_content(file_hash: str, s3_fileid: str) -> None:
     """Снять свою заявку: файл в итоге не принят, и хеш держать незачем."""
     if not file_hash:

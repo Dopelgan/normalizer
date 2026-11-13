@@ -619,10 +619,48 @@ class TestDuplicates:
 
         data = pdf_bytes()
         digest = hashlib.sha256(data).hexdigest()
-        gate = quality({"documents/копия.pdf": data}, known_hashes={digest: "оригинал.pdf"})
+        gate = quality(
+            {"documents/копия.pdf": data, "documents/оригинал.pdf": data},
+            known_hashes={digest: "оригинал.pdf"},
+        )
         verdict = gate.evaluate("копия.pdf", "documents/копия.pdf")
         assert verdict.outcome == REJECT
         assert "оригинал.pdf" in verdict.reason
+
+    def test_twin_deleted_from_storage_is_not_a_duplicate(self):
+        """
+        Прод, 13.11: принятый ранее файл удалили (объекта в хранилище нет),
+        а новую загрузку того же содержимого отклонили как «точный дубликат»
+        — единственную оставшуюся копию.
+        """
+        import hashlib
+
+        data = pdf_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        gate = quality({"documents/новый.pdf": data}, known_hashes={digest: "удалённый.pdf"})
+        verdict = gate.evaluate("новый.pdf", "documents/новый.pdf")
+        assert verdict.outcome == ACCEPT
+
+    def test_twin_unverifiable_goes_to_quarantine_not_rejection(self):
+        """Хранилище не ответило о двойнике — отказ был бы ложным, решает человек."""
+        import hashlib
+
+        class FlakyStorage(FakeStorage):
+            def exists(self, uri):
+                if "оригинал" in uri:
+                    raise ConnectionError("S3 недоступно")
+                return super().exists(uri)
+
+        data = pdf_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        gate = QualityGate(
+            profile=GatewayProfile(),
+            storage=FlakyStorage({"documents/копия.pdf": data}),
+            known_hashes={digest: "оригинал.pdf"},
+        )
+        verdict = gate.evaluate("копия.pdf", "documents/копия.pdf")
+        assert verdict.outcome == QUARANTINE
+        assert verdict.stage == "QG-2"
 
     def test_near_duplicate_only_raises_a_flag(self):
         """Похожий документ — это «обновление или дубль», решает человек."""
