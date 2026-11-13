@@ -26,7 +26,7 @@ import math
 import re
 import statistics
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from core.models.parse_result import ParsedBlock
 from core.providers import latex_text, table_from_lines
@@ -51,6 +51,8 @@ METHOD_OCR_LAYER = "ocr_layer"
 METHOD_OCR_LAYER_RECOVERED = "ocr_layer_recovered"
 #: Разметку сняли, не имея чем заменить: читается глазами, но не более.
 METHOD_LATEX_DECODED = "latex_decoded"
+#: Таблица перечитана моделью зрения (уровень 7 лестницы стратегий).
+METHOD_VLM_TABLE = "vlm_escalation"
 
 _MONO_MARKERS = ("mono", "courier", "consol", "menlo", "inconsolata", "hack", "fira code")
 
@@ -684,6 +686,8 @@ class ReconcileStats:
     frame_tables: int = 0
     #: Строк слоя из рамки таблицы, отброшенных по уверенности.
     low_confidence_table_lines: int = 0
+    #: Неразобранных таблиц, перечитанных моделью зрения (`table_reader`).
+    vlm_tables: int = 0
     layer_chars_by_page: Dict[int, int] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -704,6 +708,7 @@ class ReconcileStats:
             "table_lines_kept": self.table_lines_kept,
             "frame_tables": self.frame_tables,
             "low_confidence_table_lines": self.low_confidence_table_lines,
+            "vlm_tables": self.vlm_tables,
         }
 
 
@@ -715,6 +720,7 @@ def reconcile_with_text_layer(
     keep_structured_tables: bool = False,
     table_line_min_confidence: float = 0.0,
     split_columns: bool = False,
+    table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]] = None,
 ) -> Tuple[List[ParsedBlock], ReconcileStats]:
     """
     Текст блоков берётся из слоя, а не из OCR; всё, что не попало ни в одну
@@ -733,6 +739,10 @@ def reconcile_with_text_layer(
     прочитанный через линии сетки. Оба — только для слоя распознавания.
     `split_columns` — строки вне рамок собираются в абзацы по колонкам
     (`group_columns`).
+
+    `table_reader` — последняя попытка для таблицы, которую не удалось ни
+    выправить, ни собрать по строкам слоя: блок -> `table_data` или None.
+    Без него (или при None) таблица разбирается на текст, как раньше.
     """
     stats = ReconcileStats(layer_chars_by_page=layer.char_counts_by_page())
     if frame_table_guard:
@@ -808,7 +818,8 @@ def reconcile_with_text_layer(
                 # знает. Но текст ячеек всё равно распознан, поэтому его
                 # значения выправляются по слою.
                 replacements, kept = _fix_table(
-                    block, matched, stats, vocab, exact=source.exact, turn=turn
+                    block, matched, stats, vocab, exact=source.exact, turn=turn,
+                    table_reader=table_reader,
                 )
                 extra_blocks.extend(replacements)
                 leftovers.extend(_confident(kept, line_floor, stats))
@@ -1136,6 +1147,7 @@ def _fix_table(
     vocab: Optional[Dict[str, str]] = None,
     exact: bool = False,
     turn: int = 0,
+    table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]] = None,
 ) -> Tuple[List[ParsedBlock], List[TextLine]]:
     """
     Содержимое ячеек — по строкам слоя. Возвращает блоки, которыми таблицу
@@ -1161,6 +1173,21 @@ def _fix_table(
     if latex_text.mangled_cells(block.table_data):
         stats.mangled_tables += 1
         if not table_from_lines.repair_cells(block, _upright_lines(matched, turn)):
+            # Строки слоя такой таблицы — обычно каша (альбомная таблица на
+            # книжном листе читается поперёк), поэтому сначала модель
+            # зрения: её таблица заменяет и разметку, и строки слоя.
+            read = table_reader(block) if table_reader is not None else None
+            if read:
+                block.table_data = read
+                # HTML от MinerU — та же разметка, что и в ячейках.
+                block.table_html = None
+                block.method = METHOD_VLM_TABLE
+                stats.vlm_tables += 1
+                # Модель могла пропустить строку: строки слоя с настоящими
+                # словами, которых в её таблице нет, возвращаются текстом.
+                kept = _lines_with_new_words(matched, block)
+                stats.table_lines_kept += len(kept)
+                return [], kept
             stats.degraded_tables += 1
             return table_from_lines.degrade(block, matched), []
         stats.repaired_tables += 1
