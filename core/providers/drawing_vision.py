@@ -190,6 +190,12 @@ def analyse(image, deskew_limit: Optional[float] = None) -> SheetLayout:
         frame = _recover_frame(straight, regions, signals)
         if frame is not None:
             # Штамп дотягивается до найденной рамки так же, как до обычной.
+            #
+            # Осторожно: `_mark_title_block` правит области на месте, и здесь
+            # он вызывается по ним второй раз. Это безопасно ровно потому,
+            # что первый вызов прошёл с `frame=None` и ничего не дотянул.
+            # Если эти строки когда-нибудь переставить местами или вызвать
+            # первый раз с найденной рамкой, область штампа растянется дважды.
             regions = _mark_title_block(regions, frame)
 
     layout = SheetLayout(
@@ -666,18 +672,20 @@ def _mark_title_block(regions: List[Region], frame: Optional[List[float]]) -> Li
 #   (формы 1, 2 и 2а);
 # * `_SIDE_MAJORITY` — сторона считается подтверждённой, когда прочерчена
 #   больше чем наполовину: меньше половины — стороны скорее нет, чем есть;
-# * `_PRINT_SHRINK` — на сколько лист может быть уменьшен при печати «по
-#   размеру страницы»: непечатаемое поле принтера того же порядка, что поле
-#   рамки, 5 мм с каждой стороны, на самом узком листе A4 это 10 из 210 мм.
+# * доля листа форматы не отсеивает, а только упорядочивает — почему, см.
+#   `_fills`.
 
-_MARGIN_BIND_MM = 20.0
+# Поля листа по ГОСТ 2.301: правое, верхнее и нижнее по 5 мм, левое (поле
+# подшивки) — 20 мм. Разницу между ними проверяет `_rejected`.
 _MARGIN_MM = 5.0
 # Колонка дополнительных граф по ГОСТ 2.104: 12 мм влево от рамки. Только её
 # линии продолжаются за рамку — нижняя линия рамки уходит под колонку.
 _SIDE_COLUMN_MM = 12.0
-_PRINT_SHRINK = 2 * _MARGIN_MM / 210.0
 # Листы ГОСТ 2.301, короткая и длинная стороны в мм.
 _SHEETS_MM = ((210, 297), (297, 420), (420, 594), (594, 841), (841, 1189))
+# Шаг ряда форматов ГОСТ 2.301 по стороне: соседний формат той же ориентации
+# вдвое больше по площади, то есть в корень из двух по каждой стороне.
+_SHEET_STEP = 2 ** 0.5
 _STAMP_HEIGHTS_MM = (55.0, 40.0, 15.0)
 _SIDE_MAJORITY = 0.5
 # Сколько линий с каждой стороны листа перебирается при сборке прямоугольника.
@@ -738,10 +746,34 @@ def _recover_frame(image, regions: Sequence[Region], signals: Dict[str, Any]) ->
             continue
         report["source"] = source
         report["format_mm"] = detail
+        report["format_certain"] = _format_certain(frame, mask.shape)
         signals["inner_frame"] = frame
-        logger.info("Рамка листа восстановлена (%s): %s, формат рамки %s мм", source, frame, detail)
+        logger.info(
+            "Рамка листа восстановлена (%s): %s, формат рамки %s мм%s",
+            source, frame, detail,
+            "" if report["format_certain"] else " (формат не подтверждён: лист обрезан по рамке)",
+        )
         return frame
     return None
+
+
+def _format_certain(frame: Sequence[float], shape: Tuple[int, int]) -> bool:
+    """
+    Можно ли верить ярлыку формата у найденной рамки.
+
+    Пропорция у горизонтальных форматов почти вырождена, и разделяет их
+    только занятая доля картинки. Когда рамка упирается в край картинки,
+    собственного поля листа (5 мм по ГОСТ 2.301, 20 мм слева) в кадре нет:
+    скан обрезан по рамке, доля ничего не говорит, и формат может оказаться
+    соседним по ряду. Сама рамка при этом верна — ярлык нет.
+
+    На корпусе это 3 листа из 22 восстановленных: рамка у всех трёх легла
+    точно на линию, а формат у двух оказался на шаг больше настоящего.
+    """
+    height, width = shape
+    edge = (2 * _reach(min(height, width)) + 1) / min(height, width)
+    left, top, right, bottom = (float(value) for value in frame)
+    return min(left, top, 1.0 - right, 1.0 - bottom) > edge
 
 
 def _thin_line_mask(image):
@@ -859,17 +891,39 @@ def _sheet_of(paper: Tuple[int, int]) -> Tuple[int, int]:
     return min(fitting, key=lambda sheet: sheet[0] * sheet[1])
 
 
+def _share(paper: Tuple[int, int]) -> Tuple[float, float]:
+    """Какую долю своего листа рамка `paper` занимает по ГОСТ 2.301."""
+    sheet = _sheet_of(paper)
+    return paper[0] / sheet[0], paper[1] / sheet[1]
+
+
 def _fills(share_w: float, share_h: float, paper: Tuple[int, int]) -> bool:
     """
-    Занимает ли рамка на картинке ту же долю, что рамка `paper` на своём
-    листе. Меньше — вокруг листа фон или «рамка» лежит внутри настоящей;
-    допуск вниз — уменьшение при печати. Больше номинала бывает, когда скан
-    обрезал поля, поэтому сверху предел — весь лист.
+    Может ли рамка `paper` занимать на картинке долю `share_w`×`share_h`.
+
+    Отсеять формат по доле листа нельзя, и это главное, что тут нужно знать.
+    Доля считается от картинки, а картинка — не лист: сканер добавляет вокруг
+    листа поле, ширина которого заранее не известна. На A3 достаточно 8 мм
+    поля с каждой стороны, чтобы рамка заняла 0,917 высоты вместо
+    номинальных 0,966, и прежняя нижняя граница (номинал минус непечатаемое
+    поле принтера) отвергала верную рамку. Хуже того, прямоугольник, у
+    которого правая сторона — не линия рамки, а край бумаги, при этом границу
+    проходил и получал ярлык «A4 альбомный» на листе A3: рамка смещена, а
+    формат не тот, и размеры ушли бы к чужому масштабу.
+
+    Поэтому здесь остался только тот предел, который от поля скана не зависит:
+    больше целой картинки рамка быть не может, а меньше — не меньше, чем если
+    бы вокруг листа добавили ещё целый шаг формата ГОСТ. Лишнего белого
+    больше, чем на формат вокруг, — это уже не скан листа.
+
+    Разделять форматы (A4 альбомный, A1 и A0 отличаются по пропорции на доли
+    процента) доля листа всё-таки помогает, но как упорядочивание, а не как
+    отказ: см. `_format_of`.
     """
-    sheet = _sheet_of(paper)
+    nominal_w, nominal_h = _share(paper)
     return (
-        paper[0] / sheet[0] * (1 - _PRINT_SHRINK) <= share_w <= 1.0
-        and paper[1] / sheet[1] * (1 - _PRINT_SHRINK) <= share_h <= 1.0
+        nominal_w / _SHEET_STEP <= share_w <= 1.0
+        and nominal_h / _SHEET_STEP <= share_h <= 1.0
     )
 
 
@@ -878,9 +932,18 @@ def _format_of(
 ) -> Tuple[Optional[Tuple[int, int]], str]:
     """
     Формат внутренней рамки ГОСТ 2.301 для прямоугольника в пикселях маски
-    или причина отказа. Одной пропорции мало: книжные форматы идут подряд
-    (0,645…0,685), и рамка A4, обрезанная по верхней линии штампа, сходится с
-    A1 книжным. Поэтому формат обязан ещё и занимать свою долю листа.
+    или причина отказа.
+
+    Пропорция отсеивает, доля листа — упорядочивает. Горизонтальные форматы
+    по пропорции почти вырождены (A0 1,4169, A4 альбомный 1,4205, A1 1,4216 —
+    разница в доли процента), и выбрать между ними по одной пропорции нельзя.
+    Выбирается тот, чья доля листа ближе к наблюдаемой. Поле скана наблюдаемую
+    долю только занижает, поэтому при прочих равных побеждает формат поменьше
+    — у большего рамка обязана прилегать к краю листа теснее, чем видно.
+
+    На саму рамку выбор формата не влияет: прямоугольник собран из найденных
+    линий, формат — ярлык к нему (и масштаб мм/пиксель для проверок и для
+    вырезки штампа).
     """
     aspect = box_w / box_h
     close = [mm for mm in _FRAMES_MM if abs(mm[0] / mm[1] - aspect) <= tolerance * mm[0] / mm[1]]
@@ -888,8 +951,17 @@ def _format_of(
         return None, "пропорция не отвечает формату ГОСТ 2.301"
     fitting = [mm for mm in close if _fills(box_w / width, box_h / height, mm)]
     if not fitting:
-        return None, "рамка занимает на листе меньше, чем положено формату"
-    return min(fitting, key=lambda mm: abs(mm[0] / mm[1] - aspect)), ""
+        return None, "рамка больше картинки или вокруг неё лишний формат белого"
+    share_w, share_h = box_w / width, box_h / height
+
+    def mismatch(mm: Tuple[int, int]) -> Tuple[float, float]:
+        nominal_w, nominal_h = _share(mm)
+        return (
+            abs(nominal_w - share_w) + abs(nominal_h - share_h),
+            abs(mm[0] / mm[1] - aspect),
+        )
+
+    return min(fitting, key=mismatch), ""
 
 
 def _rejected(
@@ -942,6 +1014,31 @@ def _rejected(
         if start < bottom - slack and end > bottom + beyond:
             return "линия листа пересекает сторону: низ"
     return ""
+
+
+class _Refusals:
+    """
+    Причины, по которым отпали кандидаты в рамку.
+
+    Прямоугольников перебирается много, и причина у каждого своя. Держать
+    одну переменную нельзя: в поле попадала бы причина последнего по счёту
+    кандидата, а не та, из-за которой не прошёл самый похожий на рамку. Здесь
+    причины копятся с числом кандидатов, и в отчёт идут от частой к редкой —
+    по этому полю потом видно, какая проверка режет листы на самом деле.
+    """
+
+    def __init__(self) -> None:
+        self._seen: Dict[str, int] = {}
+
+    def add(self, why: str) -> None:
+        if why:
+            self._seen[why] = self._seen.get(why, 0) + 1
+
+    def summary(self, default: str) -> str:
+        if not self._seen:
+            return default
+        ordered = sorted(self._seen.items(), key=lambda item: (-item[1], item[0]))
+        return "; ".join("%s (кандидатов %d)" % (why, count) for why, count in ordered)
 
 
 def _covered(line: _Line, start: float, end: float) -> float:
@@ -1000,35 +1097,37 @@ def _frame_by_sides(
 
     tolerance_px = 2.0 * (2 * _reach(min(height, width)) + 1)
     best: Optional[Tuple[float, List[float], Tuple[int, int]]] = None
-    refusal = "стороны не складываются в прямоугольник"
+    refused = _Refusals()
     for top in sides["верх"]:
         for bottom in sides["низ"]:
             for left in sides["лево"]:
                 for right in sides["право"]:
                     box_w, box_h = right[0] - left[0], bottom[0] - top[0]
                     if box_w < 0.5 * width or box_h < 0.5 * height:
+                        refused.add("прямоугольник меньше половины листа")
                         continue
                     if not whole_sheet and min(
                         _covered(top, left[0], right[0]), _covered(bottom, left[0], right[0]),
                         _covered(left, top[0], bottom[0]), _covered(right, top[0], bottom[0]),
                     ) < need:
+                        refused.add("сторона прочерчена меньше чем наполовину")
                         continue
                     paper, why = _format_of(
                         box_w, box_h, width, height, tolerance_px / min(box_w, box_h))
                     if paper is None:
-                        refusal = why
+                        refused.add(why)
                         continue
                     why = _rejected([left[0], top[0], right[0], bottom[0]], paper,
                                     mask, horizontals, verticals)
                     if why:
-                        refusal = why
+                        refused.add(why)
                         continue
                     area = box_w * box_h
                     if best is None or area < best[0]:
                         best = (area, [left[0] / width, top[0] / height,
                                        right[0] / width, bottom[0] / height], paper)
     if best is None:
-        return None, refusal
+        return None, refused.summary("стороны не складываются в прямоугольник")
     return [round(c, 4) for c in best[1]], "%dx%d" % best[2]
 
 
@@ -1044,10 +1143,11 @@ def _frame_by_title_block(
     нижняя стороны рамки — линии, которыми штамп замыкается; левая и верхняя
     откладываются от них на размер формата.
 
-    Формат принимается только при подтверждении: либо рамка занимает на
-    картинке ту же долю, что на листе своего формата (`_fills`), либо на
-    предсказанных местах левой и верхней сторон лежат линии, прочерченные
-    больше чем наполовину. Подходить должен ровно один формат.
+    Формат принимается только тогда, когда на предсказанных местах левой и
+    верхней сторон действительно лежат линии, прочерченные больше чем
+    наполовину, и подходит ровно один формат. Долей листа формат здесь не
+    подтверждается: картинка — не лист, и доля зависит от поля, которое
+    добавил сканер (см. `_fills`), так что подтверждением она быть не может.
     """
     if block is None:
         return None, "штамп не найден"
@@ -1067,7 +1167,7 @@ def _frame_by_title_block(
         return None, "штамп не замкнут линиями справа и снизу"
 
     found: List[Tuple[List[float], Tuple[int, int]]] = []
-    stamp_seen, rejected = False, ""
+    stamp_seen, rejected = False, _Refusals()
     for right in rights:
         scale = (right[0] - x_left) / _STAMP_MM[0]            # пикселей маски на мм
         if scale <= 0:
@@ -1090,29 +1190,24 @@ def _frame_by_title_block(
             if left < -slack or top < -slack:
                 continue
             left, top = max(0.0, left), max(0.0, top)
-            fits = _fills((right[0] - left) / width, (bottom[0] - top) / height, paper)
             # Линии на предсказанных местах: не дальше половины поля.
             near = max(float(reach), slack / 2)
             left_line = _nearest(verticals, left, near, top, bottom[0])
             top_line = _nearest(horizontals, top, near, left, right[0])
-            if not fits and (left_line is None or top_line is None):
+            if left_line is None or top_line is None:
+                rejected.add("на предсказанных местах левой и верхней сторон линий нет")
                 continue
-            if left_line is not None:
-                left = left_line[0]
-            if top_line is not None:
-                top = top_line[0]
+            left, top = left_line[0], top_line[0]
             why = _rejected([left, top, right[0], bottom[0]], paper, mask, horizontals, verticals)
             if why:
-                rejected = why
+                rejected.add(why)
                 continue
             box = [left / width, top / height, right[0] / width, bottom[0] / height]
             found.append(([round(c, 4) for c in box], paper))
     if not stamp_seen:
         return None, "размер штампа не отвечает ГОСТ 2.104"
-    if not found and rejected:
-        return None, rejected
     if not found:
-        return None, "формат по штампу не подтверждён ни долей листа, ни линиями"
+        return None, rejected.summary("формат по штампу не подтверждён линиями")
     if len({paper for _, paper in found}) > 1:
         return None, "по штампу подходят несколько форматов"
     # Один формат, несколько пар линий (рамка и обрез рядом): внутренняя.

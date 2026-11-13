@@ -224,6 +224,117 @@ class TestRefusals:
 
 
 # ===========================================================================
+# Поля скана вокруг листа
+# ===========================================================================
+
+class TestScanMargin:
+    """
+    Картинка — не лист: сканер добавляет вокруг листа поле неизвестной
+    ширины, и доля листа, занятая рамкой, падает ниже номинальной. Пока это
+    считалось отказом, верная рамка A3 отвергалась начиная с 8 мм поля, а
+    прямоугольник с краем бумаги вместо правой стороны проходил и получал
+    ярлык «A4 альбомный».
+    """
+
+    @pytest.mark.parametrize("margin_mm", [0, 5, 8, 12, 20, 40])
+    def test_true_frame_survives_scan_margin(self, margin_mm):
+        for paper in vision._FRAMES_MM:
+            sheet = vision._sheet_of(paper)
+            share_w = paper[0] / (sheet[0] + 2 * margin_mm)
+            share_h = paper[1] / (sheet[1] + 2 * margin_mm)
+            assert vision._fills(share_w, share_h, paper), (paper, margin_mm)
+
+    def test_a_whole_format_of_white_around_is_refused(self):
+        """Лишнего белого больше, чем на формат вокруг, — это не скан листа."""
+        paper = (395, 287)                      # A3
+        sheet = vision._sheet_of(paper)
+        step = vision._SHEET_STEP
+        share_w = paper[0] / (sheet[0] * step * 1.05)
+        share_h = paper[1] / (sheet[1] * step * 1.05)
+        assert not vision._fills(share_w, share_h, paper)
+
+    def test_frame_cannot_exceed_the_picture(self):
+        assert not vision._fills(1.02, 0.95, (395, 287))
+
+    def test_degenerate_aspects_are_told_apart_by_size(self):
+        """
+        A0, A4 альбомный и A1 по пропорции почти не отличаются (1,4169,
+        1,4205, 1,4216), поэтому формат выбирается по занятой доле листа.
+        """
+        aspects = {mm: mm[0] / mm[1] for mm in ((1159, 818), (277, 195), (816, 574))}
+        assert max(aspects.values()) / min(aspects.values()) < 1.01
+        for paper in aspects:
+            # Картинка — ровно лист этого формата, рамка на своём месте.
+            sheet = vision._sheet_of(paper)
+            scale = 1000 / sheet[0]
+            width, height = int(sheet[0] * scale), int(sheet[1] * scale)
+            box_w, box_h = paper[0] * scale, paper[1] * scale
+            chosen, why = vision._format_of(box_w, box_h, width, height, 0.02)
+            assert chosen == paper, (paper, chosen, why)
+
+    def test_size_no_longer_refuses_a_format(self, data):
+        """
+        Доля листа только упорядочивает форматы. Настоящая рамка с полем
+        скана обязана получить формат, а не отказ.
+        """
+        height, width = data["mask_shape"]
+        left, top, right, bottom = data["frame_after"]
+        box_w, box_h = (right - left) * width, (bottom - top) * height
+        for margin in (1.0, 1.05, 1.2):                 # картинка шире листа
+            paper, why = vision._format_of(
+                box_w, box_h, int(width * margin), int(height * margin), 0.02)
+            assert paper is not None, (margin, why)
+
+
+# ===========================================================================
+# Причина отказа
+# ===========================================================================
+
+class TestRefusalReport:
+    def test_reasons_are_counted_not_overwritten(self):
+        """
+        Кандидатов перебирается много. В поле должна попасть не причина
+        последнего по счёту, а все с числом кандидатов, от частой к редкой.
+        """
+        refused = vision._Refusals()
+        for _ in range(3):
+            refused.add("пропорция не отвечает формату ГОСТ 2.301")
+        refused.add("нет поля подшивки слева")
+        summary = refused.summary("по умолчанию")
+        assert summary.startswith("пропорция не отвечает формату ГОСТ 2.301 (кандидатов 3)")
+        assert "нет поля подшивки слева (кандидатов 1)" in summary
+
+    def test_default_is_used_when_no_candidate_was_judged(self):
+        assert vision._Refusals().summary("сторон не нашлось") == "сторон не нашлось"
+
+    def test_format_is_marked_uncertain_when_the_sheet_is_cropped(self, data):
+        """
+        Рамка, упирающаяся в край картинки: поля листа в кадре нет, и формат
+        по доле не разделить. Сама рамка верна, ярлык — под сомнением.
+        """
+        shape = data["mask_shape"]
+        assert vision._format_certain(data["frame_after"], shape) is True
+        touching = list(data["frame_after"])
+        touching[2] = 0.9999
+        assert vision._format_certain(touching, shape) is False
+
+    def test_recovered_frame_of_a_real_sheet_has_a_certain_format(self, data):
+        height, width = data["mask_shape"]
+        box, _ = vision._frame_by_sides(
+            real.lines(data, "stitched_h"), real.lines(data, "stitched_v"),
+            real.Mask((height, width)), whole_sheet=True,
+        )
+        assert vision._format_certain(box, (height, width)) is True
+
+    def test_mask_failure_is_recorded(self, flags, monkeypatch):
+        flags(stitch=True, four_sides=True, from_title_block=True)
+        monkeypatch.setattr(vision, "_thin_line_mask", lambda image: None)
+        signals = {}
+        assert vision._recover_frame(object(), [], signals) is None
+        assert signals["frame_recovery"]["refused"] == {"mask": "маска листа не построилась"}
+
+
+# ===========================================================================
 # Рамка не подменяет уже найденную
 # ===========================================================================
 
