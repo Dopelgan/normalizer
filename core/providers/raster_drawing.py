@@ -191,6 +191,20 @@ def analyse_image(image) -> RasterVerdict:
             signals,
         )
 
+    # Тонкая рамка большого листа (4960 px) при уменьшении до рабочего
+    # размера бледнеет до фона: лист без неё шёл как страница текста.
+    thin = _thin_line_frame(image, numpy) if _thin_lines_enabled() else None
+    if thin is not None and ink <= _INK_DRAWING and text_bands <= _TEXT_PAGE_HARD:
+        thin_frame, thin_rules = thin
+        signals.update({"thin_line_frame": thin_frame, "thin_line_rules": thin_rules})
+        if thin_frame and thin_rules >= 3:
+            return RasterVerdict(
+                KIND_DRAWING, 0.7,
+                f"рамка формата и {thin_rules} длинных линий видны только без "
+                f"потери тонких линий при уменьшении",
+                signals,
+            )
+
     # Сетка таблицы тоже даёт длинные линии, и по одному их числу ведомость
     # неотличима от чертежа. Отличает соотношение: у ведомости строк текста
     # столько же, сколько линеек, у чертежа графика преобладает над текстом.
@@ -256,6 +270,43 @@ def _downscale(image, side: int):
     copy = image.copy()
     copy.thumbnail((side, side))
     return copy
+
+
+def _thin_lines_enabled() -> bool:
+    try:
+        from core.config import settings
+    except Exception:  # noqa: BLE001 — детектор работает и без настроек
+        return False
+    return bool(getattr(settings, "RASTER_FRAME_THIN_LINES", False))
+
+
+# Во сколько раз лист должен уменьшаться до рабочего размера, чтобы тонкая
+# линия успела побледнеть до фона. У листов до ~3000 px рамка держится.
+_THIN_LINE_MIN_FACTOR = 3
+
+
+def _thin_line_frame(image, numpy):
+    """
+    Рамка и длинные линии по маске, где тонкие линии переживают уменьшение:
+    перед уменьшением каждый пиксель берёт самый тёмный из окна, поэтому
+    линия в 2 px на листе 4960 px не растворяется в фоне. `None` — лист и так
+    не уменьшается настолько, чтобы линии пропадали.
+    """
+    from PIL import ImageFilter
+
+    factor = max(image.size) // WORK_SIDE
+    if factor < _THIN_LINE_MIN_FACTOR:
+        return None
+    size = min(5, factor if factor % 2 else factor + 1)
+    grey = image.convert("L").filter(ImageFilter.MinFilter(size))
+    work = numpy.asarray(_downscale(grey, WORK_SIDE), dtype=numpy.float32)
+    mask = work < _threshold(work, numpy)
+    skew = _mask_skew(mask, numpy)
+    if skew:
+        mask = _rotate_mask(mask, skew, numpy)
+    rules = (_rule_bands(mask.sum(axis=1), mask.shape[1])
+             + _rule_bands(mask.sum(axis=0), mask.shape[0]))
+    return _has_frame(mask), rules
 
 
 def _threshold(grey, numpy) -> float:

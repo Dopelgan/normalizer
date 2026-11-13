@@ -345,11 +345,20 @@ class DrawingProcessor:
         открывался как растр, и ветка молча возвращала пустой результат.
         """
         full_read = self._full_read_image(metadata)
+        drawn_pages = {
+            int(fragment.position.page) for fragment in fragments
+            if fragment.type == "drawing" and fragment.position is not None
+        }
         # Нарезанные MinerU картинки листа — это виды, а не лист: штамп,
         # номер листа и примечания остаются за ними. При полном чтении
         # картинки лист читается целиком и в этом случае.
-        if not full_read and any(fragment.type == "drawing" for fragment in fragments):
-            return []
+        only_undrawn = False
+        if not full_read and drawn_pages:
+            # Листы без единого фрагмента drawing (повёрнутый лист, который
+            # MinerU принял за таблицу) иначе не читались моделью вовсе.
+            if not (settings.DRAWING_SHEET_MISSING_PAGES and self._source_is_raster_drawing(metadata)):
+                return []
+            only_undrawn = True
         if not full_read and not self._source_is_raster_drawing(metadata):
             return []
 
@@ -359,6 +368,10 @@ class DrawingProcessor:
 
         signals = (metadata.get("classification") or {}).get("signals") or {}
         pages = list(signals.get("raster_drawing_pages") or signals.get("drawing_pages") or [1])
+        if only_undrawn:
+            pages = [page for page in pages if int(page) not in drawn_pages]
+            if not pages:
+                return []
         sheets: List[Fragment] = []
         skipped = pages[settings.DRAWING_MAX_SHEETS:]
         for index, page in enumerate(pages[: settings.DRAWING_MAX_SHEETS]):
@@ -608,15 +621,17 @@ def _field(
 ) -> Dict[str, Any]:
     """Поле контракта: значение от модели, разметка — правилами ГОСТ."""
     value = f"{label}: {text}" if label else text
+    # Марка стали — не посадка: в «12Х18Н10Т» правило посадок видит «H10».
+    no_tolerance = settings.DRAWING_MATERIAL_NO_TOLERANCE and category == "material"
     return {
         "category": category,
         "value": value,
-        "tolerance": vector_drawing.extract_tolerance(text),
+        "tolerance": None if no_tolerance else vector_drawing.extract_tolerance(text),
         "nature": vector_drawing.determine_nature(text),
         "unit": vector_drawing.extract_unit(text, category),
         "confidence": round(max(0.0, min(1.0, confidence)), 3),
         "bbox": bbox,
-        "source_of_tolerance": vector_drawing.tolerance_source(text),
+        "source_of_tolerance": "unknown" if no_tolerance else vector_drawing.tolerance_source(text),
         # Надпись прочитана с самого листа. Значений контракта это не
         # расширяет: ровно то же ставит ветка детектора.
         "provenance": "detected_from_annotation",
