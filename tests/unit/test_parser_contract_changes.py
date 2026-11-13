@@ -459,3 +459,57 @@ class TestBatchIndependence:
         assert set(pushed) == set(polled)
         assert pushed["event_id"] == polled["event_id"] == "event-6"
         assert pushed["status"] == polled["status"] == "completed"
+
+
+# ===========================================================================
+# U+0000 из текстового слоя не доходит до хранилищ
+# ===========================================================================
+
+class TestNulCharacters:
+    """PostgreSQL не переводит `\u0000` в текст: одна такая строка ломает выборки."""
+
+    def test_nul_removed_from_text_and_fields(self):
+        from core.models.contract import DrawingField, TableData
+
+        drawing = fragment(
+            text="Лист\x00 1",
+            type="drawing",
+            content=Content(
+                text="Примечание\x00",
+                structured_drawing_fields=[
+                    DrawingField(category="note", value="\x00\x00\x00\x00"),
+                    DrawingField(category="dimension", value="Ø12\x00", unit="мм\x00"),
+                    DrawingField(category="note", value=""),
+                ],
+                structured_payload={"tables": [{"rows": [["a\x00", 1]]}]},
+            ),
+        )
+        table = fragment(type="table", content=Content(
+            table_data=TableData(headers=["Поле\x00"], rows=[["\x00знач"]])))
+        fragments, _ = finalize_fragments([drawing, table], "doc-001", "f1")
+
+        import json
+        dumped = json.dumps([f.model_dump(mode="json") for f in fragments])
+        assert "\u0000" not in dumped
+        fields = fragments[0].content.structured_drawing_fields
+        # Поле из одних нулей выброшено, пустое без нулей — не тронуто.
+        assert [(f.category, f.value, f.unit) for f in fields] == [
+            ("dimension", "Ø12", "мм"), ("note", "", ""),
+        ]
+        assert fragments[0].content.text == "Примечание"
+        assert fragments[1].content.table_data.rows == [["знач"]]
+
+    def test_same_id_with_and_without_nul(self):
+        clean, _ = finalize_fragments([fragment(text="Текст фрагмента")], "doc-001", "f1")
+        dirty, _ = finalize_fragments([fragment(text="Текст\x00 фрагмента")], "doc-001", "f1")
+        assert clean[0].fragment_id == dirty[0].fragment_id
+
+    def test_nul_only_text_block_is_not_a_fragment(self):
+        blocks = [
+            text_block("\x00 \x00 \x00", order=0),
+            text_block("Текст после мусора достаточной длины.", order=1, section_title="Раздел\x00"),
+        ]
+        fragments = TextNormalizer().normalize(ParseResult(blocks=blocks), META)
+        assert [f.content.text for f in fragments] == ["Текст после мусора достаточной длины."]
+        assert "\x00" not in (fragments[0].section_title or "")
+        assert all("\x00" not in part for part in fragments[0].section_path)
