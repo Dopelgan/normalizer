@@ -65,8 +65,13 @@ from __future__ import annotations
 import re
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-# Пометка фрагмента, в котором обозначение было восстановлено.
-WARNING = "DESIGNATION_HOMOGLYPH_REPAIRED"
+# Ключ в `structured_payload` фрагмента: что именно было восстановлено.
+# Не пометка (`warnings`): для RAG пометка означает «текст неполный», а
+# здесь всё наоборот — текст стал вернее. Документ с восстановленным
+# обозначением не должен из-за этого терять полноту и чистое событие
+# индексации. Ключ остаётся измеримым для нас и не трогает полноту у
+# потребителя.
+PAYLOAD_KEY = "designation_repairs"
 
 # Классы неразличимых знаков: на листе знаки класса выглядят одинаково, и
 # какой из них имелся в виду, решает форма обозначения. Двух разных цифр в
@@ -109,8 +114,7 @@ _ALTERNATIVES = _build_alternatives()
 # Сколько прочтений части разбирается; больше — часть не правится.
 _MAX_VARIANTS = 4096
 # Буква, которая на месте цифры читается цифрой (и только так).
-_AS_DIGIT = {"О": "0", "о": "0", "O": "0", "o": "0",
-             "З": "3", "з": "3", "I": "1", "l": "1", "І": "1", "і": "1"}
+_AS_DIGIT = {"О": "0", "о": "0", "O": "0", "o": "0", "З": "3", "з": "3"}
 
 
 def _loose(char: str) -> str:
@@ -288,9 +292,12 @@ def _repair_standard(match: "re.Match[str]") -> Optional[str]:
     digits = sum(char.isdigit() for char in number)
     if digits < 3 and not (digits >= 2 and _SEPARATOR.search(number)):
         return None
-    # Префикс, набранный строчными, без разделителя в номере — скорее
-    # обычное слово: «сто 058», «ту 44».
-    if not _SEPARATOR.search(number) and not _UPPER.search(match.group("prefix")):
+    # Префикс, набранный целиком строчными, — это обычное слово, а не
+    # ссылка: «сто 50-60 деталей», «ту 100-5», «рд 12-3». Разделитель в
+    # номере тут ничего не доказывает: диапазон «50-60» выглядит как номер
+    # стандарта, а «сто» перед диапазоном — обычная русская речь. Прописная
+    # буква в префиксе нужна всегда.
+    if not _UPPER.search(match.group("prefix")):
         return None
     return prefix + (match.group("sep") or "") + number
 
@@ -368,7 +375,7 @@ def repair_text(text: str) -> Tuple[str, List[Change]]:
 
 
 def repair_fragment(fragment) -> List[Change]:
-    """Обозначения текстового фрагмента; фрагмент получает пометку правки."""
+    """Обозначения текстового фрагмента; сделанные замены — в payload."""
     text = fragment.content.text
     if not text:
         return []
@@ -376,5 +383,10 @@ def repair_fragment(fragment) -> List[Change]:
     if not changes:
         return []
     fragment.content.text = repaired
-    fragment.warnings = list(dict.fromkeys(fragment.warnings + [WARNING]))
+    payload = fragment.content.structured_payload or {}
+    payload[PAYLOAD_KEY] = [
+        {"pattern": change.pattern, "before": change.before, "after": change.after}
+        for change in changes
+    ]
+    fragment.content.structured_payload = payload
     return changes

@@ -42,8 +42,10 @@ from core.providers.designation_repair import (
     ESKD_CODES, ESKD_KINDS, GRADES, STD_PREFIXES, Change, readings,
 )
 
-# Пометка фрагмента, в котором слово сведено к одному алфавиту.
-WARNING = "MIXED_SCRIPT_WORD_RESOLVED"
+# Ключ в `structured_payload` фрагмента, а не пометка: пометка означала бы
+# для RAG «текст неполный», а слово, сведённое к одному алфавиту, — это
+# текст вернее прежнего (см. `designation_repair.PAYLOAD_KEY`).
+PAYLOAD_KEY = "mixed_script_words"
 
 # Аббревиатуры, которые встречаются в корпусе написанными одним алфавитом.
 # Список настоящих сокращений: прочтения, которого здесь нет, не бывает.
@@ -111,7 +113,7 @@ def repair_text(text: str) -> Tuple[str, List[Change]]:
 
 
 def repair_fragment(fragment) -> List[Change]:
-    """Слова текстового фрагмента; фрагмент получает пометку правки."""
+    """Слова текстового фрагмента; сведённые слова — в payload."""
     text = fragment.content.text
     if not text:
         return []
@@ -119,5 +121,9 @@ def repair_fragment(fragment) -> List[Change]:
     if not changes:
         return []
     fragment.content.text = repaired
-    fragment.warnings = list(dict.fromkeys(fragment.warnings + [WARNING]))
+    payload = fragment.content.structured_payload or {}
+    payload[PAYLOAD_KEY] = [
+        {"before": change.before, "after": change.after} for change in changes
+    ]
+    fragment.content.structured_payload = payload
     return changes

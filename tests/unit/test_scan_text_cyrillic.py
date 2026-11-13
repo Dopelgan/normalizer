@@ -45,6 +45,16 @@ REQUIREMENTS_301129 = (
 )
 
 
+def _text_fragment(page, confidence, text, method="ocr_layer"):
+    return Fragment(
+        fragment_id=f"f{page}-{confidence}", type="text",
+        content=Content(text=text),
+        position=Position(page=page, bbox=[0.0, 0.0, 1.0, 1.0], order=1),
+        confidence=confidence, completeness=1.0,
+        provenance=Provenance(method=method, strategy_level=5, source="scanned_pdf"),
+    )
+
+
 # ------------------------------------------------- правка обозначений: правит
 def test_standard_number_restored_from_lowercase_and_letter_zero():
     """«нП-о01-97»: регистр и «о» на месте нуля заданы формой обозначения."""
@@ -162,23 +172,44 @@ def test_ordinary_words_and_measurements_left_alone():
         assert designation_repair.repair_text(text) == (text, [])
 
 
+def test_lowercase_prefix_before_a_range_is_ordinary_speech():
+    """
+    «сто 50-60 деталей» — это русская речь, а не «СТО 50-60»: префикс
+    целиком строчными ссылкой не делает и диапазон в номере. Прописная
+    буква в префиксе нужна всегда, иначе правится то, что было верным.
+    """
+    for text in ("Партия сто 50-60 деталей", "Нужно ту 100-5 проверить",
+                 "Передать рд 12-3 заказчику", "Отмерить сто 100 мм"):
+        assert designation_repair.repair_text(text) == (text, [])
+
+
 def test_english_text_left_alone():
     """В английской строке латинская «OCT» — это месяц, а не «ОСТ»."""
     text = "Tested to ISO 9001 and IEC 61010 in OCT 2020"
     assert designation_repair.repair_text(text) == (text, [])
 
 
+def test_repair_is_recorded_in_payload_and_not_as_a_warning():
+    """
+    Правка — не повод считать текст неполным. Для RAG любая пометка
+    фрагмента означает «текст неполный», и документ с восстановленным
+    обозначением терял бы полноту за то, что стал вернее. Поэтому замены
+    пишутся в payload, а `warnings` не трогаются.
+    """
+    fragment = _text_fragment(1, 0.7, "Чертёж ТАДУ 405210.001TY, 12X18H10T")
+    changes = designation_repair.repair_fragment(fragment)
+    assert len(changes) == 2 and not fragment.warnings
+    recorded = fragment.content.structured_payload[designation_repair.PAYLOAD_KEY]
+    assert {item["after"] for item in recorded} == {
+        "ТАДУ 405210.001ТУ", "12Х18Н10Т"}
+
+    mixed = _text_fragment(1, 0.7, "Код ККS изделия")
+    assert mixed_script.repair_fragment(mixed) and not mixed.warnings
+    assert mixed.content.structured_payload[mixed_script.PAYLOAD_KEY] == [
+        {"before": "ККS", "after": "KKS"}]
+
+
 # ------------------------------------------------------ порог перечитывания
-def _text_fragment(page, confidence, text, method="ocr_layer"):
-    return Fragment(
-        fragment_id=f"f{page}-{confidence}", type="text",
-        content=Content(text=text),
-        position=Position(page=page, bbox=[0.0, 0.0, 1.0, 1.0], order=1),
-        confidence=confidence, completeness=1.0,
-        provenance=Provenance(method=method, strategy_level=5, source="scanned_pdf"),
-    )
-
-
 def test_corrupted_page_crosses_the_threshold():
     """
     Страница требований 061360 (оценка распознавания 0,709) за порогом по
