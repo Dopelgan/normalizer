@@ -255,6 +255,12 @@ def classify(context: DocumentContext) -> Classification:
                 raster_drawing.KIND_UNREADABLE, 0.0, "изображение не открылось"
             )
         )
+        # Признаки, по которым род листа и определялся: рамка формата, число
+        # длинных линий, полосы строк, плотность графики. Они уже посчитаны —
+        # и без них о листе снаружи известно только название рода, а по
+        # названию не отличить лист, у которого рамка есть, от листа, у
+        # которого её нет (`core/ladder/drawing_route.py`).
+        signals.update(verdict.signals or {})
         signals["raster_kind"] = verdict.kind
         signals["raster_kind_confidence"] = round(verdict.confidence, 3)
         signals["raster_kind_reason"] = verdict.reason

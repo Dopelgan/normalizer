@@ -19,8 +19,14 @@
 2. После чтения листа моделью (`settle`): объём считается по тому, что
    чертёжная ветка действительно принесла, — текст листа, поля, таблицы.
    Если она не прочитала ничего или принесла меньше `LADDER_CONTENT_KEEP_RATIO`
-   от распознавания, текст распознавания возвращается в документ, а документ
-   уходит на проверку: бедный разбор не выдаётся за полный.
+   от распознавания, текст распознавания возвращается в документ: бедный
+   разбор не выдаётся за полный.
+
+С `LADDER_STRUCTURE_OVER_LENGTH` победителя определяет состав прочитанного, а
+не объём (`core/ladder/structure.py`), и ни один признак качества не зовёт
+человека: лист, прочитанный плохо, нужно прочитать заново, а решают люди не
+это (куда документ относится, как называется, какая редакция старше). Причины
+повторного чтения собирает `reprocess_candidate`.
 
 Объём считается осторожно. Поля и таблицы чертежа повторяют переписанный текст
 листа, а вырезка вида повторяет лист, поэтому на страницу берётся одно лучшее
@@ -37,6 +43,7 @@ from core import filetypes
 from core.config import settings
 from core.ladder.base import text_chars
 from core.ladder.context import GENRE_DRAWING, SOURCE_RASTER, DocumentContext
+from core.ladder.structure import drawing_structure, picture_only
 from core.models.contract import Fragment
 from core.models.parse_result import ParseResult
 
@@ -88,7 +95,49 @@ def deferred(context: DocumentContext) -> bool:
     if context.kind != filetypes.KIND_IMAGE:
         return False
     classification = context.classification
-    return classification.source == SOURCE_RASTER and classification.genre == GENRE_DRAWING
+    return (classification.source == SOURCE_RASTER
+            and classification.genre == GENRE_DRAWING)
+
+
+def unread_frame_sheet(context: DocumentContext, result: ParseResult) -> bool:
+    """
+    Лист с рамкой формата, который разбор вернул картинкой, ничего не прочитав.
+
+    Жанр листа ставит растровый детектор по числу длинных линий и полос
+    строк, и плотный лист он называет страницей текста: у СМ1638 при рамке
+    формата нашлось 2 длинных линии вместо трёх и 7 полос строк, род листа —
+    `text_scan`, и `deferred` на него не включался.
+
+    Но одной рамки мало. Рамку детектор находит и на обычной странице с
+    таблицами — по аудиту прода на 595 листах из 4771, среди них договоры,
+    банковские гарантии и программы обеспечения качества, — и лист
+    фотографии письма с печатной рамкой выиграть спор не должен. Поэтому
+    нужен второй признак, и приходит он от другого механизма: разбор с
+    детекцией областей вернул лист одной картинкой и не взял с него ни
+    строки (`structure.picture_only`). Страницу текста MinerU читает, а
+    чертёж отдаёт картинкой — и только во втором случае счёт символов
+    сравнивает непрочитанный лист с распознаванием.
+
+    Читает такой лист всё равно чертёжная ветка, по той же рамке
+    (`DrawingProcessor._full_read_image`): условие здесь то же, что у ветки,
+    иначе два шага одного конвейера считают лист разным.
+    """
+    if not settings.LADDER_STRUCTURE_OVER_LENGTH:
+        return False
+    if not (settings.LADDER_DRAWING_OVER_OCR and settings.DRAWING_IMAGE_FULL_READ):
+        return False
+    if context.kind != filetypes.KIND_IMAGE:
+        return False
+    classification = context.classification
+    if classification.source != SOURCE_RASTER or classification.genre == GENRE_DRAWING:
+        return False
+    return has_sheet_frame(classification) and picture_only(result)
+
+
+def has_sheet_frame(classification) -> bool:
+    """Растровый детектор видит на листе рамку формата."""
+    signals = classification.signals or {}
+    return bool(signals.get("frame") or signals.get("thin_line_frame"))
 
 
 def volume(fragments: List[Fragment]) -> Volume:
@@ -142,21 +191,72 @@ def settle(
 
     got = volume(fragments)
     reserve_chars = text_chars(reserve)
-    won = got.read > 0 and got.chars >= reserve_chars * settings.LADDER_CONTENT_KEEP_RATIO
+    found = drawing_structure(fragments)
+    # Нижняя граница объёма. Состав решает, кто старше, но отбрасывать
+    # вдвое более богатое чтение из-за двух полей нельзя: порог на состав
+    # можно перешагнуть и случайно — спасённая надпись, число, принятое за
+    # размер. Граница ничего не отнимает: при её срабатывании чертёжный
+    # разбор из документа не убирается, к нему добавляется текст
+    # распознавания, то есть итог заведомо не беднее любого из двух чтений.
+    # На корпусе прода (14 прочитанных листов) она не срабатывает ни разу:
+    # разбор держит от 1.4 до 7 раз больше символов, чем запас.
+    floor = reserve_chars * settings.LADDER_CONTENT_KEEP_RATIO
+    enough_text = got.chars >= floor
+    if settings.LADDER_STRUCTURE_OVER_LENGTH:
+        # Решает состав прочитанного, а не объём. Плоский текст полей листа
+        # не возвращает вовсе, поэтому чертёжный разбор с полями старше
+        # распознавания почти при любом числе символов — но не ниже границы.
+        won = found.structured and enough_text
+    else:
+        won = got.read > 0 and got.chars >= reserve_chars * settings.LADDER_CONTENT_KEEP_RATIO
+    # Ключи исхода пишутся всегда, в том числе ложными значениями: по ним
+    # качество разбора считают запросом к БД, а ключ, которого при хорошем
+    # исходе нет, в запросе неотличим от разбора, где сверки не было вовсе.
     outcome: Dict[str, Any] = {
         "won": won,
         "volume": got.as_dict(),
+        "structure": found.as_dict(),
         "reserve_strategy": reserve.parser_name,
         "reserve_chars": reserve_chars,
+        # Лист опознан не полностью: ни штампа, ни обозначения.
+        "thin_structure": bool(won and settings.LADDER_STRUCTURE_OVER_LENGTH
+                               and not found.complete),
+        # Разбор оставлен победителем, но символов в нём меньше, чем у
+        # распознавания.
+        "thinner_kept": bool(won and got.chars < reserve_chars),
+        # Чертёжная ветка проиграла сверку: текст распознавания возвращён.
+        "lost": not won,
+        # Состав чертёжный, а символов меньше нижней границы объёма: разбор
+        # остался в документе, но текст распознавания к нему возвращён.
+        "below_content_floor": bool(settings.LADDER_STRUCTURE_OVER_LENGTH
+                                    and found.structured and not enough_text),
     }
     parse_result.ladder["drawing_route"] = outcome
     parse_result.fallback_reserve = None
     if won:
         logger.info(
             "Лист прочитан чертёжной веткой: символов %d (полей %d, строк текста %d, "
-            "строк таблиц %d) против %d у распознавания",
+            "строк таблиц %d) против %d у распознавания; состав: штамп %s, "
+            "обозначение %s, величин %d, надписей видов %d",
             got.chars, got.fields, got.transcript_lines, got.table_rows, reserve_chars,
+            found.title_block, found.designation, found.dimensions, found.view_titles,
         )
+        if settings.LADDER_STRUCTURE_OVER_LENGTH and not found.complete:
+            # Поля есть, а штампа и обозначения на листе прочитать не
+            # удалось. Человеку такой лист показывать незачем: решать тут
+            # нечего — либо штампа на листе нет (обрезанный лист, вырезка,
+            # схема), либо модель его не нашла, и тогда нужен повторный
+            # разбор, а не чужие глаза. Разбор принимается как есть, а
+            # недочитанный штамп остаётся измеримым в `drawing_route`:
+            # по нему видно, сколько таких листов в установке, и это повод
+            # править чтение штампа, а не звать человека к каждому листу.
+            logger.info(
+                "Лист %s прочитан без штампа и обозначения: полей %d, величин %d, "
+                "надписей видов %d — разбор принят",
+                metadata.get("source_path") or "?", found.fields,
+                found.dimensions, found.view_titles,
+            )
+            return fragments, {}
         if got.chars < reserve_chars:
             # Недостача в допуске: текст распознавания не возвращается, но
             # документ уходит на проверку с этой строкой в предупреждениях.
@@ -165,7 +265,6 @@ def settle(
                 f"против {reserve_chars} у {reserve.parser_name} — "
                 "оставлен разбор чертежа"
             )
-            outcome["thinner_kept"] = True
             outcome["note"] = note
             parse_result.degraded = list(dict.fromkeys(
                 list(parse_result.degraded) + [note]
@@ -176,11 +275,26 @@ def settle(
             )
         return fragments, {}
 
-    note = (
-        f"чертёжный разбор беднее распознавания: {got.chars} символов "
-        f"(прочитано единиц: {got.read}) против {reserve_chars} у {reserve.parser_name} — "
-        "текст распознавания сохранён"
-    )
+    if outcome["below_content_floor"]:
+        note = (
+            f"чертёжный разбор ниже границы объёма: {got.chars} символов при "
+            f"границе {floor:.0f} ({reserve_chars} у {reserve.parser_name}) — "
+            "разбор чертежа оставлен, текст распознавания возвращён рядом"
+        )
+    elif settings.LADDER_STRUCTURE_OVER_LENGTH:
+        note = (
+            "чертёжный разбор без структуры: полей "
+            f"{found.fields}, штамп {'есть' if found.title_block else 'нет'}, "
+            f"обозначение {'есть' if found.designation else 'нет'}, величин "
+            f"{found.dimensions} — текст распознавания "
+            f"({reserve_chars} символов, {reserve.parser_name}) сохранён"
+        )
+    else:
+        note = (
+            f"чертёжный разбор беднее распознавания: {got.chars} символов "
+            f"(прочитано единиц: {got.read}) против {reserve_chars} у {reserve.parser_name} — "
+            "текст распознавания сохранён"
+        )
     # Пометка деградации до нормализации запаса: с ней его фрагменты уходят
     # на проверку, как и при обычной победе фоллбэка.
     reserve.degraded = list(dict.fromkeys(list(reserve.degraded) + [note]))
@@ -209,9 +323,63 @@ def lost(parse_result: ParseResult) -> bool:
 
 
 def thinner_kept(parse_result: ParseResult) -> bool:
-    """Разбор оставлен победителем, но символов в нём меньше, чем у распознавания."""
+    """
+    Разбор оставлен победителем, но символов в нём меньше, чем у распознавания.
+
+    Недочитанный штамп эту недостачу поглощает: лист, который не опознан,
+    и так записан на повторное чтение, а второе имя той же причины добавило
+    бы документу предупреждение — то есть вернуло бы его человеку на стороне
+    потребителя. В самом исходе оба факта лежат рядом и считаются оба.
+    """
     route = (parse_result.ladder or {}).get("drawing_route", {})
-    return bool(route.get("thinner_kept"))
+    return bool(route.get("thinner_kept")) and not route.get("thin_structure")
+
+
+# Признаки качества, которые лечатся повторным чтением листа, а не человеком:
+# модель не прочитала лист, прочитала его короче распознавания, не нашла
+# штампа, не успела в бюджет времени. Все четыре — про то, как прошло чтение,
+# и ни один не требует решения, которое может принять только человек.
+#: Причина повторного чтения, а не предупреждение документа: штамп и
+#: обозначение на листе прочитать не удалось.
+THIN_STRUCTURE = "DRAWING_ROUTE_THIN_STRUCTURE"
+
+REPROCESS_WARNINGS = (
+    WARNING_THIN,
+    WARNING_THIN_KEPT,
+    "DRAWING_NOT_RECOGNIZED",
+    "DRAWING_SKIPPED_NO_TIME",
+    "DRAWING_SHEETS_SKIPPED",
+)
+
+
+def reprocess_candidate(warnings: List[str], parse_result: ParseResult) -> List[str]:
+    """
+    Причины, по которым документ стоит прочитать заново.
+
+    Пусто — перечитывать нечего. Непустое значение уезжает в
+    `documents.extra_data.quality_reprocess`, и по нему документы отбираются
+    на повторное чтение запросом к БД, а не руками: ни одна из причин не
+    требует человека, и держать их в очереди проверки незачем.
+    """
+    found = [warning for warning in dict.fromkeys(warnings)
+             if warning.startswith(REPROCESS_WARNINGS)]
+    if thin_structure(parse_result):
+        # Предупреждением документа недочитанный штамп не становится:
+        # предупреждение уехало бы потребителю и вернулось бы человеком.
+        found.append(THIN_STRUCTURE)
+    return found
+
+
+def thin_structure(parse_result: ParseResult) -> bool:
+    """
+    Разбор чертёжный, но штампа и обозначения на листе прочитать не удалось.
+
+    Наблюдение, а не повод звать человека: смотреть ему тут нечего, решать
+    нечего, а недочитанный штамп лечится повторным чтением листа. Признак
+    нужен, чтобы такие листы можно было посчитать в установке.
+    """
+    route = (parse_result.ladder or {}).get("drawing_route", {})
+    return bool(route.get("thin_structure"))
 
 
 def _chars(value: Any) -> int:

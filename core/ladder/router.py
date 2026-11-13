@@ -272,6 +272,26 @@ class LadderRouter:
 
             if structural:
                 structural_seen = True
+                # Место этих строк важно, и важность его не видна: признак
+                # должен быть выставлен до `candidates.append` ниже, потому
+                # что `candidate_rank` читает `sheet_read_later` из
+                # объемлющей области на каждом вызове `max`. Переставишь —
+                # кандидат попадёт в сравнение с прежним значением, и
+                # лестница молча вернётся к счёту символов.
+                if (not sheet_read_later
+                        and not self._keeps_content(chars, fallback_chars)
+                        and drawing_route.unread_frame_sheet(context, result)):
+                    # Лист с рамкой формата вернулся картинкой без текста:
+                    # читать его будет чертёжная ветка, и до её чтения счёт
+                    # символов сравнивает непрочитанный лист с
+                    # распознаванием. Старшинство такому разбору даётся
+                    # авансом — ровно как листу жанра `drawing`.
+                    sheet_read_later = True
+                    logger.info(
+                        "Лист %s: рамка формата есть, уровень %d вернул лист "
+                        "картинкой без текста — лист прочитает чертёжная ветка",
+                        context.uri, strategy.level,
+                    )
             else:
                 fallback_chars = max(fallback_chars, chars)
 
