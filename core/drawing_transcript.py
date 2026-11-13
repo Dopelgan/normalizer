@@ -27,6 +27,7 @@ import re
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
 
+from core.config import settings
 from core.models.contract import Fragment
 
 WARNING = "TEXT_FROM_VLM_TRANSCRIPT"
@@ -79,10 +80,46 @@ def apply_transcripts(fragments: List[Fragment]) -> List[Fragment]:
             if variant is not None:
                 start, end = variant
                 reading = " ".join(line for line, _ in lines[start:end])
-                fragment.content.text = f"{text}\n{reading}{VARIANT_MARK}"
-                fragment.warnings = list(dict.fromkeys(fragment.warnings + [VARIANT_WARNING]))
+                _add_variant(fragment, text, reading)
         result.append(fragment)
     return result
+
+
+def _add_variant(fragment: Fragment, text: str, reading: str) -> None:
+    """
+    Второе чтение той же надписи, расходящееся цифрой.
+
+    Что здесь важно: `content.text` — это то, что видит заказчик в выдаче
+    поиска, а не наш журнал. Приписка «(вариант чтения модели, требует
+    сверки)» обещала проверку, которой не будет: качество чтения листа
+    человеку не адресовано, файл уходит к нему только за кластером, именем
+    и конфликтом версий. Обещание, которое никто не исполнит, хуже
+    молчания, да и служебные слова попадали в индекс отдельными токенами.
+
+    Поэтому с флагом DRAWING_TRANSCRIPT_VARIANT_CLEAN в тексте остаются оба
+    чтения и ничего больше — оба находятся поиском, а чем они друг другу
+    приходятся, сказано в payload, где этому и место:
+    `transcript_variants` — пары «распознавание / модель»,
+    `transcript_verify_candidate` — заявка на машинную сверку.
+    Как показать это читателю, решает интерфейс, а не строка в индексе.
+    """
+    if not settings.DRAWING_TRANSCRIPT_VARIANT_CLEAN:
+        fragment.content.text = f"{text}\n{reading}{VARIANT_MARK}"
+        fragment.warnings = list(dict.fromkeys(fragment.warnings + [VARIANT_WARNING]))
+        return
+
+    fragment.content.text = f"{text}\n{reading}"
+    payload = dict(fragment.content.structured_payload or {})
+    variants = list(payload.get("transcript_variants") or [])
+    variants.append({"ocr": text, "model": reading})
+    payload["transcript_variants"] = variants
+    payload["transcript_variant_count"] = len(variants)
+    # Правильное действие при расхождении — сверить машинно, а не спросить.
+    payload["transcript_verify_candidate"] = True
+    fragment.content.structured_payload = payload
+    # Пометка остаётся: на ней стоит сегодняшний учёт у потребителя, и
+    # снимать её вместе с припиской — две несвязанные перемены разом.
+    fragment.warnings = list(dict.fromkeys(fragment.warnings + [VARIANT_WARNING]))
 
 
 def _page_transcripts(fragments: List[Fragment]) -> Dict[int, List[Tuple[str, str]]]:
