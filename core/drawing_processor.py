@@ -596,6 +596,13 @@ class DrawingProcessor:
             logger.warning("Штамп не прочитан")
             return False
         parsed = _merge_blocks(parsed, side)
+        if settings.DRAWING_DIMENSION_FIDELITY:
+            # «7:1» в графе «Масштаб» — это «1:1»: курсивная «1» похожа на
+            # «7», а ряд масштабов по ГОСТ 2.302 узкий. Правка делается до
+            # payload, чтобы в structured_payload и в полях стояло одно и
+            # то же значение, а запись MinerU с тем же «7:1» не оказалась
+            # повтором исправленного прочтения.
+            _repair_scale_graph(parsed)
 
         payload["title_block"] = dict(parsed.get("fields") or {})
         handwritten = dict(parsed.get("handwritten") or {})
@@ -869,6 +876,19 @@ def _merge_blocks(
         if merged["handwritten"].get(key, "").strip() == value.strip():
             merged["fields"].pop(key)
     return merged
+
+
+def _repair_scale_graph(parsed: Dict[str, Any]) -> None:
+    """
+    Значение графы «Масштаб» в разборе штампа — приводится к ряду
+    ГОСТ 2.302 (`dimension_fidelity.repair_scale`). Правится только эта
+    графа: отношение в любом другом месте листа масштабом не является.
+    """
+    for part_name in ("fields", "handwritten"):
+        part = parsed.get(part_name) or {}
+        value = part.get(title_block.SCALE)
+        if isinstance(value, str) and value:
+            part[title_block.SCALE] = dimension_fidelity.repair_scale(value)
 
 
 def _is_material(name: str, text: str) -> bool:

@@ -348,7 +348,7 @@ class QwenVisionClient:
         вырезке и путаются фамилии и код документа. Тот же потолок обязан
         стоять и в `drawing_vision.crop`, иначе вырезку ужмут до отправки.
         """
-        data = self._ask(image, _TITLE_BLOCK_FIELDS_PROMPT,
+        data = self._ask(image, _careful(_TITLE_BLOCK_FIELDS_PROMPT),
                          settings.QWEN_TITLE_BLOCK_MAX_SIDE)
         if data is None:
             return None
@@ -356,7 +356,8 @@ class QwenVisionClient:
 
     def read_side_column(self, image) -> Optional[Dict[str, Any]]:
         """Колонка дополнительных граф у левого поля -> графы и рукописные."""
-        data = self._ask(image, _SIDE_COLUMN_PROMPT, settings.QWEN_TITLE_BLOCK_MAX_SIDE)
+        data = self._ask(image, _careful(_SIDE_COLUMN_PROMPT),
+                         settings.QWEN_TITLE_BLOCK_MAX_SIDE)
         if data is None:
             return None
         return title_block.parse(data)
@@ -658,6 +659,18 @@ def _with_fixed_grade(annotation: Dict[str, Any]) -> Dict[str, Any]:
 def fix_grade(text: str) -> str:
     """«04Х19Н11МЗ» -> «04Х19Н11М3» (DRAWING_SMALL_PRINT_CARE); прочий текст не меняется."""
     return _GRADE_M3.sub(r"\g<1>3", text) if settings.DRAWING_SMALL_PRINT_CARE else text
+
+
+def _careful(prompt: str) -> str:
+    """
+    Запрос по штампу с правилом про путающиеся буквы
+    (`DRAWING_DIMENSION_FIDELITY`). Нужен и отдельному проходу по штампу
+    (`DRAWING_TITLE_BLOCK_PASS`), и колонке у левого поля: фамилии и
+    обозначение шва путаются в обоих запросах одинаково.
+    """
+    if not settings.DRAWING_DIMENSION_FIDELITY:
+        return prompt
+    return prompt + _CAREFUL_LETTERS_RULE
 
 
 def _transcribe_prompt() -> str:

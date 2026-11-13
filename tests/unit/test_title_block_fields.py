@@ -591,3 +591,73 @@ class TestWholeSheetIsNotAFrame:
             image=Image.new("L", (1653, 2339), 255), frame=[0.0, 0.0, 1.0, 1.0],
         )
         assert drawing_vision.stamp_bbox(layout) is None
+
+# ===========================================================================
+# Стык с достоверностью размеров (пачка 4)
+# ===========================================================================
+
+class TestFidelityOnTitleBlockPass:
+    """
+    Отдельный проход по штампу (DRAWING_TITLE_BLOCK_PASS) заменил прежнее
+    чтение области, а правки достоверности размеров
+    (DRAWING_DIMENSION_FIDELITY) были сделаны в прежнем пути. На проде оба
+    флага включены вместе, поэтому проверяется именно эта пара: правка
+    масштаба и правило про путающиеся буквы обязаны доезжать и здесь.
+    """
+
+    def test_scale_graph_repaired_with_both_flags(self, storage, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
+        monkeypatch.setattr(settings, "DRAWING_DIMENSION_FIDELITY", True)
+        qwen = FakeQwen(block=title_block.parse(
+            {"fields": {"Масштаб": "7:1", "Масса": "12,35"}}
+        ))
+        processor = DrawingProcessor(storage, qwen=qwen)
+        result = processor.process(SHEET_URI, {})
+        # Значение одно и то же и в structured_payload, и в поле чертежа:
+        # иначе запись MinerU с «7:1» окажется повтором исправленного.
+        assert result["payload"]["title_block"]["scale"] == "1:1"
+        fragment = processor.enrich_fragments([sheet_fragment()], {})[0]
+        assert "Масштаб: 1:1" in values(fragment)
+
+    def test_scale_graph_untouched_without_fidelity_flag(self, storage, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
+        monkeypatch.setattr(settings, "DRAWING_DIMENSION_FIDELITY", False)
+        qwen = FakeQwen(block=title_block.parse({"fields": {"Масштаб": "7:1"}}))
+        result = DrawingProcessor(storage, qwen=qwen).process(SHEET_URI, {})
+        assert result["payload"]["title_block"]["scale"] == "7:1"
+
+    def test_mass_is_not_mistaken_for_a_scale(self, storage, monkeypatch):
+        """Правка зовётся только для графы «Масштаб»."""
+        monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
+        monkeypatch.setattr(settings, "DRAWING_DIMENSION_FIDELITY", True)
+        qwen = FakeQwen(block=title_block.parse(
+            {"fields": {"Масса": "7:1", "Лист": "7"}}
+        ))
+        result = DrawingProcessor(storage, qwen=qwen).process(SHEET_URI, {})
+        assert result["payload"]["title_block"]["mass"] == "7:1"
+        assert result["payload"]["title_block"]["sheet"] == "7"
+
+    @pytest.mark.parametrize("method", ["read_title_block_fields", "read_side_column"])
+    def test_careful_letters_rule_reaches_both_stamp_prompts(self, method, monkeypatch):
+        """
+        Правило про «б/в», «ж/х», «н/п» и обозначение шва нужно и вырезке
+        штампа, и колонке у левого поля: фамилии путаются в обеих.
+        """
+        from core.providers import qwen_client
+
+        asked = []
+
+        def fake_ask(self, image, prompt, max_side):
+            asked.append(prompt)
+            return None
+
+        monkeypatch.setattr(qwen_client.QwenVisionClient, "_ask", fake_ask)
+        client = qwen_client.QwenVisionClient.__new__(qwen_client.QwenVisionClient)
+
+        monkeypatch.setattr(settings, "DRAWING_DIMENSION_FIDELITY", True)
+        getattr(client, method)(object())
+        assert "Ербасов" in asked[-1] and "Н1-ИНп" in asked[-1]
+
+        monkeypatch.setattr(settings, "DRAWING_DIMENSION_FIDELITY", False)
+        getattr(client, method)(object())
+        assert "Ербасов" not in asked[-1]
