@@ -232,3 +232,15 @@ def test_default_is_sequential(monkeypatch):
     assert result == [(p, p) for p in range(5)]
     assert threads == {threading.current_thread().name}
     assert "OMP_THREAD_LIMIT" not in os.environ
+
+
+def test_parse_pages_passes_soft_time_limit_through(provider, monkeypatch):
+    """Мягкий предел задачи во время рендера страниц не превращается в «OCR недоступен»."""
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    def _expired(*args, **kwargs):
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(tesseract_fallback, "convert_from_path", _expired)
+    with pytest.raises(SoftTimeLimitExceeded):
+        provider.parse_pages("s3://bucket/doc.pdf", [1, 2], file_type="pdf")

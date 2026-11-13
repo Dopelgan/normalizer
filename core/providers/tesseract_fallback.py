@@ -141,6 +141,8 @@ class TesseractFallbackProvider:
                 images = convert_from_path(
                     local_path, first_page=first, last_page=last, dpi=settings.OCR_DPI
                 )
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.error("pdf2image не смог обработать страницы %s: %s", pages, exc)
                 raise OcrUnavailable(str(exc)) from exc
