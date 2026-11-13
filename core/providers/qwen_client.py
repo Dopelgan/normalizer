@@ -209,6 +209,44 @@ _TRANSCRIBE_PROMPT = """Перепиши весь текст, который е�
 """
 
 
+# Знак шероховатости в правом верхнем углу поля чертежа
+# (`DRAWING_CORNER_ROUGHNESS`). Вопрос узкий нарочно: вырезку угла нашла
+# геометрия, и модель отвечает только, есть ли в ней знак. Что этот знак
+# значит, решает не она, а `core.drawing_kinds.general_roughness`.
+_CORNER_ROUGHNESS_PROMPT = """На картинке — правый верхний угол поля чертежа. По ГОСТ 2.309 сюда
+выносят знак шероховатости поверхностей, не обозначенных на изображениях:
+знак «√» с параметром («Ra 6,3», «Rz 40») и, если на видах стоят свои знаки,
+после него тот же знак в скобках — «√ Ra 6,3 (√)». Верни JSON:
+
+{"sign": true, "value": "Ra 6,3", "bracket_sign": true}
+
+Правила:
+- sign — есть ли в углу знак шероховатости с параметром. Заголовок вида,
+  размер, обозначение чертежа и любая другая надпись знаком не считаются.
+- value — параметр и число как на листе, с запятой: «Ra 6,3», «Rz 40».
+- bracket_sign — стоит ли после значения знак шероховатости в скобках.
+- Знака в углу нет — верни {"sign": false}. Ничего не додумывай.
+"""
+
+# Размеры по изображениям (`DRAWING_VALUE_KIND`). Заголовки переданы
+# списком: модель не придумывает их, а раскладывает по ним то, что видит.
+# Ответ принимается не на веру — см. `core.drawing_kinds.view_membership`.
+_VIEW_VALUES_PROMPT = """На листе чертежа есть изображения с заголовками: {titles}.
+Для каждого заголовка перечисли размеры, которые проставлены на изображении
+под этим заголовком. Верни JSON:
+
+{{"views": [{{"title": "<заголовок из списка>", "values": ["<размер как на листе>"]}}]}}
+
+Правила:
+- title — ровно как в списке выше.
+- values — размеры, углы и радиусы как на листе: «⌀32», «35°», «R1», «20±0,1».
+- Включай только размеры самого изображения с этим заголовком. Размеры
+  главного вида, видов без заголовка и других изображений не включай.
+- Не уверен, к какому изображению относится размер, — не включай его.
+  Ничего не додумывай.
+"""
+
+
 # Знак отклонения и справочная звёздочка (`DRAWING_DIMENSION_FIDELITY`).
 # В транскрипции листа «30±10*» приходило как «30+10*», а на вырезке вида
 # знак был верный: модель подменяет «±» на «+» сама, и правится это запросом.
@@ -235,6 +273,11 @@ _SMALL_PRINT_RULE = """- Запятую в десятичной дроби не 
   вверху и внизу от размера, пиши полностью, со знаком и запятой: «12+0,8»,
   «40−0,25», «⌀16(+0,018/−0,007)».
 """
+
+# Потолок ответа на вопрос с ответом в одну строку: длинный ответ на такой
+# вопрос — уже не ответ, и ждать его незачем.
+_SHORT_ANSWER_TOKENS = 200
+
 
 @dataclass
 class SheetReading:
@@ -373,6 +416,33 @@ class QwenVisionClient:
             "headers": [str(h) for h in headers] if isinstance(headers, list) else [],
             "rows": _string_rows(data.get("rows")),
         }
+
+    def read_corner_roughness(self, image) -> Optional[Dict[str, Any]]:
+        """
+        Вырезка правого верхнего угла поля чертежа -> есть ли в ней знак
+        шероховатости, его значение и знак в скобках
+        (DRAWING_CORNER_ROUGHNESS). `None` — модель не ответила.
+        """
+        data = self._ask(image, _CORNER_ROUGHNESS_PROMPT, settings.QWEN_REGION_MAX_SIDE,
+                         max_tokens=_SHORT_ANSWER_TOKENS)
+        if data is None:
+            return None
+        return {
+            "sign": data.get("sign") is True,
+            "value": str(data.get("value") or ""),
+            "bracket_sign": data.get("bracket_sign") is True,
+        }
+
+    def read_view_values(self, image, titles: Sequence[str]) -> Optional[Dict[str, Any]]:
+        """
+        Лист целиком -> какие размеры стоят на изображении с каким
+        заголовком (DRAWING_VALUE_KIND). `None` — модель не ответила.
+        """
+        prompt = _VIEW_VALUES_PROMPT.format(titles=", ".join(f"«{title}»" for title in titles))
+        data = self._ask(image, prompt, settings.QWEN_SHEET_MAX_SIDE)
+        if data is None or not isinstance(data.get("views"), list):
+            return None
+        return {"views": [view for view in data["views"] if isinstance(view, dict)]}
 
     def transcribe(self, image) -> Optional[List[str]]:
         """Весь текст листа строками: штамп, графы, примечания, таблицы."""

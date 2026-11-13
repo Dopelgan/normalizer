@@ -73,6 +73,7 @@ from core.providers import (
 from core.providers.qwen_client import CATEGORIES, QwenVisionClient
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.vector_drawing import structure_ratio
+from core import drawing_kinds
 from core.drawing_quality import apply_drawing_quality
 from core.drawing_stale_sources import suppress_stale_sources
 from core.drawing_transcript import apply_transcripts
@@ -206,6 +207,16 @@ class DrawingProcessor:
             # Один размер, прочитанный и на листе целиком, и на вырезке вида:
             # остаётся прочтение со знаком «±» и со справочной звёздочкой.
             fields = dimension_fidelity.merge_readings(fields)
+        if settings.DRAWING_VALUE_KIND:
+            drawing_kinds.mark_chamfers(fields)
+        # Читается сам файл, а не вырезка из него, — значит, это лист целиком:
+        # только у листа есть правый верхний угол поля чертежа и заголовки
+        # изображений (`core/drawing_kinds.py`).
+        if image_ref and image_ref == str(metadata.get("source_path") or ""):
+            if settings.DRAWING_CORNER_ROUGHNESS:
+                self._general_roughness(layout, fields, lines, payload, started)
+            if settings.DRAWING_VALUE_KIND:
+                self._view_membership(layout, fields, lines, payload, started)
         mode = MODE_VISION_VLM if (self.vision_enabled and layout.regions) else MODE_SHEET_ONLY
         if not fields and not payload["tables"] and not payload.get("transcript_lines"):
             return _empty(MODE_NONE)
@@ -522,6 +533,68 @@ class DrawingProcessor:
     def _out_of_time(self, started: float) -> bool:
         budget = settings.DRAWING_TIME_BUDGET
         return bool(budget) and (time.monotonic() - started) > budget
+
+    def _can_ask(self, started: float) -> bool:
+        """Есть ли время ещё на один вызов модели: бюджет листа и срок задачи."""
+        left = deadline.remaining()
+        return not self._out_of_time(started) and (left is None or left >= settings.VLM_TIMEOUT)
+
+    # ------------------------------------------------------- род значения
+    def _general_roughness(
+        self,
+        layout: drawing_vision.SheetLayout,
+        fields: List[Dict[str, Any]],
+        transcript: Optional[List[str]],
+        payload: Dict[str, Any],
+        started: float,
+    ) -> None:
+        """
+        Знак шероховатости в правом верхнем углу поля чертежа
+        (DRAWING_CORNER_ROUGHNESS). Вырезка угла читается отдельным коротким
+        запросом, если чтение листа не дало поля со знаком в самом углу;
+        решение — `drawing_kinds.general_roughness`. Итог, в том числе отказ
+        и его причина, пишется в `payload["corner_roughness"]`.
+        """
+        corner = drawing_vision.roughness_corner(layout)
+        reading = None
+        if corner and drawing_kinds.needs_corner_reading(fields, corner) and self._can_ask(started):
+            reading = self.qwen.read_corner_roughness(
+                drawing_vision.crop(layout.image, corner, padding=0.0))
+        decision = drawing_kinds.general_roughness(fields, transcript, corner, reading)
+        if corner:
+            decision["bbox"] = corner
+        payload["corner_roughness"] = decision
+        value = decision.get("value")
+        if value and not drawing_kinds.mark_general_roughness(fields, value, corner):
+            # Значение есть на вырезке угла и в тексте листа, а полем его
+            # чтение листа не вернуло: поле создаётся на месте угла.
+            fields.append(_field(category="roughness", text=value, bbox=list(corner),
+                                 confidence=_FROM_REGION))
+            drawing_kinds.mark_general_roughness(fields, value, corner)
+
+    def _view_membership(
+        self,
+        layout: drawing_vision.SheetLayout,
+        fields: List[Dict[str, Any]],
+        transcript: Optional[List[str]],
+        payload: Dict[str, Any],
+        started: float,
+    ) -> None:
+        """
+        Размеры на изображениях с заголовками (DRAWING_VALUE_KIND): модель
+        раскладывает размеры по заголовкам, `drawing_kinds.view_membership`
+        принимает только проверенное. Лист без заголовков, прочитанных
+        обоими проходами, не спрашивается.
+        """
+        titles = drawing_kinds.view_titles(fields, transcript)
+        if not titles:
+            return
+        names = [drawing_kinds.title_text(field) for field in titles.values()]
+        answer = self.qwen.read_view_values(layout.image, names) if self._can_ask(started) else None
+        payload["view_membership"] = {
+            "titles": names, "read": answer is not None,
+            **drawing_kinds.view_membership(fields, titles, answer, transcript),
+        }
 
     # ------------------------------------------------------------ чтение
     def _read_title_block(

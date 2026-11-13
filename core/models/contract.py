@@ -19,7 +19,10 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel, ConfigDict, Field, field_serializer, field_validator, model_serializer,
+    model_validator,
+)
 
 FragmentType = Literal["text", "table", "formula", "drawing", "image", "structured"]
 DocumentStatus = Literal["pending", "indexed", "error"]
@@ -225,6 +228,23 @@ class DrawingField(BaseModel):
         "detected_from_annotation", "reference_table", "expert_verified",
         "full_page_ocr", "vector_text_layer",
     ] = "detected_from_annotation"
+    # Род значения из оформления листа (core/drawing_kinds.py):
+    # `roughness_unspecified_surfaces`, `chamfer`; `kind_label` — он же
+    # по-русски. `view` — заголовок изображения, на котором стоит размер.
+    # В отличие от остальных ключей, эти приходят только заполненными: поле
+    # без подписи выглядит ровно как до появления подписей, и разбор с
+    # выключенными флагами не меняется ни на байт.
+    kind: Optional[str] = None
+    kind_label: Optional[str] = None
+    view: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _only_set_kind(self, handler):
+        data = handler(self)
+        for key in ("kind", "kind_label", "view"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class Content(BaseModel):

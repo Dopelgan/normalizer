@@ -395,6 +395,30 @@ def title_block_crop(layout: "SheetLayout", region: Region) -> List[float]:
     return stamp_bbox(layout) or list(region.bbox)
 
 
+# Правый верхний угол поля чертежа, куда по ГОСТ 2.309 выносят знак
+# шероховатости неуказанных поверхностей: доли ширины и высоты рамки. Знак
+# стоит в 5–10 мм от рамки и занимает около 45×10 мм; на A4 это до четверти
+# ширины и десятой части высоты поля. Шире брать нельзя: в вырезку попадёт
+# вид со своим, местным знаком.
+_ROUGHNESS_CORNER = (0.3, 0.12)
+
+
+def roughness_corner(layout: "SheetLayout") -> Optional[List[float]]:
+    """
+    Угол поля чертежа под знак шероховатости или None, если рамка формата
+    не найдена: без неё «правый верхний угол» — это угол картинки, а на
+    скане с полями он пуст.
+    """
+    if not layout.frame:
+        return None
+    left, top, right, bottom = (float(value) for value in layout.frame)
+    width, height = _ROUGHNESS_CORNER
+    return [
+        round(right - width * (right - left), 4), round(top, 4),
+        round(right, 4), round(top + height * (bottom - top), 4),
+    ]
+
+
 def upright(image, turn: int = -90):
     """
     Колонка дополнительных граф, повёрнутая под чтение. По ГОСТ 2.104
