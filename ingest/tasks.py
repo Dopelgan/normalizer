@@ -24,6 +24,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from core import filetypes, telemetry
 from core.celery_app import app
 from core import deadline
+from core import document_parts
 from core.config import settings
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import document_quality
@@ -517,6 +518,11 @@ def process_document(
                 fragments, parse_result, metadata, normalizer
             )
             flags_by_id.update(restored_flags)
+
+        # Ярлык и его значения — один фрагмент (DOCUMENT_PARTS_MARKUP, по
+        # умолчанию выключено). До выдачи идентификаторов и фактов: иначе
+        # факты считались бы по фрагменту, которого в контракте уже нет.
+        fragments = document_parts.apply(fragments)
 
         # Идентификаторы, происхождение и факты — после ветки чертежей:
         # она заменяет фрагменты и вставляет разбор листа целиком, и только
