@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 # Предупреждение документа: чертёжный разбор листа беднее распознавания.
 WARNING_THIN = "DRAWING_ROUTE_THINNER_THAN_OCR"
 
+# Разбор уложился в допуск `LADDER_CONTENT_KEEP_RATIO`, но символов в нём
+# всё равно меньше, чем выдало распознавание. Текст распознавания при этом
+# не возвращается — иначе допуск не имел бы смысла, — поэтому недостача
+# обязана быть видна: без неё лист, прочитанный наполовину, уходит как
+# полный и молча.
+WARNING_THIN_KEPT = "DRAWING_ROUTE_THINNER_KEPT"
+
 _TITLE_BLOCK = "title_block"
 
 
@@ -150,6 +157,23 @@ def settle(
             "строк таблиц %d) против %d у распознавания",
             got.chars, got.fields, got.transcript_lines, got.table_rows, reserve_chars,
         )
+        if got.chars < reserve_chars:
+            # Недостача в допуске: текст распознавания не возвращается, но
+            # документ уходит на проверку с этой строкой в предупреждениях.
+            note = (
+                f"чертёжный разбор короче распознавания: {got.chars} символов "
+                f"против {reserve_chars} у {reserve.parser_name} — "
+                "оставлен разбор чертежа"
+            )
+            outcome["thinner_kept"] = True
+            outcome["note"] = note
+            parse_result.degraded = list(dict.fromkeys(
+                list(parse_result.degraded) + [note]
+            ))
+            logger.warning(
+                "Лист %s прочитан короче распознавания: %s",
+                metadata.get("source_path") or "?", note,
+            )
         return fragments, {}
 
     note = (
@@ -182,6 +206,12 @@ def settle(
 def lost(parse_result: ParseResult) -> bool:
     """Чертёжная ветка получила лист и проиграла сверку: документ не полон."""
     return (parse_result.ladder or {}).get("drawing_route", {}).get("won") is False
+
+
+def thinner_kept(parse_result: ParseResult) -> bool:
+    """Разбор оставлен победителем, но символов в нём меньше, чем у распознавания."""
+    route = (parse_result.ladder or {}).get("drawing_route", {})
+    return bool(route.get("thinner_kept"))
 
 
 def _chars(value: Any) -> int:

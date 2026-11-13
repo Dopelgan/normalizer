@@ -476,6 +476,11 @@ def process_document(
             # Бедный разбор листа не выдаётся за полный: документ на проверку.
             review_required = True
             drawing_warnings.append(drawing_route.WARNING_THIN)
+        elif drawing_route.thinner_kept(parse_result):
+            # Недостача в пределах допуска: разбор оставлен, но лист всё
+            # равно прочитан короче распознавания — тоже на проверку.
+            review_required = True
+            drawing_warnings.append(drawing_route.WARNING_THIN_KEPT)
         warnings = list(dict.fromkeys(warnings + drawing_warnings))
         document_status = "partial" if report["failed_pages"] or report["coverage_unknown"] or review_required else "completed"
         mime_type = filetypes.mime_for(located.file_type)

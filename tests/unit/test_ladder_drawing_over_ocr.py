@@ -305,6 +305,36 @@ class TestSettleAfterSheetRead:
         assert any("текст распознавания сохранён" in note for note in result.degraded)
         assert drawing_route.lost(result) is True
 
+    def test_kept_but_thinner_read_is_not_passed_off_as_whole(self):
+        """
+        Разбор уложился в допуск `LADDER_CONTENT_KEEP_RATIO`, но прочитал
+        вдвое меньше распознавания. Текст распознавания не возвращается —
+        иначе допуск не имел бы смысла, — зато недостача видна: без неё
+        полулист уходил победителем и молча.
+        """
+        result = chosen_with_reserve(2985)
+        lines = [f"XT{i} A{i} B{i} 0,75" for i in range(160)]
+        fragments = [drawing_sheet(lines=lines)]
+        settled, flags = drawing_route.settle(fragments, result, METADATA, TextNormalizer())
+        route_outcome = result.ladder["drawing_route"]
+        assert [f.type for f in settled] == ["drawing"] and flags == {}
+        assert route_outcome["won"] is True
+        assert route_outcome["thinner_kept"] is True
+        assert route_outcome["volume"]["chars"] < route_outcome["reserve_chars"]
+        assert any("короче распознавания" in note for note in result.degraded)
+        assert drawing_route.thinner_kept(result) is True
+        assert drawing_route.lost(result) is False
+
+    def test_full_read_is_not_marked_thinner(self):
+        """Разбор не беднее распознавания — ни пометки, ни деградации."""
+        result = chosen_with_reserve(1692)
+        lines = [f"XT{i} A{i} B{i} 0,75" for i in range(200)]
+        fragments = [drawing_sheet(lines=lines, fields=["XT1", "XT2"])]
+        drawing_route.settle(fragments, result, METADATA, TextNormalizer())
+        assert "thinner_kept" not in result.ladder["drawing_route"]
+        assert result.degraded == []
+        assert drawing_route.thinner_kept(result) is False
+
     def test_thin_read_does_not_replace_richer_recognition(self):
         """Три размера против 2985 символов распознавания: остаётся и то и другое."""
         result = chosen_with_reserve(2985)
@@ -385,3 +415,19 @@ class TestDocumentAfterSettle:
         # Служебные пометки возвращённого текста доехали до БД.
         assert all(flags["is_fallback"] and flags["needs_review"]
                    for kind, flags in rows if kind == "text")
+
+    def test_kept_but_thinner_sheet_goes_to_review(self, run):
+        """Недостача в допуске доезжает до документа предупреждением."""
+        lines = [f"XT{i} A{i} B{i} 0,75" for i in range(160)]
+
+        def enrich(self, fragments, metadata):
+            return [drawing_sheet(lines=lines, fragment_id="sheet")]
+
+        document, extra, rows = run(2985, enrich)
+        assert [f["type"] for f in document["fragments"]] == ["drawing"]
+        assert document["status"] == "partial"
+        assert document["review_required"] is True
+        assert drawing_route.WARNING_THIN_KEPT in document["warnings"]
+        assert drawing_route.WARNING_THIN not in document["warnings"]
+        assert extra["drawing_route"]["won"] is True
+        assert extra["drawing_route"]["thinner_kept"] is True
