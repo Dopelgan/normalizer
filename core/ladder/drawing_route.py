@@ -37,6 +37,7 @@ from core import filetypes
 from core.config import settings
 from core.ladder.base import text_chars
 from core.ladder.context import GENRE_DRAWING, SOURCE_RASTER, DocumentContext
+from core.ladder.structure import drawing_structure
 from core.models.contract import Fragment
 from core.models.parse_result import ParseResult
 
@@ -44,6 +45,15 @@ logger = logging.getLogger(__name__)
 
 # Предупреждение документа: чертёжный разбор листа беднее распознавания.
 WARNING_THIN = "DRAWING_ROUTE_THINNER_THAN_OCR"
+
+# Разбор чертёжный по составу, но лист по нему не опознан: ни штампа, ни
+# обозначения прочитать не удалось. Разбор остаётся победителем — полей
+# распознавание не даёт вовсе, — но за полный лист не выдаётся.
+WARNING_THIN_STRUCTURE = "DRAWING_ROUTE_THIN_STRUCTURE"
+
+# Фоллбэк выиграл сравнение при живом структурном уровне. Снаружи документ
+# выглядит разобранным, в индексе — строки распознавания без структуры.
+WARNING_FALLBACK_WON = "LADDER_FALLBACK_WON_UNSTRUCTURED"
 
 # Разбор уложился в допуск `LADDER_CONTENT_KEEP_RATIO`, но символов в нём
 # всё равно меньше, чем выдало распознавание. Текст распознавания при этом
@@ -88,7 +98,24 @@ def deferred(context: DocumentContext) -> bool:
     if context.kind != filetypes.KIND_IMAGE:
         return False
     classification = context.classification
-    return classification.source == SOURCE_RASTER and classification.genre == GENRE_DRAWING
+    if classification.source != SOURCE_RASTER:
+        return False
+    if classification.genre == GENRE_DRAWING:
+        return True
+    # Жанр листа ставит растровый детектор по числу длинных линий и полос
+    # строк, и плотный лист он называет страницей текста: у СМ1638 при
+    # рамке формата нашлось 2 длинных линии вместо трёх и 7 полос строк.
+    # Читает такой лист всё равно чертёжная ветка — по той же рамке
+    # (`DrawingProcessor._full_read_image`), — значит и в лестнице его
+    # число символов о потере текста не говорит. Условие здесь то же, что
+    # у ветки: иначе два шага одного конвейера считают лист разным.
+    return settings.LADDER_STRUCTURE_OVER_LENGTH and has_sheet_frame(classification)
+
+
+def has_sheet_frame(classification) -> bool:
+    """Растровый детектор видит на листе рамку формата."""
+    signals = classification.signals or {}
+    return bool(signals.get("frame") or signals.get("thin_line_frame"))
 
 
 def volume(fragments: List[Fragment]) -> Volume:
@@ -142,10 +169,18 @@ def settle(
 
     got = volume(fragments)
     reserve_chars = text_chars(reserve)
-    won = got.read > 0 and got.chars >= reserve_chars * settings.LADDER_CONTENT_KEEP_RATIO
+    found = drawing_structure(fragments)
+    if settings.LADDER_STRUCTURE_OVER_LENGTH:
+        # Решает состав прочитанного, а не объём. Плоский текст полей листа
+        # не возвращает вовсе, поэтому чертёжный разбор с полями старше
+        # распознавания при любом числе символов.
+        won = found.structured
+    else:
+        won = got.read > 0 and got.chars >= reserve_chars * settings.LADDER_CONTENT_KEEP_RATIO
     outcome: Dict[str, Any] = {
         "won": won,
         "volume": got.as_dict(),
+        "structure": found.as_dict(),
         "reserve_strategy": reserve.parser_name,
         "reserve_chars": reserve_chars,
     }
@@ -154,9 +189,29 @@ def settle(
     if won:
         logger.info(
             "Лист прочитан чертёжной веткой: символов %d (полей %d, строк текста %d, "
-            "строк таблиц %d) против %d у распознавания",
+            "строк таблиц %d) против %d у распознавания; состав: штамп %s, "
+            "обозначение %s, величин %d, надписей видов %d",
             got.chars, got.fields, got.transcript_lines, got.table_rows, reserve_chars,
+            found.title_block, found.designation, found.dimensions, found.view_titles,
         )
+        if settings.LADDER_STRUCTURE_OVER_LENGTH and not found.complete:
+            # Поля есть, а лист по ним не опознан: ни штампа, ни обозначения.
+            # Разбор остаётся победителем, но полным листом не считается.
+            note = (
+                "чертёжный разбор без штампа и обозначения: полей "
+                f"{found.fields}, величин {found.dimensions}, надписей видов "
+                f"{found.view_titles} — оставлен разбор чертежа"
+            )
+            outcome["thin_structure"] = True
+            outcome["note"] = note
+            parse_result.degraded = list(dict.fromkeys(
+                list(parse_result.degraded) + [note]
+            ))
+            logger.warning(
+                "Лист %s опознан не полностью: %s",
+                metadata.get("source_path") or "?", note,
+            )
+            return fragments, {}
         if got.chars < reserve_chars:
             # Недостача в допуске: текст распознавания не возвращается, но
             # документ уходит на проверку с этой строкой в предупреждениях.
@@ -176,11 +231,20 @@ def settle(
             )
         return fragments, {}
 
-    note = (
-        f"чертёжный разбор беднее распознавания: {got.chars} символов "
-        f"(прочитано единиц: {got.read}) против {reserve_chars} у {reserve.parser_name} — "
-        "текст распознавания сохранён"
-    )
+    if settings.LADDER_STRUCTURE_OVER_LENGTH:
+        note = (
+            "чертёжный разбор без структуры: полей "
+            f"{found.fields}, штамп {'есть' if found.title_block else 'нет'}, "
+            f"обозначение {'есть' if found.designation else 'нет'}, величин "
+            f"{found.dimensions} — текст распознавания "
+            f"({reserve_chars} символов, {reserve.parser_name}) сохранён"
+        )
+    else:
+        note = (
+            f"чертёжный разбор беднее распознавания: {got.chars} символов "
+            f"(прочитано единиц: {got.read}) против {reserve_chars} у {reserve.parser_name} — "
+            "текст распознавания сохранён"
+        )
     # Пометка деградации до нормализации запаса: с ней его фрагменты уходят
     # на проверку, как и при обычной победе фоллбэка.
     reserve.degraded = list(dict.fromkeys(list(reserve.degraded) + [note]))
@@ -212,6 +276,33 @@ def thinner_kept(parse_result: ParseResult) -> bool:
     """Разбор оставлен победителем, но символов в нём меньше, чем у распознавания."""
     route = (parse_result.ladder or {}).get("drawing_route", {})
     return bool(route.get("thinner_kept"))
+
+
+def thin_structure(parse_result: ParseResult) -> bool:
+    """Разбор чертёжный, но лист по нему не опознан: ни штампа, ни обозначения."""
+    route = (parse_result.ladder or {}).get("drawing_route", {})
+    return bool(route.get("thin_structure"))
+
+
+def unstructured_fallback(parse_result: ParseResult) -> bool:
+    """
+    Фоллбэк выиграл сравнение при живом структурном уровне.
+
+    Это та же потеря, что и проигрыш чертёжной сверки, только обнаруженная
+    на шаг раньше: структуру документа кто-то вернуть смог, а наружу уехал
+    плоский текст. До этой проверки такой документ выдавался как `completed`
+    — деградация была записана в `degraded` и в лог, но статуса не меняла, и
+    человек документ не видел.
+    """
+    if not settings.LADDER_STRUCTURE_OVER_LENGTH:
+        return False
+    ladder = parse_result.ladder or {}
+    if "drawing_route" in ladder:
+        # Исход сверки чертёжного листа уже назван своим предупреждением
+        # (`WARNING_THIN`, `WARNING_THIN_KEPT`, `WARNING_THIN_STRUCTURE`):
+        # второе имя той же потери ничего потребителю не добавляет.
+        return False
+    return bool(ladder.get("fallback_won"))
 
 
 def _chars(value: Any) -> int:

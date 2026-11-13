@@ -550,6 +550,16 @@ def process_document(
             # равно прочитан короче распознавания — тоже на проверку.
             review_required = True
             drawing_warnings.append(drawing_route.WARNING_THIN_KEPT)
+        elif drawing_route.thin_structure(parse_result):
+            # Поля листа есть, а штампа и обозначения нет: лист опознан не
+            # полностью, за полный он не выдаётся.
+            review_required = True
+            drawing_warnings.append(drawing_route.WARNING_THIN_STRUCTURE)
+        if drawing_route.unstructured_fallback(parse_result):
+            # Плоский текст наружу при живом структурном уровне — потеря, и
+            # молчать о ней статусом нельзя (LADDER_STRUCTURE_OVER_LENGTH).
+            review_required = True
+            drawing_warnings.append(drawing_route.WARNING_FALLBACK_WON)
         warnings = list(dict.fromkeys(warnings + drawing_warnings))
         document_status = "partial" if report["failed_pages"] or report["coverage_unknown"] or review_required else "completed"
         mime_type = filetypes.mime_for(located.file_type)
