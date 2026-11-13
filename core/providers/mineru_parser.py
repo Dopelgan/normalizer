@@ -579,8 +579,8 @@ class MinerUParserProvider(DocumentParserProvider):
             response = requests.post(url, files=files, data=data, timeout=timeout)
         except requests.ReadTimeout as exc:
             # Долгий разбор большого скана — свойство документа, а не отказ
-            # сервиса. Раньше таймаут помечал MinerU недоступным на минуту, и
-            # все соседние документы уходили в плоский OCR без таблиц.
+            # сервиса. Если по таймауту помечать MinerU недоступным на минуту, все
+            # соседние документы уйдут в плоский OCR без таблиц.
             raise ParserTimedOut(f"MinerU не уложился в {timeout} с: {exc}") from exc
         except requests.RequestException as exc:
             self.mark_unavailable()

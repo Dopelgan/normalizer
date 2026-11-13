@@ -309,8 +309,8 @@ def _classify_pdf(context: DocumentContext) -> Classification:
         signals.update(raster_signals)
         if not drawing_pages:
             # Векторный детектор на скане не видит ничего: линии там —
-            # пиксели. Без растровой проверки скан чертежа получал жанр
-            # unknown, и ветка чертежей (Qwen-VL) на него не включалась.
+            # пиксели. Без растровой проверки скан чертежа получает жанр
+            # unknown, и ветка чертежей (Qwen-VL) на него не включается.
             raster_pages, checked = _raster_drawing_pages(context.data)
             signals["raster_drawing_pages"] = raster_pages
             # Растровый детектор ошибается чаще векторного (~13 % ложных на

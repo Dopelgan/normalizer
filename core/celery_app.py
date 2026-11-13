@@ -65,7 +65,7 @@ app.conf.update(
     result_expires=settings.RESULT_TTL_SECONDS,
     # С acks_late Redis возвращает неподтверждённую задачу в очередь через
     # visibility_timeout (по умолчанию 3600 с). Разбор живёт до
-    # PARSE_TASK_TIME_LIMIT (3900 с), и долгий скан получал второго
+    # PARSE_TASK_TIME_LIMIT (3900 с), и долгий скан получил бы второго
     # исполнителя — двойной OCR на занятом GPU. Срок берётся с запасом.
     broker_transport_options={"visibility_timeout": broker_visibility_timeout()},
 )

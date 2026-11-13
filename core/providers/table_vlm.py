@@ -4,13 +4,13 @@
 Таблица уходит сюда, когда модель таблиц MinerU отдала ячейки разметкой, а
 собрать их заново по строкам OCR не вышло. Типичный случай — альбомная
 таблица на книжном листе паспорта: MinerU читает её поперёк, Tesseract
-тоже, и строки слоя — каша из обрывков. Раньше такая таблица разбиралась
-на эти обрывки (`table_from_lines.degrade`): значения ячеек терялись.
+тоже, и строки слоя — каша из обрывков. Разобранная на эти обрывки
+(`table_from_lines.degrade`) таблица теряет значения ячеек.
 
 Здесь страница рендерится, таблица вырезается по рамке MinerU, ставится
 прямо по OSD Tesseract и читается моделью. Не вышло на любом шаге — None,
-и вызывающий разбирает таблицу на текст, как раньше: эта ветка только
-добавляет шанс, но не отнимает прежний исход.
+и вызывающий разбирает таблицу на текст: эта ветка только добавляет
+шанс, но не отнимает обычный исход.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ TableReader = Callable[[ParsedBlock], Optional[Dict[str, Any]]]
 def table_reader(file_bytes: Optional[bytes], file_type: str, client=None) -> Optional[TableReader]:
     """
     Функция «блок таблицы -> table_data или None» для `reconcile_with_text_layer`.
-    None — ветка выключена, файла нет или модели нет: тогда всё как раньше.
+    None — ветка выключена, файла нет или модели нет.
     """
     if not settings.TABLE_VLM_RETRY_ENABLED or not file_bytes:
         return None
@@ -55,7 +55,7 @@ def table_reader(file_bytes: Optional[bytes], file_type: str, client=None) -> Op
         left = deadline.remaining()
         if left is not None and left < settings.VLM_TIMEOUT:
             # До срока задачи не уложится вызов модели: таблица разбирается
-            # на текст, как раньше, а документ не теряется по сроку.
+            # на текст, а документ не теряется по сроку.
             logger.warning("Таблица на стр. %s не перечитана: до срока задачи %.0f с",
                            block.page, left)
             return None
