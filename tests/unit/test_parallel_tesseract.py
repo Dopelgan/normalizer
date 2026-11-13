@@ -75,11 +75,6 @@ def provider(monkeypatch):
     monkeypatch.setattr(tesseract_fallback, "convert_from_path", _render)
     monkeypatch.setattr(settings, "OCR_BATCH_PAGES", 5)
     monkeypatch.setattr(settings, "OCR_PREPROCESS_ENABLED", False)
-    # Память прохода считается по странице и языку. Здесь проверяется
-    # сама память, а не выбор языка, поэтому построчный выбор
-    # (OCR_PER_LINE_LANGUAGE) закреплён выключенным: с ним на страницу
-    # приходится по вызову на язык, и счёт вызовов стал бы про другое.
-    monkeypatch.setattr(settings, "OCR_PER_LINE_LANGUAGE", False)
     monkeypatch.setattr(settings, "TESSERACT_PAGE_WORKERS", 4)
     return provider
 
