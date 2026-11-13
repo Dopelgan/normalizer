@@ -95,6 +95,14 @@ CONTEXT_KEY = "record_context"
 # разметку частей не читает, а абзацы различает.
 _JOIN = "\n\n"
 
+# Фраза об осторожности — одна на запись (см. `_caution`). Словами, какими
+# это читает заказчик: без «уверенности», «модели» и прежней приписки
+# «(требует сверки)».
+CAUTION_ALL = ("Все значения в этой записи прочитаны с изображения чертежа, "
+               "и каждое из них нужно сверить с самим чертежом.")
+CAUTION_PART = ("Часть значений в этой записи прочитана с изображения "
+                "чертежа, и эти значения нужно сверить с самим чертежом.")
+
 # Оговорка о непривязанных размерах. Одна на запись: областей видов в
 # разборе нет, и сказать это надо честно, но один раз.
 NO_VIEW_LINK = ("К какому виду или разрезу относится каждый размер, "
@@ -265,7 +273,7 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
         return content.text
     fields = [
         {"category": f.category, "value": f.value, "tolerance": f.tolerance,
-         "unit": f.unit}
+         "unit": f.unit, "confirmed": f.confirmed}
         for f in (content.structured_drawing_fields or [])
     ]
     lines = [line for line in (content.text or "").split("\n")]
@@ -280,6 +288,7 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
         parts.extend((kind, item) for item in items)
         return items
 
+    add("caution", _caution(fields, payload))
     add("stamp", _stamp(payload, fields))
     add("handwritten", _handwritten(payload, fields))
     # Оговорка про непривязанные размеры говорится один раз — в той из двух
@@ -375,10 +384,16 @@ def _graph_key(raw: Any) -> str:
     («Масса», «масса», «Вес»), приводится к каноническому. Внутренний ключ
     разбора (`mass`, `norm_control`) каноническим не считается — в
     справочнике синонимов его нет, — но сам является ключом `LABELS` и
-    берётся как есть: свёртка превратила бы `norm_control` в «norm control»
-    и графа потеряла бы и подпись, и своё место в порядке ГОСТ. Всё
-    остальное — свёрнутой записью, чтобы непонятая графа и её исправленная
-    копия нашли друг друга.
+    берётся как есть. Всё остальное — свёрнутой записью, чтобы непонятая
+    графа и её исправленная копия нашли друг друга.
+
+    **Упрощать это до одной свёртки нельзя, и вот почему.** Так уже было
+    сделано, и штамп сломался целиком: `canonical("designation")` возвращает
+    `None` (в синонимах записаны русские названия граф, а не внутренние
+    ключи), а `_fold("norm_control")` даёт «norm control». Запись выглядела
+    как «designation — ТАДУ 302318.207.00 СБ», «mass — 26,02»: графа теряла
+    и подпись по ГОСТ, и своё место в порядке. Проверка внутреннего ключа
+    посередине стоит здесь именно для этого.
     """
     name = _clean(raw)
     known = canonical(name)
@@ -466,6 +481,45 @@ def _graphs(block: Any, corrected: Dict[tuple, str],
             continue
         out[key] = value
     return out, names
+
+
+def _caution(fields: Sequence[Dict[str, Any]],
+             payload: Dict[str, Any]) -> List[str]:
+    """
+    Одна фраза о том, что значения записи нужно сверить с чертежом.
+
+    Зачем она здесь. До сборки запись листа без текста отдавал в индекс
+    адаптер RAG, и он помечал каждое неподтверждённое значение. Теперь
+    единственный, кто записывает лист, — эта сборка, и осторожность обязана
+    перейти вместе с содержанием: проза, которая называет «Масса — 15,7» и
+    молчит о том, что число прочитано с картинки, утверждает больше, чем
+    знает.
+
+    Почему фразой на запись, а не пометкой при каждом значении.
+    Подтверждает Normalizer почти ничего (`DRAWING_MIN_FACT_CONFIDENCE`
+    = 0.95), поэтому пометка стояла бы почти у каждого значения — а то, что
+    стоит у всего, не читают вовсе, и она же заглушила бы подписи, ради
+    которых запись и собирается.
+
+    Фраза идёт первой частью: читающий встречает её прежде значений, а не
+    после них. Она коротка (около сотни символов) и в тот же кусок, что
+    основная надпись, укладывается с запасом, так что ответ на «какая
+    масса» из первого куска не вытесняет.
+    """
+    total = unconfirmed = 0
+    for field in fields:
+        total += 1
+        if not field.get("confirmed"):
+            unconfirmed += 1
+    for table in (payload.get("tables") or []):
+        if not isinstance(table, dict) or not (table.get("rows") or []):
+            continue
+        total += 1
+        if not table.get("confirmed"):
+            unconfirmed += 1
+    if not total or not unconfirmed:
+        return []
+    return [CAUTION_ALL if unconfirmed == total else CAUTION_PART]
 
 
 def _stamp(payload: Dict[str, Any],

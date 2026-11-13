@@ -681,6 +681,65 @@ class TestTables:
 
 
 # -------------------------------------------------------------------- конвейер
+class TestCaution:
+    """
+    Фраза о сверке с чертежом. До сборки неподтверждённые значения помечал
+    адаптер RAG; единственным, кто записывает лист, стала сборка, и
+    осторожность обязана перейти вместе с содержанием.
+    """
+
+    def test_unconfirmed_values_are_admitted_once(self, composed):
+        fragment = _fragment(SHEET_LINE, fields=[
+            {"category": "size", "value": "⌀8,5", "confidence": 0.8},
+        ], payload={"title_block": TADU_STAMP})
+        drawing_record.apply([fragment])
+        record = fragment.content.text
+        assert record.startswith(drawing_record.CAUTION_ALL)
+        assert record.count(drawing_record.CAUTION_ALL) == 1
+
+    def test_part_unconfirmed_says_part(self, composed):
+        fragment = _fragment(SHEET_LINE, fields=[
+            {"category": "size", "value": "⌀8,5", "confidence": 0.99,
+             "confirmed": True},
+            {"category": "radius", "value": "R65", "confidence": 0.4},
+        ])
+        drawing_record.apply([fragment])
+        assert fragment.content.text.startswith(drawing_record.CAUTION_PART)
+
+    def test_everything_confirmed_says_nothing(self, composed):
+        fragment = _fragment(SHEET_LINE, fields=[
+            {"category": "size", "value": "⌀8,5", "confidence": 0.99,
+             "confirmed": True},
+        ])
+        drawing_record.apply([fragment])
+        record = fragment.content.text
+        assert drawing_record.CAUTION_ALL not in record
+        assert drawing_record.CAUTION_PART not in record
+
+    def test_an_unconfirmed_table_also_counts(self, composed):
+        fragment = _fragment(SHEET_LINE, payload={"tables": [{
+            "kind": "table", "rows": [["Сдувка", "С-22-2"]],
+        }]})
+        drawing_record.apply([fragment])
+        assert fragment.content.text.startswith(drawing_record.CAUTION_ALL)
+
+    def test_the_old_parenthetical_is_not_used(self, composed):
+        """Приписку «(требует сверки)» из индексируемого текста убрали."""
+        fragment = _fragment(SHEET_LINE, fields=[
+            {"category": "size", "value": "⌀8,5", "confidence": 0.8},
+        ])
+        drawing_record.apply([fragment])
+        assert "(требует сверки)" not in fragment.content.text
+
+    def test_the_caution_is_plain_language(self, composed):
+        """Без «уверенности», «модели» и прочего служебного словаря."""
+        for sentence in (drawing_record.CAUTION_ALL, drawing_record.CAUTION_PART):
+            lowered = sentence.lower()
+            for word in ("модель", "уверенност", "confidence", "vlm",
+                         "подтвержд", "confirmed"):
+                assert word not in lowered
+
+
 class TestChunkability:
     """
     Разметка частей для чанкера RAG. Он режет запись по пределу в токенах и
@@ -743,15 +802,18 @@ class TestChunkability:
                                              "Шероховатость", "Углы",
                                              "Допуски", "Линейные"))
 
-    def test_the_stamp_is_the_first_part(self, composed):
+    def test_the_stamp_opens_the_record_after_the_caution(self, composed):
         """
         Если запись разрежут и найдётся только первый кусок, в нём должен
         быть ответ на «какая масса». Это свойство порядка, а не случайность.
+        Фраза об осторожности идёт прежде значений, но коротка и основную
+        надпись из первого куска не вытесняет: предел — 512 токенов, около
+        1280 символов.
         """
         fragment = self._composed()
         parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
-        assert parts[0]["kind"] == "stamp"
-        assert "Масса — 26,02" in fragment.content.text[:parts[0]["end"]]
+        assert [part["kind"] for part in parts[:2]] == ["caution", "stamp"]
+        assert "Масса — 26,02" in fragment.content.text[:1280]
 
     def test_parts_are_separated_by_a_blank_line(self, composed):
         """Чанкер, который разметку не читает, а абзацы различает, тоже попадёт."""
