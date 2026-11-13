@@ -12,25 +12,24 @@
     ТАДУ 302318.207.00 СБ / Справ. N / Перв. применение / A / 6 / N°1 /
     N°1 / 5 / R65 / N°1 / 8 / 2 / B / A / 7 / … / 629 / 03.2020
 
-Всё прочитано, и ответить по этому нельзя ни на что. При этом подписанные
-величины у разбора **уже есть** и лежат в том же фрагменте: графы штампа —
-в `structured_payload["title_block"]` (там и `mass: "26,02"`, которого в
-тексте записи нет вовсе), рукописные графы — в `title_block_handwritten`,
-размеры с их родом — в `structured_drawing_fields`, таблицы листа — в
-`structured_payload["tables"]`. В текст записи они не попадали никогда.
+Всё прочитано, и ответить по этому нельзя ни на что.
 
-Чем это является и чем не является. Это правка **читаемости**, а не возврат
-потерянных данных, и путать их нельзя. Адаптер RAG
-(`super_rag/parser/adapter.py`, `_fragment_search_text`) у фрагмента, у
-которого `content.text` пуст, уже отдавал в индекс поля и весь
-`structured_payload` каноническим JSON под меткой `[DRAWING]` — то есть
-масса в поиске была, в виде JSON. Таких фрагментов большинство: 4687 из
-5110 на проде. Для них сборка JSON не дублирует, а **заменяет** его прозой
-(адаптер возвращает текст, едва он появился), и индексируемый текст
-становится короче примерно в двенадцать раз. У остальных 423 фрагментов
-текст листа есть, адаптер отдаёт только его, и JSON не отдавался никогда —
-вот там графы штампа в поиск действительно не попадали, и именно такие
-листы читал заказчик, когда забраковал запись.
+**Значение при этом не терялось — терялось то, чем оно является.** Это и
+есть довод модуля, и путать его с «значения не было» нельзя. Масса «26,02»
+в переписанном тексте листа стоит, но стоит голым числом среди других
+голых чисел: замер на 27 листах — значение массы есть в индексируемом
+тексте у 27 из 27 и до сборки, и после, а подпись «Масса» при нём — у 0 из
+27 до и у 27 из 27 после. Поэтому ответить на «какая масса крышки» было
+нечем, хотя число лежало в индексе.
+
+Подписанные величины у разбора тоже уже есть, в том же фрагменте: графы
+штампа — в `structured_payload["title_block"]`, рукописные — в
+`title_block_handwritten`, размеры с их родом — в
+`structured_drawing_fields`, таблицы листа — в
+`structured_payload["tables"]`. В текст записи они не попадали.
+
+Собирается только тот фрагмент, у которого текст листа есть, — почему
+именно так, сказано в `apply`.
 
 Что делает модуль. Собирает из того же фрагмента запись по частям, у каждой
 части — название, у каждого значения — то, чем оно является:
@@ -87,6 +86,14 @@ from core.providers.title_block import (
 DROPPED_KEY = "record_dropped_furniture"
 # Ключ в payload: запись собрана по частям (для отладки и замеров).
 COMPOSED_KEY = "record_composed"
+# Ключ в payload: разметка частей записи для чанкера (см. `_part_index`).
+PARTS_KEY = "record_parts"
+# Ключ в payload: чем назвать кусок записи без основной надписи.
+CONTEXT_KEY = "record_context"
+
+# Части разделены пустой строкой: по ней режет и тот чанкер, который
+# разметку частей не читает, а абзацы различает.
+_JOIN = "\n\n"
 
 # Оговорка о непривязанных размерах. Одна на запись: областей видов в
 # разборе нет, и сказать это надо честно, но один раз.
@@ -140,11 +147,14 @@ _KIND_TITLES: Sequence[tuple] = (
     ("linear", "Линейные размеры"),
 )
 
-# Знак диаметра во всех начертаниях. Образец тот же, что в
-# `core/providers/drawing_text.py`: векторный путь складывает в поля то, что
-# прочитал, не приводя знак к одному виду, и «Ø57» иначе уходило бы в
-# линейные размеры.
-_DIAMETER_GLYPHS = re.compile(r"[Øøᴓ⌀ΦϕφФ]")
+# Знак диаметра во всех начертаниях. Образцы те же и с тем же условием,
+# что в `core/providers/drawing_text.py`: векторный путь складывает в поля
+# то, что прочитал, не приводя знак к одному виду, и «Ø57» иначе уходило бы
+# в линейные размеры. Кириллическая «Ф» — только вплотную к числу: «Ф20»
+# это диаметр, а «Фаска 2х45°» — слово, и попало бы в диаметры, потому что
+# проверка знака идёт прежде проверки градуса.
+_DIAMETER_GLYPHS = re.compile(r"[Øøϕφ⌀Φ]")
+_DIAMETER_CYRILLIC = re.compile(r"(?<![А-Яа-яЁёA-Za-z])[Фф](?=\s?\d)")
 _ANGLE_SIGN = re.compile(r"°")
 # Надпись сама говорит, что она за величина: предельное отклонение, знак
 # умножения размеров или названная единица.
@@ -209,11 +219,31 @@ def apply(fragments: List[Fragment]) -> List[Fragment]:
 
     При выключенном флаге не делается ничего: текст уходит байт в байт
     таким, каким был.
+
+    Собирается только тот фрагмент, у которого текст листа есть.
+    Фрагмент без текста (а таких на проде 4687 из 5110 — это вырезки видов
+    и векторные чертежи) не собирается по двум причинам.
+
+    Первая и решающая: там запись не наша. Пустой `content.text` отдаёт в
+    индекс не Normalizer, а адаптер RAG, и он помечает каждое
+    неподтверждённое значение словами «(требует сверки)». Проза этих пометок
+    не несёт, а подтверждает Normalizer почти ничего — порог 0.95. Заказчик
+    увидел бы «Обозначения и выноски на листе: Шток.» — простое утверждение
+    о значении, прочитанном с уверенностью 0,4–0,8, в корпусе
+    Росэнергоатома. Это тот же изъян, из-за которого здесь не говорится
+    «технические требования» о категории `note`: заголовок не вправе
+    утверждать больше, чем знают данные.
+
+    Вторая: собирать там почти нечего. На 150 таких фрагментах с прода
+    графа «Масса» не нашлась ни у одного, а основная надпись — у семи.
+    Весь выигрыш и вся исходная задача — на листах, где текст есть.
     """
     if not enabled():
         return fragments
     for fragment in fragments:
         if fragment.type != "drawing":
+            continue
+        if not (fragment.content.text or "").strip():
             continue
         compose_fragment(fragment)
     return fragments
@@ -241,32 +271,128 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
     lines = [line for line in (content.text or "").split("\n")]
     kept, dropped = _without_furniture(lines)
 
-    parts: List[str] = []
-    parts.extend(_stamp(payload, fields))
-    parts.extend(_handwritten(payload, fields))
+    # Порядок частей — это и порядок полезности: если запись разрежут и
+    # найдётся только первый кусок, в нём должна быть основная надпись, то
+    # есть ответ на «какая масса». Это свойство записи, а не случайность.
+    parts: List[tuple] = []
+
+    def add(kind: str, items: Sequence[str]) -> Sequence[str]:
+        parts.extend((kind, item) for item in items)
+        return items
+
+    add("stamp", _stamp(payload, fields))
+    add("handwritten", _handwritten(payload, fields))
     # Оговорка про непривязанные размеры говорится один раз — в той из двух
     # частей, которая встретится первой.
-    views = _views(kept, hedge=True)
-    parts.extend(views)
-    parts.extend(_dimensions(fields, hedge=not views))
-    parts.extend(_positions(fields))
-    parts.extend(_callouts(fields))
-    parts.extend(_notes(fields))
-    parts.extend(_tables(payload))
-    parts.extend(_sheet_lines(kept))
+    views = add("views", _views(kept, hedge=True))
+    add("dimensions", _dimensions(fields, hedge=not views))
+    add("positions", _positions(fields))
+    add("callouts", _callouts(fields))
+    add("notes", _notes(fields))
+    add("tables", _tables(payload))
+    add("sheet_lines", _sheet_lines(kept))
 
     if not parts:
         return None
-    text = "\n\n".join(parts)
+    text = _JOIN.join(body for _, body in parts)
     content.text = text
     payload[COMPOSED_KEY] = True
+    payload[PARTS_KEY] = _part_index(parts)
+    context = _context(payload, fields)
+    if context:
+        payload[CONTEXT_KEY] = context
     if dropped:
         payload[DROPPED_KEY] = dropped
     content.structured_payload = payload
     return text
 
 
+def _part_index(parts: Sequence[tuple]) -> List[Dict[str, Any]]:
+    """
+    Разметка частей записи: где каждая начинается, где кончается и где внутри
+    неё можно резать.
+
+    Зачем она в payload, а не выводится из текста. Чанкер RAG
+    (`super_rag/ingest/normalize/service.py::_source_token_windows`) режет
+    запись по пределу в токенах и ищет границы «только по явным пометкам
+    источника»: заголовок Markdown или номер пункта. Прозаический заголовок
+    «Диаметры — …» для него невидим, поэтому длинную запись он разрежет
+    посреди перечня — и до модели дойдёт кусок «Диаметры —» без значений или
+    значения без того, чем они являются. То есть ровно то, против чего
+    запись и собиралась. Угадывать заголовок образцом не надо: сборка знает
+    границы точно и называет их здесь.
+
+    На каждую часть: `kind` — устойчивое имя, `title` — её первая строка
+    (её повторяют на продолжении, если часть пришлось разрезать), `start` и
+    `end` — границы в символах `content.text`, `breaks` — смещения начал
+    строк внутри части, где резать безопасно. Строка перечня сама себя
+    называет до « — », поэтому её можно повторить как заголовок, если
+    разрезать пришлось и внутри строки.
+    """
+    index: List[Dict[str, Any]] = []
+    cursor = 0
+    for kind, body in parts:
+        title, _, _ = body.partition("\n")
+        breaks: List[int] = []
+        offset = 0
+        for line in body.split("\n")[:-1]:
+            offset += len(line) + 1
+            breaks.append(cursor + offset)
+        index.append({
+            "kind": kind,
+            "title": title,
+            "start": cursor,
+            "end": cursor + len(body),
+            "breaks": breaks,
+        })
+        cursor += len(body) + len(_JOIN)
+    return index
+
+
+def _context(payload: Dict[str, Any], fields: Sequence[Dict[str, Any]]) -> str:
+    """
+    Чем назвать кусок записи, в который не попала основная надпись.
+
+    В прозу это не дописывается: заголовок куска собирает чанкер
+    (`_contextual_header`), он уходит в поиск и не показывается заказчику,
+    и второй такой же механизм в самом тексте был бы повтором в каждой
+    части — шумом для того, кто запись читает.
+    """
+    block, _ = _graphs(payload.get("title_block"), _corrected(fields), by_hand=False)
+    said = [block[key] for key in ("designation", "name") if key in block]
+    if "sheet" in block:
+        said.append(f"лист {block['sheet']}")
+    return ", ".join(said)
+
+
 # ----------------------------------------------------------------- части
+
+def _graph_key(raw: Any) -> str:
+    """
+    Ключ графы, одинаковый у всех, кто её ищет.
+
+    Три случая, и порядок важен. Имя, которое знает справочник ГОСТ 2.104
+    («Масса», «масса», «Вес»), приводится к каноническому. Внутренний ключ
+    разбора (`mass`, `norm_control`) каноническим не считается — в
+    справочнике синонимов его нет, — но сам является ключом `LABELS` и
+    берётся как есть: свёртка превратила бы `norm_control` в «norm control»
+    и графа потеряла бы и подпись, и своё место в порядке ГОСТ. Всё
+    остальное — свёрнутой записью, чтобы непонятая графа и её исправленная
+    копия нашли друг друга.
+    """
+    name = _clean(raw)
+    known = canonical(name)
+    if known:
+        return known
+    if name in LABELS:
+        return name
+    return _fold(name)
+
+
+def _graph_name(key: str, raw: Any) -> str:
+    """Подпись графы для записи: по ГОСТ, если графа известна, иначе словом разбора."""
+    return label(key) if key in LABELS else _clean(raw)
+
 
 def _corrected(fields: Sequence[Dict[str, Any]]) -> Dict[tuple, str]:
     """
@@ -297,14 +423,14 @@ def _corrected(fields: Sequence[Dict[str, Any]]) -> Dict[tuple, str]:
         by_hand = text.endswith(f"({HANDWRITTEN_MARK})")
         if by_hand:
             text = _clean(text[: -len(f"({HANDWRITTEN_MARK})")])
-        key = canonical(name) or _fold(name)
+        key = _graph_key(name)
         if text and (key, by_hand) not in out:
             out[(key, by_hand)] = text
     return out
 
 
 def _graphs(block: Any, corrected: Dict[tuple, str],
-            by_hand: bool) -> Dict[str, str]:
+            by_hand: bool) -> tuple:
     """
     Графы штампа с приведёнными именами.
 
@@ -313,16 +439,22 @@ def _graphs(block: Any, corrected: Dict[tuple, str],
     `title_block.canonical` — тем же справочником, которым его приводит сам
     разбор штампа, чтобы «масса» и `mass` не стали двумя разными графами.
     Непонятое имя остаётся как есть: потерять графу хуже, чем назвать её
-    словом модели.
+    словом модели. Искать такую графу приходится по свёрнутой записи — той
+    же, которой её ключует `_corrected`, иначе исправленная копия
+    непонятой графы не находилась бы никогда, — а показывается она всё
+    равно словом модели, не свёрткой. Возвращаются поэтому два отображения:
+    значения по ключу поиска и подписи для записи.
     """
     if not isinstance(block, dict):
-        return {}
+        return {}, {}
     out: Dict[str, str] = {}
+    names: Dict[str, str] = {}
     for raw_key, raw_value in block.items():
         value = _clean(raw_value)
         if not value:
             continue
-        key = canonical(str(raw_key)) or str(raw_key)
+        key = _graph_key(raw_key)
+        names.setdefault(key, _graph_name(key, raw_key))
         # Исправленная копия того же значения, если она есть.
         value = corrected.get((key, by_hand), value)
         if key in out:
@@ -333,17 +465,18 @@ def _graphs(block: Any, corrected: Dict[tuple, str],
                 out[key] = f"{out[key]}{_GRAPH_JOIN}{value}"
             continue
         out[key] = value
-    return out
+    return out, names
 
 
 def _stamp(payload: Dict[str, Any],
            fields: Sequence[Dict[str, Any]]) -> List[str]:
     """Основная надпись: графа со своим значением, в порядке ГОСТ 2.104."""
-    block = _graphs(payload.get("title_block"), _corrected(fields), by_hand=False)
+    block, names = _graphs(payload.get("title_block"), _corrected(fields),
+                           by_hand=False)
     if not block:
         return []
     said = [
-        f"{label(key)} — {block[key]}."
+        f"{names[key]} — {block[key]}."
         for key in _STAMP_ORDER if key in block
     ]
     signed = [
@@ -354,7 +487,7 @@ def _stamp(payload: Dict[str, Any],
     # графу, о которой здесь не сказано, и терять её нельзя.
     known = set(_STAMP_ORDER) | {key for key, _ in _SIGNERS} | set(_HAND_ORDER)
     rest = [
-        f"{label(key)} — {block[key]}."
+        f"{names[key]} — {block[key]}."
         for key in sorted(block) if key not in known
     ]
     if not (said or signed or rest):
@@ -372,13 +505,13 @@ def _stamp(payload: Dict[str, Any],
 def _handwritten(payload: Dict[str, Any],
                  fields: Sequence[Dict[str, Any]]) -> List[str]:
     """Графы, заполненные от руки: с оговоркой о надёжности чтения."""
-    hand = _graphs(payload.get("title_block_handwritten"), _corrected(fields),
-                   by_hand=True)
+    hand, names = _graphs(payload.get("title_block_handwritten"),
+                          _corrected(fields), by_hand=True)
     if not hand:
         return []
-    said = [f"{label(key)} — {hand[key]}." for key in _HAND_ORDER if key in hand]
+    said = [f"{names[key]} — {hand[key]}." for key in _HAND_ORDER if key in hand]
     said += [
-        f"{label(key)} — {hand[key]}."
+        f"{names[key]} — {hand[key]}."
         for key in sorted(hand) if key not in _HAND_ORDER
     ]
     if not said:
@@ -553,7 +686,7 @@ def _kind_of(field: Dict[str, Any]) -> Optional[str]:
     if category != "size":
         return None
     value = str(field.get("value") or "")
-    if _DIAMETER_GLYPHS.search(value):
+    if _DIAMETER_GLYPHS.search(value) or _DIAMETER_CYRILLIC.search(value):
         return "diameter"
     if _ANGLE_SIGN.search(value):
         return "angle"

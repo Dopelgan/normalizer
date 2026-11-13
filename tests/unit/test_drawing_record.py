@@ -16,6 +16,7 @@ from core.contract_finalize import finalize_fragments
 from core.ladder import drawing_route
 from core.models.parse_result import ParsedBlock, ParseResult
 from core.normalizer import TextNormalizer
+from core.providers.title_block import label
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 
 # Настоящий текст записи листа СМ1638.11.05.00.00.00 СБ — тот самый
@@ -51,6 +52,10 @@ TADU_TEXT = "\n".join([
 ])
 
 # Графы штампа того же листа, как их принёс разбор.
+# Одна строка листа. Сборка идёт только у фрагмента с текстом листа,
+# поэтому в тестах частей текст листа всегда непустой.
+SHEET_LINE = "25"
+
 TADU_STAMP = {
     "mass": "26,02",
     "name": "Трубная обвязка",
@@ -152,6 +157,26 @@ class TestNoLoss:
         drawing_record.apply([fragment])
         assert "2 месга" in fragment.content.text
 
+    def test_fragment_without_sheet_text_is_left_alone(self, composed):
+        """
+        Фрагмент без текста листа не собирается: его запись отдаёт в индекс
+        адаптер RAG, и он помечает неподтверждённые значения словами
+        «требует сверки». Проза этих пометок не несёт.
+        """
+        fragment = _fragment("", fields=[
+            {"category": "callout", "value": "Шток", "confidence": 0.4},
+        ], payload={"title_block": TADU_STAMP})
+        drawing_record.apply([fragment])
+        assert fragment.content.text is None
+        assert drawing_record.COMPOSED_KEY not in fragment.content.structured_payload
+
+    def test_whitespace_only_text_counts_as_no_text(self, composed):
+        fragment = _fragment("   \n  \n", fields=[
+            {"category": "callout", "value": "Шток"},
+        ])
+        drawing_record.apply([fragment])
+        assert drawing_record.COMPOSED_KEY not in fragment.content.structured_payload
+
     def test_nothing_to_compose_leaves_fragment_alone(self, composed):
         fragment = _fragment("")
         assert drawing_record.compose_fragment(fragment) is None
@@ -178,14 +203,14 @@ class TestValuesVerbatim:
         assert "26.02" not in fragment.content.text
 
     def test_tolerance_is_named_not_glued_to_the_number(self, composed):
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "size", "value": "⌀200", "tolerance": "±2"},
         ])
         drawing_record.apply([fragment])
         assert "⌀200 (допуск ±2)" in fragment.content.text
 
     def test_tolerance_already_inside_the_value_is_not_repeated(self, composed):
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "size", "value": "⌀200±2", "tolerance": "±2"},
         ])
         drawing_record.apply([fragment])
@@ -193,7 +218,7 @@ class TestValuesVerbatim:
 
     def test_bare_digit_tolerance_is_not_swallowed_by_the_value(self, composed):
         """Допуск «2» входит в «⌀200» как подстрока, но назван не был."""
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "size", "value": "⌀200", "tolerance": "2"},
         ])
         drawing_record.apply([fragment])
@@ -201,7 +226,7 @@ class TestValuesVerbatim:
 
     def test_second_graph_reading_is_not_swallowed_as_a_substring(self, composed):
         """«2,7» не считается сказанным потому, что входит в «12,75»."""
-        fragment = _fragment("", payload={"title_block": {
+        fragment = _fragment(SHEET_LINE, payload={"title_block": {
             "mass": "12,75", "масса": "2,7",
         }})
         drawing_record.apply([fragment])
@@ -240,7 +265,7 @@ class TestStamp:
         графы по-русски («масса»), а не внутренними ключами. Без приведения
         имени графа уходила в запись строчной и не в своём порядке.
         """
-        fragment = _fragment("", payload={"title_block": {
+        fragment = _fragment(SHEET_LINE, payload={"title_block": {
             "масса": "2,7", "листов": "1", "литера": "И", "масштаб": "1:2",
             "организация": 'ООО "ФИНПРОМАТОМ"',
         }})
@@ -250,7 +275,7 @@ class TestStamp:
                 'Организация — ООО "ФИНПРОМАТОМ".' in record)
 
     def test_two_namings_of_one_graph_are_both_kept(self, composed):
-        fragment = _fragment("", payload={"title_block": {
+        fragment = _fragment(SHEET_LINE, payload={"title_block": {
             "mass": "2,7", "масса": "2,75",
         }})
         drawing_record.apply([fragment])
@@ -262,7 +287,7 @@ class TestStamp:
         применяет только к значениям полей («Обозначение: …»). Заказчику
         надо показать исправленную копию, а не ту, что рядом с ней.
         """
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "title_block", "value": "Обозначение: ТАДУ 421451.001"},
         ], payload={"title_block": {"designation": "ТАДУ 421451001"}})
         drawing_record.apply([fragment])
@@ -270,7 +295,7 @@ class TestStamp:
         assert "ТАДУ 421451001" not in fragment.content.text
 
     def test_graph_without_a_corrected_copy_falls_back_to_payload(self, composed):
-        fragment = _fragment("", fields=[], payload={
+        fragment = _fragment(SHEET_LINE, fields=[], payload={
             "title_block": {"mass": "26,02"}})
         drawing_record.apply([fragment])
         assert "Масса — 26,02." in fragment.content.text
@@ -280,14 +305,44 @@ class TestStamp:
         Одна графа бывает прочитана и печатной в штампе, и рукописной в
         боковой колонке — это два разных значения, и путать их нельзя.
         """
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "title_block", "value": "Инв. № подл.: 1012-02 (рукописно)"},
         ], payload={"title_block_handwritten": {"inventory": "1012-O2"}})
         drawing_record.apply([fragment])
         assert "Инв. № подл. — 1012-02." in fragment.content.text
 
+    def test_unknown_graph_also_gets_its_corrected_value(self, composed):
+        """
+        Непонятая графа ищется по свёрнутой записи и у поля, и у payload —
+        иначе исправленная копия такой графы не находилась бы никогда, а
+        запасной путь срабатывал бы по случайности.
+        """
+        fragment = _fragment(SHEET_LINE, fields=[
+            {"category": "title_block", "value": "Код заказа: ВД-005"},
+        ], payload={"title_block": {"Код заказа": "ВД-ОО5"}})
+        drawing_record.apply([fragment])
+        assert "Код заказа — ВД-005." in fragment.content.text
+        assert "ВД-ОО5" not in fragment.content.text
+
+    @pytest.mark.parametrize("key", ["mass", "scale", "designation", "format"])
+    def test_internal_key_keeps_its_gost_label(self, composed, key):
+        """
+        Внутренний ключ разбора — ключ `LABELS`, а не повод звать графу
+        «mass». Подписанты сюда не входят: их запись называет глаголом.
+        """
+        fragment = _fragment(SHEET_LINE, payload={"title_block": {key: "X"}})
+        drawing_record.apply([fragment])
+        assert f"{label(key)} — X." in fragment.content.text
+        assert f"{key} — X." not in fragment.content.text
+
+    def test_internal_signer_key_is_named_by_the_verb(self, composed):
+        fragment = _fragment(SHEET_LINE,
+                             payload={"title_block": {"norm_control": "X"}})
+        drawing_record.apply([fragment])
+        assert "Лист подписали: нормоконтроль X." in fragment.content.text
+
     def test_unknown_graph_is_not_dropped(self, composed):
-        fragment = _fragment("", payload={"title_block": {"custom_graph": "ВД005"}})
+        fragment = _fragment(SHEET_LINE, payload={"title_block": {"custom_graph": "ВД005"}})
         drawing_record.apply([fragment])
         assert "ВД005" in fragment.content.text
 
@@ -415,7 +470,7 @@ class TestViews:
 # ------------------------------------------------------------------- размеры
 class TestDimensions:
     def test_values_are_grouped_by_what_they_are(self, composed):
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "size", "value": "⌀57"},
             {"category": "size", "value": "100±10"},
             {"category": "size", "value": "35°"},
@@ -445,14 +500,14 @@ class TestDimensions:
         выводит из категории любому числу, с листа не читая. Признаком
         он поэтому не считается.
         """
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "size", "value": value, "unit": "мм"}])
         drawing_record.apply([fragment])
         assert "Линейные размеры" not in (fragment.content.text or "")
 
     @pytest.mark.parametrize("value", ["L", "h", "d", "Dp", "Dn"])
     def test_letter_placeholder_is_not_announced_as_a_dimension(self, composed, value):
-        fragment = _fragment("", fields=[{"category": "size", "value": value}])
+        fragment = _fragment(SHEET_LINE, fields=[{"category": "size", "value": value}])
         drawing_record.apply([fragment])
         assert "Линейные размеры" not in (fragment.content.text or "")
 
@@ -464,7 +519,7 @@ class TestDimensions:
         ({"category": "size", "value": "250", "tolerance": "±2"}, "250"),
     ])
     def test_dimension_that_says_what_it_is_stays(self, composed, field, expected):
-        fragment = _fragment("", fields=[field])
+        fragment = _fragment(SHEET_LINE, fields=[field])
         drawing_record.apply([fragment])
         assert expected in fragment.content.text
         assert "Линейные размеры" in fragment.content.text
@@ -477,18 +532,31 @@ class TestDimensions:
         drawing_record.apply([fragment])
         assert "\n3\n1\n7" in fragment.content.text
 
-    @pytest.mark.parametrize("value", ["Ø57", "ø44", "Φ20", "φ8,5", "⌀10"])
+    @pytest.mark.parametrize("value", ["Ø57", "ø44", "Φ20", "φ8,5", "⌀10", "Ф20"])
     def test_every_diameter_glyph_is_a_diameter(self, composed, value):
         """
         Векторный путь кладёт в поля то, что прочитал, знак к одному виду
         не приводя: «Ø57» уходило в линейные размеры.
         """
-        fragment = _fragment("", fields=[{"category": "size", "value": value}])
+        fragment = _fragment(SHEET_LINE, fields=[{"category": "size", "value": value}])
         drawing_record.apply([fragment])
         assert f"Диаметры — {value}." in fragment.content.text
 
+    @pytest.mark.parametrize("value", ["Фаска 2х45°", "Фланец"])
+    def test_cyrillic_ef_in_a_word_is_not_a_diameter(self, composed, value):
+        """
+        «Ф» считается диаметром только вплотную к числу, как и в
+        `drawing_text`: иначе «Фаска 2х45°» ушла бы в диаметры, потому что
+        знак диаметра проверяется прежде градуса.
+        """
+        fragment = _fragment(SHEET_LINE, fields=[
+            {"category": "size", "value": value},
+        ])
+        drawing_record.apply([fragment])
+        assert "Диаметры" not in fragment.content.text
+
     def test_repeated_reading_is_said_once(self, composed):
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "size", "value": "⌀57"},
             {"category": "size", "value": "⌀57"},
         ])
@@ -496,7 +564,7 @@ class TestDimensions:
         assert "Диаметры — ⌀57." in fragment.content.text
 
     def test_positions_point_at_the_specification(self, composed):
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "position", "value": "17"},
             {"category": "position", "value": "18"},
             {"category": "position", "value": "19"},
@@ -507,14 +575,14 @@ class TestDimensions:
         assert "в спецификации" in record
 
     def test_callouts_are_their_own_part(self, composed):
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "callout", "value": "Т1-ИНп-3"},
         ])
         drawing_record.apply([fragment])
         assert "Обозначения и выноски на листе: Т1-ИНп-3." in fragment.content.text
 
     def test_requirements_are_kept_as_written(self, composed):
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "note",
              "value": "1. Сварка аргонодуговая по ГОСТ 14771-76."},
         ])
@@ -530,7 +598,7 @@ class TestDimensions:
         документа СМК; заголовок «технические требования листа» был бы
         неправдой.
         """
-        fragment = _fragment("", fields=[
+        fragment = _fragment(SHEET_LINE, fields=[
             {"category": "note",
              "value": "2 Выходные данные анализа СМК включают в себя"},
         ])
@@ -541,7 +609,7 @@ class TestDimensions:
 # ------------------------------------------------------------------- таблицы
 class TestTables:
     def test_every_cell_gets_its_column_name(self, composed):
-        fragment = _fragment("", payload={"tables": [{
+        fragment = _fragment(SHEET_LINE, payload={"tables": [{
             "kind": "table",
             "title": "Таблица исполнений",
             "headers": ["Обозначение", "Наименование", "Кол-во"],
@@ -554,7 +622,7 @@ class TestTables:
                 "Кол-во — 1 экз.." in record)
 
     def test_headerless_row_keeps_its_values(self, composed):
-        fragment = _fragment("", payload={"tables": [{
+        fragment = _fragment(SHEET_LINE, payload={"tables": [{
             "kind": "table", "rows": [["Консервация В3-0", "2024"]],
         }]})
         drawing_record.apply([fragment])
@@ -565,7 +633,7 @@ class TestTables:
         Сетка штампа — те же подписи и значения, что запись уже назвала
         графами. Повтор вернул бы перемешивание подписей с числами.
         """
-        fragment = _fragment("", payload={
+        fragment = _fragment(SHEET_LINE, payload={
             "title_block": TADU_STAMP,
             "tables": [{
                 "kind": "title_block",
@@ -585,7 +653,7 @@ class TestTables:
         Та же пометка `title_block`, но это «Комплектность»: наименования и
         количества, а не подписи граф. Такая таблица остаётся.
         """
-        fragment = _fragment("", payload={
+        fragment = _fragment(SHEET_LINE, payload={
             "title_block": TADU_STAMP,
             "tables": [{
                 "kind": "title_block",
@@ -604,7 +672,7 @@ class TestTables:
 
     def test_stamp_grid_is_kept_when_graphs_were_not_parsed(self, composed):
         """Без разобранных граф сетка — всё, что о штампе известно."""
-        fragment = _fragment("", payload={"tables": [{
+        fragment = _fragment(SHEET_LINE, payload={"tables": [{
             "kind": "title_block",
             "rows": [["Изм", "Лист", "N докум."], ["Разраб.", "Прохоров"]],
         }]})
@@ -613,6 +681,110 @@ class TestTables:
 
 
 # -------------------------------------------------------------------- конвейер
+class TestChunkability:
+    """
+    Разметка частей для чанкера RAG. Он режет запись по пределу в токенах и
+    ищет границы «только по явным пометкам источника» (заголовок Markdown,
+    номер пункта) — прозаический заголовок «Диаметры — …» для него невидим.
+    Поэтому границы называются явно, в payload.
+    """
+
+    def _composed(self):
+        fragment = _fragment(SM1638_TEXT + "\n" + TADU_TEXT, fields=[
+            {"category": "size", "value": "⌀8,5"},
+            {"category": "radius", "value": "R65"},
+            {"category": "position", "value": "17"},
+            {"category": "note", "value": "1. Размеры для справок."},
+        ], payload={"title_block": TADU_STAMP})
+        drawing_record.apply([fragment])
+        return fragment
+
+    def test_offsets_reconstruct_the_record_exactly(self, composed):
+        fragment = self._composed()
+        text = fragment.content.text
+        parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
+        assert "\n\n".join(text[p["start"]:p["end"]] for p in parts) == text
+
+    def test_parts_do_not_overlap_and_run_in_order(self, composed):
+        fragment = self._composed()
+        parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
+        assert parts[0]["start"] == 0
+        for earlier, later in zip(parts, parts[1:]):
+            assert earlier["end"] < later["start"]
+
+    def test_title_is_the_first_line_of_its_part(self, composed):
+        fragment = self._composed()
+        text = fragment.content.text
+        for part in fragment.content.structured_payload[drawing_record.PARTS_KEY]:
+            body = text[part["start"]:part["end"]]
+            assert body.startswith(part["title"])
+            assert "\n" not in part["title"]
+
+    def test_breaks_are_line_starts_inside_their_part(self, composed):
+        fragment = self._composed()
+        text = fragment.content.text
+        for part in fragment.content.structured_payload[drawing_record.PARTS_KEY]:
+            for offset in part["breaks"]:
+                assert part["start"] < offset <= part["end"]
+                assert text[offset - 1] == "\n"
+
+    def test_a_group_of_values_is_never_cut_from_its_heading(self, composed):
+        """
+        Между началами строк — значит, перечень «Диаметры — …» режется только
+        целиком. Внутри строки чанкер резать не обязан: самая большая часть
+        «Размеры» на 250 листах с прода — 411 символов из 1280 предела.
+        """
+        fragment = self._composed()
+        text = fragment.content.text
+        part = next(p for p in fragment.content.structured_payload[
+            drawing_record.PARTS_KEY] if p["kind"] == "dimensions")
+        for offset in part["breaks"]:
+            assert text[offset:].startswith(("Диаметры", "Радиусы", "Резьба",
+                                             "Шероховатость", "Углы",
+                                             "Допуски", "Линейные"))
+
+    def test_the_stamp_is_the_first_part(self, composed):
+        """
+        Если запись разрежут и найдётся только первый кусок, в нём должен
+        быть ответ на «какая масса». Это свойство порядка, а не случайность.
+        """
+        fragment = self._composed()
+        parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
+        assert parts[0]["kind"] == "stamp"
+        assert "Масса — 26,02" in fragment.content.text[:parts[0]["end"]]
+
+    def test_parts_are_separated_by_a_blank_line(self, composed):
+        """Чанкер, который разметку не читает, а абзацы различает, тоже попадёт."""
+        fragment = self._composed()
+        text = fragment.content.text
+        parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
+        for earlier, later in zip(parts, parts[1:]):
+            assert text[earlier["end"]:later["start"]] == "\n\n"
+
+    def test_context_names_the_sheet_and_is_not_repeated_in_the_prose(self, composed):
+        """
+        Обозначение в каждый кусок ставит чанкер своим заголовком, который в
+        поиск уходит, а заказчику не показывается. В прозе его повторять не
+        надо — это был бы шум в каждой части.
+        """
+        fragment = self._composed()
+        payload = fragment.content.structured_payload
+        context = payload[drawing_record.CONTEXT_KEY]
+        assert "ТАДУ 302318.207.00 СБ" in context
+        assert "Трубная обвязка" in context
+        assert fragment.content.text.count("ТАДУ 302318.207.00 СБ") == 2
+
+    def test_no_markup_is_added_to_the_prose(self, composed):
+        """Границы названы в payload, а не решёткой Markdown в тексте."""
+        fragment = self._composed()
+        assert "#" not in fragment.content.text
+
+    def test_nothing_emitted_when_nothing_is_composed(self, composed):
+        fragment = _fragment("")
+        drawing_record.apply([fragment])
+        assert drawing_record.PARTS_KEY not in fragment.content.structured_payload
+
+
 class TestPipeline:
     def test_other_fragment_types_are_untouched(self, composed):
         fragment = Fragment(
