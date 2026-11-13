@@ -550,18 +550,36 @@ def process_document(
             # равно прочитан короче распознавания — тоже на проверку.
             review_required = True
             drawing_warnings.append(drawing_route.WARNING_THIN_KEPT)
-        elif drawing_route.thin_structure(parse_result):
-            # Поля листа есть, а штампа и обозначения нет: лист опознан не
-            # полностью, за полный он не выдаётся.
-            review_required = True
-            drawing_warnings.append(drawing_route.WARNING_THIN_STRUCTURE)
-        if drawing_route.unstructured_fallback(parse_result):
-            # Плоский текст наружу при живом структурном уровне — потеря, и
-            # молчать о ней статусом нельзя (LADDER_STRUCTURE_OVER_LENGTH).
-            review_required = True
-            drawing_warnings.append(drawing_route.WARNING_FALLBACK_WON)
+        # Победа фоллбэка сама по себе проверки не требует. Наружу уходит
+        # результат, у которого текста и подтверждённых страниц не меньше,
+        # чем у проигравшего уровня: лестница отдаёт старшинство фоллбэку
+        # ровно тогда, когда структурный уровень потерял текст или страницу.
+        # Доказать по этим данным, что в выбранном результате чего-то не
+        # хватает, нельзя, а звать человека к документу, о котором нечего
+        # сказать, — платить за проверку впустую. Деградация остаётся в
+        # `degraded`, `fallback_won` и в логе уровня ERROR.
         warnings = list(dict.fromkeys(warnings + drawing_warnings))
-        document_status = "partial" if report["failed_pages"] or report["coverage_unknown"] or review_required else "completed"
+        # Неполнота документа и вызов человека — разные вещи, и до сих пор
+        # они были одним флагом.
+        text_incomplete = bool(
+            review_required or report["failed_pages"] or report["coverage_unknown"]
+        )
+        reprocess = drawing_route.reprocess_candidate(warnings, parse_result)
+        if settings.LADDER_STRUCTURE_OVER_LENGTH:
+            # Качество разбора человека не касается. К человеку документ идёт
+            # за решением, которое может принять только он: куда документ
+            # относится, как он называется, какая редакция старше. Насколько
+            # хорошо прочитан лист — забота системы: это лечится повторным
+            # чтением, а не чужими глазами, и платить за проверку каждого
+            # недочитанного листа незачем. Всё, из чего складывался этот
+            # флаг здесь, — признаки качества разбора (`document_quality`,
+            # `drawing_route`), поэтому он снимается целиком.
+            #
+            # Неполнота при этом не замалчивается: статус остаётся `partial`,
+            # предупреждения и `degraded` на месте, пометки отдельных
+            # фрагментов (`needs_review`) тоже — по ним качество считают.
+            review_required = False
+        document_status = "partial" if text_incomplete else "completed"
         mime_type = filetypes.mime_for(located.file_type)
         normalized_hash = normalized_content_hash(fragments)
 
@@ -597,6 +615,12 @@ def process_document(
                 "warnings": warnings,
                 "processing_profile_version": PROCESSING_PROFILE_VERSION,
                 "review_required": review_required,
+                # Текст документа неполон — независимо от того, зовут ли
+                # человека. По этому полю считают качество разбора, а не
+                # загрузку людей, и оно же отбирает документы на повторное
+                # чтение (`quality_reprocess` называет причины).
+                "text_incomplete": text_incomplete,
+                "quality_reprocess": reprocess,
                 "normalized_content_hash": normalized_hash,
                 "parsed_pages_count": parse_result.page_count or len(parse_result.pages()),
                 "total_fragments": len(fragments),

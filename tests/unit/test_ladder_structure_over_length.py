@@ -214,7 +214,6 @@ class TestRouteOnASheetTheDetectorCalledText:
         assert result.ladder["chosen_strategy"] == "plain_ocr"
         assert result.ladder["fallback_won"] is True
         assert result.fallback_reserve is None
-        assert drawing_route.unstructured_fallback(result) is False
 
     def test_flag_off_scores_are_the_ones_from_the_log(self, flag_off):
         """Решал не балл: у проигравшего уровня он был выше."""
@@ -300,7 +299,7 @@ class TestOrdinaryDocumentsKeepThePlainRoute:
         """
         result = route(720, 8, data=PDF, file_type="pdf", genre=GENRE_DRAWING)
         assert result.ladder["chosen_strategy"] == "plain_ocr"
-        assert drawing_route.unstructured_fallback(result) is True
+        assert result.ladder["fallback_won"] is True
 
     def test_table_grid_and_stamps_do_not_make_a_drawing(self, flag_on):
         """
@@ -370,8 +369,13 @@ class TestSettleDecidedByStructure:
         drawing_route.settle([garble], result, METADATA, TextNormalizer())
         assert result.ladder["drawing_route"]["won"] is False
 
-    def test_structured_but_unidentified_sheet_is_not_passed_off_as_whole(self):
-        """Размеры есть, штампа и обозначения нет: разбор остаётся, лист — на проверку."""
+    def test_structured_but_unidentified_sheet_is_accepted_not_escalated(self):
+        """
+        Размеры есть, штампа и обозначения нет. Разбор принимается: человеку
+        здесь решать нечего — либо штампа на листе нет, либо модель его не
+        нашла, и тогда нужен повторный разбор. Недочитанный штамп остаётся
+        счётным признаком, но предупреждением документа не становится.
+        """
         result = chosen_with_reserve(1692)
         sheet = sheet_fragment(fields=(("size", "⌀12"), ("size", "45")))
         settled, flags = drawing_route.settle(
@@ -380,11 +384,18 @@ class TestSettleDecidedByStructure:
         assert result.ladder["drawing_route"]["won"] is True
         assert result.ladder["drawing_route"]["thin_structure"] is True
         assert drawing_route.thin_structure(result) is True
-        assert any("без штампа и обозначения" in note for note in result.degraded)
+        assert result.degraded == []
+        assert drawing_route.reprocess_candidate([], result) == [
+            drawing_route.THIN_STRUCTURE]
 
 
-class TestDocumentIsReturnedToAHuman:
-    """Молчаливый `completed` при победе плоского текста больше не выдаётся."""
+class TestQualityNeverCallsAHuman:
+    """
+    К человеку документ идёт за решением, которое может принять только он:
+    куда документ относится, как он называется, какая редакция старше.
+    Насколько хорошо прочитан лист — забота системы, и в очередь проверки
+    такой документ не попадает ни по одному из признаков качества.
+    """
 
     @pytest.fixture
     def run(self, monkeypatch, temp_storage, task_db, fake_redis):
@@ -432,25 +443,29 @@ class TestDocumentIsReturnedToAHuman:
         assert extra["chosen_strategy"] == "layout"
         assert extra["drawing_route"]["won"] is True
         assert document["status"] == "completed"
-        assert drawing_route.WARNING_FALLBACK_WON not in document["warnings"]
+        assert document["review_required"] is False
+        assert extra["quality_reprocess"] == []
 
-    def test_fallback_victory_is_no_longer_silent(self, flag_on, run):
+    def test_fallback_victory_does_not_call_a_human(self, flag_on, run):
         """
-        Лист без рамки, разобранный плоским текстом при живом уровне 5:
-        маршрут остаётся прежним, но документ уходит человеку, а не в индекс
-        как полный.
+        Лист без рамки, разобранный плоским текстом при живом уровне 5.
+        Маршрут остаётся прежним, человека не зовут: в выбранном результате
+        текста и подтверждённых страниц не меньше, чем у проигравшего
+        уровня, и сказать человеку о таком документе нечего. Деградация при
+        этом не исчезает — она в `warnings`, в `degraded` и в логе.
         """
         parse_result = route(1240, 0, signals=LETTER_SIGNALS)
         assert parse_result.ladder["fallback_won"] is True
         document, extra = run(
             parse_result, lambda self, fragments, metadata: fragments)
         assert extra["chosen_strategy"] == "plain_ocr"
-        assert document["status"] == "partial"
-        assert document["review_required"] is True
-        assert drawing_route.WARNING_FALLBACK_WON in document["warnings"]
+        assert document["review_required"] is False
+        assert extra["fallback_won"] is True
+        assert any("выиграл сравнение" in w for w in document["warnings"])
+        assert extra["degraded"]
 
     def test_flag_off_publishes_the_same_document_as_today(self, flag_off, run):
-        """Поведение при выключенном флаге не меняется — включая молчание."""
+        """Поведение при выключенном флаге не меняется."""
         parse_result = route(1240, 0, signals=LETTER_SIGNALS)
         document, extra = run(
             parse_result, lambda self, fragments, metadata: fragments)
@@ -458,31 +473,15 @@ class TestDocumentIsReturnedToAHuman:
         assert extra["fallback_won"] is True
         assert document["status"] == "completed"
         assert document["review_required"] is False
-        assert drawing_route.WARNING_FALLBACK_WON not in document["warnings"]
 
-    def test_degraded_document_carries_a_warning_rag_cannot_treat_as_advisory(
+    def test_unread_sheet_keeps_the_text_says_partial_and_asks_no_one(
         self, flag_on, run):
         """
-        Статуса `partial` для потребителя мало. RAG считает `partial` полным
-        текстом, если все страницы разобраны и среди предупреждений нет ни
-        одного, кроме совещательных — `DRAWING_COMPLETENESS_UNKNOWN`,
-        `DRAWING_NOT_RECOGNIZED` и `parser_contract_dropped_invalid_extracted_facts:`
-        (`super_rag/parser/completeness.py`), — и тогда ставит событию
-        `indexed` без причины. Поэтому деградировавший документ обязан
-        уезжать с предупреждением вне этого списка, иначе он снова
-        проваливается в тишину.
+        Модель лист не прочитала. Текст распознавания возвращается, документ
+        честно говорит о себе `partial` — но человека не зовёт: решать ему
+        тут нечего, лист нужно прочитать заново. Причина повторного чтения
+        лежит в `quality_reprocess`, по ней документы и отбираются.
         """
-        advisory = {"DRAWING_COMPLETENESS_UNKNOWN", "DRAWING_NOT_RECOGNIZED"}
-        document, _ = run(
-            route(1240, 0, signals=LETTER_SIGNALS),
-            lambda self, fragments, metadata: fragments,
-        )
-        assert document["status"] == "partial"
-        assert [w for w in document["warnings"]
-                if w not in advisory
-                and not w.startswith("parser_contract_dropped_invalid_extracted_facts:")]
-
-    def test_unread_sheet_goes_back_for_review_with_the_recognition_text(self, flag_on, run):
         document, extra = run(
             chosen_with_reserve(1692),
             lambda self, fragments, metadata: [unread_picture()],
@@ -490,8 +489,34 @@ class TestDocumentIsReturnedToAHuman:
         text = "".join(f["content"]["text"] or "" for f in document["fragments"])
         assert len("".join(text.split())) == 1692
         assert document["status"] == "partial"
-        assert document["review_required"] is True
+        assert document["review_required"] is False
+        assert extra["text_incomplete"] is True
         assert drawing_route.WARNING_THIN in document["warnings"]
+        assert set(extra["quality_reprocess"]) == {
+            "DRAWING_NOT_RECOGNIZED", drawing_route.WARNING_THIN}
+
+    def test_flag_off_still_sends_an_unread_sheet_to_a_human(self, flag_off, run):
+        """Прежнее поведение `LADDER_DRAWING_OVER_OCR` не тронуто."""
+        document, _ = run(
+            chosen_with_reserve(1692, genre=GENRE_DRAWING),
+            lambda self, fragments, metadata: [unread_picture()],
+        )
+        assert document["status"] == "partial"
+        assert document["review_required"] is True
+
+    def test_sheet_without_a_title_block_asks_no_one_either(self, flag_on, run):
+        """Недочитанный штамп — причина перечитать лист, а не позвать человека."""
+        document, extra = run(
+            chosen_with_reserve(98),
+            lambda self, fragments, metadata: [
+                sheet_fragment(fields=(("size", "⌀12"), ("size", "45")))],
+        )
+        assert document["review_required"] is False
+        assert extra["drawing_route"]["thin_structure"] is True
+        assert extra["quality_reprocess"] == [drawing_route.THIN_STRUCTURE]
+        # Счётный признак, но не предупреждение документа: предупреждение
+        # уехало бы потребителю и вернулось бы человеком.
+        assert drawing_route.THIN_STRUCTURE not in document["warnings"]
 
 
 class TestNothingChangesWithoutTheFlag:
@@ -518,4 +543,4 @@ class TestNothingChangesWithoutTheFlag:
         result = ParseResult(blocks=[ParsedBlock(type="text", text=text_of(50), page=1)])
         assert drawing_route.lost(result) is False
         assert drawing_route.thin_structure(result) is False
-        assert drawing_route.unstructured_fallback(result) is False
+        assert drawing_route.reprocess_candidate([], result) == []
