@@ -166,6 +166,18 @@ _SIGN_RULE = """- Знак отклонения переписывай ровн�
 - Звёздочку справочного размера не теряй: «30±10*», «(Y+12)*».
 """
 
+# Мелкий шрифт штампа и выносок (`DRAWING_DIMENSION_FIDELITY`). На проде
+# «Ербасов» прочитано как «Ервасов», «Бажко» — как «Бахко», «Н1-ИНп» — как
+# «H1-ИНн»: ошибка в одной букве, которую не выправит ни словарь (фамилии
+# в нём нет), ни правило (прочтений у буквы два). Поэтому вырезка штампа
+# увеличивается, а в запрос добавляется правило про эти буквы.
+_CAREFUL_LETTERS_RULE = """- Фамилии в графах штампа читай по буквам и не подбирай похожее слово.
+  В шрифте по ГОСТ 2.304 путаются «б» и «в», «ж» и «х», «н» и «п»,
+  «и» и «н»: «Ербасов», а не «Ервасов»; «Бажко», а не «Бахко».
+- Обозначение сварного шва пиши кириллицей и целиком: «Н1-ИНп», «У4-ИНп»,
+  «Т1-ИНп» — не «H1-ИНн» и не «T1-ИНн».
+"""
+
 _SMALL_PRINT_RULE = """- Запятую в десятичной дроби не теряй: «M20x1,5», «Rz 3,2», «⌀8,5» — а не
   «M20x15», «Rz 32», «⌀85». Предельные отклонения, написанные мелко справа
   вверху и внизу от размера, пиши полностью, со знаком и запятой: «12+0,8»,
@@ -236,7 +248,7 @@ class QwenVisionClient:
             hint=f"\n- Подсказка по разметке листа: {hint}" if hint else "",
         )
         if settings.DRAWING_DIMENSION_FIDELITY:
-            prompt += _SIGN_RULE
+            prompt += _SIGN_RULE + _CAREFUL_LETTERS_RULE
         if settings.DRAWING_SMALL_PRINT_CARE:
             prompt += _SMALL_PRINT_RULE
             image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
@@ -255,7 +267,13 @@ class QwenVisionClient:
 
     def read_title_block(self, image) -> Optional[Dict[str, Any]]:
         """Вырезанный штамп -> графы и та же таблица построчно."""
-        data = self._ask(image, _TITLE_BLOCK_PROMPT, settings.QWEN_REGION_MAX_SIDE)
+        prompt = _TITLE_BLOCK_PROMPT
+        if settings.DRAWING_DIMENSION_FIDELITY:
+            # Фамилии в штампе — мелкий рукописный шрифт: вырезка
+            # увеличивается, как и вырезка вида с мелкими отклонениями.
+            prompt += _CAREFUL_LETTERS_RULE
+            image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
+        data = self._ask(image, prompt, settings.QWEN_REGION_MAX_SIDE)
         if data is None:
             return None
         fields = data.get("fields")
@@ -568,7 +586,8 @@ def _transcribe_prompt() -> str:
     """Запрос «перепиши весь текст листа»; с DRAWING_SMALL_PRINT_CARE — с правилом про дроби."""
     return (
         _TRANSCRIBE_PROMPT
-        + (_SIGN_RULE if settings.DRAWING_DIMENSION_FIDELITY else "")
+        + (_SIGN_RULE + _CAREFUL_LETTERS_RULE
+           if settings.DRAWING_DIMENSION_FIDELITY else "")
         + (_SMALL_PRINT_RULE if settings.DRAWING_SMALL_PRINT_CARE else "")
     )
 
