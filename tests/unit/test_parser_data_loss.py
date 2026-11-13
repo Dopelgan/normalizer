@@ -1,7 +1,7 @@
 """
-Причинные регрессии потерь данных в разборе (10.11.2026):
-формулы XLSX без сохранённого значения, обрыв OCR после сбойной пачки
-страниц и таймаут MinerU, выключавший разбор с разметкой для всех документов.
+Потери данных в разборе: формулы XLSX без сохранённого значения, обрыв OCR
+после сбойной пачки страниц и таймаут MinerU, который не должен выключать
+разбор с разметкой для всех документов.
 """
 
 import io
@@ -95,7 +95,7 @@ def test_text_layer_continues_after_failed_batch(pdf_provider, monkeypatch):
 
 
 def test_unknown_page_count_does_not_invent_failed_pages(pdf_provider, monkeypatch):
-    """Число страниц неизвестно: пачки за концом документа — не неудачи (ревью 2b0d2e1)."""
+    """Число страниц неизвестно: пачки за концом документа — не неудачи."""
     monkeypatch.setattr(pdf_provider, "_page_count", staticmethod(lambda path: 0))
 
     def render(path, first_page, last_page, dpi):
@@ -194,7 +194,7 @@ def test_restoration_keeps_every_page_of_a_scan():
     assert sample and applied
 
 
-# ------------------------------------------- общий срок задачи (ревью 6ff80ed)
+# ------------------------------------------------------- общий срок задачи
 
 def test_deadline_bounds_budgets_only_inside_task():
     from core import deadline
@@ -268,7 +268,7 @@ def test_ocr_render_does_not_swallow_soft_time_limit(pdf_provider, monkeypatch):
 
 
 def test_soft_limit_keeps_best_candidate_already_found():
-    """Мягкий лимит на дорогом уровне не теряет результат дешёвого (ревью f7e47ff)."""
+    """Мягкий лимит на дорогом уровне не теряет результат дешёвого."""
     from celery.exceptions import SoftTimeLimitExceeded
     from core.ladder.router import LadderRouter
     from core.models.parse_result import ParsedBlock, ParseResult
@@ -299,7 +299,7 @@ def test_restoration_stops_before_task_deadline():
     assert restored is None and applied == []  # ни одной страницы не начато
 
 
-# ------------------------------------------------- сканы чертежей в PDF (10.11)
+# ------------------------------------------------------- сканы чертежей в PDF
 
 def _scanned_drawing_pdf(pages: int = 1) -> bytes:
     """Скан чертежа: рамка ГОСТ с полем подшивки 20 мм (9,5 % ширины), без текстового слоя."""
@@ -326,7 +326,7 @@ def _scanned_drawing_pdf(pages: int = 1) -> bytes:
 
 
 def test_scanned_pdf_drawing_is_classified_as_drawing(monkeypatch):
-    """Скан PDF без векторных линий проверяется растровым детектором (раньше — нет)."""
+    """Скан PDF без векторных линий проверяется растровым детектором."""
     from core.ladder.context import GENRE_DRAWING, DocumentContext
     from core.providers import raster_drawing
 
@@ -397,9 +397,9 @@ def _no_pdf_render(*args, **kwargs):
 
 class TestExtensionlessAttachmentIsOcrAsImage:
     """
-    Регрессия ревью 3c9374b: у вложения чата ключ — голый uuid, временный
-    файл получал суффикс `.pdf`, и PNG уходил в pdf2image ("Unable to get
-    page count"): слой распознавания и полный OCR-фоллбэк терялись.
+    У вложения чата ключ — голый uuid. Временный файл с суффиксом `.pdf`
+    отправил бы PNG в pdf2image ("Unable to get page count"), и слой
+    распознавания и полный OCR-фоллбэк потерялись бы.
     """
 
     def test_materialize_suffix_from_file_type(self):

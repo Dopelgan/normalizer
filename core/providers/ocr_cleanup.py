@@ -36,7 +36,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from celery.exceptions import SoftTimeLimitExceeded
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
@@ -45,11 +45,11 @@ logger = logging.getLogger(__name__)
 # Латинская (и греческая) буква -> кириллические прочтения, первое — самое
 # вероятное. Курсив ГОСТ даёт «u» вместо «и», «m» вместо «т», «n» вместо
 # «п», «g»/«d» вместо «д», «b» вместо «в»/«б»/«ь». На примечаниях чертежей
-# (13.11) ещё «z» вместо «г»/«з», «s» вместо «з», «n» вместо «л», «a» вместо
+# ещё «z» вместо «г»/«з», «s» вместо «з», «n» вместо «л», «a» вместо
 # «я», «x» вместо «к», «u»/«y» вместо «ч», «C» вместо «Д»: «Cozobopa» —
 # «Договора», «Macca usdenua» — «Масса изделия», «MEXHONOZUYECKUX» —
 # «ТЕХНОЛОГИЧЕСКИХ». Лишние прочтения стоят дальше по рангу и проходят
-# только через словарь, как и прежние.
+# только через словарь, как и остальные.
 _LATIN_TO_CYR: Dict[str, Tuple[str, ...]] = {
     "a": ("а", "я"), "b": ("в", "б", "ь"), "c": ("с",), "d": ("д", "б"),
     "e": ("е",), "g": ("д",), "h": ("н",), "i": ("й", "і"), "k": ("к",),

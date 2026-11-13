@@ -359,8 +359,8 @@ def process_document(
 
             if document is not None and document.status == "pending":
                 # Порог — жёсткий лимит разбора с запасом, а не таймаут
-                # синхронного ответа (900 с): раньше живой часовой разбор
-                # считался зависшим и запускался второй раз.
+                # синхронного ответа (900 с): иначе живой часовой разбор
+                # считается зависшим и запускается второй раз.
                 if doc_repo.is_stale(document, parse_stale_after_seconds()):
                     logger.warning("Документ %s завис в pending, перезапускаем", doc_id)
                 else:

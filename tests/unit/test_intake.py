@@ -376,9 +376,9 @@ class TestEscalation:
 
     def test_unsure_positive_marker_is_accepted_for_review(self):
         """
-        Регрессия (прод, 11.2026): неуверенный, но опознанный маркером
-        принимаемой категории документ без G-4 уходил в карантин и в индекс
-        не попадал. Признаков против нет — принимается с пометкой проверки.
+        Неуверенный, но опознанный маркером принимаемой категории документ
+        без G-4 не уходит в карантин: признаков против нет — принимается с
+        пометкой проверки.
         """
         previous = self._uncertain({CATEGORY_TECHNICAL: 1.0, CATEGORY_BUSINESS: 1.0})
         verdict = gateway().escalation_layer("documents/x.pdf", b"", previous)
@@ -416,7 +416,7 @@ class TestEscalation:
             assert verdict.outcome == QUARANTINE, negative
 
     def test_personal_name_with_designation_is_not_accepted(self):
-        """«личное_ТАДУ 687000.001.pdf» раньше отклонялся — не должен стать КД."""
+        """«личное_ТАДУ 687000.001.pdf» — личное, а не КД."""
         uri = "imports/u/личное_ТАДУ 687000.001.pdf"
         data = self._scan()
         verdict = gateway({uri: data}).evaluate(uri, uri, len(data))

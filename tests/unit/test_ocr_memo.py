@@ -3,8 +3,8 @@
 
 Лестница на скане запускает уровень 4 (plain_ocr, `parse_all_pages`) и
 уровень 5, где после MinerU тот же Tesseract снова читает те же страницы
-(`text_layer`). Оба прохода рендерят страницы одинаково и давали один и тот
-же результат — второй проход был чистой потерей времени (~40 % Tesseract).
+(`text_layer`). Оба прохода рендерят страницы одинаково и дают один и тот
+же результат — второй проход был бы чистой потерей времени (~40 % Tesseract).
 """
 
 from PIL import Image, ImageDraw
@@ -83,7 +83,7 @@ def test_different_pages_and_modes_are_not_confused(monkeypatch):
 
 
 def test_empty_result_is_not_remembered(monkeypatch):
-    """Пустой ответ неотличим от сбоя Tesseract — повтор как раньше."""
+    """Пустой ответ неотличим от сбоя Tesseract — страница читается снова."""
     fake = _Tesseract(words=())
     _patch(monkeypatch, fake)
     provider = TesseractFallbackProvider(storage=object())
@@ -148,7 +148,7 @@ def _run_ladder(monkeypatch, temp_storage):
 def test_ladder_reads_scan_once_and_keeps_both_results(monkeypatch, temp_storage):
     result, layout, fake = _run_ladder(monkeypatch, temp_storage)
     assert fake.calls == 1
-    # Уровень 4 по-прежнему отработал и вошёл в сравнение — выбор тот же.
+    # Уровень 4 отработал и вошёл в сравнение — выбор тот же.
     attempts = result.ladder["attempts"]
     assert [a["strategy"] for a in attempts] == ["plain_ocr", "layout"]
     assert attempts[0]["chars"] > 0
