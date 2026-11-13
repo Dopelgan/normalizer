@@ -28,6 +28,7 @@ from core.drawing_quality import document_quality
 from core.contract_finalize import finalize_fragments, normalized_content_hash
 from core.db.session import SessionLocal
 from core.drawing_processor import DrawingProcessor
+from core.ladder import drawing_route
 from core.mappers import document_to_metadata, fragment_to_row, row_to_fragment
 from core.models.contract import (
     DocumentMetadata,
@@ -441,6 +442,12 @@ def process_document(
 
         with telemetry.measure("parse.drawings", doc_id=doc_id):
             fragments = DrawingProcessor(storage).enrich_fragments(fragments, metadata)
+            # Лист, отданный чертёжной ветке авансом (LADDER_DRAWING_OVER_OCR):
+            # теперь он прочитан, и объём сверяется с распознаванием заново.
+            fragments, restored_flags = drawing_route.settle(
+                fragments, parse_result, metadata, normalizer
+            )
+            flags_by_id.update(restored_flags)
 
         # Идентификаторы, происхождение и факты — после ветки чертежей:
         # она заменяет фрагменты и вставляет разбор листа целиком, и только
@@ -465,6 +472,10 @@ def process_document(
                 and not any(f.type == "drawing" for f in fragments)):
             review_required = True
             drawing_warnings.append("DRAWING_NOT_RECOGNIZED")
+        if drawing_route.lost(parse_result):
+            # Бедный разбор листа не выдаётся за полный: документ на проверку.
+            review_required = True
+            drawing_warnings.append(drawing_route.WARNING_THIN)
         warnings = list(dict.fromkeys(warnings + drawing_warnings))
         document_status = "partial" if report["failed_pages"] or report["coverage_unknown"] or review_required else "completed"
         mime_type = filetypes.mime_for(located.file_type)
@@ -519,6 +530,10 @@ def process_document(
                 "chosen_strategy": ladder.get("chosen_strategy"),
                 "ladder_attempts": ladder.get("attempts") or [],
                 "fallback_won": bool(ladder.get("fallback_won")),
+                # Итог сверки чертёжного разбора с распознаванием — только
+                # у листов, где она была (LADDER_DRAWING_OVER_OCR).
+                **({"drawing_route": ladder["drawing_route"]}
+                   if ladder.get("drawing_route") else {}),
                 "degraded": list(parse_result.degraded),
                 "text_layer_stats": parse_result.text_layer_stats or {},
                 # Время каждой операции рядом с документом: по нему видно,

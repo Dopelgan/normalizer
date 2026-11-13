@@ -23,6 +23,13 @@
 символа со страницы, не должен побеждать распознавание всей страницы только
 потому, что он структурный.
 
+У оговорки есть граница применимости (`LADDER_DRAWING_OVER_OCR`): на
+листе-картинке, который растровый детектор считает чертежом, число символов
+у структурного разбора о потере не говорит. MinerU возвращает такой лист
+одной картинкой, а читает его модель — после лестницы. Здесь старшинство
+структурного разбора сохраняется, лучший фоллбэк остаётся в запасе, а
+сохранность сверяется после чтения листа (`core/ladder/drawing_route.py`).
+
 Правило сравнения: результаты уровней не смешиваются. Каждый уровень даёт
 свой результат целиком, они сравниваются оценкой, и наружу уходит лучший —
 вместе со сведениями о том, какой стратегией он получен и что пробовали до
@@ -40,6 +47,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from core import deadline
 from core.config import settings
+from core.ladder import drawing_route
 from core.ladder.base import Strategy, text_chars
 from core.ladder.context import DocumentContext
 from core.ladder.scoring import Score, score_result
@@ -191,11 +199,17 @@ class LadderRouter:
         # граница того, сколько текста на ней вообще есть.
         fallback_chars = 0
         structural_seen = False
+        # Лист прочитает чертёжная ветка: счёт символов у структурного
+        # разбора сравнивал бы непрочитанный лист с распознаванием.
+        sheet_read_later = drawing_route.deferred(context)
 
         def candidate_rank(candidate):
             parsed, evaluated, _, unit_coverage = candidate
             structured = not parsed.is_fallback
-            retains = self._keeps_content(text_chars(parsed), fallback_chars)
+            retains = (
+                self._keeps_content(text_chars(parsed), fallback_chars)
+                or (structured and sheet_read_later)
+            )
             # Дополнительная страница не оправдывает доказанную потерю уже
             # извлечённого текста. После нового fallback переоцениваем и
             # прежних кандидатов относительно той же мерки сохранности.
@@ -267,7 +281,8 @@ class LadderRouter:
             # проверка — сохранность: разбор, потерявший больше половины
             # текста относительно фоллбэка, старшинства не получает и
             # соревнуется по баллу наравне.
-            keeps = structural and self._keeps_content(chars, fallback_chars)
+            keeps_text = structural and self._keeps_content(chars, fallback_chars)
+            keeps = keeps_text or (structural and sheet_read_later)
             # Третий ключ — разрешение равенства: при одинаковом балле
             # старше тот, у кого есть структура. Но только если он её не
             # купил ценой потерянного текста, иначе оговорка о сохранности
@@ -279,7 +294,10 @@ class LadderRouter:
                 if keeps and not units_complete:
                     logger.info("Уровень %d не подтвердил все исходные единицы — пробуем следующий", strategy.level)
                     continue
-                if keeps and units_complete:
+                # Останавливает лестницу только измеренная сохранность:
+                # старшинство авансом (лист прочитает чертёжная ветка) не
+                # повод пропускать следующие уровни.
+                if keeps_text and units_complete:
                     break
                 if structural:
                     logger.info(
@@ -331,6 +349,22 @@ class LadderRouter:
                 best.degraded.append(note)
             logger.warning("Разбор %s деградировал: %s", context.uri, note)
 
+        # Старшинство выдано авансом: лист ещё не прочитан. Лучший фоллбэк
+        # уезжает вместе с результатом, и после чтения листа моделью объём
+        # сверяется заново — уже по тому, что чертёжная ветка принесла.
+        reserve: Optional[ParseResult] = None
+        if (sheet_read_later and not best.is_fallback
+                and not self._keeps_content(text_chars(best), fallback_chars)):
+            fallbacks = [c for c in candidates if c[0].is_fallback]
+            if fallbacks:
+                reserve = max(fallbacks, key=lambda c: (text_chars(c[0]), c[1].value))[0]
+                best.fallback_reserve = reserve
+                logger.info(
+                    "Лист-чертёж %s: разбор с %d символами оставлен старшим — лист "
+                    "прочитает чертёжная ветка; %s (%d символов) в запасе",
+                    context.uri, text_chars(best), reserve.parser_name, text_chars(reserve),
+                )
+
         best.ladder = {
             "chosen_level": best_strategy.level,
             "chosen_strategy": best_strategy.name,
@@ -340,6 +374,11 @@ class LadderRouter:
             "fallback_won": fallback_won,
             "degraded": list(best.degraded),
         }
+        if reserve is not None:
+            best.ladder["drawing_deferred"] = {
+                "reserve_strategy": reserve.parser_name,
+                "reserve_chars": text_chars(reserve),
+            }
         logger.info(
             "Выбран уровень %d (%s) с оценкой %.3f из %d попыток",
             best_strategy.level, best_strategy.name, best_score.value, len(attempts),

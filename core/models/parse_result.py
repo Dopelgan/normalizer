@@ -96,6 +96,11 @@ class ParseResult(BaseModel):
     # том, что система отработала хуже, чем умеет, — и молчать о них нельзя:
     # лежащий mineru-api иначе неотличим от плохого скана.
     degraded: List[str] = Field(default_factory=list)
+    # Лучший результат сплошного распознавания, когда лестница отдала лист
+    # чертёжной ветке (LADDER_DRAWING_OVER_OCR). Нужен после чтения листа
+    # моделью: если оно вышло беднее распознавания, текст возвращается
+    # (core/ladder/drawing_route.py). В сырой результат не пишется.
+    fallback_reserve: Optional["ParseResult"] = Field(None, exclude=True)
 
     def pages(self) -> List[int]:
         return sorted({b.page for b in self.blocks})
