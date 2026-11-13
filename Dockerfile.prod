@@ -40,18 +40,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # нельзя. Выбор модели — настройка `OCR_TESSDATA_DIR`, по умолчанию пусто,
 # то есть читают системные модели и образ ведёт себя как прежде.
 #
-# osd в каталог берётся системная: в tessdata_best это тот же файл, что в
-# пакете Debian (побайтово), а каталог --tessdata-dir подменяется целиком,
-# и без osd отвалится определение поворота листа.
+# osd кладётся в каталог копией системного. Распознаванию он не нужен —
+# `--tessdata-dir` получают только вызовы с языками rus+eng, — но тот же
+# каталог можно включить переменной TESSDATA_PREFIX, а она подменяет
+# каталог всем вызовам Tesseract, в том числе определению поворота листа.
+# В tessdata_best это побайтово тот же файл, поэтому он копируется из
+# образа, а не скачивается.
+#
+# TESSDATA_BEST_ENABLED=0 собирает образ без скачивания: сборке в сети без
+# выхода на github остаются системные модели и прежнее поведение.
+ARG TESSDATA_BEST_ENABLED=1
 ARG TESSDATA_BEST_URL=https://github.com/tesseract-ocr/tessdata_best/raw/4.1.0
 ARG TESSDATA_BEST_RUS_SHA256=b617eb6830ffabaaa795dd87ea7fd251adfe9cf0efe05eb9a2e8128b7728d6b6
 ARG TESSDATA_BEST_ENG_SHA256=8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba
-RUN mkdir -p /opt/tessdata/best \
-    && curl -sSLf -o /opt/tessdata/best/rus.traineddata "$TESSDATA_BEST_URL/rus.traineddata" \
-    && curl -sSLf -o /opt/tessdata/best/eng.traineddata "$TESSDATA_BEST_URL/eng.traineddata" \
-    && echo "$TESSDATA_BEST_RUS_SHA256  /opt/tessdata/best/rus.traineddata" | sha256sum -c - \
-    && echo "$TESSDATA_BEST_ENG_SHA256  /opt/tessdata/best/eng.traineddata" | sha256sum -c - \
-    && cp /usr/share/tesseract-ocr/5/tessdata/osd.traineddata /opt/tessdata/best/
+RUN if [ "$TESSDATA_BEST_ENABLED" = "1" ]; then set -e; \
+      mkdir -p /opt/tessdata/best; \
+      curl -sSLf -o /opt/tessdata/best/rus.traineddata "$TESSDATA_BEST_URL/rus.traineddata"; \
+      curl -sSLf -o /opt/tessdata/best/eng.traineddata "$TESSDATA_BEST_URL/eng.traineddata"; \
+      echo "$TESSDATA_BEST_RUS_SHA256  /opt/tessdata/best/rus.traineddata" | sha256sum -c -; \
+      echo "$TESSDATA_BEST_ENG_SHA256  /opt/tessdata/best/eng.traineddata" | sha256sum -c -; \
+      cp "$(dirname "$(find /usr/share -name osd.traineddata -print -quit)")/osd.traineddata" \
+         /opt/tessdata/best/; \
+    fi
 
 COPY --from=builder /install /usr/local
 

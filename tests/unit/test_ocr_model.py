@@ -9,12 +9,14 @@
 """
 
 import logging
+import shlex
 
 from core.config import settings
 from core.providers import ocr_model
 
 
 def _tessdata(tmp_path, names=ocr_model.REQUIRED):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     for name in names:
         # Содержимое не важно: проверяется только наличие файлов.
         (tmp_path / name).write_bytes(b"traineddata")
@@ -31,7 +33,7 @@ class TestTessdataDir:
         directory = _tessdata(tmp_path)
         monkeypatch.setattr(settings, "OCR_TESSDATA_DIR", directory)
         assert ocr_model.tessdata_dir() == directory
-        assert ocr_model.tessdata_option() == f" --tessdata-dir {directory}"
+        assert shlex.split(ocr_model.tessdata_option()) == ["--tessdata-dir", directory]
 
     def test_surrounding_spaces_do_not_break_the_path(self, monkeypatch, tmp_path):
         directory = _tessdata(tmp_path)
@@ -47,25 +49,21 @@ class TestTessdataDir:
 
     def test_incomplete_directory_falls_back_to_system(self, monkeypatch, tmp_path, caplog):
         # `--tessdata-dir` подменяет каталог целиком: без eng не соберётся
-        # связка rus+eng, без osd отвалится определение поворота листа.
-        # Половина каталога хуже системного — её не берём.
+        # связка rus+eng. Половина каталога хуже системного — её не берём.
         directory = _tessdata(tmp_path, ("rus.traineddata",))
         monkeypatch.setattr(ocr_model, "_warned", set())
         monkeypatch.setattr(settings, "OCR_TESSDATA_DIR", directory)
         with caplog.at_level(logging.WARNING):
             assert ocr_model.tessdata_dir() is None
         assert "eng.traineddata" in caplog.text
-        assert "osd.traineddata" in caplog.text
 
-    def test_cleanup_vocabulary_follows_the_chosen_model(self, monkeypatch, tmp_path):
-        # Словарь выправки собирается из файлов модели. Если лист прочитан
-        # одной моделью, а словарь взят у другой, выправка сверяется с чужим
-        # словарём — поэтому выбранный каталог идёт первым.
-        from core.providers import ocr_cleanup
-
-        directory = _tessdata(tmp_path)
+    def test_path_with_a_space_is_quoted(self, monkeypatch, tmp_path):
+        # pytesseract разбирает строку конфигурации через shlex.split:
+        # неэкранированный пробел развалил бы вызов на два слова.
+        directory = _tessdata(tmp_path / "модели best", )
         monkeypatch.setattr(settings, "OCR_TESSDATA_DIR", directory)
-        assert ocr_cleanup._tessdata_dir() == directory
+        option = ocr_model.tessdata_option()
+        assert shlex.split(option) == ["--tessdata-dir", directory]
 
     def test_warning_is_logged_once_per_directory(self, monkeypatch, tmp_path, caplog):
         # Лист за листом один и тот же каталог не должен забивать лог.
