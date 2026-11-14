@@ -120,6 +120,8 @@
 | Стадия | Файл | Функция |
 |---|---|---|
 | Блоки → фрагменты контракта | `core/normalizer/normalizer.py` | `TextNormalizer.normalize` (73), `normalize_with_flags` (80) |
+| **Рамка бланка и переносы обычного документа** | `core/document_furniture.py` | `apply`, `is_furniture`, `without_splices`, `without_hyphen_breaks` — вызывается из `core/contract_finalize.finalize_fragments` |
+| Ярлык/заголовок и его текст одним фрагментом | `core/document_parts.py` | `apply`, `is_label_line`, `is_heading_line` |
 | Полнота текста/таблиц/формул | `core/normalizer/completeness.py` | `PageCoverage` (17), `TextLayerRecall` (59), `table_completeness` (103), `formula_completeness` (117) |
 | Чанкование | `core/strategies/factory.py` + `fixed_size.py`, `paragraph.py`, `semantic.py` | — |
 | Извлечение фактов | `core/facts/extractor.py` | `extract_facts` (426); `facts_from_text` (281), `facts_from_table` (328), `facts_from_drawing_fields` (375) |
@@ -162,6 +164,9 @@
 | `DRAWING_DIAGNOSTICS_NOT_INDEXED` | `false` | `core/contract_finalize.py` |
 | `DRAWING_RECORD_WITHOUT_SHEET_TEXT` | `false` | `core/drawing_record.py` |
 | `DRAWING_RECORD_USES_VALUE_LINKS` | `false` | `core/drawing_record.py` |
+| `SCAN_DROP_FRAME_FURNITURE` | `false` | `core/document_furniture.py`, `core/contract_finalize.py` |
+| `SCAN_JOIN_HYPHENATED_WORDS` | `false` | `core/document_furniture.py`, `core/contract_finalize.py` |
+| `DOCUMENT_HEADING_WITH_BODY` | `false` | `core/document_parts.py` |
 | `DRAWING_FIELD_CATEGORY_STRICT` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_CATEGORY_PROSE_GUARD` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_SMALL_PRINT_CARE` | `false` | `core/providers/qwen_client.py` |
@@ -330,3 +335,22 @@
     `designation_repair` группировку цифр не меняют ни в одну сторону, а формы с
     лишней точкой («ГОСТ 14.771-76», «4.00007.002») не даёт ни один проход кода —
     они приходят с чтения.
+16. **Короткий чанк — это почти всегда текстовый документ, а не чертёж.**
+    Замер по выгрузке индекса 50 документов прода: 2901 чанк, медиана 158
+    символов, короче 120 — 1195, то есть 41,2 %. Из этих 1195 **ни один** не
+    приходит от чертёжного фрагмента, а чанки собранной записи чертежа (52 в
+    выборке) имеют медиану 1338 и ни одного короче 120. Короткие — это рамка
+    бланка текстового документа (270), заголовок в отрыве от своего текста
+    (262), обрывки распознавания (60), строки полей адаптера RAG (63) и
+    короткие фразы настоящих документов (516); девять сканированных РЭ/ПС/СТП
+    держат 1003 из 1195. Искать причину в ветке чертежей — терять время.
+17. **Долю коротких чанков снятием мусора почти не сдвинуть, и это
+    арифметика, а не свойство правила.** Снятый короткий чанк уходит и из
+    числителя, и из знаменателя: 240 снятых рамок дают 41,2 % → 36,6 %, а не
+    41,2 % → 29,8 %, как выходит, если вычесть только из числителя (так было
+    посчитано в первом докладе, и это было неверно). Долю двигает упаковка
+    соседних обрывков — она переносит чанк из коротких в длинные, а не
+    удаляет, — и она на стороне RAG (`super_rag/ingest/normalize/service.py`).
+    Со стороны Normalizer честные метрики другие: сколько мусорных чанков
+    снято, сколько подписей граф вырезано из читаемого текста и сколько слов
+    снова находится поиском.

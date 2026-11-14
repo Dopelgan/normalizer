@@ -24,7 +24,7 @@ from core.facts.extractor import extract_facts
 from core.models.contract import Fragment
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import apply_drawing_quality
-from core import drawing_record
+from core import document_furniture, drawing_record
 from core.providers import designation_repair, mixed_script
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,12 @@ def finalize_fragments(
     факты. Возвращает фрагменты и карту «прежний id -> новый id»: по ней
     пересобираются служебные пометки, собранные нормализатором.
     """
+    # Рамка бланка — до идентификаторов и до фактов: в индекс и в факты
+    # должен уйти тот текст, который увидит заказчик, а снятый фрагмент не
+    # должен получить ни идентификатора, ни порядкового номера
+    # (`SCAN_DROP_FRAME_FURNITURE`, `SCAN_JOIN_HYPHENATED_WORDS`).
+    fragments = document_furniture.apply(fragments)
+
     id_map: Dict[str, str] = {}
     seen: Dict[str, int] = {}
 
