@@ -456,6 +456,21 @@ def classify(text: str, line: Optional[TextLine] = None, turn: int = 0) -> Tuple
     if _strict_enabled():
         return _classify_strict(text)
 
+    if _prose_guard_enabled() and _is_prose(text):
+        # Фраза размерной категории не получает (`DRAWING_CATEGORY_PROSE_GUARD`):
+        # знак внутри требования говорит о том, что требование упоминает
+        # величину, а не о том, что надпись эту величину задаёт. Марка и
+        # квалитет — исключение: они названы тем же, чем являются, и в
+        # строгом разборе проверяются тоже прежде проверки на фразу.
+        lowered = text.lower()
+        if any(word in lowered for word in _MATERIAL_WORDS):
+            return "material", 0.85
+        if _fidelity_enabled() and dimension_fidelity.is_steel_grade(text):
+            return "material", 0.85
+        if _IT_GRADE.search(text):
+            return "tolerance", 0.75
+        return "note", 0.4
+
     if _THREAD.search(text):
         return "thread", 0.9
     if _RADIUS.search(text):
@@ -492,9 +507,22 @@ def decisive_category(text: str) -> Optional[str]:
     оказались правы 26 раз из 26 там, где нотация решает, а модель — ни
     разу; поэтому спор на них решается в пользу правил, а не понижением
     уверенности. Вне этих записей функция молчит: там спор остаётся спором.
+
+    Нотация решает за **надпись**, а не за фразу, в которой она упомянута
+    (`DRAWING_CATEGORY_PROSE_GUARD`). Знак диаметра и знак шероховатости
+    искались в любом месте строки, поэтому нумерованный пункт требований
+    получал размерную категорию целиком: «5. Координаты отверстий ⌀8,5 и их
+    количество N определяется схемой размеров…» уходил в индекс как
+    «Размер», а «8. Лицевую сторону шлифовать, шерох. не хуже чем Ra 1,6» —
+    как «Шероховатость». Предел тот же, которым здесь уже ограничены радиус
+    и резьба: во фразе нотация не решает, и такой пункт остаётся
+    непримеченным текстом листа. Проверка на фразу идёт прежде остальных:
+    при включённом флаге ни одно правило не ставит категорию фразе.
     """
     stripped = " ".join((text or "").split())
     if not stripped:
+        return None
+    if _prose_guard_enabled() and _is_prose(stripped):
         return None
     if _ROUGHNESS.search(stripped):
         return "roughness"
@@ -572,6 +600,12 @@ def _strict_enabled() -> bool:
     from core.config import settings
 
     return bool(getattr(settings, "DRAWING_FIELD_CATEGORY_STRICT", False))
+
+
+def _prose_guard_enabled() -> bool:
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_CATEGORY_PROSE_GUARD", False))
 
 
 def _without_grades(text: str) -> str:

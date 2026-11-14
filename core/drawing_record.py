@@ -107,6 +107,11 @@ CAUTION_PART = ("Часть значений в этой записи прочи
 # разборе нет, и сказать это надо честно, но один раз.
 NO_VIEW_LINK = ("К какому виду или разрезу относится каждый размер, "
                 "запись чертежа не указывает.")
+# То же, когда часть размеров привязана к видам
+# (`DRAWING_RECORD_USES_VALUE_LINKS`): оговорка говорит о непривязанных, а
+# не обо всех размерах листа — иначе она противоречила бы самой записи.
+NO_VIEW_LINK_PART = ("Там, где вид не назван при размере, к какому виду или "
+                     "разрезу размер относится, запись чертежа не указывает.")
 
 # Графы основной надписи в том порядке, в котором их спрашивают.
 # Подписи берутся из `title_block.LABELS`: имя графы здесь и в разборе
@@ -221,6 +226,13 @@ def enabled() -> bool:
     return bool(getattr(settings, "DRAWING_RECORD_COMPOSED", False))
 
 
+def without_text_enabled() -> bool:
+    """Сборка и для фрагмента без текста листа (`DRAWING_RECORD_WITHOUT_SHEET_TEXT`)."""
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_RECORD_WITHOUT_SHEET_TEXT", False))
+
+
 def apply(fragments: List[Fragment]) -> List[Fragment]:
     """
     Запись каждого чертёжного фрагмента собирается по частям.
@@ -245,13 +257,33 @@ def apply(fragments: List[Fragment]) -> List[Fragment]:
     Вторая: собирать там почти нечего. На 150 таких фрагментах с прода
     графа «Масса» не нашлась ни у одного, а основная надпись — у семи.
     Весь выигрыш и вся исходная задача — на листах, где текст есть.
+
+    **`DRAWING_RECORD_WITHOUT_SHEET_TEXT` собирает и их, и первый довод
+    выше оказался неверным не в оценке риска, а в сравнении.** Отказ
+    сравнивался с молчанием, а сравнивать надо с тем, что уходит в индекс
+    сегодня: те же неуверенные значения, по одному на строку, и у каждой
+    строки хвост «(требует сверки)» — на проде 8633 хвоста на 327
+    документов, и они доходят до текста ответа на экране («Круг 100 ГОСТ
+    7417-75, сталь 12Х18Н10Т (требует сверки)»). Значит вопрос не в том,
+    называть ли неуверенное значение, а в том, как сказать о неуверенности
+    честно: **одной фразой на запись** (`_caution`), которую человек
+    читает, вместо приписки при каждом значении, которую не читает никто.
+    Уверенность по каждому значению остаётся там, где она и была, — в
+    `structured_drawing_fields` каждого поля.
+
+    Потерь и здесь нет, но беспотерьность держится другим: части 9 у такого
+    фрагмента быть не может — строк листа нет вовсе, — и её роль берёт
+    `_other_marks`: надписи, которых не назвала ни одна часть выше (голое
+    число, буквенное обозначение без значения). Без этой части голое число
+    пропало бы из записи совсем, потому что в перечень родов величин его
+    `_kind_of` сознательно не пускает.
     """
     if not enabled():
         return fragments
     for fragment in fragments:
         if fragment.type != "drawing":
             continue
-        if not (fragment.content.text or "").strip():
+        if not (fragment.content.text or "").strip() and not without_text_enabled():
             continue
         compose_fragment(fragment)
     return fragments
@@ -288,18 +320,30 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
         parts.extend((kind, item) for item in items)
         return items
 
+    # Привязка величины к виду, если она в данных есть
+    # (`DRAWING_RECORD_USES_VALUE_LINKS`). Пустая карта — значит привязки
+    # нет, и запись говорит об этом прямо, как говорила всегда.
+    links = _views_of(payload, fields)
+
     add("caution", _caution(fields, payload))
     add("stamp", _stamp(payload, fields))
     add("handwritten", _handwritten(payload, fields))
     # Оговорка про непривязанные размеры говорится один раз — в той из двух
-    # частей, которая встретится первой.
-    views = add("views", _views(kept, hedge=True))
-    add("dimensions", _dimensions(fields, hedge=not views))
+    # частей, которая встретится первой. При полной привязке не говорится
+    # вовсе: она была бы неправдой.
+    views = add("views", _views(kept, hedge=not links))
+    add("dimensions", _dimensions(fields, hedge=not views and not links, links=links))
     add("positions", _positions(fields))
     add("callouts", _callouts(fields))
     add("notes", _notes(fields))
     add("tables", _tables(payload))
-    add("sheet_lines", _sheet_lines(kept))
+    if add("sheet_lines", _sheet_lines(kept)):
+        pass
+    elif without_text_enabled():
+        # Строк листа нет: беспотерьность держит часть «остальные надписи»,
+        # а не повтор текста. Считается по уже собранному: в неё попадает
+        # только то, чего ни одна часть выше не назвала.
+        add("other_marks", _other_marks(fields, _JOIN.join(body for _, body in parts)))
 
     if not parts:
         return None
@@ -599,16 +643,32 @@ def _views(lines: Sequence[str], hedge: bool) -> List[str]:
     return [said + ("\n" + NO_VIEW_LINK if hedge else "")]
 
 
-def _dimensions(fields: Sequence[Dict[str, Any]], hedge: bool) -> List[str]:
-    """Размеры по роду величины: число всегда при том, чем оно является."""
+def _dimensions(fields: Sequence[Dict[str, Any]], hedge: bool,
+                links: Optional[Dict[int, str]] = None) -> List[str]:
+    """
+    Размеры по роду величины: число всегда при том, чем оно является.
+
+    Вид при размере называется, когда привязка есть в данных
+    (`links`, см. `_views_of`). Привязана обычно часть величин, поэтому
+    оговорка о непривязанных остаётся — но говорит уже о них, а не обо
+    всех размерах листа.
+    """
+    links = links or {}
     buckets: Dict[str, List[str]] = {kind: [] for kind, _ in _KIND_TITLES}
-    for field in fields:
+    unlinked = 0
+    for index, field in enumerate(fields):
         kind = _kind_of(field)
         if kind is None:
             continue
         value = _with_tolerance(field)
-        if value and value not in buckets[kind]:
-            buckets[kind].append(value)
+        if not value:
+            continue
+        view = links.get(index)
+        said_value = f"{value} (вид {view})" if view else value
+        if links and not view:
+            unlinked += 1
+        if said_value not in buckets[kind]:
+            buckets[kind].append(said_value)
     said = [
         f"{title} — " + "; ".join(buckets[kind]) + "."
         for kind, title in _KIND_TITLES if buckets[kind]
@@ -618,7 +678,50 @@ def _dimensions(fields: Sequence[Dict[str, Any]], hedge: bool) -> List[str]:
     head = "Размеры и обозначения величин на листе, по роду величины."
     if hedge:
         head += " " + NO_VIEW_LINK
+    elif unlinked:
+        head += " " + NO_VIEW_LINK_PART
     return [head + "\n" + "\n".join(said)]
+
+
+def _views_of(payload: Dict[str, Any],
+              fields: Sequence[Dict[str, Any]]) -> Dict[int, str]:
+    """
+    Карта «номер поля -> имя вида» из `value_links`
+    (`DRAWING_RECORD_USES_VALUE_LINKS`).
+
+    Зачем. Привязку величины к виду считает
+    `core/providers/drawing_views.py` и кладёт в
+    `structured_payload["value_links"]`, но до этого флага её не читал
+    никто: запись говорила «к какому виду относится каждый размер, запись
+    чертежа не указывает» даже тогда, когда вид в данных был назван. То
+    есть вся работа связывания в индекс не доезжала вовсе.
+
+    Привязка сверяется по значению, а не только по номеру поля:
+    `drawing_views` хранит в записи и `field_index`, и `value` ровно для
+    этого, а между связыванием и сборкой поля успевают пройти чистку
+    (`core/contract_finalize._drop_nul`), которая способна сдвинуть
+    нумерацию. Разошлось — привязка не используется: чужой вид при размере
+    хуже отсутствия вида.
+    """
+    from core.config import settings
+
+    if not getattr(settings, "DRAWING_RECORD_USES_VALUE_LINKS", False):
+        return {}
+    block = payload.get("value_links")
+    if not isinstance(block, dict):
+        return {}
+    out: Dict[int, str] = {}
+    for record in block.get("fields") or ():
+        if not isinstance(record, dict):
+            continue
+        name = record.get("view_name") or record.get("view")
+        index = record.get("field_index")
+        if not name or not isinstance(index, int) or not 0 <= index < len(fields):
+            continue
+        if str(record.get("value") or "") != str(fields[index].get("value") or ""):
+            continue
+        out[index] = " ".join(str(name).split())
+    return out
 
 
 def _positions(fields: Sequence[Dict[str, Any]]) -> List[str]:
@@ -706,6 +809,36 @@ def _sheet_lines(lines: Sequence[str]) -> List[str]:
     if not body:
         return []
     return ["Надписи листа в порядке чтения.\n" + "\n".join(body)]
+
+
+def _other_marks(fields: Sequence[Dict[str, Any]], said: str) -> List[str]:
+    """
+    Надписи листа, которых не назвала ни одна часть выше.
+
+    Эта часть есть только у фрагмента без текста листа
+    (`DRAWING_RECORD_WITHOUT_SHEET_TEXT`), где части «Надписи листа в
+    порядке чтения» быть не может: строк нет. Без неё из записи пропало бы
+    то, чему разбор не назвал рода величины, — голое число (номер выноски
+    или зоны), буквенное обозначение без значения, графа штампа без
+    канонического имени. Это те самые надписи, которые `_kind_of`
+    сознательно не пускает в перечень родов, и терять их нельзя: на одном
+    только листе крышки голых чисел пять из ста четырёх надписей, и среди
+    них координаты отверстий.
+
+    Заголовок говорит ровно то, что известно: надпись на листе есть, а чем
+    она является, разбор не называет. Порядок — порядок полей, то есть
+    порядок чтения листа моделью или текстовым слоем.
+    """
+    rest: List[str] = []
+    for field in fields:
+        value = _with_tolerance(field)
+        if not value or value in said or value in rest:
+            continue
+        rest.append(value)
+    if not rest:
+        return []
+    return ["Остальные надписи листа; чем именно является каждая из них, "
+            "разбор не называет.\n" + "\n".join(rest)]
 
 
 # --------------------------------------------------------------- частности
