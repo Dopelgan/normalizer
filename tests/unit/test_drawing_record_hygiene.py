@@ -371,3 +371,139 @@ class TestProseGuard:
         monkeypatch.setattr(settings, "DRAWING_FIELD_CATEGORY_STRICT", strict)
         for text in NOTES:
             assert classify(text)[0] == "note"
+
+
+class TestAllFieldsSaid:
+    """
+    Запись произносит каждое значение, поэтому адаптеру RAG нечего
+    дописывать (`DRAWING_RECORD_ALL_FIELDS_SAID`,
+    `DRAWING_RECORD_STAMP_FROM_FIELDS`).
+
+    Значения — с настоящего листа ТАДУ 421451.003.07.003 «Табличка»,
+    переобработанного 14.11 с семью флагами: именно на нём хвостов стало
+    больше (13 → 29), потому что сборка собрала лист в один фрагмент, а
+    значения, которых запись не назвала, адаптер дописал строками
+    «Основная надпись: Фарфурат (требует сверки)».
+    """
+
+    @staticmethod
+    def sheet() -> Fragment:
+        fields = [
+            # Графа штампа с именем: запись назовёт её графой.
+            DrawingField(category="title_block", value="Разраб.: Бабанин",
+                         confidence=0.85, confirmed=False),
+            # Графа штампа без имени: имени по догадке не получает.
+            DrawingField(category="title_block", value="Фарфурат",
+                         confidence=0.85, confirmed=False),
+            # Голое число: род величины ему не назвать (`_kind_of`).
+            DrawingField(category="size", value="5", confidence=0.8, confirmed=False),
+            DrawingField(category="size", value="5±1", confidence=0.8, confirmed=False),
+            DrawingField(category="position", value="п.4", confidence=0.8,
+                         confirmed=False),
+            DrawingField(category="callout", value="4 места", confidence=0.8,
+                         confirmed=False),
+        ]
+        payload = {
+            "recognition_mode": "sheet_only",
+            "title_block": {"designation": "ТАДУ 421451.003.07.003"},
+            "tables": [{"kind": "other", "headers": ["Изм.", "Лист"],
+                        "rows": [["1", "301"], ["2", "302"]]}],
+        }
+        return Fragment(
+            fragment_id="", type="drawing",
+            content=Content(text="ТАДУ 421451.003.07.003\n5±1\n4 места",
+                            structured_drawing_fields=fields,
+                            structured_payload=payload),
+            position=Position(page=1, bbox=[0, 0, 1, 1]),
+            confidence=0.8, completeness=None,
+            provenance=Provenance(method="vlm_full_page", strategy_level=7,
+                                  source="drawing"),
+        )
+
+    @pytest.fixture
+    def said(self, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_RECORD_COMPOSED", True)
+        monkeypatch.setattr(settings, "DRAWING_RECORD_ALL_FIELDS_SAID", True)
+        monkeypatch.setattr(settings, "DRAWING_RECORD_STAMP_FROM_FIELDS", True)
+
+    @pytest.fixture
+    def said_off(self, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_RECORD_COMPOSED", True)
+        monkeypatch.setattr(settings, "DRAWING_RECORD_ALL_FIELDS_SAID", False)
+        monkeypatch.setattr(settings, "DRAWING_RECORD_STAMP_FROM_FIELDS", False)
+
+    @staticmethod
+    def values_of(fragment: Fragment):
+        return [field.value for field in fragment.content.structured_drawing_fields]
+
+    def test_flag_off_leaves_values_unsaid(self, said_off):
+        """Без флага «5» и «Фарфурат» в тексте не называются — их и дописывал адаптер."""
+        source = self.sheet()
+        fragments, _ = finalize_fragments([source], doc_id="d1")
+        from core.drawing_record import _whole_value_said
+
+        text = fragments[0].content.text or ""
+        assert not _whole_value_said("5", text)
+        assert "Фарфурат" not in text
+
+    def test_every_value_said_whole(self, said):
+        """Каждое значение стоит в тексте целым значением — правилом адаптера."""
+        from core.drawing_record import _whole_value_said
+
+        source = self.sheet()
+        fields = list(source.content.structured_drawing_fields)
+        fragments, _ = finalize_fragments([source], doc_id="d1")
+        text = fragments[0].content.text or ""
+        for field in fields:
+            value = field.value
+            if field.category == "title_block" and ": " in value:
+                # Адаптер RAG разбирает графу на подпись и значение
+                # (`_DRAWING_LABELLED_VALUE`) и ищет в тексте значение,
+                # а не строку «Разраб.: Бабанин» целиком.
+                value = value.split(":", 1)[1].strip()
+            assert _whole_value_said(value, text), value
+
+    def test_table_rows_said(self, said):
+        from core.drawing_record import _whole_value_said
+
+        fragments, _ = finalize_fragments([self.sheet()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        assert _whole_value_said("1\t301", text)
+        assert _whole_value_said("2\t302", text)
+
+    def test_named_graph_keeps_its_name(self, said):
+        """Графа, которую поле назвало, стоит в записи графой, а не в остатке."""
+        fragments, _ = finalize_fragments([self.sheet()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        head = text.index("Основная надпись листа.")
+        tail = text.index("Остальное, прочитанное на листе")
+        assert "Бабанин" in text[head:tail]
+
+    def test_unnamed_graph_not_invented(self, said):
+        """Графа без имени имени не получает — уходит в последнюю часть."""
+        fragments, _ = finalize_fragments([self.sheet()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        tail = text[text.index("Остальное, прочитанное на листе"):]
+        assert "Фарфурат" in tail
+
+    def test_caution_still_once(self, said):
+        fragments, _ = finalize_fragments([self.sheet()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        assert text.count("нужно сверить с самим чертежом") == 1
+        assert "(требует сверки)" not in text
+
+    def test_parts_markup_contiguous(self, said):
+        """Разметка частей — подряд и без зазоров, иначе чанкер её отвергнет."""
+        fragments, _ = finalize_fragments([self.sheet()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        parts = (fragments[0].content.structured_payload or {}).get("record_parts") or []
+        assert parts and parts[0]["start"] == 0
+        assert parts[-1]["end"] == len(text)
+        for before, after in zip(parts, parts[1:]):
+            assert before["end"] == after["start"]
+
+    def test_idempotent(self, said):
+        fragments, _ = finalize_fragments([self.sheet()], doc_id="d1")
+        once = fragments[0].content.text
+        again, _ = finalize_fragments(fragments, doc_id="d1")
+        assert again[0].content.text == once
