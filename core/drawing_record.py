@@ -238,6 +238,13 @@ def without_text_enabled() -> bool:
     return bool(getattr(settings, "DRAWING_RECORD_WITHOUT_SHEET_TEXT", False))
 
 
+def without_any_type_enabled() -> bool:
+    """Сборка для фрагмента с полями любого типа (`DRAWING_RECORD_ANY_FIELD_FRAGMENT`)."""
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_RECORD_ANY_FIELD_FRAGMENT", False))
+
+
 def all_fields_said_enabled() -> bool:
     """Запись произносит каждое значение (`DRAWING_RECORD_ALL_FIELDS_SAID`)."""
     from core.config import settings
@@ -300,12 +307,36 @@ def apply(fragments: List[Fragment]) -> List[Fragment]:
     if not enabled():
         return fragments
     for fragment in fragments:
-        if fragment.type != "drawing":
+        if fragment.type != "drawing" and not _has_fields(fragment):
             continue
         if not (fragment.content.text or "").strip() and not without_text_enabled():
             continue
         compose_fragment(fragment)
     return fragments
+
+
+def _has_fields(fragment: Fragment) -> bool:
+    """
+    Фрагмент несёт разобранные величины чертежа, хотя чертежом не назван
+    (`DRAWING_RECORD_ANY_FIELD_FRAGMENT`).
+
+    Зачем. Сборка смотрела на `type == "drawing"`, а адаптер RAG смотрит на
+    **наличие полей**: фрагмент любого типа с `structured_drawing_fields`
+    он выводит строками «Метка: значение» с хвостом «(требует сверки)»
+    (`drawing_search_text` отказывает только тому, у кого нет ни полей, ни
+    фактов). Из-за этого расхождения часть листов оставалась записанной
+    построчно: на десяти переобработанных чертежах 431 хвост держался в том
+    числе на фрагментах, которых сборка не касалась вовсе. Проверено
+    прогоном: фрагмент той же формы с `type="drawing"` собирается и хвостов
+    не даёт, а с `type="image"` или `"text"` — не собирается.
+
+    Потерь нет и здесь: часть «Надписи листа в порядке чтения» повторяет
+    прежний текст фрагмента целиком, поэтому проза текстового фрагмента
+    остаётся в записи дословно, только после названных частей.
+    """
+    if not without_any_type_enabled():
+        return False
+    return bool(fragment.content.structured_drawing_fields)
 
 
 def compose_fragment(fragment: Fragment) -> Optional[str]:

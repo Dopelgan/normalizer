@@ -166,6 +166,7 @@
 | `DRAWING_RECORD_USES_VALUE_LINKS` | `false` | `core/drawing_record.py` |
 | `DRAWING_RECORD_STAMP_FROM_FIELDS` | `false` | `core/drawing_record.py` |
 | `DRAWING_RECORD_ALL_FIELDS_SAID` | `false` | `core/drawing_record.py` |
+| `DRAWING_RECORD_ANY_FIELD_FRAGMENT` | `false` | `core/drawing_record.py` |
 | `SCAN_DROP_FRAME_FURNITURE` | `false` | `core/document_furniture.py`, `core/contract_finalize.py` |
 | `SCAN_JOIN_HYPHENATED_WORDS` | `false` | `core/document_furniture.py`, `core/contract_finalize.py` |
 | `DOCUMENT_HEADING_WITH_BODY` | `false` | `core/document_parts.py` |

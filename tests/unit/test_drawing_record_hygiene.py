@@ -507,3 +507,80 @@ class TestAllFieldsSaid:
         once = fragments[0].content.text
         again, _ = finalize_fragments(fragments, doc_id="d1")
         assert again[0].content.text == once
+
+
+class TestAnyFieldFragment:
+    """
+    Фрагмент с величинами чертежа собирается независимо от типа
+    (`DRAWING_RECORD_ANY_FIELD_FRAGMENT`).
+
+    Форма — с настоящего листа ТАДУ 421451.003 Э4 л.2: сырой перечень
+    клемм в тексте и только графы штампа в полях. У этого документа 88
+    хвостов из 431 держались на фрагментах, которых сборка не касалась.
+    """
+
+    STAMP = [("title_block", "РРР.1099.10.УК.СКУА60.ТМ.5С0001"),
+             ("title_block", "Конюхов"), ("title_block", "Лист 2")]
+
+    @classmethod
+    def fragment(cls, kind: str, text=None, fields=None) -> Fragment:
+        items = cls.STAMP if fields is None else fields
+        return Fragment(
+            fragment_id="", type=kind,
+            content=Content(
+                text=text,
+                structured_drawing_fields=[
+                    DrawingField(category=c, value=v, confidence=0.5, confirmed=False)
+                    for c, v in items],
+                structured_payload={"recognition_mode": "sheet_only"}),
+            position=Position(page=1, bbox=[0, 0, 1, 1]),
+            confidence=0.5, completeness=None,
+            provenance=Provenance(method="vlm_full_page", strategy_level=7,
+                                  source="drawing"))
+
+    @pytest.fixture
+    def any_type(self, monkeypatch):
+        for flag in ("DRAWING_RECORD_COMPOSED", "DRAWING_RECORD_WITHOUT_SHEET_TEXT",
+                     "DRAWING_RECORD_ALL_FIELDS_SAID",
+                     "DRAWING_RECORD_ANY_FIELD_FRAGMENT"):
+            monkeypatch.setattr(settings, flag, True)
+
+    @pytest.fixture
+    def any_type_off(self, monkeypatch):
+        for flag in ("DRAWING_RECORD_COMPOSED", "DRAWING_RECORD_WITHOUT_SHEET_TEXT",
+                     "DRAWING_RECORD_ALL_FIELDS_SAID"):
+            monkeypatch.setattr(settings, flag, True)
+        monkeypatch.setattr(settings, "DRAWING_RECORD_ANY_FIELD_FRAGMENT", False)
+
+    @pytest.mark.parametrize("kind", ["image", "text"])
+    def test_flag_off_leaves_it_uncomposed(self, any_type_off, kind):
+        source = self.fragment(kind, text="XT2131\nXT2132")
+        out, _ = finalize_fragments([source], doc_id="d1")
+        assert out[0].content.text == "XT2131\nXT2132"
+
+    @pytest.mark.parametrize("kind", ["image", "text", "drawing"])
+    def test_composed_for_any_type(self, any_type, kind):
+        from core.drawing_record import _whole_value_said
+
+        source = self.fragment(kind, text="XT2131\nXT2132")
+        out, _ = finalize_fragments([source], doc_id="d1")
+        text = out[0].content.text or ""
+        assert "нужно сверить с самим чертежом" in text
+        for _, value in self.STAMP:
+            assert _whole_value_said(value, text), value
+
+    def test_original_text_kept_verbatim(self, any_type):
+        source = self.fragment("text", text="XT2131\nXT2132\nXT2140")
+        out, _ = finalize_fragments([source], doc_id="d1")
+        text = out[0].content.text or ""
+        assert "XT2131\nXT2132\nXT2140" in text
+
+    def test_fragment_without_fields_untouched(self, any_type):
+        plain = Fragment(
+            fragment_id="", type="text",
+            content=Content(text="Технические требования к монтажу."),
+            position=Position(page=1, bbox=[0, 0, 1, 1]),
+            confidence=0.9, completeness=None,
+            provenance=Provenance(method="ocr_layer", strategy_level=5, source="pdf"))
+        out, _ = finalize_fragments([plain], doc_id="d1")
+        assert out[0].content.text == "Технические требования к монтажу."
