@@ -103,7 +103,7 @@
 | **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
 | Качество фрагмента чертежа | `core/drawing_quality.py` | `apply_drawing_quality` (7), `document_quality` (71) |
 | Правка абзацев OCR по строкам листа | `core/drawing_transcript.py` | `_page_transcripts` (88) |
-| **Пересборка текста записи по частям** (`DRAWING_RECORD_COMPOSED`) | `core/drawing_record.py` | `apply` (224), `compose_fragment` (260), разметка частей для чанкера — `_part_index` (319) |
+| **Пересборка текста записи по частям** (`DRAWING_RECORD_COMPOSED`) | `core/drawing_record.py` | `apply` (236), `compose_fragment` (292), разметка частей для чанкера — `_part_index` (363); часть «остальные надписи» — `_other_marks`; вид при размере — `_views_of` |
 | Разметка частей обычного документа | `core/document_parts.py` | — |
 | Учёт разбора в сторону от индекса (`DRAWING_DIAGNOSTICS_NOT_INDEXED`) | `core/contract_finalize.py` | `_diagnostics_aside` |
 | Снятие устаревших источников | `core/drawing_stale_sources.py` | — |
@@ -160,6 +160,8 @@
 | `DRAWING_RECORD_COMPOSED` | `false` | `core/drawing_record.py`, `core/contract_finalize.py`, `core/document_parts.py` |
 | `DRAWING_VALUE_VIEW_LINKS` | `false` | `core/providers/drawing_views.py`, `core/drawing_processor.py` |
 | `DRAWING_DIAGNOSTICS_NOT_INDEXED` | `false` | `core/contract_finalize.py` |
+| `DRAWING_RECORD_WITHOUT_SHEET_TEXT` | `false` | `core/drawing_record.py` |
+| `DRAWING_RECORD_USES_VALUE_LINKS` | `false` | `core/drawing_record.py` |
 | `DRAWING_FIELD_CATEGORY_STRICT` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_CATEGORY_PROSE_GUARD` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_SMALL_PRINT_CARE` | `false` | `core/providers/qwen_client.py` |

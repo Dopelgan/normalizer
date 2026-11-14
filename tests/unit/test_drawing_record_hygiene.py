@@ -140,6 +140,181 @@ class TestDiagnosticsAside:
         assert fragments[0].content.structured_payload == {"any": 1}
 
 
+class TestRecordWithoutSheetText:
+    """
+    Лист без текста записывает Normalizer, а не адаптер RAG
+    (`DRAWING_RECORD_WITHOUT_SHEET_TEXT`).
+
+    Надписи здесь настоящие — с листа ТАДУ 305179.001.03 СБ (пробка
+    ЭК150), `tests/fixtures/real_sheet_views.json`.
+    """
+
+    @staticmethod
+    def textless() -> Fragment:
+        from core.providers.vector_drawing import classify
+
+        marks = ["⌀200±2", "250±2", "А(2:1)", "11", "8", "п.6", "В–В",
+                 "Лицевую сторону шлифовать, шерох. не хуже чем Ra 1,6"]
+        fields = []
+        for value in marks:
+            category, confidence = classify(value)
+            fields.append(DrawingField(category=category, value=value,
+                                       confidence=confidence, confirmed=False))
+        return Fragment(
+            fragment_id="", type="drawing",
+            content=Content(text=None, structured_drawing_fields=fields,
+                            structured_payload={"recognition_mode": "sheet_only"}),
+            position=Position(page=1, bbox=[0, 0, 1, 1]),
+            confidence=0.6, completeness=None,
+            provenance=Provenance(method="vlm_full_page", strategy_level=7,
+                                  source="drawing"),
+        )
+
+    @pytest.fixture
+    def composed(self, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_RECORD_COMPOSED", True)
+
+    @pytest.fixture
+    def without_text(self, monkeypatch, composed):
+        monkeypatch.setattr(settings, "DRAWING_RECORD_WITHOUT_SHEET_TEXT", True)
+
+    def test_flag_off_leaves_text_empty(self, composed, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_RECORD_WITHOUT_SHEET_TEXT", False)
+        fragments, _ = finalize_fragments([self.textless()], doc_id="d1")
+        assert not fragments[0].content.text
+
+    def test_record_composed(self, without_text):
+        fragments, _ = finalize_fragments([self.textless()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        assert "Размеры и обозначения величин на листе" in text
+
+    def test_nothing_lost(self, without_text):
+        """Ни одна надпись не исчезает — в том числе голое число."""
+        source = self.textless()
+        values = [field.value for field in source.content.structured_drawing_fields]
+        fragments, _ = finalize_fragments([source], doc_id="d1")
+        text = fragments[0].content.text or ""
+        for value in values:
+            assert value in text, value
+
+    def test_bare_numbers_in_other_marks(self, without_text):
+        """Голое число рода величины не получает, но из записи не уходит."""
+        fragments, _ = finalize_fragments([self.textless()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        head = "Остальные надписи листа"
+        assert head in text
+        tail = text[text.index(head):]
+        assert "11" in tail and "8" in tail
+
+    def test_caution_once_and_no_tails(self, without_text):
+        """Осторожность — одной фразой на запись, а не припиской при значении."""
+        fragments, _ = finalize_fragments([self.textless()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        assert text.count("нужно сверить с самим чертежом") == 1
+        assert "(требует сверки)" not in text
+
+    def test_confidence_stays_per_value(self, without_text):
+        """Уверенность по каждому значению остаётся в полях фрагмента."""
+        fragments, _ = finalize_fragments([self.textless()], doc_id="d1")
+        fields = fragments[0].content.structured_drawing_fields
+        # Фраза на запись — одна, а уверенность осталась у каждого значения
+        # своя: её читает всякий, кому она нужна.
+        assert fields and all(field.confidence is not None for field in fields)
+        assert len({field.confidence for field in fields}) > 1
+
+    def test_idempotent(self, without_text):
+        fragments, _ = finalize_fragments([self.textless()], doc_id="d1")
+        once = fragments[0].content.text
+        again, _ = finalize_fragments(fragments, doc_id="d1")
+        assert again[0].content.text == once
+
+    def test_empty_fragment_untouched(self, without_text):
+        """Собирать нечего — фрагмент остаётся как был."""
+        bare = Fragment(
+            fragment_id="", type="drawing",
+            content=Content(text=None, structured_drawing_fields=[], structured_payload={}),
+            position=Position(page=1, bbox=[0, 0, 1, 1]),
+            confidence=0.1, completeness=None,
+            provenance=Provenance(method="vlm_full_page", strategy_level=7, source="drawing"),
+        )
+        fragments, _ = finalize_fragments([bare], doc_id="d1")
+        assert not fragments[0].content.text
+
+
+class TestRecordUsesValueLinks:
+    """Запись называет вид при размере, когда привязка есть в данных."""
+
+    @staticmethod
+    def linked() -> Fragment:
+        fields = [
+            DrawingField(category="size", value="⌀200", tolerance="±2",
+                         confidence=0.95, confirmed=True),
+            DrawingField(category="size", value="⌀300", tolerance="±2",
+                         confidence=0.95, confirmed=True),
+        ]
+        payload = {
+            "recognition_mode": "sheet_only",
+            "value_links": {
+                "fields": [
+                    {"field_index": 0, "value": "⌀200", "view": "v1",
+                     "view_name": "А (2:1)", "basis": "inside"},
+                    {"field_index": 1, "value": "⌀300", "view": None,
+                     "basis": "unattributed", "why": "outside_views"},
+                ],
+                "counts": {"linked": 1, "unlinked": 1, "ambiguous": 0,
+                           "no_coordinates": 0},
+            },
+        }
+        return Fragment(
+            fragment_id="", type="drawing",
+            content=Content(text="⌀200±2\n⌀300±2", structured_drawing_fields=fields,
+                            structured_payload=payload),
+            position=Position(page=1, bbox=[0, 0, 1, 1]),
+            confidence=0.95, completeness=None,
+            provenance=Provenance(method="vlm_full_page", strategy_level=7,
+                                  source="drawing"),
+        )
+
+    @pytest.fixture
+    def uses_links(self, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_RECORD_COMPOSED", True)
+        monkeypatch.setattr(settings, "DRAWING_RECORD_USES_VALUE_LINKS", True)
+
+    @pytest.fixture
+    def links_off(self, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_RECORD_COMPOSED", True)
+        monkeypatch.setattr(settings, "DRAWING_RECORD_USES_VALUE_LINKS", False)
+
+    def test_flag_off_says_nothing_known(self, links_off):
+        fragments, _ = finalize_fragments([self.linked()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        assert "вид А (2:1)" not in text
+        assert "запись чертежа не указывает" in text
+
+    def test_view_named_at_value(self, uses_links):
+        fragments, _ = finalize_fragments([self.linked()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        assert "⌀200 (допуск ±2) (вид А (2:1))" in text
+
+    def test_hedge_speaks_of_unlinked_only(self, uses_links):
+        fragments, _ = finalize_fragments([self.linked()], doc_id="d1")
+        text = fragments[0].content.text or ""
+        assert "Там, где вид не назван при размере" in text
+        assert "относится каждый размер, запись чертежа не указывает" not in text
+
+    def test_mismatched_index_ignored(self, uses_links):
+        """Номер поля сдвинулся — привязка не используется: чужой вид хуже пустоты."""
+        fragment = self.linked()
+        payload = dict(fragment.content.structured_payload)
+        payload["value_links"] = dict(payload["value_links"])
+        payload["value_links"]["fields"] = [
+            {"field_index": 0, "value": "⌀999", "view": "v1", "view_name": "А (2:1)"},
+        ]
+        fragment.content.structured_payload = payload
+        fragments, _ = finalize_fragments([fragment], doc_id="d1")
+        assert "(вид" not in (fragments[0].content.text or "")
+
+
 @pytest.fixture
 def guard(monkeypatch):
     monkeypatch.setattr(settings, "DRAWING_CATEGORY_PROSE_GUARD", True)
