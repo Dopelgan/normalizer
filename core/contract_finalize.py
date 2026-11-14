@@ -206,8 +206,76 @@ def finalize_fragments(
     # чертежей, то есть ровно то место, где собирать и надо.
     if extract:
         drawing_record.apply(fragments)
+        if settings.DRAWING_DIAGNOSTICS_NOT_INDEXED:
+            for fragment in fragments:
+                _diagnostics_aside(fragment)
 
     return fragments, id_map
+
+
+# Ключи `structured_payload`, которые читает потребитель. Всё остальное у
+# чертежа — наш учёт разбора, и в индексируемый текст он не идёт.
+#
+# Кто читает что: `title_block`, `title_block_handwritten`, `tables` —
+# адаптер RAG и сборка записи (`core/drawing_record.py`); `record_parts`,
+# `record_context` — чанкер RAG (`super_rag/ingest/normalize/service.py`),
+# без них он режет запись посреди перечня; `sheet_reparse_candidate`,
+# `sheet_reparse_reason` — очередь перечитывания RAG
+# (`super_rag/parser/completeness.py`, вид `rag_sheet_reparse_candidate`);
+# `transcript_line_count`, `transcript_complete` — качество фрагмента
+# (`core/drawing_quality.py`); `recognition_mode`, `sheet_type`,
+# `coordinate_reference` — чем прочитан лист.
+_PAYLOAD_FOR_CONSUMER: frozenset = frozenset({
+    "title_block", "title_block_handwritten", "tables",
+    "record_parts", "record_context",
+    "sheet_reparse_candidate", "sheet_reparse_reason",
+    "transcript_line_count", "transcript_complete",
+    "recognition_mode", "sheet_type", "coordinate_reference",
+})
+# Куда переносится учёт. Поле `completeness_mechanisms` уже есть в
+# контракте, в текст не попадает нигде и ни одним потребителем не читается:
+# у RAG `extra="ignore"`, поэтому запись из него собрать нельзя даже
+# случайно.
+DIAGNOSTICS_KEY = "drawing_diagnostics"
+
+
+def _diagnostics_aside(fragment: Fragment) -> None:
+    """
+    Служебные данные разбора чертежа — из `structured_payload` в
+    `completeness_mechanisms`.
+
+    Зачем перенос, а не удаление. Рамки надписей, причины непривязки и
+    счётчики нужны нам: по ним видно, почему величина осталась без вида и
+    какой лист имеет смысл перечитать. Удалив их, мы бы считали обрывы
+    грепом по логам воркера. Но искомым текстом они быть не должны:
+    адаптер RAG выводит строкой «Метка: значение» любой ключ payload,
+    которого нет в его собственном списке служебных, и `value_links`
+    туда не внесён — ни один новый наш ключ туда не внесён и не может
+    быть внесён заранее. Поэтому решает не список чужого репозитория, а
+    место хранения: `completeness_mechanisms` не индексируется.
+
+    Делается последним шагом, после сборки записи: все, кто читает эти
+    ключи внутри конвейера (`core/drawing_processor.process`,
+    `core/drawing_quality.py`, `core/drawing_record.py`), к этому моменту
+    уже прочитали. Идемпотентно: второй проход переносить нечего.
+    """
+    if fragment.type != "drawing":
+        return
+    payload = fragment.content.structured_payload
+    if not payload:
+        return
+    aside = {key: value for key, value in payload.items()
+             if key not in _PAYLOAD_FOR_CONSUMER}
+    if not aside:
+        return
+    fragment.content.structured_payload = {
+        key: value for key, value in payload.items() if key in _PAYLOAD_FOR_CONSUMER
+    } or None
+    mechanisms = dict(fragment.completeness_mechanisms or {})
+    kept = dict(mechanisms.get(DIAGNOSTICS_KEY) or {})
+    kept.update(aside)
+    mechanisms[DIAGNOSTICS_KEY] = kept
+    fragment.completeness_mechanisms = mechanisms
 
 
 def normalized_content_hash(fragments: List[Fragment]) -> Optional[str]:
