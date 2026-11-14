@@ -30,14 +30,17 @@ from __future__ import annotations
 
 import base64
 import contextvars
+import hashlib
 import io
 import json
 import logging
+import os
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -72,6 +75,73 @@ def close_shared_session() -> None:
         if _shared is not None:
             _shared.close()
             _shared = None
+
+
+# Кэш ответов модели (VLM_RESPONSE_CACHE). Подробно, от чего ключ зависит и
+# почему кэшируется именно сырой ответ, — в core/config.py у флага.
+def _cache_dir() -> Path:
+    name = settings.VLM_RESPONSE_CACHE_DIR or str(
+        Path(settings.ARTIFACTS_MOUNT) / "vlm-cache"
+    )
+    return Path(name)
+
+
+def cache_key(model: str, max_tokens: int, prompt: str, encoded: str) -> str:
+    """
+    Отпечаток вызова. В него входит всё, что меняет ответ: модель, потолок
+    ответа, температура, готовый текст запроса и байты картинки в том виде,
+    в каком они уходят в модель. Картинка хешируется отдельно от остального,
+    чтобы её длинная base64-строка не собиралась в памяти второй раз.
+    """
+    digest = hashlib.sha256()
+    digest.update(_SYSTEM.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(
+        f"{model}\0{max_tokens}\0{settings.QWEN_TEMPERATURE}\0".encode("utf-8")
+    )
+    digest.update(prompt.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(encoded.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def cache_get(key: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Сохранённый ответ или None. Битый файл — это промах, не ошибка."""
+    if not settings.VLM_RESPONSE_CACHE:
+        return None
+    path = _cache_dir() / key[:2] / f"{key}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        content = data["content"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(content, str):
+        return None
+    finish = data.get("finish")
+    logger.info("Ответ модели взят из кэша (%s)", key[:12])
+    return content, finish if isinstance(finish, str) else None
+
+
+def cache_put(key: str, answer: Tuple[str, Optional[str]]) -> None:
+    """
+    Записать ответ. Запись идёт во временный файл рядом и переименованием:
+    два воркера пишут в один том, и половина файла, прочитанная третьим,
+    стала бы молчаливым промахом с мусором вместо ответа.
+    """
+    if not settings.VLM_RESPONSE_CACHE:
+        return
+    content, finish = answer
+    path = _cache_dir() / key[:2] / f"{key}.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps({"content": content, "finish": finish}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("Ответ модели не записан в кэш: %s", exc)
 
 # Категории полей чертежа, которые модель имеет право назвать. Всё прочее
 # сводится к правилам разбора: выдуманная категория в индекс не попадает.
@@ -719,10 +789,11 @@ class QwenVisionClient:
         if not encoded:
             return None
 
+        limit = max_tokens or settings.QWEN_MAX_TOKENS
         body = {
             "model": self.model,
             "temperature": settings.QWEN_TEMPERATURE,
-            "max_tokens": max_tokens or settings.QWEN_MAX_TOKENS,
+            "max_tokens": limit,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": _SYSTEM},
@@ -732,13 +803,19 @@ class QwenVisionClient:
                 ]},
             ],
         }
+        key = cache_key(self.model, limit, prompt, encoded)
+        cached = cache_get(key)
+        if cached is not None:
+            return cached
         payload = self._post(body)
         if payload is None:
             return None
         content = _content_of(payload)
         if content is None:
             return None
-        return content, _finish_of(payload)
+        answer = (content, _finish_of(payload))
+        cache_put(key, answer)
+        return answer
 
     def _post(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
