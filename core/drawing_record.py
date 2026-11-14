@@ -193,6 +193,11 @@ _VIEW_WORD = re.compile(
 _VIEW_MAX_CHARS = 40
 
 _FOLD = re.compile(r"[\s.,:;№\-_]+")
+# Знак, который может быть частью одного значения чертежа, а не границей
+# между значениями. Список тот же, что у адаптера RAG
+# (`_VALUE_CHAR_RE`): по нему решается, сказано значение целиком или
+# только похожим куском (`_whole_value_said`).
+_VALUE_CHAR = re.compile(r"[\w,.+\-*⌀ØøΦφ°×x/±]", re.IGNORECASE)
 
 
 def _fold(text: str) -> str:
@@ -231,6 +236,20 @@ def without_text_enabled() -> bool:
     from core.config import settings
 
     return bool(getattr(settings, "DRAWING_RECORD_WITHOUT_SHEET_TEXT", False))
+
+
+def all_fields_said_enabled() -> bool:
+    """Запись произносит каждое значение (`DRAWING_RECORD_ALL_FIELDS_SAID`)."""
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_RECORD_ALL_FIELDS_SAID", False))
+
+
+def stamp_from_fields_enabled() -> bool:
+    """Графы штампа берутся и из полей (`DRAWING_RECORD_STAMP_FROM_FIELDS`)."""
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_RECORD_STAMP_FROM_FIELDS", False))
 
 
 def apply(fragments: List[Fragment]) -> List[Fragment]:
@@ -337,9 +356,14 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
     add("callouts", _callouts(fields))
     add("notes", _notes(fields))
     add("tables", _tables(payload))
-    if add("sheet_lines", _sheet_lines(kept)):
-        pass
-    elif without_text_enabled():
+    lines_said = add("sheet_lines", _sheet_lines(kept))
+    if all_fields_said_enabled():
+        # Последней частью — всё прочитанное, чего не назвала ни одна
+        # часть выше. Это и беспотерьность, и единственный способ погасить
+        # хвост «(требует сверки)»: адаптер RAG дописывает строку с хвостом
+        # на каждое значение, которого не нашёл в тексте.
+        add("unsaid", _unsaid(fields, payload, _JOIN.join(body for _, body in parts)))
+    elif not lines_said and without_text_enabled():
         # Строк листа нет: беспотерьность держит часть «остальные надписи»,
         # а не повтор текста. Считается по уже собранному: в неё попадает
         # только то, чего ни одна часть выше не назвала.
@@ -514,6 +538,22 @@ def _graphs(block: Any, corrected: Dict[tuple, str],
     значения по ключу поиска и подписи для записи.
     """
     if not isinstance(block, dict):
+        block = {}
+    if stamp_from_fields_enabled():
+        # Графа, которую принесли поля, а в payload её нет: разбор штампа
+        # кладёт в payload ответ одного прохода, а поля собираются со
+        # всех. На проде из-за этого запись молчала о графах, которые
+        # адаптер RAG тут же дописывал строкой с хвостом «(требует
+        # сверки)»: 109 хвостов из 554 на десяти чертежах стояли на
+        # строках «Основная надпись: …». Имя графы берётся то, которым её
+        # назвало поле; где поле имени не несёт, графа остаётся
+        # непоимённованной и уходит в последнюю часть записи, а не
+        # получает имя по догадке.
+        block = dict(block)
+        for (key, hand), value in corrected.items():
+            if hand is by_hand and key and key not in block:
+                block[key] = value
+    if not block:
         return {}, {}
     out: Dict[str, str] = {}
     names: Dict[str, str] = {}
@@ -809,6 +849,91 @@ def _sheet_lines(lines: Sequence[str]) -> List[str]:
     if not body:
         return []
     return ["Надписи листа в порядке чтения.\n" + "\n".join(body)]
+
+
+def _unsaid(fields: Sequence[Dict[str, Any]], payload: Dict[str, Any],
+            said: str) -> List[str]:
+    """
+    Всё прочитанное, чего не назвала ни одна часть записи
+    (`DRAWING_RECORD_ALL_FIELDS_SAID`).
+
+    Зачем это нужно, и почему именно так. Адаптер RAG, получив фрагмент с
+    текстом, дописывает к тексту строку «Метка: значение» на **каждое**
+    прочитанное значение, которого в тексте не нашёл, и к каждой такой
+    строке — хвост «(требует сверки)». После сборки записи на проде так
+    осталось 554 хвоста на десяти чертежах, и 423 из них — значения полей,
+    которых запись не назвала: голое число (его не пускает `_kind_of`),
+    графа штампа без имени, позиция, выноска. То есть хвост берётся не
+    оттуда, где мы молчим о неуверенности, а оттуда, где мы **молчим о
+    значении**.
+
+    Отсюда правило: запись обязана произнести каждое значение хотя бы
+    один раз. Тогда адаптеру дописывать нечего, и хвост не появляется —
+    не потому, что мы его запретили (в чужом репозитории мы ничего
+    запретить не можем), а потому, что его нечем породить.
+
+    Сравнение идёт **тем же** правилом, которым ищет адаптер
+    (`_whole_value_said`): значение считается сказанным, только если стоит
+    в тексте целым значением, а не частью другого. Иначе «5» считалось бы
+    сказанным внутри «5±1», адаптер решал бы иначе, и хвост оставался бы.
+
+    Строки таблиц берутся сырыми, склеенными табуляцией: адаптер
+    дописывает строку таблицы именно так, и прозой её не подменить. Это
+    та же соломка, что и часть «Надписи листа в порядке чтения», и стоит
+    она в записи последней, после всего читаемого.
+    """
+    rest: List[str] = []
+
+    def add_value(value: str) -> None:
+        if not value or _whole_value_said(value, said):
+            return
+        if any(_whole_value_said(value, line) for line in rest):
+            return
+        rest.append(value)
+
+    for field in fields:
+        value = _clean(field.get("value"))
+        if field.get("category") in ("title_block", "material"):
+            # Графа записана как «Подпись: значение», а адаптер ищет в
+            # тексте само значение, без подписи. Поэтому и сверяется, и
+            # дописывается значение: иначе остаток повторял бы графу,
+            # которую запись уже назвала словами («разработал Бабанин»).
+            _, sep, text = value.partition(":")
+            if sep and _clean(text):
+                value = _clean(text)
+        add_value(value)
+    for table in (payload.get("tables") or []):
+        if not isinstance(table, dict):
+            continue
+        for row in (table.get("rows") or []):
+            if not _row_said(row):
+                continue
+            add_value("\t".join(_clean(cell) for cell in row).strip())
+    if not rest:
+        return []
+    return ["Остальное, прочитанное на листе; чем именно является каждая "
+            "запись, разбор не называет.\n" + "\n".join(rest)]
+
+
+def _whole_value_said(value: str, haystack: str) -> bool:
+    """
+    Значение стоит в тексте **целым** значением, а не частью другого.
+
+    Правило то же, которым сверяет адаптер RAG
+    (`super_rag/parser/adapter._whole_value_in`): границей считается всё,
+    кроме букв, цифр и знаков, входящих в сами значения чертежа. Поэтому
+    «1» не считается сказанной внутри «100», а «⌀28*» — внутри «⌀28*2».
+    Правило повторено здесь нарочно: если наше «сказано» разойдётся с его
+    «найдено», хвост останется ровно там, где мы решили, что всё хорошо.
+    """
+    if not value:
+        return True
+    for match in re.finditer(re.escape(value), haystack):
+        before = haystack[match.start() - 1] if match.start() else " "
+        after = haystack[match.end()] if match.end() < len(haystack) else " "
+        if not (_VALUE_CHAR.match(before) or _VALUE_CHAR.match(after)):
+            return True
+    return False
 
 
 def _other_marks(fields: Sequence[Dict[str, Any]], said: str) -> List[str]:
