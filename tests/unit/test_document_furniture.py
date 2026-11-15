@@ -238,6 +238,33 @@ class TestApply:
         # Спаны остаются: из какой единицы источника взят фрагмент, по-прежнему известно.
         assert [span.source_unit_id for span in out[0].position.source_spans] == ["unit-1"]
 
+    def test_length_changing_repair_also_stops_promising_exact_offsets(self, monkeypatch):
+        """Починка, изменившая длину текста, снимает обещание так же, как рамка.
+
+        Сведение разорванного слова укорачивает текст, а смещения измерены по
+        исходному блоку: тот же устаревший `char_end`, что и у рамки.
+        """
+        from core.models.contract import SourceSpan
+
+        monkeypatch.setattr(settings, "SCAN_NO_MIXED_SCRIPT_WORDS", True)
+        monkeypatch.setattr(settings, "SCAN_DESIGNATION_REPAIR", True)
+        monkeypatch.setattr(settings, "SCAN_DROP_FRAME_FURNITURE", False)
+        monkeypatch.setattr(settings, "SCAN_JOIN_HYPHENATED_WORDS", False)
+
+        fragment = text_fragment("начало")
+        fragment.position.source_spans = [SourceSpan(
+            source_unit_id="unit-3", page=1, char_start=0, char_end=6)]
+        fragment.position.text_offsets_exact = True
+
+        def shorten(target):
+            target.content.text = "начал"
+            return [object()]
+
+        monkeypatch.setattr("core.providers.mixed_script.repair_fragment", shorten)
+        out, _ = finalize_fragments([fragment], doc_id="d1")
+        assert out[0].content.text == "начал"
+        assert out[0].position.text_offsets_exact is False
+
     def test_untouched_text_keeps_exact_offsets(self, furniture, joining):
         """Текст, который правило не меняло, обещание сохраняет."""
         from core.models.contract import SourceSpan

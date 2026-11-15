@@ -147,10 +147,19 @@ def finalize_fragments(
         _drop_nul(fragment)
         # До fragment_id и до извлечения фактов: факт и идентификатор должны
         # считаться по тому тексту, который уйдёт в индекс.
+        # Починки текста тоже меняют его длину (сведение разорванного слова
+        # укорачивает), а смещения измерены по тексту исходного блока. Там, где
+        # длина изменилась, точные смещения больше не обещаются — то же, что
+        # делает снятие рамки у себя (`document_furniture.apply`). Замена той же
+        # длины диапазон не ломает, и обещание остаётся.
+        before_repairs = fragment.content.text or ""
         if settings.SCAN_NO_MIXED_SCRIPT_WORDS and fragment.type == "text":
             mixed_script.repair_fragment(fragment)
         if settings.SCAN_DESIGNATION_REPAIR and fragment.type == "text":
             designation_repair.repair_fragment(fragment)
+        if (fragment.position is not None
+                and len(fragment.content.text or "") != len(before_repairs)):
+            fragment.position.text_offsets_exact = False
         if fragment.type == "drawing":
             apply_drawing_quality(fragment)
         if fragment.provenance.source_unit_id is None:
