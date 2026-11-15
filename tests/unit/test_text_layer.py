@@ -175,6 +175,53 @@ class TestReconcile:
         assert stats.recovered_blocks == 1
         assert any(b.type == "text" and "Навык" in (b.text or "") for b in blocks)
 
+    def test_empty_table_frame_does_not_stay_in_the_output(self):
+        """Пустая рамка не уезжает в индекс фрагментом без содержимого.
+
+        Прежде снятие рамки стояло под «если восстановить не удалось», то есть
+        ровно наоборот: удалось — рамка оставалась. На проде так набралось
+        5629 таких фрагментов из 6098, и примерно у 4176 текст уже лежал рядом
+        восстановленным блоком.
+        """
+        block = ParsedBlock(type="table", table_data=None, page=1,
+                            bbox=[0.05, 0.05, 0.95, 0.60])
+        layer = layer_of(line("Навык Проверяется ли", 0.10))
+
+        blocks, stats = reconcile_with_text_layer([block], layer)
+
+        assert stats.dropped_empty_tables == 1
+        assert not any(b.type == "table" for b in blocks)
+        # Текст вышел ровно одним блоком, а не двумя.
+        assert sum(1 for b in blocks if "Навык" in (b.text or "")) == 1
+
+    def test_frame_with_a_crop_is_kept(self):
+        """Вырезка таблицы — это содержимое: такую рамку снимать нельзя."""
+        block = ParsedBlock(type="table", table_data=None, page=1,
+                            bbox=[0.05, 0.05, 0.95, 0.60],
+                            image_ref="s3://bucket/table-1.png")
+        layer = layer_of(line("Навык Проверяется ли", 0.10))
+
+        blocks, stats = reconcile_with_text_layer([block], layer)
+
+        assert stats.dropped_empty_tables == 0
+        assert any(b.type == "table" and b.image_ref for b in blocks)
+
+    def test_frame_with_raw_html_is_kept(self):
+        """Сырой HTML таблицы тоже содержимое, хотя `_carries_own_text` его не видит.
+
+        Он смотрит только на `table_data`, поэтому рамку с неразобранным HTML
+        проверяем отдельно: иначе разметка таблицы потерялась бы.
+        """
+        block = ParsedBlock(type="table", table_data=None, page=1,
+                            bbox=[0.05, 0.05, 0.95, 0.60],
+                            table_html="<table><tr><td>Навык</td></tr></table>")
+        layer = layer_of(line("Навык Проверяется ли", 0.10))
+
+        blocks, stats = reconcile_with_text_layer([block], layer)
+
+        assert stats.dropped_empty_tables == 0
+        assert any(b.type == "table" and b.table_html for b in blocks)
+
     def test_blocks_are_renumbered_in_reading_order(self):
         upper = ParsedBlock(type="text", text="Верхний", page=1, bbox=[0.05, 0.05, 0.9, 0.12])
         lower = ParsedBlock(type="text", text="Нижний", page=1, bbox=[0.05, 0.60, 0.9, 0.68])
