@@ -60,10 +60,11 @@ def reading(*values):
     ])
 
 
-def crop_fragment():
+def crop_fragment(bbox=(0.3, 0.2, 0.7, 0.5), page=1):
+    # По умолчанию вырезка занимает 0,12 площади листа — мелкая.
     return Fragment(
         fragment_id="doc-1-frag-001", type="image", content=Content(image_ref=CROP_URI),
-        position=Position(page=1, bbox=[0.3, 0.2, 0.7, 0.5], order=1),
+        position=Position(page=page, bbox=list(bbox), order=1),
         confidence=0.9, completeness=1.0,
         provenance=Provenance(method="mineru_image", strategy_level=5, source="raster_only"),
     )
@@ -126,6 +127,58 @@ class TestWholeSheetWithCrops:
         processor.qwen.reading, processor.qwen.lines = None, None
         out = processor.enrich_fragments([], metadata())
         assert out == []
+
+
+class TestSmallCropsSkipped:
+    """
+    Мелкая вырезка вида со страницы, которая читается целиком, в модель не
+    уходит (DRAWING_SKIP_SMALL_CROPS). Крупная вырезка и вырезка со страницы
+    без полного чтения читаются как раньше.
+    """
+
+    @pytest.fixture
+    def skip_crops(self, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_SKIP_SMALL_CROPS", True)
+
+    def test_flag_off_keeps_todays_number_of_model_calls(self, storage, full_read):
+        processor, qwen = model(storage)
+        out = processor.enrich_fragments([crop_fragment()], metadata())
+        # Проход «лист целиком» сегодня идёт и на вырезку, и на страницу.
+        assert qwen.asked == ["sheet", "title_block", "table",
+                              "sheet", "transcribe", "title_block", "table"]
+        assert [f.content.image_ref for f in out] == [SHEET_URI, CROP_URI]
+
+    def test_flag_on_small_crop_does_not_reach_the_model(self, storage, full_read, skip_crops):
+        processor, qwen = model(storage)
+        out = processor.enrich_fragments([crop_fragment()], metadata())
+        # Остаётся только проход по самой странице.
+        assert qwen.asked == ["sheet", "transcribe", "title_block", "table"]
+        sheet_fragment = out[0]
+        assert sheet_fragment.content.image_ref == SHEET_URI
+        assert sheet_fragment.type == "drawing"
+        assert sheet_fragment.content.text == "\n".join(LINES)
+        # Вырезка не пропадает из документа, но остаётся картинкой.
+        crop_out = out[1]
+        assert crop_out.content.image_ref == CROP_URI and crop_out.type == "image"
+        assert not crop_out.review_required and not crop_out.warnings
+
+    def test_flag_on_large_crop_is_still_read(self, storage, full_read, skip_crops):
+        processor, qwen = model(storage)
+        # Доля площади 0,887 — покрытие такой вырезки не проверено.
+        processor.enrich_fragments([crop_fragment(bbox=(0.03, 0.03, 0.97, 0.97))], metadata())
+        assert qwen.asked.count("sheet") == 2
+
+    def test_flag_on_crop_of_an_unread_page_is_still_read(self, storage, full_read, skip_crops):
+        processor, qwen = model(storage)
+        # Целиком читается только страница 1 — вырезка со второй нужна.
+        processor.enrich_fragments([crop_fragment(page=2)], metadata())
+        assert qwen.asked.count("sheet") == 2
+
+    def test_flag_on_without_full_read_the_crop_is_read(self, storage, skip_crops):
+        processor, qwen = model(storage)
+        out = processor.enrich_fragments([crop_fragment()], metadata())
+        assert qwen.asked.count("sheet") == 1
+        assert [f.content.image_ref for f in out] == [CROP_URI]
 
 
 class TestSheetCalledText:
