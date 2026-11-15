@@ -118,6 +118,24 @@ def cache_key(base_url: str, body: Dict[str, Any], encoded: str) -> str:
     return digest.hexdigest()
 
 
+def cache_key_v1(model: str, max_tokens: int, prompt: str, encoded: str) -> str:
+    """
+    Ключ прежней версии — ровно как его считал старый код (до адреса сервера
+    и тела запроса целиком). Нужен только для переноса записей старого кэша
+    в новый (VLM_CACHE_V1_FALLBACK); убрать вместе с настройкой.
+    """
+    digest = hashlib.sha256()
+    digest.update(_SYSTEM.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(
+        f"{model}\0{max_tokens}\0{settings.QWEN_TEMPERATURE}\0".encode("utf-8")
+    )
+    digest.update(prompt.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(encoded.encode("utf-8"))
+    return digest.hexdigest()
+
+
 def cache_get(key: str) -> Optional[Tuple[str, Optional[str]]]:
     """Сохранённый ответ или None. Битый файл — это промах, не ошибка."""
     if not settings.VLM_RESPONSE_CACHE:
@@ -844,6 +862,16 @@ class QwenVisionClient:
         key = cache_key(self._base(), body, encoded)
         image_url["url"] = encoded
         cached = cache_get(key)
+        if cached is None and settings.VLM_CACHE_V1_FALLBACK:
+            # Временно (VLM_CACHE_V1_FALLBACK): промах по новому ключу
+            # проверяется по ключу прежней версии. Тело запроса у неё было
+            # из тех же полей, и все её записи сделаны одним сервером прода,
+            # так что найденный ответ — ответ на этот же запрос. Он
+            # переписывается под новый ключ и дальше берётся оттуда; старый
+            # файл не трогается.
+            cached = cache_get(cache_key_v1(self.model, limit, prompt, encoded))
+            if cached is not None:
+                cache_put(key, cached)
         if cached is not None:
             return cached
         payload = self._post(body)

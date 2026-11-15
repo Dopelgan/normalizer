@@ -407,6 +407,69 @@ class TestResponseCache:
         assert qwen_client.cache_get(key) == ("первый", "stop")
         assert [p.name for p in cache.rglob("*") if p.is_file()] == [f"{key}.json"]
 
+    def test_identical_body_gives_identical_key(self):
+        """Одно и то же тело запроса — один ключ, независимо от порядка полей
+        и от того, что это другой объект."""
+        def body(order):
+            fields = {
+                "model": "qwen", "temperature": 0.1, "max_tokens": 512,
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": ""}},
+                    {"type": "text", "text": "Перепиши лист"},
+                ]}],
+            }
+            return {name: fields[name] for name in order}
+
+        names = ["model", "temperature", "max_tokens", "response_format", "messages"]
+        first = qwen_client.cache_key("http://gpu:8000/v1", body(names), "data:x")
+        second = qwen_client.cache_key("http://gpu:8000/v1", body(names[::-1]), "data:x")
+        assert first == second
+        changed = body(names)
+        changed["max_tokens"] = 513
+        assert qwen_client.cache_key("http://gpu:8000/v1", changed, "data:x") != first
+
+    def test_v1_key_is_computed_as_the_old_code_did(self, mocker):
+        """Ключ прежней версии сверен с выводом старого cache_key на том же запросе."""
+        mocker.patch.object(qwen_client.settings, "QWEN_TEMPERATURE", 0.1)
+        key = qwen_client.cache_key_v1(
+            "Qwen/Qwen3.8-27B-FP8", 8192, "Перепиши весь текст листа.",
+            "data:image/png;base64,iVBORw0KGgo=",
+        )
+        assert key == "1a87ef451fb7f384cf7927394a32f052de55322320f00325350d6888313ea24c"
+
+    def test_v1_hit_is_migrated_once_then_served_from_v2(self, mocker, cache):
+        mocker.patch.object(qwen_client.settings, "VLM_CACHE_V1_FALLBACK", True)
+        v1_keys = mocker.spy(qwen_client, "cache_key_v1")
+        sheet = picture()
+        # Первый вызов: ключ v1 этого запроса, модель спрошена, файлы убраны.
+        client(FakeSession(FakeResponse(answer({"annotations": []})))).read_sheet(sheet)
+        old_key = v1_keys.spy_return
+        for path in cache.rglob("*.json"):
+            path.unlink()
+        # Запись старого кода лежит под ключом v1.
+        old_path = cache / old_key[:2] / f"{old_key}.json"
+        old_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.write_text(
+            '{"content": "{\\"annotations\\": [{\\"value\\": \\"20\\"}]}", "finish": "stop"}',
+            encoding="utf-8",
+        )
+        migrated = client(FakeSession()).read_sheet(sheet)
+        assert migrated.annotations[0]["value"] == "20"
+        assert old_path.exists()
+        # Без старого файла ответ берётся из v2, модель не спрашивается.
+        old_path.unlink()
+        calls = v1_keys.call_count
+        again = client(FakeSession()).read_sheet(sheet)
+        assert again.annotations[0]["value"] == "20"
+        assert v1_keys.call_count == calls
+
+    def test_without_v1_file_the_model_is_asked(self, mocker, cache):
+        mocker.patch.object(qwen_client.settings, "VLM_CACHE_V1_FALLBACK", True)
+        session = FakeSession(FakeResponse(answer({"annotations": [{"value": "30"}]})))
+        assert client(session).read_sheet(picture()).annotations[0]["value"] == "30"
+        assert len(session.requests) == 1
+
     def test_broken_cache_file_is_a_miss(self, cache):
         session = FakeSession(
             FakeResponse(answer({"annotations": []})),
