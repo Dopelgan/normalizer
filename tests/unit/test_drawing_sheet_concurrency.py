@@ -332,3 +332,37 @@ def test_connection_pool_holds_every_parallel_request(monkeypatch):
         assert session.get_adapter("https://vlm.example/v1")._pool_maxsize >= 12
     finally:
         qwen_client.close_shared_session()
+
+
+def test_late_sheet_out_of_time_keeps_running_sheets(temp_storage, monkeypatch):
+    """
+    Лист, которому не хватило срока, не отменяет листы, уже прошедшие свою
+    проверку срока: их работа доходит до конца, как при чтении по очереди.
+    """
+    from core import drawing_processor as dp
+
+    def outcome(concurrency):
+        monkeypatch.setattr(settings, "VLM_SHEET_CONCURRENCY", concurrency)
+        checks = {"n": 0}
+        lock = threading.Lock()
+
+        def remaining():
+            with lock:
+                checks["n"] += 1
+                return 10_000.0 if checks["n"] <= 3 else 1.0
+
+        monkeypatch.setattr(deadline, "remaining", remaining)
+        processor = DrawingProcessor(temp_storage, qwen=QwenVisionClient(endpoint="http://vlm.test/v1"))
+
+        def process(uri, metadata, page, transcribe=False, page_fields=None):
+            time.sleep(0.05 if page == 1 else 0.3)
+            deadline.check_cancelled()      # как `_ask_text` перед следующим вызовом
+            return f"r{page}"
+
+        monkeypatch.setattr(processor, "process", process)
+        result = processor._read_sheets("src/scan.pdf", {}, PAGES, False, [None] * len(PAGES))
+        return ["NO_TIME" if r is dp._NO_TIME else r for r in result]
+
+    serial = outcome(1)
+    assert serial == ["r1", "r2", "r3", "NO_TIME", "NO_TIME"]
+    assert outcome(3) == serial

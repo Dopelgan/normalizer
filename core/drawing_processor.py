@@ -800,22 +800,27 @@ class DrawingProcessor:
         Одна и та же страница дважды в списке — по очереди: второй вызов
         видит прочтения первого через общий список, и порядок там важен.
         """
-        stop = threading.Event()
+        # Два события, а не одно. `no_time` — лист увидел нехватку срока:
+        # следующие листы не начинаются, а уже начатые доходят до конца, как
+        # при чтении по очереди. `abort` — задача оборвалась: начатые листы
+        # бросают работу перед следующим вызовом модели.
+        no_time = threading.Event()
+        abort = threading.Event()
 
         def read(page: Any, fields: Optional[List[Dict[str, Any]]]) -> Any:
             # Срок проверяется, когда лист дождался места, а не когда встал в
             # очередь. Лист, который увидел нехватку времени, останавливает
             # и все следующие, как остановка цикла при чтении по очереди.
-            if stop.is_set():
+            if no_time.is_set() or abort.is_set():
                 return _NO_TIME
             left = deadline.remaining()
             if left is not None and left < settings.VLM_TIMEOUT:
-                stop.set()
+                no_time.set()
                 logger.warning("Разбор листа %s стр. %d пропущен: до срока задачи %.0f с",
                                source_uri, page, left)
                 return _NO_TIME
             try:
-                with deadline.cancel_on(stop):
+                with deadline.cancel_on(abort):
                     return self.process(
                         source_uri, metadata, page, transcribe=full_read, page_fields=fields,
                     )
@@ -845,14 +850,16 @@ class DrawingProcessor:
                 for page, fields in zip(pages, fields_of)
             ]
             return [future.result() for future in futures]
-        finally:
+        except BaseException:
             # Обрыв задачи (SoftTimeLimitExceeded приходит в главный поток,
             # пока он ждёт ответы): листы из очереди не начинаются, а начатые
             # бросают работу перед следующим вызовом модели
             # (`deadline.check_cancelled` в `_ask_text` и перед повтором в
             # `_post`). Запрос, уже ушедший в vLLM, прервать нечем: он
             # дожидается ответа или своего таймаута, и на этом лист кончается.
-            stop.set()
+            abort.set()
+            raise
+        finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
     def _pages_read_whole(self, metadata: Dict[str, Any]) -> frozenset:
