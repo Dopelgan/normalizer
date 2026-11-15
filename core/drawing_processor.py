@@ -131,7 +131,7 @@ class DrawingProcessor:
     def process(
         self, image_ref: str, metadata: Dict[str, Any], page: int = 1,
         transcribe: bool = False, log_page: Optional[int] = None,
-        text_only: bool = False,
+        text_only: bool = False, page_fields: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Возвращает:
@@ -141,6 +141,13 @@ class DrawingProcessor:
         `log_page` — номер страницы только для лога: у вырезки MinerU номер
         страницы живёт во фрагменте, а не в `page` (там всегда 1, потому что
         вырезка — отдельная картинка). На разбор не влияет.
+
+        `page_fields` — список прочтений ТОЙ ЖЕ страницы листа, накопленный
+        прежними вызовами этого метода: страница и нарезанные с неё вырезки
+        видов разбираются разными вызовами, а надпись у них одна. Список
+        сквозной и пополняется здесь же — прочтения вырезок доходят до
+        прохода по странице (`dimension_fidelity.adopt_page_signs`). Без
+        него (None) сведение остаётся в точности прежним, внутри вызова.
         """
         if not self.qwen.available:
             logger.error(
@@ -272,6 +279,13 @@ class DrawingProcessor:
                 dimension_fidelity.adopt_transcript_signs(
                     fields, payload.get("transcript_lines")
                 )
+            if page_fields is not None:
+                # Тот же размер, прочитанный в другом вызове `process()` по
+                # той же странице: лист целиком и вырезка вида с него — это
+                # два фрагмента, и merge_readings их не сводит. Список
+                # сквозной, поэтому пополняется уже сведёнными полями.
+                dimension_fidelity.adopt_page_signs(fields, page_fields)
+                page_fields.extend(fields)
         # Связь величины с видом: заголовок из уже прочитанных надписей,
         # область — из геометрии листа. Поля не меняются, модель не
         # вызывается; выключенный флаг не добавляет ничего. Место важно:
@@ -496,6 +510,11 @@ class DrawingProcessor:
         чертежей: фрагмента `image` в таком документе нет.
         """
         result: List[Fragment] = []
+        # Прочтения по страницам, накопленные вызовами `process()`: вырезка
+        # вида и сама страница читаются разными вызовами, а надпись у них
+        # одна. Вырезки идут до прохода по странице, поэтому страница видит
+        # их прочтения, а не наоборот.
+        page_fields: Dict[int, List[Dict[str, Any]]] = {}
         text_document = settings.DRAWING_PAGE_CLASSIFIER_ENABLED and _is_text_document(fragments, metadata)
         # Страницы, которые ветвь «лист целиком» прочитает сама: мелкие
         # вырезки с них в модель не уходят (DRAWING_SKIP_SMALL_CROPS).
@@ -539,9 +558,11 @@ class DrawingProcessor:
                 result.append(fragment)
                 continue
             try:
+                sheet_page = int(fragment.position.page) if fragment.position else 0
                 drawing_result = self.process(
                     fragment.content.image_ref, metadata,
                     log_page=fragment.position.page if fragment.position else None,
+                    page_fields=page_fields.setdefault(sheet_page, []),
                 )
                 enriched = self.build_fragment(drawing_result, fragment, metadata)
             except SoftTimeLimitExceeded:
@@ -556,7 +577,7 @@ class DrawingProcessor:
             result.append(enriched or fragment)
 
         had_drawings = any(f.type == "drawing" for f in result)
-        sheets = self._sheet_drawings(result, metadata)
+        sheets = self._sheet_drawings(result, metadata, page_fields)
         pdf_full_read = self._full_read_pdf(metadata)
         if sheets and (pdf_full_read or (had_drawings and settings.DRAWING_SHEET_MISSING_PAGES)):
             # Дочитанный лист встаёт перед фрагментами своей страницы, а не
@@ -662,10 +683,15 @@ class DrawingProcessor:
 
     # -------------------------------------------------- лист-картинка целиком
     def _sheet_drawings(
-        self, fragments: List[Fragment], metadata: Dict[str, Any]
+        self, fragments: List[Fragment], metadata: Dict[str, Any],
+        page_fields: Optional[Dict[int, List[Dict[str, Any]]]] = None,
     ) -> List[Fragment]:
         """
         Разбор листов целиком, когда документ — скан или фото чертежа.
+
+        `page_fields` — прочтения по страницам из уже разобранных вырезок
+        той же страницы (см. `process`). Без него проход по странице
+        сводит прочтения только внутри своего вызова, как раньше.
 
         У скана PDF разбирается каждый чертёжный лист (по классификации
         лестницы), а не только файл как одна картинка: PDF как растр не
@@ -710,7 +736,11 @@ class DrawingProcessor:
                 skipped = pages[index:]
                 break
             try:
-                drawing_result = self.process(source_uri, metadata, page, transcribe=full_read)
+                drawing_result = self.process(
+                    source_uri, metadata, page, transcribe=full_read,
+                    page_fields=(None if page_fields is None
+                                 else page_fields.setdefault(int(page), [])),
+                )
             except SoftTimeLimitExceeded:
                 raise
             except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
