@@ -815,11 +815,14 @@ class DrawingProcessor:
                                source_uri, page, left)
                 return _NO_TIME
             try:
-                return self.process(
-                    source_uri, metadata, page, transcribe=full_read, page_fields=fields,
-                )
+                with deadline.cancel_on(stop):
+                    return self.process(
+                        source_uri, metadata, page, transcribe=full_read, page_fields=fields,
+                    )
             except SoftTimeLimitExceeded:
                 raise
+            except deadline.Cancelled:
+                return _NO_TIME
             except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
                 logger.error("Разбор листа %s стр. %d не удался: %s", source_uri, page, exc)
                 return None
@@ -844,8 +847,11 @@ class DrawingProcessor:
             return [future.result() for future in futures]
         finally:
             # Обрыв задачи (SoftTimeLimitExceeded приходит в главный поток,
-            # пока он ждёт ответы): листы из очереди не начинаются, начатые
-            # доходят до своего таймаута вызова, а их ответы не нужны.
+            # пока он ждёт ответы): листы из очереди не начинаются, а начатые
+            # бросают работу перед следующим вызовом модели
+            # (`deadline.check_cancelled` в `_ask_text` и перед повтором в
+            # `_post`). Запрос, уже ушедший в vLLM, прервать нечем: он
+            # дожидается ответа или своего таймаута, и на этом лист кончается.
             stop.set()
             pool.shutdown(wait=False, cancel_futures=True)
 

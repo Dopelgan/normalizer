@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from core import deadline
 from core.config import settings
@@ -66,7 +67,23 @@ def shared_session() -> requests.Session:
     with _session_lock:
         if _shared is None:
             _shared = requests.Session()
+            # Пул соединений не меньше, чем запросов к модели разом: листы
+            # документа (VLM_SHEET_CONCURRENCY) по частям листа
+            # (DRAWING_TRANSCRIBE_TILE_PARALLEL). У requests по умолчанию 10,
+            # и лишние соединения сверх пула закрывались бы после ответа
+            # с предупреждением «Connection pool is full».
+            size = max(10, pool_size())
+            adapter = HTTPAdapter(pool_connections=10, pool_maxsize=size)
+            _shared.mount("http://", adapter)
+            _shared.mount("https://", adapter)
         return _shared
+
+
+def pool_size() -> int:
+    """Сколько запросов к модели может идти из одного документа разом."""
+    sheets = max(1, int(settings.VLM_SHEET_CONCURRENCY))
+    tiles = max(1, int(settings.DRAWING_TRANSCRIBE_TILE_PARALLEL))
+    return sheets * tiles
 
 
 def close_shared_session() -> None:
@@ -838,6 +855,9 @@ class QwenVisionClient:
         if not self.available:
             logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
             return None
+        # Лист, чтение которого отменено (задача оборвалась, пока он шёл в
+        # потоке), следующего вызова модели не делает.
+        deadline.check_cancelled()
         encoded = encode_image(image, max_side)
         if not encoded:
             return None
@@ -898,6 +918,8 @@ class QwenVisionClient:
         url = f"{self._base()}/chat/completions"
         for attempt in range(self.retries + 1):
             last = attempt >= self.retries
+            if attempt:
+                deadline.check_cancelled()
             try:
                 response = self.session.post(
                     url, json=body, headers=headers, timeout=self.timeout
