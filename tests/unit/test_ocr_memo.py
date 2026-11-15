@@ -190,3 +190,32 @@ def test_memo_is_dropped_when_parse_fails(monkeypatch):
             DocumentContext(uri="documents/x.png", file_type="png", metadata={}, data=b"x")
         )
     assert tesseract_fallback._MEMO.get() is None
+
+
+def test_read_after_failed_preparation_is_not_remembered(monkeypatch):
+    """Сбой подготовки (поворот, выравнивание, снятие линий): страница
+    читается как есть, но это чтение не запоминается — следующий проход
+    готовит лист заново, как и после пустого ответа."""
+    fake = _Tesseract()
+    monkeypatch.setattr(settings, "OCR_PREPROCESS_ENABLED", True)
+    monkeypatch.setattr(tesseract_fallback.pytesseract, "image_to_data", fake)
+    real_prepare = tesseract_fallback.prepare_page
+    attempts = []
+
+    def flaky_prepare(image, upscaled=False):
+        attempts.append(image.size)
+        if len(attempts) == 1:
+            raise MemoryError("нет памяти под маску линий")
+        return real_prepare(image, upscaled=upscaled)
+
+    monkeypatch.setattr(tesseract_fallback, "prepare_page", flaky_prepare)
+    provider = TesseractFallbackProvider(storage=object())
+    with ocr_memo():
+        fallback = provider.ocr_lines(_page())
+        retried = provider.ocr_lines(_page())
+        again = provider.ocr_lines(_page())
+    # Исходный лист прочитан и после сбоя, а повтор дошёл до подготовки.
+    assert fallback and retried and again
+    assert len(attempts) == 2
+    # Удачное чтение после повтора запоминается как обычно.
+    assert fake.calls == 2
