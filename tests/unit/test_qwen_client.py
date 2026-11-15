@@ -370,6 +370,43 @@ class TestResponseCache:
         assert client(FakeSession()).read_sheet(sheet).cut is True
         assert len(session.requests) == 1
 
+    def test_other_endpoint_is_another_key(self, cache):
+        """Одно имя модели на другом сервере — другие веса: ответ одного
+        сервера не выдаётся за ответ другого."""
+        session = FakeSession(
+            FakeResponse(answer({"annotations": [{"value": "20"}]})),
+            FakeResponse(answer({"annotations": [{"value": "30"}]})),
+        )
+        sheet = picture()
+        own = client(session, endpoint="http://gpu-a:8000", model="qwen")
+        other = client(session, endpoint="http://gpu-b:8000", model="qwen")
+        assert own.read_sheet(sheet).annotations[0]["value"] == "20"
+        assert other.read_sheet(sheet).annotations[0]["value"] == "30"
+        assert len(session.requests) == 2
+
+    def test_overlapping_writers_of_one_key_do_not_lose_the_write(self, mocker, cache):
+        """Два писателя одного ключа в одном процессе (плитки идут потоками):
+        у каждого свой временный файл, ни одна запись не теряется и мусора
+        не остаётся."""
+        key = "ab" + "0" * 62
+        real_replace = qwen_client.os.replace
+        warnings = mocker.spy(qwen_client.logger, "warning")
+        nested = []
+
+        def overlapping_replace(src, dst):
+            # Второй писатель целиком успевает между записью и переименованием первого.
+            if not nested:
+                nested.append(True)
+                qwen_client.cache_put(key, ("второй", None))
+            return real_replace(src, dst)
+
+        mocker.patch.object(qwen_client.os, "replace", side_effect=overlapping_replace)
+        qwen_client.cache_put(key, ("первый", "stop"))
+
+        assert warnings.call_count == 0
+        assert qwen_client.cache_get(key) == ("первый", "stop")
+        assert [p.name for p in cache.rglob("*") if p.is_file()] == [f"{key}.json"]
+
     def test_broken_cache_file_is_a_miss(self, cache):
         session = FakeSession(
             FakeResponse(answer({"annotations": []})),

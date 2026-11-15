@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -86,20 +87,32 @@ def _cache_dir() -> Path:
     return Path(name)
 
 
-def cache_key(model: str, max_tokens: int, prompt: str, encoded: str) -> str:
+# Версия ключа. Ключи прежней версии (без адреса сервера и без тела запроса
+# целиком) с новыми не совпадают: старые файлы на томе остаются как есть и
+# просто не находятся.
+_CACHE_KEY_VERSION = b"vlm-cache-key-v2"
+
+
+def cache_key(base_url: str, body: Dict[str, Any], encoded: str) -> str:
     """
-    Отпечаток вызова. В него входит всё, что меняет ответ: модель, потолок
-    ответа, температура, готовый текст запроса и байты картинки в том виде,
-    в каком они уходят в модель. Картинка хешируется отдельно от остального,
-    чтобы её длинная base64-строка не собиралась в памяти второй раз.
+    Отпечаток вызова. В него входит всё, что уходит в модель: адрес
+    сервера (одно имя модели на другом сервере — другие веса), тело
+    запроса целиком — модель, потолок ответа, температура, формат ответа,
+    системный и пользовательский текст — и байты картинки в том виде, в
+    каком они уходят в модель. Тело хешируется целиком, без списка полей:
+    новое поле запроса само попадает в ключ, и неполный ключ не выдаст
+    чужой ответ. Картинка в `body` должна стоять пустой строкой и
+    хешируется отдельно, чтобы её длинная base64-строка не собиралась в
+    памяти второй раз.
     """
     digest = hashlib.sha256()
-    digest.update(_SYSTEM.encode("utf-8"))
+    digest.update(_CACHE_KEY_VERSION)
+    digest.update(b"\0")
+    digest.update(base_url.encode("utf-8"))
     digest.update(b"\0")
     digest.update(
-        f"{model}\0{max_tokens}\0{settings.QWEN_TEMPERATURE}\0".encode("utf-8")
+        json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")
     )
-    digest.update(prompt.encode("utf-8"))
     digest.update(b"\0")
     digest.update(encoded.encode("utf-8"))
     return digest.hexdigest()
@@ -127,21 +140,33 @@ def cache_put(key: str, answer: Tuple[str, Optional[str]]) -> None:
     Записать ответ. Запись идёт во временный файл рядом и переименованием:
     два воркера пишут в один том, и половина файла, прочитанная третьим,
     стала бы молчаливым промахом с мусором вместо ответа.
+
+    Временный файл у каждого писателя свой (mkstemp), а не по номеру
+    процесса: потоки одного процесса пишут один ключ одновременно, и общий
+    временный файл одного переписывал бы и уносил запись другого.
     """
     if not settings.VLM_RESPONSE_CACHE:
         return
     content, finish = answer
     path = _cache_dir() / key[:2] / f"{key}.json"
+    tmp: Optional[str] = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(
-            json.dumps({"content": content, "finish": finish}, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        handle, tmp = tempfile.mkstemp(dir=path.parent, prefix=f"{key}.", suffix=".tmp")
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps({"content": content, "finish": finish}, ensure_ascii=False)
+            )
         os.replace(tmp, path)
+        tmp = None
     except OSError as exc:
         logger.warning("Ответ модели не записан в кэш: %s", exc)
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 # Категории полей чертежа, которые модель имеет право назвать. Всё прочее
 # сводится к правилам разбора: выдуманная категория в индекс не попадает.
@@ -800,6 +825,9 @@ class QwenVisionClient:
             return None
 
         limit = max_tokens or settings.QWEN_MAX_TOKENS
+        # Картинка встаёт в тело после подсчёта ключа: ключ берёт тело
+        # целиком, а её байты — отдельно (см. cache_key).
+        image_url: Dict[str, str] = {"url": ""}
         body = {
             "model": self.model,
             "temperature": settings.QWEN_TEMPERATURE,
@@ -808,12 +836,13 @@ class QwenVisionClient:
             "messages": [
                 {"role": "system", "content": _SYSTEM},
                 {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": encoded}},
+                    {"type": "image_url", "image_url": image_url},
                     {"type": "text", "text": prompt},
                 ]},
             ],
         }
-        key = cache_key(self.model, limit, prompt, encoded)
+        key = cache_key(self._base(), body, encoded)
+        image_url["url"] = encoded
         cached = cache_get(key)
         if cached is not None:
             return cached
