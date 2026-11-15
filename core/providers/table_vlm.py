@@ -101,8 +101,13 @@ def _table_data(table: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return data
 
 
-def _render_page(file_bytes: bytes, file_type: str, page: int):
-    """Страница `page` (с 1) -> PIL RGB. None — не открылась."""
+def _render_page(file_bytes: bytes, file_type: str, page: int, dpi: Optional[int] = None):
+    """
+    Страница `page` (с 1) -> PIL RGB. None — не открылась.
+
+    `dpi` — разрешение рендера; по умолчанию `TABLE_VLM_DPI`. Своё
+    разрешение нужно дочитыванию пустых рамок: у него свой потолок цены.
+    """
     from PIL import Image
 
     if filetypes.is_image(file_type):
@@ -115,7 +120,7 @@ def _render_page(file_bytes: bytes, file_type: str, page: int):
     try:
         if not 1 <= page <= document.page_count:
             return None
-        pixmap = document[page - 1].get_pixmap(dpi=settings.TABLE_VLM_DPI)
+        pixmap = document[page - 1].get_pixmap(dpi=int(dpi or settings.TABLE_VLM_DPI))
         return Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
     finally:
         document.close()
