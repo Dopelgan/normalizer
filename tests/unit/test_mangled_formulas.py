@@ -188,5 +188,11 @@ class TestDuplicateTableContinuation:
         blocks, stats = reconcile_with_text_layer([parsed, empty], layer)
 
         assert stats.duplicate_lines == 0
-        assert stats.dropped_empty_tables == 0
+        # Предмет теста — гашение повторов, и он прежний: повторов нет, новая
+        # строка пришла. А пустая рамка-продолжение на второй странице теперь
+        # снимается: своего содержимого у неё нет (ни строк, ни вырезки, ни
+        # HTML), её текст уже вышел отдельным блоком, и держать её в индексе
+        # фрагментом без содержимого незачем.
+        assert stats.dropped_empty_tables == 1
+        assert not any(b.type == "table" and b.page == 2 for b in blocks)
         assert any(b.type == "text" and "AT-041" in (b.text or "") for b in blocks)
