@@ -951,6 +951,11 @@ class DrawingProcessor:
         """Надписи, прочитанные моделью на листе целиком -> поля контракта."""
         fields: List[Dict[str, Any]] = []
         for annotation in annotations:
+            # Надпись строкой, а не объектом: модель иногда отдаёт голый
+            # текст. Без проверки весь лист терялся на AttributeError,
+            # который в `enrich_fragments` глотался молча.
+            if not isinstance(annotation, dict):
+                annotation = {"value": annotation}
             text = drawing_text.normalize(str(annotation.get("value") or ""))
             readable, reason = drawing_text.looks_like_text(text)
             if not readable:
