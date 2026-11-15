@@ -50,7 +50,7 @@ from core.providers.document_parser import (
     ParserFailed,
     ParserUnavailable,
 )
-from core.providers import dimension_fidelity, ocr_cleanup, table_vlm
+from core.providers import blank_table_ocr, dimension_fidelity, ocr_cleanup
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.tesseract_fallback import TesseractFallbackProvider
 from core.providers.vector_drawing import (
@@ -466,7 +466,7 @@ class MinerUParserProvider(DocumentParserProvider):
                     keep_structured_tables=settings.OCR_KEEP_STRUCTURED_TABLES,
                     table_line_min_confidence=settings.OCR_TABLE_LINE_MIN_CONFIDENCE,
                     split_columns=settings.OCR_SPLIT_WIDE_GAPS,
-                    table_reader=table_vlm.table_reader(file_bytes, file_type),
+                    table_reader=blank_table_ocr.table_reader(file_bytes, file_type),
                 )
                 if vocab is not None:
                     # Ячейки таблиц и текст MinerU, не перекрытые слоем.
@@ -526,6 +526,14 @@ class MinerUParserProvider(DocumentParserProvider):
                 unread_pages = self._unread_pages(
                     layer_pages_read, pages, layer_truncated, blocks
                 )
+                # Страницы отклонённых пустых рамок — отдельная причина:
+                # проход слоя не обрывался, но содержимое рамки не
+                # прочитано ничем. `_unread_pages` про это не знает и без
+                # объединения такая потеря снова стала бы молчаливой.
+                if stats.blank_table_unread_pages:
+                    unread_pages = sorted(
+                        set(unread_pages) | stats.blank_table_unread_pages
+                    )
                 if unread_pages:
                     result.unread_text_pages = unread_pages
                 return result
