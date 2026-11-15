@@ -497,6 +497,21 @@ class DrawingProcessor:
         """
         result: List[Fragment] = []
         text_document = settings.DRAWING_PAGE_CLASSIFIER_ENABLED and _is_text_document(fragments, metadata)
+        pdf_full_read = self._full_read_pdf(metadata)
+        # Лист целиком — до вырезок (DRAWING_SHEET_READ_ONCE). Разбор листов
+        # при полном чтении не смотрит на фрагменты документа: ветка
+        # `only_undrawn`, которой нужен признак «на листе есть чертёж»,
+        # включается лишь при выключенном полном чтении. Поэтому порядок
+        # можно поменять только здесь — и только для `_full_read_pdf`.
+        sheets_read_first: Optional[List[Fragment]] = None
+        sheet_pages: set = set()
+        if settings.DRAWING_SHEET_READ_ONCE and pdf_full_read:
+            sheets_read_first = self._sheet_drawings([], metadata)
+            sheet_pages = {
+                int(sheet.position.page) for sheet in sheets_read_first
+                if sheet.position is not None
+                and (sheet.content.structured_payload or {}).get("transcript_line_count")
+            }
         for fragment in fragments:
             # Векторный чертёж уже разобран парсером по текстовому слою —
             # там точные значения и углы, читать нечего.
@@ -509,6 +524,14 @@ class DrawingProcessor:
             if text_document and _is_small_picture(fragment):
                 # Логотип или печать в тексте: чертежом не становится и
                 # вызова модели не стоит. Фрагмент остаётся картинкой.
+                result.append(fragment)
+                continue
+            if (fragment.position is not None
+                    and int(fragment.position.page) in sheet_pages):
+                # Лист этой страницы уже прочитан целиком, со штампом и всем
+                # текстом: вырезка вида — часть того же листа, и второй раз
+                # платить за неё проходом модели незачем. Вырезка остаётся
+                # картинкой на своём месте, страница не теряется.
                 result.append(fragment)
                 continue
             left = deadline.remaining()
@@ -537,8 +560,8 @@ class DrawingProcessor:
             result.append(enriched or fragment)
 
         had_drawings = any(f.type == "drawing" for f in result)
-        sheets = self._sheet_drawings(result, metadata)
-        pdf_full_read = self._full_read_pdf(metadata)
+        sheets = (self._sheet_drawings(result, metadata)
+                  if sheets_read_first is None else sheets_read_first)
         if sheets and (pdf_full_read or (had_drawings and settings.DRAWING_SHEET_MISSING_PAGES)):
             # Дочитанный лист встаёт перед фрагментами своей страницы, а не
             # в начало документа: порядок страниц сохраняется.

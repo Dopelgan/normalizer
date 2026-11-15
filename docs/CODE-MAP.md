@@ -172,6 +172,7 @@
 | `VLM_RESPONSE_CACHE` | `false` | `core/providers/qwen_client.py` (`cache_key`/`cache_get`/`cache_put`, вызов из `_ask_text` 781) |
 | `DRAWING_IMAGE_FULL_READ` | `false` | `core/drawing_processor.py`, `core/drawing_quality.py`, `core/ladder/drawing_route.py` |
 | `DRAWING_PDF_FULL_READ` | `false` | `core/drawing_processor.py`, `core/drawing_quality.py` |
+| `DRAWING_SHEET_READ_ONCE` | `false` | `core/drawing_processor.py` (`enrich_fragments` 499–520, 530) |
 | `DRAWING_TRANSCRIBE_TILES` | `false` | `core/providers/qwen_client.py`, `core/drawing_processor.py`, `core/drawing_quality.py` |
 | `DRAWING_TRANSCRIPT_FIXES_OCR` | `false` | `core/drawing_transcript.py`, `core/drawing_processor.py`, `core/drawing_stale_sources.py` |
 | `DRAWING_SUPPRESS_STALE_ON_FULL_READ` | `false` | `core/drawing_processor.py`, `core/drawing_stale_sources.py` |
