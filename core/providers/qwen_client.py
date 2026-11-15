@@ -741,9 +741,19 @@ class QwenVisionClient:
             # Модель сбилась на счёт («QF1», «QF2», … «QF1000»): хвост счёта —
             # выдумка, а не текст листа. Ответ считается оборванным на нём,
             # и часть листа дочитывается мельче.
+            #
+            # Сколько строк ряда оставить, решает его начало. Ряд, начавшийся со
+            # своего начала, мог быть настоящим и сорваться на счёт по ходу: его
+            # первые строки — скорее всего настоящие обозначения с листа, и они
+            # остаются. Ряд, начавшийся с середины, выдуман целиком: проверено на
+            # листе, где ряд шёл с «XT21» до «XT1131», а ни XT1, ни XT20 на листе
+            # не было. Прежде и из такого ряда оставались первые тридцать строк,
+            # и выдуманные обозначения попадали в текст чертежа, в индекс и в
+            # цитаты: поиск по «XT34» приводил на лист, где его нет.
+            keep = _COUNT_RUN if _run_starts_at_its_beginning(lines, start) else 0
             logger.warning("Модель сбилась на счёт с «%s»: %d строк отброшено",
-                           lines[start], len(lines) - start - _COUNT_RUN)
-            return lines[:start + _COUNT_RUN], True
+                           lines[start], len(lines) - start - keep)
+            return lines[:start + keep], True
         return lines, cut
 
     def health(self) -> bool:
@@ -1177,6 +1187,28 @@ def salvage_lines(content: str) -> List[str]:
 _COUNT_RUN = 30
 _COUNT_RUN_WHOLE = 200
 _NUMBERED = re.compile(r"^(.*?)(\d+)$")
+
+
+def _run_starts_at_its_beginning(lines: Sequence[str], start: int) -> bool:
+    """Начинается ли ряд со своего начала, а не с середины.
+
+    Да — если первый его номер первый в серии (единица) или член той же серии с
+    меньшим номером уже встречался в ответе выше. Нет — ряд возник из ниоткуда:
+    «XT21» без XT1…XT20 на листе. От этого зависит, сохранять ли голову ряда:
+    настоящий ряд, сорвавшийся на счёт по ходу, голову имеет настоящую, а
+    выдуманный с середины — нет.
+    """
+    match = _NUMBERED.match(lines[start])
+    if not match:
+        return False
+    prefix, first = match.group(1), int(match.group(2))
+    if first <= 1:
+        return True
+    for line in lines[:start]:
+        earlier = _NUMBERED.match(line)
+        if earlier and earlier.group(1) == prefix and int(earlier.group(2)) < first:
+            return True
+    return False
 
 
 def counting_run(lines: Sequence[str], limit: int = _COUNT_RUN) -> Optional[int]:
