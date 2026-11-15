@@ -237,6 +237,51 @@ class TestProseGetsNoHeading:
         assert classify("12X18H10Т ГОСТ 5582-75")[0] == "material"
 
 
+class TestScaledViewTitleIsCallout:
+    """
+    Название вида с масштабом по ГОСТ 2.302 — «А(2:1)», «Д (1:2)», «Г-Г(1:1)».
+    Прод относил такие строки к «note», и часть записи «Виды, разрезы и
+    сечения, названные на листе» выходила пустой: по выборке прода это
+    60 полей на 48 фрагментах чертежей.
+    """
+
+    @pytest.mark.parametrize("text", [
+        # Частоты в проде: «Д (1:2)» 47, «Д(1:2)» 23, «E (1:1)» 18,
+        # «Г-Г(1:1)» 14, «A(2:1)» 9.
+        "А(2:1)",
+        "Д (1:2)",
+        "Д(1:2)",
+        "E (1:1)",
+        "Г-Г(1:1)",
+        "A(2:1)",
+        "Б-Б (2,5:1)",
+    ])
+    def test_scaled_title_is_callout(self, strict, text):
+        assert classify(text) == ("callout", 0.8)
+
+    @pytest.mark.parametrize("text", [
+        # Без двоеточия в скобках это номер исполнения, а не масштаб.
+        "Б(4)",
+        "20",
+        "12Х18Н10Т",
+        "Ra 1,6",
+    ])
+    def test_not_a_view_title(self, strict, text):
+        assert classify(text) != ("callout", 0.8)
+
+    def test_execution_number_stays_note(self, strict):
+        assert classify("Б(4)") == ("note", 0.4)
+
+    @pytest.mark.parametrize("text", [
+        # Простая пара и одиночная буква классифицировались верно и раньше.
+        "Б-Б",
+        "A-A",
+        "A",
+    ])
+    def test_plain_pair_unchanged(self, strict, text):
+        assert classify(text) == ("callout", 0.8)
+
+
 class TestTranscriptSigns:
     """Знак «±», потерянный проходом по надписям, но целый в транскрипции."""
 

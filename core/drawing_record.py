@@ -81,6 +81,7 @@ from core.models.contract import Fragment
 from core.providers.title_block import (
     HANDWRITTEN_MARK, LABELS, canonical, label,
 )
+from core.providers.vector_drawing import VIEW_SCALE_GROUP
 
 # Ключ в payload: сколько подписей граф без значения убрано из текста листа.
 DROPPED_KEY = "record_dropped_furniture"
@@ -185,7 +186,7 @@ _VIEW_PAIR = re.compile(
 # восемнадцать штук. Это та же неоднозначность, из-за которой видом не
 # считается и одиночная буква.
 _VIEW_SCALED = re.compile(
-    r"^[А-ЯЁA-Z]\s*\(\s*\d+(?:[.,]\d+)?\s*:\s*\d+(?:[.,]\d+)?\s*\)$")
+    r"^[А-ЯЁA-Z]\s*" + VIEW_SCALE_GROUP + r"$")
 _VIEW_WORD = re.compile(
     r"^(вид|разрез|сечение|развёртка|развертка)\b", re.IGNORECASE)
 # Строка-название вида не бывает длинной: «Вид на изделие со снятой…» —
