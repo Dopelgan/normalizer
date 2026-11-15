@@ -370,3 +370,65 @@ class TestOcrLayerForRaster:
             result = parser.parse("documents/test.pdf", "pdf")
         assert any("mineru_unavailable" in note for note in result.degraded)
 
+
+
+def _zik_table_html() -> str:
+    """Перечень ЗИП на листе в рамке: первой строкой MinerU захватил графу «Изм»."""
+    names = ["Обозначение", "Наименование", "Применяемость",
+             "Кол-во в изделии, шт.", "Кол-во, шт.", "Примечание", "", "", ""]
+    data = ["КМБ 5.302.017", "Втулка", "", "4", "12", "", "", "", ""]
+    def tr(cells):
+        return "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+    return "<table>" + tr(["Изм"] + [""] * 8) + tr(names) + tr(data) + "</table>"
+
+
+class TestStampRowHeaderFix:
+    def test_off_by_default_keeps_stamp_header(self, monkeypatch):
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", False)
+        parsed = parse_table_html(_zik_table_html())
+        assert parsed["headers"][0] == "Изм"
+
+    def test_stamp_row_dropped_real_names_become_headers(self, monkeypatch):
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
+        parsed = parse_table_html(_zik_table_html())
+        assert parsed["headers"][:6] == [
+            "Обозначение", "Наименование", "Применяемость",
+            "Кол-во в изделии, шт.", "Кол-во, шт.", "Примечание"]
+        assert parsed["rows"] == [["КМБ 5.302.017", "Втулка", "", "4", "12", "", "", "", ""]]
+        assert len(parsed["headers"]) == 9
+
+    @pytest.mark.parametrize("label", ["Изм.", "ИЗМ", "Лист", "№ докум.", "N докум.",
+                                       "Подп. и дата", "Инв. № подл.", "Взам. инв. №",
+                                       "Н. контр.", "Разраб."])
+    def test_label_variants(self, monkeypatch, label):
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
+        html = (f"<table><tr><td>{label}</td><td></td></tr>"
+                "<tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></table>")
+        assert parse_table_html(html)["headers"] == ["A", "B"]
+
+    def test_several_stamp_rows_dropped(self, monkeypatch):
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
+        html = ("<table><tr><td>Изм</td><td></td></tr><tr><td>Лист</td><td>Дата</td></tr>"
+                "<tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></table>")
+        parsed = parse_table_html(html)
+        assert parsed["headers"] == ["A", "B"]
+        assert parsed["rows"] == [["1", "2"]]
+
+    @pytest.mark.parametrize("first", [
+        # Лист регистрации изменений: «Изм.» — настоящий столбец, рядом данные.
+        ["Изм.", "Номера листов (страниц)"],
+        ["Изм", "3"],
+        ["Измеритель", ""],
+    ])
+    def test_row_with_data_kept(self, monkeypatch, first):
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
+        html = ("<table><tr>" + "".join(f"<td>{c}</td>" for c in first) + "</tr>"
+                "<tr><td>A</td><td>B</td></tr></table>")
+        assert parse_table_html(html)["headers"] == first
+
+    def test_only_stamp_rows_left_untouched(self, monkeypatch):
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
+        html = "<table><tr><td>Изм</td><td></td></tr><tr><td>Лист</td><td></td></tr></table>"
+        parsed = parse_table_html(html)
+        assert parsed["headers"] == ["Изм", ""]
+        assert parsed["rows"] == [["Лист", ""]]

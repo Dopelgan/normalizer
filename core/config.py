@@ -175,6 +175,11 @@ class Settings(BaseSettings):
     # (core/providers/text_layer.py, сшивка и векторного слоя, и слоя
     # распознавания). По умолчанию выключено.
     FRAME_TABLE_GUARD_ENABLED: bool = False
+    # Первые строки сетки таблицы MinerU из одних подписей граф штампа
+    # ГОСТ 2.104 («Изм», «Лист», «Подп.», …) без данных снимаются, и шапкой
+    # становится следующая строка (core/providers/mineru_parser.py,
+    # parse_table_html). По умолчанию выключено.
+    STAMP_ROW_HEADER_FIX: bool = False
     # Классификатор «чертёж или текст в рамке ЕСКД» поверх
     # DRAWING_TEXT_IN_FRAME_ENABLED: (1) лист ТЗ/ПМ/ТУ с вставленным рисунком
     # и штампом текстового документа — страница текста

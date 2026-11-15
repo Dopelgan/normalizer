@@ -196,6 +196,7 @@
 | `DRAWING_AUTO_ROTATE` | `true` | `core/providers/drawing_vision.py` |
 | `RASTER_FRAME_THIN_LINES` | `false` | `core/providers/raster_drawing.py` |
 | `FRAME_TABLE_GUARD_ENABLED` | `false` | `core/providers/mineru_parser.py` |
+| `STAMP_ROW_HEADER_FIX` | `false` | `core/providers/mineru_parser.py` |
 | `OCR_LAYER_ENABLED` | `true` | `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |
 | `OCR_LAYER_DROP_LOW_CONFIDENCE` | `false` | `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |
 | `OCR_LAYER_DROP_REPEATED` | `false` | `core/providers/mineru_parser.py` |

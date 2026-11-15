@@ -327,6 +327,52 @@ class _TableHTMLParser(HTMLParser):
             self._cell.append(data)
 
 
+# Подписи граф основной надписи и боковых граф ГОСТ 2.104 в свёрнутом виде
+# (`_fold_stamp_label`): «Изм.», «Лист», «№ докум.», «Подп.», «Дата»,
+# «Разраб.», «Пров.», «Н. контр.», «Утв.», «Инв. № подл.», «Взам. инв. №»,
+# «Подп. и дата».
+_STAMP_LABELS = frozenset({
+    "изм", "лист", "докум", "подп", "дата", "разраб", "пров", "нконтр",
+    "утв", "инвподл", "взаминв", "подпидата",
+})
+_STAMP_NUMBER_SIGN_RE = re.compile(r"(?<![a-zа-я])[n№](?![a-zа-я])")
+_STAMP_NON_WORD_RE = re.compile(r"[\W_]+")
+
+
+def _fold_stamp_label(cell: str) -> str:
+    """«Инв. № подл.» -> «инвподл»: регистр, «ё», знак номера и пунктуация не в счёт."""
+    text = cell.lower().replace("ё", "е")
+    text = _STAMP_NUMBER_SIGN_RE.sub("", text)
+    return _STAMP_NON_WORD_RE.sub("", text)
+
+
+def _is_stamp_only_row(row: List[str]) -> bool:
+    """Строка из одних подписей граф штампа: ни одной ячейки с данными."""
+    filled = [c for c in row if c.strip()]
+    return bool(filled) and all(_fold_stamp_label(c) in _STAMP_LABELS for c in filled)
+
+
+def _drop_leading_stamp_rows(rows: List[List[str]], flags: List[bool]) -> int:
+    """
+    Сколько первых строк сетки — подписи рамки, а не шапка таблицы.
+
+    На листе в рамке формата MinerU захватывает в таблицу графу «Изм»
+    штампа: первой строкой сетки становится ["Изм", "", …], а настоящие
+    имена столбцов уходят в строки. Такие строки снимаются, только если за
+    ними есть строка с данными; строка с любой ячейкой данных не снимается.
+    Исходный HTML остаётся в `table_html`.
+    """
+    skip = 0
+    while skip < len(rows) and _is_stamp_only_row(rows[skip]):
+        skip += 1
+    if skip == len(rows):
+        return 0
+    if skip:
+        del rows[:skip]
+        del flags[:skip]
+    return skip
+
+
 def parse_table_html(html: str) -> Optional[Dict[str, Any]]:
     """HTML таблицы -> {'headers': [...], 'rows': [[...]]}. None, если пусто."""
     if not html or "<t" not in html.lower():
@@ -341,6 +387,9 @@ def parse_table_html(html: str) -> Optional[Dict[str, Any]]:
 
     if not parser.rows:
         return None
+
+    if settings.STAMP_ROW_HEADER_FIX:
+        _drop_leading_stamp_rows(parser.rows, parser.header_flags)
 
     headers: List[str] = []
     rows = parser.rows
