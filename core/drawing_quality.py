@@ -68,16 +68,28 @@ def _transcribed_pages(drawings):
     )
 
 
+def _from_rescan(fragment):
+    """
+    Лист перечитывания плохого скана (DRAWING_RESCAN_POOR_OCR_PAGES). Его
+    страница уже покрыта распознаванием, и лист только добавляет текст
+    модели: его недочитанная часть или неизмеренная полнота — повод
+    проверить сам лист, но не потеря страницы документа.
+    """
+    return "rescan_reason" in (fragment.content.structured_payload or {})
+
+
 def document_quality(fragments):
     """Один результат используется при первой выдаче и сохраняется в БД."""
     drawings = [fragment for fragment in fragments if fragment.type == "drawing"]
     warnings = list(dict.fromkeys(w for fragment in fragments for w in fragment.warnings))
+    # Листы перечитывания документ частичным не делают (см. _from_rescan).
+    judged = [fragment for fragment in drawings if not _from_rescan(fragment)]
     if settings.DRAWING_UNMEASURED_NOT_PARTIAL:
         # Неизмеренная полнота чтения — повод проверить фрагмент, но не
         # потеря страницы: документ partial только при реальной потере.
         covered = _transcribed_pages(drawings)
-        drawing_partial = any(_drawing_lost(fragment, covered) for fragment in drawings)
+        drawing_partial = any(_drawing_lost(fragment, covered) for fragment in judged)
     else:
-        drawing_partial = any(fragment.review_required for fragment in drawings)
+        drawing_partial = any(fragment.review_required for fragment in judged)
     return bool(drawing_partial
                 or any("DRAWING_NOT_RECOGNIZED" in f.warnings for f in fragments)), warnings

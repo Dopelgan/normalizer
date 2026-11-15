@@ -13,6 +13,7 @@ import pytest
 
 from core import drawing_processor as dp
 from core.drawing_processor import DrawingProcessor
+from core.drawing_quality import apply_drawing_quality, document_quality
 from core.models.contract import Content, Fragment, Position, Provenance
 from core.scan_text_rescan import Verdict
 
@@ -127,3 +128,33 @@ def test_already_transcribed_page_is_not_read_again(rescan_on):
 
     assert sheets == []
     assert qwen.calls == 0
+
+
+@pytest.mark.parametrize("unmeasured_not_partial", [True, False])
+def test_rescan_sheet_does_not_make_document_partial(rescan_on, monkeypatch,
+                                                     unmeasured_not_partial):
+    """Перечитанная страница уже покрыта распознаванием: недочитанная часть
+    или неизмеренная полнота листа-перечитывания ставит на проверку сам
+    лист, но не делает документ частичным."""
+    monkeypatch.setattr(dp.settings, "DRAWING_UNMEASURED_NOT_PARTIAL", unmeasured_not_partial)
+    processor = DrawingProcessor(rescan_on, qwen=TranscribingQwen([]))
+
+    def partial(image, payload, missing_regions, started):
+        payload["transcript_complete"] = False
+        missing_regions.append({"kind": "transcript_tile", "bbox": [0.5, 0.0, 1.0, 1.0],
+                                "reason": "timeout"})
+        return ["Технические требования"]
+
+    monkeypatch.setattr(processor, "_transcribe", partial)
+    ocr = _ocr_fragment(1)
+    sheets = processor._rescan_poor_pages([ocr], {"source_path": SCAN_URI, "doc_id": "doc-1"})
+    assert len(sheets) == 1
+    apply_drawing_quality(sheets[0])
+    assert sheets[0].review_required
+
+    partial_doc, _ = document_quality([ocr, *sheets])
+    assert not partial_doc
+
+    # Тот же лист не из перечитывания документ частичным делает.
+    del sheets[0].content.structured_payload["rescan_reason"]
+    assert document_quality([ocr, *sheets])[0]
