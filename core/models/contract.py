@@ -362,6 +362,16 @@ class DocumentResult(BaseModel):
     schema_version: Literal["2.0"] = "2.0"
     processing_profile_version: Optional[str] = None
     review_required: bool = False
+    # Текст документа неполон — отдельно от вызова человека. Эти две вещи
+    # разошлись: качество разбора человека не касается (он решает только
+    # размещение, имя и редакцию), поэтому `review_required` у неполного
+    # документа снимается. Потребителю от этого полнота текста стала не видна,
+    # и документ с непрочитанными страницами проходил у него как полный.
+    # ``None`` — старая запись, признака в ней нет.
+    text_incomplete: Optional[bool] = None
+    # Страницы с блоками, но без прочитанного текста. Отдельно от
+    # `unknown_pages`: покрытие страниц у них полное, не прочитан текст.
+    unread_text_pages: List[int] = Field(default_factory=list)
     error: Optional[ParserError] = None
 
     @field_validator("error", mode="before")

@@ -367,6 +367,9 @@ def build_document_result(
         warnings=list(extra.get("warnings") or []),
         processing_profile_version=extra.get("processing_profile_version"),
         review_required=bool(extra.get("review_required", False)),
+        # Повторная выдача обязана называть полноту так же, как свежий разбор.
+        text_incomplete=extra.get("text_incomplete"),
+        unread_text_pages=list(extra.get("unread_text_pages") or []),
     ).model_dump(mode="json")
 
 
@@ -793,6 +796,8 @@ def process_document(
             warnings=warnings,
             processing_profile_version=PROCESSING_PROFILE_VERSION,
             review_required=review_required,
+            text_incomplete=text_incomplete,
+            unread_text_pages=parse_result.unread_text_pages,
         ).model_dump(mode="json")
         finalize(request_id, s3_fileid, result, dialog_id, event_id)
 
