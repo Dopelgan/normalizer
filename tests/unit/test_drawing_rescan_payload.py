@@ -12,6 +12,7 @@
 import pytest
 
 from core import drawing_processor as dp
+from core.contract_finalize import finalize_fragments
 from core.drawing_processor import DrawingProcessor
 from core.drawing_quality import apply_drawing_quality, document_quality
 from core.models.contract import Content, Fragment, Position, Provenance
@@ -158,3 +159,33 @@ def test_rescan_sheet_does_not_make_document_partial(rescan_on, monkeypatch,
     # Тот же лист не из перечитывания документ частичным делает.
     del sheets[0].content.structured_payload["rescan_reason"]
     assert document_quality([ocr, *sheets])[0]
+
+
+@pytest.mark.parametrize("diagnostics_not_indexed", [True, False])
+def test_rescan_sheet_stays_out_of_partial_after_finalize(rescan_on, monkeypatch,
+                                                          diagnostics_not_indexed):
+    """Как в задаче разбора: finalize_fragments идёт до document_quality,
+    меняет идентификаторы и может унести учёт разбора из payload. Лист
+    перечитывания должен опознаваться и после этого."""
+    monkeypatch.setattr(dp.settings, "DRAWING_DIAGNOSTICS_NOT_INDEXED", diagnostics_not_indexed)
+    monkeypatch.setattr(dp.settings, "DRAWING_UNMEASURED_NOT_PARTIAL", True)
+    processor = DrawingProcessor(rescan_on, qwen=TranscribingQwen([]))
+
+    def partial(image, payload, missing_regions, started):
+        payload["transcript_complete"] = False
+        missing_regions.append({"kind": "transcript_tile", "bbox": [0.5, 0.0, 1.0, 1.0],
+                                "reason": "timeout"})
+        return ["Технические требования"]
+
+    monkeypatch.setattr(processor, "_transcribe", partial)
+    ocr = _ocr_fragment(1)
+    sheets = processor._rescan_poor_pages([ocr], {"source_path": SCAN_URI, "doc_id": "doc-1"})
+    assert len(sheets) == 1
+
+    fragments, _ = finalize_fragments([ocr, *sheets], "doc-1")
+    sheet_after = next(f for f in fragments if f.type == "drawing")
+    payload = sheet_after.content.structured_payload or {}
+    # Учёт перечитывания в индексируемый payload не попадает при включённом флаге.
+    assert ("rescan_reason" in payload) is not diagnostics_not_indexed
+    assert sheet_after.review_required
+    assert not document_quality(fragments)[0]

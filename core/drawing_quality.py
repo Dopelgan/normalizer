@@ -74,8 +74,20 @@ def _from_rescan(fragment):
     страница уже покрыта распознаванием, и лист только добавляет текст
     модели: его недочитанная часть или неизмеренная полнота — повод
     проверить сам лист, но не потеря страницы документа.
+
+    Признак — `rescan_reason`. С DRAWING_DIAGNOSTICS_NOT_INDEXED
+    `finalize_fragments` (до `document_quality`) уносит его из payload в
+    `completeness_mechanisms["drawing_diagnostics"]`, а идентификатор
+    фрагмента меняет, поэтому смотрятся оба места. В payload для
+    потребителя признак не добавляется: без флага он ушёл бы в
+    индексируемый текст строкой «Метка: значение».
     """
-    return "rescan_reason" in (fragment.content.structured_payload or {})
+    if "rescan_reason" in (fragment.content.structured_payload or {}):
+        return True
+    # Ключ — contract_finalize.DIAGNOSTICS_KEY; импорт оттуда был бы
+    # циклическим (contract_finalize импортирует этот модуль).
+    diagnostics = (fragment.completeness_mechanisms or {}).get("drawing_diagnostics")
+    return isinstance(diagnostics, dict) and "rescan_reason" in diagnostics
 
 
 def document_quality(fragments):
