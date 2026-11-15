@@ -16,6 +16,7 @@ from core.contract_finalize import finalize_fragments
 from core.ladder import drawing_route
 from core.models.parse_result import ParsedBlock, ParseResult
 from core.normalizer import TextNormalizer
+from core.providers import title_block
 from core.providers.title_block import label
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 
@@ -357,6 +358,100 @@ class TestStamp:
         assert "Записи от руки" in record
         assert "Инв. № подл. — 1012-02." in record
         assert "Подп. и дата — 10.02.2022." in record
+
+
+# ------------------------------------------------- обозначение, как на листе
+class TestDesignationAsRead:
+    """
+    Обозначение листа в записи — двумя написаниями: приведённым к
+    ГОСТ 2.201 и тем, которое напечатано на листе.
+
+    Образец настоящий: на листе ТАДУ 421451.003.02 модель читает
+    обозначение слипшимся («ТАДУ 421451003.02»), приведение ставит точки, и
+    до этой правки в запись уходило только приведённое написание.
+    Токенизатор BM25 приводит к строчным и режет по точкам, поэтому у
+    «421451003.02» и «421451.003.02» нет ни одного общего токена — человек,
+    набравший обозначение так, как видит его на чертеже, до записи листа не
+    доходил. Проверено на живом словаре: токен «421451003» в нём есть,
+    «421451.003» — нет.
+    """
+
+    GLUED = "ТАДУ 421451003.02"
+    CANONICAL = "ТАДУ 421451.003.02"
+
+    def _composed(self, designation):
+        """Фрагмент с собранной записью: штамп проходит разбор целиком."""
+        parsed = title_block.parse({"fields": {
+            "Обозначение": designation,
+            "Наименование": "Трубная обвязка",
+            "Масса": "26,02",
+        }})
+        fragment = _fragment(SHEET_LINE, payload={
+            "title_block": dict(parsed["fields"]),
+        })
+        drawing_record.apply([fragment])
+        return fragment
+
+    def _stamp_part(self, fragment):
+        """Текст части «Основная надпись листа» по разметке частей."""
+        parts = fragment.content.structured_payload[drawing_record.PARTS_KEY]
+        stamp = [part for part in parts if part["kind"] == "stamp"]
+        assert len(stamp) == 1
+        part = stamp[0]
+        assert part["title"] == "Основная надпись листа."
+        return fragment.content.text[part["start"]:part["end"]]
+
+    def test_canonical_spelling_is_still_said(self, composed):
+        fragment = self._composed(self.GLUED)
+        assert f"Обозначение — {self.CANONICAL}." in fragment.content.text
+
+    def test_spelling_from_the_sheet_reaches_the_record(self, composed):
+        """Главное: написанное на листе обозначение есть в тексте записи."""
+        fragment = self._composed(self.GLUED)
+        assert (f"Обозначение (как на листе) — {self.GLUED}."
+                in fragment.content.text)
+
+    def test_both_spellings_stand_in_the_stamp_part(self, composed):
+        """
+        Обе записи — в одной части с графами штампа: отдельной частью
+        чанкер вправе отрезать второе написание от того, что по нему ищут.
+        """
+        fragment = self._composed(self.GLUED)
+        part = self._stamp_part(fragment)
+        assert self.CANONICAL in part
+        assert self.GLUED in part
+
+    def test_part_and_fragment_count_do_not_change(self, composed):
+        """Строка добавлена внутрь части, а не новой частью."""
+        glued = self._composed(self.GLUED)
+        plain = self._composed(self.CANONICAL)
+        payload = glued.content.structured_payload
+        assert ([part["kind"] for part in payload[drawing_record.PARTS_KEY]]
+                == [part["kind"] for part
+                    in plain.content.structured_payload[
+                        drawing_record.PARTS_KEY]])
+        fragment = self._composed(self.GLUED)
+        assert len(drawing_record.apply([fragment])) == 1
+
+    def test_same_spelling_adds_no_line(self, composed):
+        """
+        Приведение ничего не изменило — второй строки нет. Обозначение не
+        выдумывается: строка стоит только там, где модель прочла другое
+        написание.
+        """
+        fragment = self._composed(self.CANONICAL)
+        assert "как на листе" not in fragment.content.text
+        assert fragment.content.text.count(self.CANONICAL) == 1
+
+    def test_parse_keeps_the_reading_verbatim(self):
+        """Второе написание — прочтение модели, перенесённое дословно."""
+        parsed = title_block.parse({"fields": {"Обозначение": self.GLUED}})
+        assert parsed["fields"]["designation"] == self.CANONICAL
+        assert parsed["fields"][title_block.AS_READ] == self.GLUED
+        # Графой контракта второе написание не становится: `entries` идёт
+        # по `LABELS`, и служебного ключа там нет.
+        assert [name for name, _, _ in title_block.entries(parsed)] == [
+            "Обозначение"]
 
 
 # ---------------------------------------------------------------- рамка-мебель
