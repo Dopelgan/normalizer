@@ -309,6 +309,14 @@ def apply(fragments: List[Fragment]) -> List[Fragment]:
             joined += count
         if text != (fragment.content.text or ""):
             fragment.content.text = text
+            # Точные смещения больше не обещаются: текст фрагмента уже не равен
+            # тексту исходного блока, по которому они измерялись, и `char_end`
+            # указывает за конец. Без этого цитата на скане бланка
+            # подсвечивалась со сдвигом или вылезала за свой текст. Спаны
+            # остаются — они говорят, из какой единицы источника взят фрагмент;
+            # так же поступает сборка частей документа (`document_parts`).
+            if fragment.position is not None:
+                fragment.position.text_offsets_exact = False
         kept.append(fragment)
     if dropped or spliced or joined:
         logger.info("Рамка бланка: снято фрагментов %d, вырезано граф из текста %d, "

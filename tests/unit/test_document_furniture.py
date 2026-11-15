@@ -218,6 +218,40 @@ class TestApply:
         again, _ = finalize_fragments(out, doc_id="d1")
         assert again[0].content.text == once
 
+    def test_rewritten_text_stops_promising_exact_offsets(self, furniture, joining):
+        """Переписанный текст снимает обещание точных смещений.
+
+        Смещения измеряются по тексту исходного блока (`source_contract`), и
+        снятие графы или сращивание переноса делает их неверными: `char_end`
+        указывает за конец текста. Цитата на скане бланка подсвечивалась со
+        сдвигом или вылезала за свой текст.
+        """
+        from core.models.contract import SourceSpan
+
+        fragment = text_fragment(SPLICED)
+        fragment.position.source_spans = [SourceSpan(
+            source_unit_id="unit-1", page=1, char_start=0, char_end=len(SPLICED))]
+        fragment.position.text_offsets_exact = True
+        out, _ = finalize_fragments([fragment], doc_id="d1")
+        assert out[0].content.text != SPLICED
+        assert out[0].position.text_offsets_exact is False
+        # Спаны остаются: из какой единицы источника взят фрагмент, по-прежнему известно.
+        assert [span.source_unit_id for span in out[0].position.source_spans] == ["unit-1"]
+
+    def test_untouched_text_keeps_exact_offsets(self, furniture, joining):
+        """Текст, который правило не меняло, обещание сохраняет."""
+        from core.models.contract import SourceSpan
+
+        clean = CONTENT[3]
+        fragment = text_fragment(clean)
+        fragment.position.source_spans = [SourceSpan(
+            source_unit_id="unit-2", page=1, char_start=0, char_end=len(clean))]
+        fragment.position.text_offsets_exact = True
+        out, _ = finalize_fragments([fragment], doc_id="d1")
+        assert out[0].content.text == clean
+        assert out[0].position.text_offsets_exact is True
+
+
 
 class TestHeadingWithBody:
     HEADINGS = [
