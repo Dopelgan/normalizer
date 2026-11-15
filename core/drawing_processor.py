@@ -661,8 +661,12 @@ class DrawingProcessor:
                 logger.error("Перечитывание страницы %d файла %s не удалось: %s",
                              page, source_uri, exc)
                 continue
-            if not (drawing_result.get("structured_payload") or {}).get(
-                    "transcript_line_count"):
+            # Ответ `process` — ещё не фрагмент: строки лежат в
+            # `payload.transcript_lines`, а `transcript_line_count` считает
+            # уже `build_fragment`. Неполное прочтение (часть листа не
+            # прочитана) тоже идёт дальше: пропуски уходят в missing_regions,
+            # а `transcript_complete=False` остаётся в payload.
+            if not (drawing_result.get("payload") or {}).get("transcript_lines"):
                 continue
             anchor = Fragment(
                 fragment_id=f"{metadata.get('doc_id') or 'doc'}-rescan-{page:03d}",
