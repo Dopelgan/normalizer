@@ -408,7 +408,7 @@ class TestStampRowHeaderFix:
 
     def test_several_stamp_rows_dropped(self, monkeypatch):
         monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
-        html = ("<table><tr><td>Изм</td><td></td></tr><tr><td>Лист</td><td>Дата</td></tr>"
+        html = ("<table><tr><td>Изм</td><td></td></tr><tr><td></td><td>Лист</td></tr>"
                 "<tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></table>")
         parsed = parse_table_html(html)
         assert parsed["headers"] == ["A", "B"]
@@ -417,6 +417,7 @@ class TestStampRowHeaderFix:
     @pytest.mark.parametrize("first", [
         # Лист регистрации изменений: «Изм.» — настоящий столбец, рядом данные.
         ["Изм.", "Номера листов (страниц)"],
+        ["Лист", "Дата"],
         ["Изм", "3"],
         ["Измеритель", ""],
     ])
@@ -425,6 +426,50 @@ class TestStampRowHeaderFix:
         html = ("<table><tr>" + "".join(f"<td>{c}</td>" for c in first) + "</tr>"
                 "<tr><td>A</td><td>B</td></tr></table>")
         assert parse_table_html(html)["headers"] == first
+
+    def test_revision_sheet_header_kept(self, monkeypatch):
+        # Лист регистрации изменений: шапка целиком из подписей граф штампа,
+        # но это имена столбцов, по ним отвечают на вопросы об изменениях.
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
+        head = ["Изм", "Лист", "№ докум.", "Подп.", "Дата"]
+        html = ("<table><tr>" + "".join(f"<td>{c}</td>" for c in head) + "</tr>"
+                "<tr><td>1</td><td>3</td><td>ТМ-12-25</td><td>Иванов</td><td>12.03.25</td></tr>"
+                "<tr><td>2</td><td>5</td><td>ТМ-40-25</td><td>Петров</td><td>01.07.25</td></tr>"
+                "</table>")
+        parsed = parse_table_html(html)
+        assert parsed["headers"] == head
+        assert parsed["rows"][0] == ["1", "3", "ТМ-12-25", "Иванов", "12.03.25"]
+
+    def test_one_column_date_list_kept(self, monkeypatch):
+        # Таблица в один столбец: «Дата» — её имя, а не графа штампа;
+        # других ячеек в строке нет, и строка не снимается.
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
+        html = ("<table><tr><td>Дата</td></tr><tr><td>12.03.25</td></tr>"
+                "<tr><td>01.07.25</td></tr></table>")
+        parsed = parse_table_html(html)
+        assert parsed["headers"] == ["Дата"]
+        assert parsed["rows"] == [["12.03.25"], ["01.07.25"]]
+
+    def test_th_header_after_stamp_row(self, monkeypatch):
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
+        html = ("<table><tr><td>Изм</td><td></td><td></td></tr>"
+                "<tr><th>Обозначение</th><th>Наименование</th><th>Кол-во, шт.</th></tr>"
+                "<tr><td>КМБ 5.302.017</td><td>Втулка</td><td>12</td></tr></table>")
+        parsed = parse_table_html(html)
+        assert parsed["headers"] == ["Обозначение", "Наименование", "Кол-во, шт."]
+        assert parsed["rows"] == [["КМБ 5.302.017", "Втулка", "12"]]
+
+    def test_table_html_stays_raw(self, parser, monkeypatch):
+        monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
+        html = _zik_table_html()
+        payload = {"results": {"test.pdf": {"content_list": json.dumps([
+            {"type": "table", "table_body": html, "page_idx": 0}])}}}
+        with requests_mock.Mocker() as m:
+            m.post(PARSE_URL, json=payload)
+            result = parser.parse("documents/test.pdf", "pdf")
+        table = next(b for b in result.blocks if b.type == "table")
+        assert table.table_data["headers"][0] == "Обозначение"
+        assert table.table_html == html
 
     def test_only_stamp_rows_left_untouched(self, monkeypatch):
         monkeypatch.setattr(settings, "STAMP_ROW_HEADER_FIX", True)
