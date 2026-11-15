@@ -65,6 +65,22 @@ SPLICED = (
 )
 
 
+# Страница 1 свидетельства о поверке (doc-3200eb32143f9a398e00ef83c91b31aa):
+# подпись графы бланка по приказу 2510 напечатана мелким шрифтом под
+# названием поля, и распознавание ставит её между названием «Средство
+# измерений» и его значением «Преобразователь термоэлектрический ...».
+CERTIFICATE = (
+    "СВИДЕТЕЛЬСТВО О ПОВЕРКЕ № С-ВЯ/15-11-2026/260024 "
+    "Средство измерений "
+    "наименование и обозначение типа, модификация (при наличии), "
+    "регистрационный номер в Федеральном информационном фонде по "
+    "обеспечению единства измерений, "
+    "Преобразователь термоэлектрический; ТХА Метран-2700, модификация "
+    "2700-01, рег. № 75763-19; Зав. номер 260024 "
+    "поверено в полном объёме и признано пригодным к применению."
+)
+
+
 @pytest.fixture
 def furniture(monkeypatch):
     monkeypatch.setattr(settings, "SCAN_DROP_FRAME_FURNITURE", True)
@@ -141,6 +157,54 @@ class TestSplices:
         assert cut == 0 and fixed == text
 
 
+class TestFormCaptions:
+    """Мелкий шрифт бланка свидетельства о поверке, стоящий между ярлыком
+    и значением.
+
+    На проде из 274 чанков со словом «СВИДЕТЕЛЬСТВО О ПОВЕРКЕ» в 89 чанках
+    55 документов подпись графы бланка (по приказу 2510) напечатана
+    физически между названием поля и его значением, поэтому ярлык и
+    значение попадают в разные чанки, и на вопрос о значении возвращается
+    ярлык без значения. Рамка ЕСКД такую подпись не знает, а `_SPLICE`
+    на стыке «буква — строчная буква» здесь не срабатывает: справа от
+    подписи стоит заглавная буква значения.
+    """
+
+    def test_label_and_value_become_adjacent(self, furniture):
+        fixed, cut = document_furniture.without_splices(CERTIFICATE)
+        assert cut >= 1
+        assert "наименование и обозначение типа" not in fixed
+        assert "единства измерений" not in fixed
+        assert "Средство измерений Преобразователь термоэлектрический" in fixed
+        assert "Зав. номер 260024" in fixed
+
+    @pytest.mark.parametrize("caption", [
+        "полное и краткое наименование организации-поверителя",
+        "заводской (серийный) номер или буквенно-цифровое обозначение",
+        "наименование или обозначение документа, на основании которого "
+        "выполнена поверка",
+        "должность руководителя или другого уполномоченного лица",
+        "фамилия, инициалы",
+        "перечень влияющих факторов с указанием их значений",
+    ])
+    def test_each_caption_dropped(self, furniture, caption):
+        text = ("Знак поверки нанесён на свидетельство. " + caption
+                + " Общество с ограниченной ответственностью «Поверка-Сервис». "
+                + "Прочий текст страницы. " * 8)
+        fixed, cut = document_furniture.without_splices(text)
+        assert cut >= 1
+        assert caption not in fixed
+
+    def test_content_not_touched(self, furniture):
+        """Фраза содержания, похожая на подпись бланка, остаётся целиком."""
+        text = ("В формуляр заносятся фамилию, инициалы и должность лица, "
+                "принявшего изделие, а также наименование организации, "
+                "выполнившей монтаж, и обозначение документа, по которому "
+                "выполнены работы на объекте заказчика в полном объёме.")
+        fixed, cut = document_furniture.without_splices(text)
+        assert cut == 0 and fixed == text
+
+
 class TestHyphenBreaks:
     @pytest.mark.parametrize("text,expected", [
         ("эксплуата- ции", "эксплуатации"),
@@ -162,6 +226,52 @@ class TestHyphenBreaks:
     def test_dash_between_words_kept(self):
         text = "завода-изготовителя — 24 месяца"
         assert document_furniture.without_hyphen_breaks(text)[0] == text
+
+
+class TestHyphenBreaksAcrossNewline:
+    """Перенос, отданный распознаванием дефисом и переводом строки.
+
+    Такой разрыв на проде встречается 1083 раза в 32 документах в
+    текстовых фрагментах и ещё 840 раз в 204 фрагментах 100 документов —
+    в чертёжных. Прежний образец требовал пробела или табуляции между
+    половинками, поэтому ни один из этих случаев не сращивался.
+    """
+
+    def test_joined_when_head_is_cyrillic(self):
+        text = ("Указанный ресурс действителен при соблюдении потребите-\n"
+                "лем требований документации.")
+        fixed, joined = document_furniture.without_hyphen_breaks(text)
+        assert joined == 1
+        assert "соблюдении потребителем требований" in fixed
+        assert "-" not in fixed
+
+    def test_compound_head_kept(self):
+        """Составное слово с переводом строки — тоже не сращивается."""
+        text = "пуско-\nналадочных работ"
+        fixed, joined = document_furniture.without_hyphen_breaks(text)
+        assert joined == 0
+        assert fixed == text
+
+    @pytest.mark.parametrize("text", [
+        "Hand-\nover",
+        "ship-\narrived",
+        "manufac-\nturing",
+    ])
+    def test_latin_head_left_alone(self, text):
+        """Латинская голова не сращивается: защиты для неё ещё нет."""
+        fixed, joined = document_furniture.without_hyphen_breaks(text)
+        assert joined == 0
+        assert fixed == text
+
+    def test_windows_newline(self):
+        fixed, joined = document_furniture.without_hyphen_breaks("поверхно-\r\nстей")
+        assert (fixed, joined) == ("поверхностей", 1)
+
+    def test_idempotent(self):
+        text = "манометр измери-\nтельный поверен"
+        once, first = document_furniture.without_hyphen_breaks(text)
+        twice, second = document_furniture.without_hyphen_breaks(once)
+        assert first == 1 and second == 0 and twice == once
 
 
 class TestApply:
@@ -211,6 +321,37 @@ class TestApply:
         fragment.type = "drawing"
         out, _ = finalize_fragments([fragment], doc_id="d1")
         assert len(out) == 1
+
+    def test_drawing_hyphen_break_joined(self, furniture, joining):
+        """У чертежа переносы сращиваются: 840 случаев в 204 фрагментах прода."""
+        fragment = text_fragment("Трубопровод из полиэтилена высокого давле-\nния")
+        fragment.type = "drawing"
+        out, _ = finalize_fragments([fragment], doc_id="d1")
+        assert len(out) == 1
+        assert out[0].content.text == "Трубопровод из полиэтилена высокого давления"
+
+    def test_drawing_frame_still_not_dropped(self, furniture, joining):
+        """Расширение не добавило чертежу ни снятия рамки, ни вырезания граф."""
+        frame = text_fragment("Формат А4")
+        frame.type = "drawing"
+        spliced = text_fragment(SPLICED)
+        spliced.type = "drawing"
+        out, _ = finalize_fragments([frame, spliced], doc_id="d1")
+        assert len(out) == 2
+        assert out[0].content.text == "Формат А4"
+        assert "Подпись и дата" in (out[1].content.text or "")
+
+    def test_drawing_hyphen_break_stops_promising_exact_offsets(self, furniture, joining):
+        from core.models.contract import SourceSpan
+
+        raw = "Трубопровод из полиэтилена высокого давле-\nния"
+        fragment = text_fragment(raw)
+        fragment.type = "drawing"
+        fragment.position.source_spans = [SourceSpan(
+            source_unit_id="unit-4", page=1, char_start=0, char_end=len(raw))]
+        fragment.position.text_offsets_exact = True
+        out, _ = finalize_fragments([fragment], doc_id="d1")
+        assert out[0].position.text_offsets_exact is False
 
     def test_idempotent(self, furniture, joining):
         out, _ = finalize_fragments([text_fragment(SPLICED)], doc_id="d1")
