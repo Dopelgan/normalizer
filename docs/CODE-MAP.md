@@ -98,23 +98,6 @@
 | Проход по боковым графам | `core/drawing_processor.py` | `_read_side_column` (911) |
 | Проход по таблицам листа | `core/drawing_processor.py` | `_read_table` (928) |
 | Поля из аннотаций векторного PDF | `core/drawing_processor.py` | `_fields_from_annotations` (948); категории — `core/providers/vector_drawing.classify` |
-| Клиент Qwen-VL, разрезание листа на плитки | `core/providers/qwen_client.py` | `transcribe` / `transcribe_sheet` (397) |
-||||||| fd0c0e5
-| **Вся ветка чертежей** | `core/drawing_processor.py` | `DrawingProcessor.process` (130), `enrich_fragments` (358) — вызывается из `ingest/tasks.py:513` |
-| Разметка листа геометрией | `core/drawing_processor.py` | `_sheet_drawings` (434) |
-| Проход «перепиши лист целиком» | `core/drawing_processor.py` | `_transcribe` (557) → `core/providers/qwen_client.py` |
-| Проход по штампу | `core/drawing_processor.py` | `_read_title_block` (592), `_read_title_block_fields` (635); канонические метки — `core/providers/title_block.py` `LABELS` |
-| Проход по боковым графам | `core/drawing_processor.py` | `_read_side_column` (700) |
-| Проход по таблицам листа | `core/drawing_processor.py` | `_read_table` (717) |
-| Поля из аннотаций векторного PDF | `core/drawing_processor.py` | `_fields_from_annotations` (737); категории — `core/providers/vector_drawing.classify` |
-| Клиент Qwen-VL, разрезание листа на плитки | `core/providers/qwen_client.py` | `transcribe` / `transcribe_sheet` (397) |
-| **Вся ветка чертежей** | `core/drawing_processor.py` | `DrawingProcessor.process` (131), `enrich_fragments` (489) — вызывается из `ingest/tasks.py:598` |
-| Разметка листа геометрией | `core/drawing_processor.py` | `_sheet_drawings` (645) |
-| Проход «перепиши лист целиком» | `core/drawing_processor.py` | `_transcribe` (768) → `core/providers/qwen_client.py` |
-| Проход по штампу | `core/drawing_processor.py` | `_read_title_block` (803), `_read_title_block_fields` (846); канонические метки — `core/providers/title_block.py` `LABELS` |
-| Проход по боковым графам | `core/drawing_processor.py` | `_read_side_column` (911) |
-| Проход по таблицам листа | `core/drawing_processor.py` | `_read_table` (928) |
-| Поля из аннотаций векторного PDF | `core/drawing_processor.py` | `_fields_from_annotations` (948); категории — `core/providers/vector_drawing.classify` |
 | Клиент Qwen-VL, разрезание листа на плитки | `core/providers/qwen_client.py` | `transcribe` (621) / `transcribe_sheet` (635); единственная точка вызова модели — `_ask_text` (781) |
 | Геометрия и повороты листа | `core/providers/drawing_vision.py`, `core/providers/raster_drawing.py` | — |
 | Выправка размеров построчно | `core/providers/dimension_fidelity.py` | `repair_lines` |
@@ -286,17 +269,10 @@
 3. **`DRAWING_SHEETS_SKIPPED:7,8` — список страниц, а не количество.** Собирается в
    `core/drawing_processor.py:716`. В RAG эта же строка разбирается по префиксу
    (`super_rag/parser/completeness.py`), поэтому формат менять нельзя.
-4. **`DRAWING_TIME_BUDGET` — бюджет на лист** (`core/drawing_processor.py:798`,
-   `:229`), по умолчанию 420 с. Предел задачи — другой: `PARSE_TASK_SOFT_TIME_LIMIT=3600` /
-   `PARSE_TASK_TIME_LIMIT=3900`. Их не складывать и не путать.
-||||||| fd0c0e5
-4. **`DRAWING_TIME_BUDGET` — бюджет на лист** (`core/drawing_processor.py:587`,
-   `:566`), по умолчанию 420 с. Предел задачи — другой: `PARSE_TASK_SOFT_TIME_LIMIT=3600` /
-   `PARSE_TASK_TIME_LIMIT=3900`. Их не складывать и не путать.
-4. **`DRAWING_TIME_BUDGET` — бюджет на лист** (`core/drawing_processor.py:798`,
-   `:777`), по умолчанию 420 с. Предел задачи — другой: `PARSE_TASK_SOFT_TIME_LIMIT=3600` /
+4. **`DRAWING_TIME_BUDGET` — бюджет на лист** (`core/drawing_processor.py:887`,
+   `:865`), по умолчанию 420 с. Предел задачи — другой: `PARSE_TASK_SOFT_TIME_LIMIT=3600` /
    `PARSE_TASK_TIME_LIMIT=3900`, и они объявлены на самой задаче
-   (`ingest/tasks.py:440-441`), поэтому **именно они и действуют**: `--time-limit=600
+   (`ingest/tasks.py:443-444`), поэтому **именно они и действуют**: `--time-limit=600
    --soft-time-limit=540` в командной строке воркеров — лишь предел пула для задач,
    которые своего не объявили (celery 5.4.0, `worker/request.py:363`: `timeout=time_limit
    or task.time_limit`). Проверено на проде 14.11: 12 разборов завершились успешно
@@ -332,14 +308,11 @@
    сравнения «чертёж против OCR» — всё добавленное в текст раздувает этот счёт. При этом
    `core/contract_finalize._content_signature` (36) для чертежа хеширует поля и таблицы,
    а не текст, поэтому `fragment_id` от правок текста не меняется.
-10. **Место сборки текста чертежа — `build_fragment`** (строка 460), а при
+10. **Место сборки текста чертежа — `build_fragment`** (строка 474), а при
     `DRAWING_RECORD_COMPOSED` текст пересобирается вторым и последним местом —
     `core/drawing_record.compose_fragment`, из `core/contract_finalize.py`.
-||||||| fd0c0e5
-10. **Единственное место сборки текста чертежа — `build_fragment`** (строка 329).
-10. **Единственное место сборки текста чертежа — `build_fragment`** (строка 460).
     `core/providers/vector_drawing.py` своих `Content` не создаёт и `text` не ставит
-    (проверено: конструкций `Content(` там нет). Если появится второй путь — эту строку
+    (проверено: конструкций `Content(` там нет). Если появится третий путь — эту строку
     и п. 9 править.
 11. **Запись идёт не туда, откуда пришёл файл.** При `S3_READONLY=true` (по умолчанию)
     всё производное пишется в `ARTIFACTS_MOUNT`, а не в исходный бакет
