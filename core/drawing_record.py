@@ -79,7 +79,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from core.models.contract import Fragment
 from core.providers.title_block import (
-    HANDWRITTEN_MARK, LABELS, canonical, label,
+    AS_READ, HANDWRITTEN_MARK, LABELS, canonical, label,
 )
 
 # Ключ в payload: сколько подписей граф без значения убрано из текста листа.
@@ -112,6 +112,14 @@ NO_VIEW_LINK = ("К какому виду или разрезу относитс
 # не обо всех размерах листа — иначе она противоречила бы самой записи.
 NO_VIEW_LINK_PART = ("Там, где вид не назван при размере, к какому виду или "
                      "разрезу размер относится, запись чертежа не указывает.")
+
+# Подпись строки со вторым написанием обозначения (`title_block.AS_READ`).
+# Словами о том, откуда написание взялось, — как и прочие подписи записи:
+# это не другое обозначение, а то же самое, набранное так, как оно стоит на
+# листе. Без этой строки запись листа несла только приведённую к ГОСТ 2.201
+# запись, у которой с напечатанной на чертеже нет ни одного общего токена
+# BM25, и поиск по обозначению с листа до записи не доходил.
+AS_READ_TITLE = f"{LABELS['designation']} (как на листе)"
 
 # Графы основной надписи в том порядке, в котором их спрашивают.
 # Подписи берутся из `title_block.LABELS`: имя графы здесь и в разборе
@@ -649,8 +657,16 @@ def _caution(fields: Sequence[Dict[str, Any]],
 def _stamp(payload: Dict[str, Any],
            fields: Sequence[Dict[str, Any]]) -> List[str]:
     """Основная надпись: графа со своим значением, в порядке ГОСТ 2.104."""
-    block, names = _graphs(payload.get("title_block"), _corrected(fields),
-                           by_hand=False)
+    raw_block = payload.get("title_block")
+    as_read = ""
+    if isinstance(raw_block, dict) and raw_block.get(AS_READ):
+        # Второе написание обозначения — не графа штампа, и в общий перебор
+        # граф ему нельзя: `_graph_key` свернул бы служебный ключ в
+        # «designationasread» и выдал бы его в записи этим словом. Поэтому
+        # оно вынимается до разбора граф и говорится отдельной строкой.
+        raw_block = dict(raw_block)
+        as_read = _clean(raw_block.pop(AS_READ))
+    block, names = _graphs(raw_block, _corrected(fields), by_hand=False)
     if not block:
         return []
     said = [
@@ -673,6 +689,11 @@ def _stamp(payload: Dict[str, Any],
     body = ["Основная надпись листа."]
     if said:
         body.append(" ".join(said))
+    if as_read and as_read != block.get("designation"):
+        # Обозначение, как оно напечатано на листе. Строка стоит в той же
+        # части, что и сама графа: вынеси её отдельной частью — и чанкер
+        # вправе отрезать её от записи, по которой лист и ищут.
+        body.append(f"{AS_READ_TITLE} — {as_read}.")
     if rest:
         body.append(" ".join(rest))
     if signed:
