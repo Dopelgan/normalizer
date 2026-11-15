@@ -323,7 +323,7 @@ class TestFlag:
 
         monkeypatch.setattr(settings, "DRAWING_SUPPRESS_STALE_ON_FULL_READ", False)
         processor = DrawingProcessor(temp_storage, qwen=FakeQwen())
-        monkeypatch.setattr(processor, "_sheet_drawings", lambda fragments, metadata: [])
+        monkeypatch.setattr(processor, "_sheet_drawings", lambda fragments, metadata, page_fields=None: [])
         fragments = [sheet(), paragraph(NOISE)]
         assert len(processor.enrich_fragments(fragments, {"doc_id": "doc-1"})) == 2
 
@@ -336,6 +336,6 @@ class TestFlag:
 
         monkeypatch.setattr(settings, "DRAWING_SUPPRESS_STALE_ON_FULL_READ", True)
         processor = DrawingProcessor(temp_storage, qwen=FakeQwen())
-        monkeypatch.setattr(processor, "_sheet_drawings", lambda fragments, metadata: [])
+        monkeypatch.setattr(processor, "_sheet_drawings", lambda fragments, metadata, page_fields=None: [])
         fragments = [sheet(), paragraph(NOISE)]
         assert len(processor.enrich_fragments(fragments, {"doc_id": "doc-1"})) == 1
