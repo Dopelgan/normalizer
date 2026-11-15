@@ -205,6 +205,7 @@
 | `DRAWING_MIN_COMPLETENESS` = `0.90`, `DRAWING_MIN_FACT_CONFIDENCE` | константы кода | `core/processing_contract.py` → `core/drawing_quality.py` | когда фрагмент чертежа «потерян» |
 | `DRAWING_TIME_BUDGET` | `420` | `core/drawing_processor.py` (`_out_of_time` 587, `_transcribe` 566), `core/providers/qwen_client.py` | бюджет **на лист** (не на документ) |
 | `DRAWING_MAX_SHEETS` | `6` | `core/drawing_processor.py` | сколько листов читается моделью |
+| `VLM_SHEET_CONCURRENCY` | `1` | `core/drawing_processor.py` (`_read_sheets`) | сколько листов документа читается одновременно; порядок и результат не меняются |
 | `DRAWING_MAX_REGIONS` | `4` | `core/drawing_processor.py`, `core/providers/drawing_vision.py` | сколько областей на лист |
 | `DRAWING_RENDER_DPI` | `200` | `core/drawing_processor.py` | — |
 | `DRAWING_TRANSCRIBE_MAX_SIDE` / `_MAX_TOKENS` | `2800` / `8192` | `core/providers/qwen_client.py` | — |

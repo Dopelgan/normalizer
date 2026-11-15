@@ -56,8 +56,11 @@
 (`core/drawing_stale_sources.py`, `DRAWING_SUPPRESS_STALE_ON_FULL_READ`).
 """
 
+import contextvars
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from core import filetypes
@@ -113,6 +116,16 @@ _TEXT_DOC_MIN_FIGURE_AREA = 0.06
 # текста и таблиц. Скан сборочного чертежа, который растровый детектор не
 # узнал, — это штамп и пара подписей: до порога он не дотягивает.
 _TEXT_DOC_MIN_CHARS_PER_PAGE = 300
+
+# Лист не читается: до срока задачи вызов модели не уложится
+# (`DrawingProcessor._read_sheets`).
+_NO_TIME = object()
+
+# MuPDF не поддерживает работу из нескольких потоков одновременно, даже с
+# разными документами, а листы одного документа могут читаться параллельно
+# (VLM_SHEET_CONCURRENCY). Рендер страницы — доли секунды против десятков
+# секунд модели, поэтому он просто идёт по очереди.
+_PDF_RENDER_LOCK = threading.Lock()
 
 
 class DrawingProcessor:
@@ -732,23 +745,21 @@ class DrawingProcessor:
                 return []
         sheets: List[Fragment] = []
         skipped = pages[settings.DRAWING_MAX_SHEETS:]
-        for index, page in enumerate(pages[: settings.DRAWING_MAX_SHEETS]):
-            left = deadline.remaining()
-            if left is not None and left < settings.VLM_TIMEOUT:
-                logger.warning("Разбор листа %s стр. %d пропущен: до срока задачи %.0f с",
-                               source_uri, page, left)
+        chosen = pages[: settings.DRAWING_MAX_SHEETS]
+        # Списки прочтений берутся здесь, в порядке страниц: потоки листов
+        # получают каждый свой список и общий словарь не трогают.
+        fields_of = [
+            None if page_fields is None else page_fields.setdefault(int(page), [])
+            for page in chosen
+        ]
+        readings = self._read_sheets(source_uri, metadata, chosen, full_read, fields_of)
+        # Фрагменты собираются строго в порядке страниц, в каком бы порядке
+        # ни закончились вызовы модели.
+        for index, (page, drawing_result) in enumerate(zip(chosen, readings)):
+            if drawing_result is _NO_TIME:
                 skipped = pages[index:]
                 break
-            try:
-                drawing_result = self.process(
-                    source_uri, metadata, page, transcribe=full_read,
-                    page_fields=(None if page_fields is None
-                                 else page_fields.setdefault(int(page), [])),
-                )
-            except SoftTimeLimitExceeded:
-                raise
-            except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
-                logger.error("Разбор листа %s стр. %d не удался: %s", source_uri, page, exc)
+            if drawing_result is None:
                 continue
             anchor = Fragment(
                 # Нулевой номер: лист целиком идёт перед своими фрагментами и не
@@ -770,6 +781,73 @@ class DrawingProcessor:
             sheets[0].review_required = True
             sheets[0].warnings = list(dict.fromkeys(sheets[0].warnings + [note]))
         return sheets
+
+    def _read_sheets(
+        self, source_uri: str, metadata: Dict[str, Any], pages: List[Any],
+        full_read: bool, fields_of: List[Optional[List[Dict[str, Any]]]],
+    ) -> List[Any]:
+        """
+        Ответы `process` по листам в порядке `pages`: результат, `None` —
+        лист не разобран, `_NO_TIME` — до срока задачи вызов не уложится,
+        и этот лист и все следующие не читаются.
+
+        С VLM_SHEET_CONCURRENCY > 1 листы читаются одновременно, но не
+        больше этого числа разом. Результат тот же, что и по очереди: каждый
+        лист читается тем же вызовом `process` со своей страницей и своим
+        списком прочтений страницы, отказ листа ловится у самого листа и
+        соседей не трогает, а ответы возвращаются в порядке страниц.
+
+        Одна и та же страница дважды в списке — по очереди: второй вызов
+        видит прочтения первого через общий список, и порядок там важен.
+        """
+        stop = threading.Event()
+
+        def read(page: Any, fields: Optional[List[Dict[str, Any]]]) -> Any:
+            # Срок проверяется, когда лист дождался места, а не когда встал в
+            # очередь. Лист, который увидел нехватку времени, останавливает
+            # и все следующие, как остановка цикла при чтении по очереди.
+            if stop.is_set():
+                return _NO_TIME
+            left = deadline.remaining()
+            if left is not None and left < settings.VLM_TIMEOUT:
+                stop.set()
+                logger.warning("Разбор листа %s стр. %d пропущен: до срока задачи %.0f с",
+                               source_uri, page, left)
+                return _NO_TIME
+            try:
+                return self.process(
+                    source_uri, metadata, page, transcribe=full_read, page_fields=fields,
+                )
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
+                logger.error("Разбор листа %s стр. %d не удался: %s", source_uri, page, exc)
+                return None
+
+        workers = min(max(1, int(settings.VLM_SHEET_CONCURRENCY)), len(pages))
+        if workers <= 1 or len({int(page) for page in pages}) != len(pages):
+            readings: List[Any] = []
+            for page, fields in zip(pages, fields_of):
+                reading = read(page, fields)
+                readings.append(reading)
+                if reading is _NO_TIME:
+                    break
+            return readings + [_NO_TIME] * (len(pages) - len(readings))
+
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="drawing-sheet")
+        try:
+            # Срок задачи хранится в contextvars: потоку нужна копия контекста.
+            futures = [
+                pool.submit(contextvars.copy_context().run, read, page, fields)
+                for page, fields in zip(pages, fields_of)
+            ]
+            return [future.result() for future in futures]
+        finally:
+            # Обрыв задачи (SoftTimeLimitExceeded приходит в главный поток,
+            # пока он ждёт ответы): листы из очереди не начинаются, начатые
+            # доходят до своего таймаута вызова, а их ответы не нужны.
+            stop.set()
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def _pages_read_whole(self, metadata: Dict[str, Any]) -> frozenset:
         """
@@ -1155,18 +1233,19 @@ def _render_pdf_page(data: bytes, page: int):
         from PIL import Image
     except ImportError:  # pragma: no cover
         return None
-    try:
-        document = fitz.open(stream=data, filetype="pdf")
-    except Exception as exc:  # noqa: BLE001
-        logger.error("PDF чертежа не открылся: %s", exc)
-        return None
-    try:
-        if not 1 <= page <= document.page_count:
+    with _PDF_RENDER_LOCK:
+        try:
+            document = fitz.open(stream=data, filetype="pdf")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("PDF чертежа не открылся: %s", exc)
             return None
-        pixmap = document[page - 1].get_pixmap(dpi=settings.DRAWING_RENDER_DPI)
-        return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-    finally:
-        document.close()
+        try:
+            if not 1 <= page <= document.page_count:
+                return None
+            pixmap = document[page - 1].get_pixmap(dpi=settings.DRAWING_RENDER_DPI)
+            return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+        finally:
+            document.close()
 
 
 def _field(
