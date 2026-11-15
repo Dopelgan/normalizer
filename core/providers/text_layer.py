@@ -26,8 +26,9 @@ import math
 import re
 import statistics
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from core.config import settings
 from core.models.parse_result import ParsedBlock
 from core.providers import latex_text, table_from_lines
 
@@ -53,6 +54,9 @@ METHOD_OCR_LAYER_RECOVERED = "ocr_layer_recovered"
 METHOD_LATEX_DECODED = "latex_decoded"
 #: Таблица перечитана моделью зрения (уровень 7 лестницы стратегий).
 METHOD_VLM_TABLE = "vlm_escalation"
+# Пустая рамка таблицы, дочитанная Tesseract по рендеру страницы: метод
+# тот же, что у фоллбэка, — провенанс не должен выдавать её за слой.
+METHOD_BLANK_TABLE_OCR = "tesseract"
 
 _MONO_MARKERS = ("mono", "courier", "consol", "menlo", "inconsolata", "hack", "fira code")
 
@@ -688,6 +692,13 @@ class ReconcileStats:
     low_confidence_table_lines: int = 0
     #: Неразобранных таблиц, перечитанных моделью зрения (`table_reader`).
     vlm_tables: int = 0
+    #: Пустых рамок таблиц, дочитанных по рендеру страницы (`blank_table_ocr`).
+    blank_tables_read: int = 0
+    #: Пустых рамок, отклонённых затвором: их страницы помечаются непрочитанными.
+    blank_tables_rejected: int = 0
+    #: Страницы отклонённых рамок. Уезжают в `unread_text_pages` парсера:
+    #: без этого потеря содержимого рамки была бы снова молчаливой.
+    blank_table_unread_pages: Set[int] = field(default_factory=set)
     layer_chars_by_page: Dict[int, int] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -709,6 +720,9 @@ class ReconcileStats:
             "frame_tables": self.frame_tables,
             "low_confidence_table_lines": self.low_confidence_table_lines,
             "vlm_tables": self.vlm_tables,
+            "blank_tables_read": self.blank_tables_read,
+            "blank_tables_rejected": self.blank_tables_rejected,
+            "blank_table_unread_pages": sorted(self.blank_table_unread_pages),
         }
 
 
@@ -740,9 +754,18 @@ def reconcile_with_text_layer(
     `split_columns` — строки вне рамок собираются в абзацы по колонкам
     (`group_columns`).
 
-    `table_reader` — последняя попытка для таблицы, которую не удалось ни
-    выправить, ни собрать по строкам слоя: блок -> `table_data` или None.
-    Без него (или при None) таблица разбирается на текст, как раньше.
+    `table_reader` — последняя попытка для таблицы: блок -> прочитанное или
+    None. Один слот на два взаимоисключающих состояния блока:
+
+    * таблица со своим содержимым, которую не удалось ни выправить, ни
+      собрать по строкам слоя -> `table_data`;
+    * пустая рамка, в которой не оказалось ни содержимого, ни строк слоя
+      -> `{"text": ...}` (и необязательная `confidence` в долях единицы).
+
+    Без него (или при None) таблица разбирается на текст, как раньше, а
+    пустая рамка остаётся пустой. Дочитывание пустых рамок к тому же
+    стоит под `BLANK_TABLE_OCR_ENABLED`: при выключенном флаге сшивка
+    ведёт себя в точности как прежде.
     """
     stats = ReconcileStats(layer_chars_by_page=layer.char_counts_by_page())
     if frame_table_guard:
@@ -771,7 +794,12 @@ def reconcile_with_text_layer(
             page_lines = column_lines(page_lines)
 
         if not page_lines:
-            result.extend(page_blocks)
+            # Весь разбор ниже (`_assign_lines`, `page_turn`,
+            # `layer_vocabulary`, `group_lines`) считает, что строки есть,
+            # поэтому страница без слоя по-прежнему уходит как есть. Но
+            # пустые рамки на ней — ровно тот случай, ради которого
+            # дочитывание и сделано: содержимого нет ни у рамки, ни у слоя.
+            result.extend(_read_blank_frames(page_blocks, stats, table_reader))
             continue
 
         # Если MinerU отдал только `content_list`, координат у блоков нет и
@@ -863,6 +891,16 @@ def reconcile_with_text_layer(
                     # может повторять строку таблицы на законных основаниях.
                     fresh = list(matched)
                 leftovers.extend(fresh)
+            elif (block.type == "table" and not matched
+                  and not _carries_own_text(block)):
+                # Пустая рамка на странице, у которой строки слоя есть, но
+                # не внутри этой рамки (`not matched`). Случай тот же, что
+                # на странице вовсе без слоя, — только добрался сюда через
+                # общий цикл, поэтому вторая точка входа нужна отдельно.
+                fresh_block = _read_blank_frame(block, stats, table_reader)
+                if fresh_block is not None:
+                    extra_blocks.append(fresh_block)
+                    dropped.append(block)
 
         if dropped:
             page_blocks = [b for b in page_blocks if not any(b is d for d in dropped)]
@@ -1156,6 +1194,70 @@ def fold_homoglyphs(text: str) -> str:
     текст из файла, а не свёрнутый.
     """
     return "".join(_HOMOGLYPHS.get(ch, ch) for ch in text.lower() if not ch.isspace())
+
+
+def _read_blank_frames(
+    page_blocks: List[ParsedBlock],
+    stats: ReconcileStats,
+    table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]],
+) -> List[ParsedBlock]:
+    """
+    Блоки страницы с дочитанными пустыми рамками. Прочитанная рамка
+    заменяется текстовым блоком: содержимого у неё нет, и пустая рамка в
+    индексе — фрагмент без текста, без таблицы и без полей. Всё остальное
+    (в том числе рамка с вырезкой или сырым HTML) проходит как есть.
+    """
+    result: List[ParsedBlock] = []
+    for block in page_blocks:
+        fresh = _read_blank_frame(block, stats, table_reader)
+        if fresh is None:
+            result.append(block)
+            continue
+        result.append(fresh)
+    return result
+
+
+def _read_blank_frame(
+    block: ParsedBlock,
+    stats: ReconcileStats,
+    table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]],
+) -> Optional[ParsedBlock]:
+    """
+    Пустая рамка таблицы -> текстовый блок с дочитанным содержимым или None.
+
+    Отказ (затвор не пропустил, предел рамок, срок, сбой) помечает
+    страницу непрочитанной: содержимое рамки не прочитано ничем, и молчать
+    об этом нельзя — именно так 1180 рамок прода пропали незаметно.
+    """
+    if not settings.BLANK_TABLE_OCR_ENABLED or table_reader is None:
+        return None
+    if block.type != "table" or _carries_own_text(block):
+        return None
+    # Вырезка и сырой HTML — это содержимое: оно уезжает в индекс своей
+    # дорогой, потери текста там нет, а дочитывание дало бы вторую копию.
+    # `_carries_own_text` смотрит только на `table_data` и про них не знает,
+    # поэтому проверяем здесь сами — как и снятие пустой рамки выше.
+    if block.image_ref or block.table_html:
+        return None
+    read = table_reader(block)
+    text = (read or {}).get("text") if isinstance(read, dict) else None
+    text = " ".join((text or "").split())
+    if not text:
+        stats.blank_tables_rejected += 1
+        stats.blank_table_unread_pages.add(block.page)
+        return None
+    stats.blank_tables_read += 1
+    confidence = read.get("confidence")
+    return ParsedBlock(
+        type="text",
+        text=text,
+        page=block.page,
+        bbox=list(block.bbox),
+        page_size=list(block.page_size) if block.page_size else None,
+        confidence=float(confidence) if confidence is not None else 1.0,
+        method=METHOD_BLANK_TABLE_OCR,
+        is_fallback=True,
+    )
 
 
 def _fix_table(
