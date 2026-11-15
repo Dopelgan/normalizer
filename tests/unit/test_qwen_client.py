@@ -381,3 +381,54 @@ class TestResponseCache:
             path.write_text("не json", encoding="utf-8")
         client(session).read_sheet(sheet)
         assert len(session.requests) == 2
+
+
+class TestBboxPermille:
+    """Координаты в промилле: формат ответа не доходит ниже разбора."""
+
+    def test_rule_replaces_fraction_rule_in_prompt(self, mocker):
+        prompt = client(FakeSession())._sheet_prompt("")
+        assert qwen_client._BBOX_FRACTION_RULE in prompt
+        mocker.patch.object(qwen_client.settings, "DRAWING_BBOX_PERMILLE", True)
+        changed = client(FakeSession())._sheet_prompt("")
+        assert qwen_client._BBOX_FRACTION_RULE not in changed
+        assert "целые числа от 0 до 1000" in changed
+
+    def test_integers_become_fractions(self):
+        got = qwen_client.permille_to_fractions(
+            [{"value": "⌀44H7", "bbox": [123, 567, 234, 678]}]
+        )
+        assert got[0]["bbox"] == [0.123, 0.567, 0.234, 0.678]
+        assert got[0]["value"] == "⌀44H7"
+
+    def test_whole_sheet_sentinel_survives(self):
+        """`[0, 0, 1, 1]` — признак «места нет», и остаётся им."""
+        got = qwen_client.permille_to_fractions([{"bbox": [0, 0, 1, 1]}])
+        assert got[0]["bbox"] == [0.0, 0.0, 1.0, 1.0]
+
+    def test_full_sheet_in_permille_is_the_same_sentinel(self):
+        got = qwen_client.permille_to_fractions([{"bbox": [0, 0, 1000, 1000]}])
+        assert got[0]["bbox"] == [0.0, 0.0, 1.0, 1.0]
+
+    def test_pixels_are_dropped_not_divided(self):
+        """1200 пикселей — не 1.2 доли: иначе надпись получит чужое место."""
+        got = qwen_client.permille_to_fractions([{"bbox": [100, 200, 1200, 1400]}])
+        assert got[0]["bbox"] == [0.0, 0.0, 1.0, 1.0]
+
+    def test_fractions_from_model_are_left_alone(self):
+        """Модель не послушалась правила — её доли уже доли."""
+        got = qwen_client.permille_to_fractions([{"bbox": [0.123, 0.567, 0.234, 0.678]}])
+        assert got[0]["bbox"] == [0.123, 0.567, 0.234, 0.678]
+
+    def test_annotation_without_bbox_is_untouched(self):
+        items = [{"value": "20"}, "строка без обёртки", 0.52, {"bbox": [1, 2, 3]}]
+        assert qwen_client.permille_to_fractions(items) == items
+
+    def test_reading_converts_before_parsing(self, mocker):
+        mocker.patch.object(qwen_client.settings, "DRAWING_BBOX_PERMILLE", True)
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_TILES", False)
+        payload = {"annotations": [{"category": "size", "value": "20",
+                                    "bbox": [100, 200, 300, 400]}]}
+        session = FakeSession(FakeResponse(answer(payload)))
+        reading = client(session).read_sheet(picture())
+        assert reading.annotations[0]["bbox"] == [0.1, 0.2, 0.3, 0.4]

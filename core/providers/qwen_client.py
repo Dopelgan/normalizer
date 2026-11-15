@@ -306,6 +306,60 @@ _SMALL_PRINT_RULE = """- Запятую в десятичной дроби не 
   «40−0,25», «⌀16(+0,018/−0,007)».
 """
 
+# Координаты в промилле (`DRAWING_BBOX_PERMILLE`). Строка правила про bbox
+# в запросе заменяется целиком: просить «от 0 до 1» и «целыми» одновременно
+# значит просить противоположного, и модель выбирает сама.
+_BBOX_FRACTION_RULE = (
+    "- bbox — доли стороны листа от 0 до 1, порядок: лево, верх, право, низ."
+)
+_BBOX_PERMILLE_RULE = (
+    "- bbox — целые числа от 0 до 1000: тысячные доли стороны листа,\n"
+    "  порядок лево, верх, право, низ. Пример: [123, 567, 234, 678].\n"
+    "  Дробей не пиши, только целые."
+)
+# Рамка всего листа: и признак «места нет» в разборе, и то, во что
+# превращается честное [0, 0, 1000, 1000].
+_WHOLE_SHEET = [0.0, 0.0, 1.0, 1.0]
+
+
+def permille_to_fractions(annotations: Sequence[Any]) -> List[Any]:
+    """
+    Координаты из промилле в доли листа, сразу после ответа модели. Ниже
+    этого места формат ответа не виден: и разбор надписи
+    (`_bbox` в core/drawing_processor.py), и перенос координат части на лист
+    (`place_in_sheet`), и середина рамки (`_centre`) продолжают работать с
+    долями, как работали.
+
+    Целое и дробное различаются по типу, а не по величине: модель, не
+    послушавшую правило, незачем переводить — её доли уже доли. Поэтому
+    перевод берёт только списки из четырёх целых.
+
+    Число больше 1000 — не промилле: это прежний ответ в пикселях, и
+    отбрасывается он здесь, а не делением на 1000, иначе 1200 пикселей
+    превратились бы в правдоподобные 1.2 и прошли бы проверку «больше 1.5»
+    (core/drawing_processor.py), поставив надписи чужое место.
+    """
+    out: List[Any] = []
+    for item in annotations:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        box = item.get("bbox")
+        if not (isinstance(box, (list, tuple)) and len(box) == 4):
+            out.append(item)
+            continue
+        if not all(isinstance(c, int) and not isinstance(c, bool) for c in box):
+            out.append(item)      # дроби от модели — уже доли листа
+            continue
+        if max(box) > 1000 or max(box) <= 1:
+            # Пиксели — отбросить; [0, 0, 1, 1] — та же «рамки нет», что и
+            # в разборе, и признак сохраняется ровно таким.
+            out.append({**item, "bbox": list(_WHOLE_SHEET)})
+            continue
+        out.append({**item, "bbox": [round(c / 1000.0, 4) for c in box]})
+    return out
+
+
 @dataclass
 class SheetReading:
     """
@@ -415,6 +469,10 @@ class QwenVisionClient:
             prompt += _SIGN_RULE + _CAREFUL_LETTERS_RULE
         if settings.DRAWING_SMALL_PRINT_CARE:
             prompt += _SMALL_PRINT_RULE
+        if settings.DRAWING_BBOX_PERMILLE:
+            if _BBOX_FRACTION_RULE not in prompt:
+                raise RuntimeError("правило про bbox в запросе не найдено")
+            prompt = prompt.replace(_BBOX_FRACTION_RULE, _BBOX_PERMILLE_RULE)
         return prompt
 
     @staticmethod
@@ -463,6 +521,8 @@ class QwenVisionClient:
         if not isinstance(annotations, list):
             logger.warning("Модель вернула JSON без списка annotations")
             annotations = []
+        if settings.DRAWING_BBOX_PERMILLE:
+            annotations = permille_to_fractions(annotations)
         readable, lost = as_annotations(annotations)
         if lost:
             # Вид элемента называется в логе: каким именно он был, по
