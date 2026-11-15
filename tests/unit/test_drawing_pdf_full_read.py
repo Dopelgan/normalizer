@@ -74,7 +74,7 @@ def processor(temp_storage, monkeypatch):
     proc = DrawingProcessor(temp_storage, qwen=FakeQwen())
     asked = []
 
-    def process(image_ref, metadata, page=1, transcribe=False):
+    def process(image_ref, metadata, page=1, transcribe=False, **kwargs):
         asked.append((page, transcribe))
         payload = {"tables": []}
         if transcribe:

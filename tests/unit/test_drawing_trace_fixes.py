@@ -68,7 +68,7 @@ def processor(temp_storage, monkeypatch):
     proc = DrawingProcessor(temp_storage, qwen=FakeQwen())
     asked = []
 
-    def process(image_ref, metadata, page=1, transcribe=False):
+    def process(image_ref, metadata, page=1, transcribe=False, **kwargs):
         asked.append(page)
         return {"detected_count": 1, "avg_confidence": 0.75, "mode": "sheet_only",
                 "parsed_fields": [_field("size", "120*", [0.1, 0.1, 0.2, 0.2], 0.75)],
