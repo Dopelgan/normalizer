@@ -497,6 +497,9 @@ class DrawingProcessor:
         """
         result: List[Fragment] = []
         text_document = settings.DRAWING_PAGE_CLASSIFIER_ENABLED and _is_text_document(fragments, metadata)
+        # Страницы, которые ветвь «лист целиком» прочитает сама: мелкие
+        # вырезки с них в модель не уходят (DRAWING_SKIP_SMALL_CROPS).
+        whole_pages = self._pages_read_whole(metadata)
         for fragment in fragments:
             # Векторный чертёж уже разобран парсером по текстовому слою —
             # там точные значения и углы, читать нечего.
@@ -509,6 +512,22 @@ class DrawingProcessor:
             if text_document and _is_small_picture(fragment):
                 # Логотип или печать в тексте: чертежом не становится и
                 # вызова модели не стоит. Фрагмент остаётся картинкой.
+                result.append(fragment)
+                continue
+            if self._crop_covered_by_whole_page(fragment, whole_pages):
+                # Мелкая вырезка вида со страницы, которую ветвь «лист
+                # целиком» прочитает сама: то же содержимое в более крупном
+                # масштабе, новых пикселей в ней нет. Замеренное покрытие:
+                # у вырезок с долей площади ниже порога все надписи и все
+                # слова нашлись в проходе по странице.
+                #
+                # Пропускаются только мелкие вырезки. Широкий вариант
+                # (пропускать с читаемой целиком страницы все вырезки) ждёт
+                # сшивки чтений между вызовами `process()`: `merge_readings`
+                # сливает показания внутри одного вызова, поэтому допуски и
+                # знаки вида `⌀6,6-0,05`, `10°±1°` прочитались на крупной
+                # вырезке, а в проходе по странице остались без формы
+                # допуска — то есть потерялись бы.
                 result.append(fragment)
                 continue
             left = deadline.remaining()
@@ -717,6 +736,41 @@ class DrawingProcessor:
             sheets[0].review_required = True
             sheets[0].warnings = list(dict.fromkeys(sheets[0].warnings + [note]))
         return sheets
+
+    def _pages_read_whole(self, metadata: Dict[str, Any]) -> frozenset:
+        """
+        Номера страниц, которые ветвь «лист целиком» прочитает сама.
+
+        Повторяет выбор страниц из `_sheet_drawings` для случая полного
+        чтения: тот же список чертёжных страниц из классификации и тот же
+        потолок `DRAWING_MAX_SHEETS`. Пустое множество — когда флаг
+        выключен или полного чтения не будет, и тогда вырезки читаются как
+        раньше.
+        """
+        if not settings.DRAWING_SKIP_SMALL_CROPS:
+            return frozenset()
+        if not (self._full_read_image(metadata) or self._full_read_pdf(metadata)):
+            return frozenset()
+        if not str(metadata.get("source_path") or ""):
+            return frozenset()      # без источника лист целиком не открыть
+        signals = (metadata.get("classification") or {}).get("signals") or {}
+        pages = list(signals.get("raster_drawing_pages") or signals.get("drawing_pages") or [1])
+        return frozenset(int(page) for page in pages[: settings.DRAWING_MAX_SHEETS])
+
+    @staticmethod
+    def _crop_covered_by_whole_page(fragment: Fragment, whole_pages: frozenset) -> bool:
+        """
+        Мелкая ли это вырезка со страницы, которая читается целиком.
+
+        Доля площади берётся из bbox фрагмента в долях листа; без bbox или
+        с bbox не в долях размер неизвестен, и вырезка читается как раньше.
+        """
+        if not whole_pages or fragment.position is None:
+            return False
+        if int(fragment.position.page) not in whole_pages:
+            return False
+        share = _page_area_share(fragment)
+        return share is not None and share < settings.DRAWING_SKIP_SMALL_CROP_AREA
 
     def _full_read_image(self, metadata: Dict[str, Any]) -> bool:
         """
@@ -1039,15 +1093,25 @@ def _value_view_links() -> bool:
     return bool(getattr(settings, "DRAWING_VALUE_VIEW_LINKS", False))
 
 
-def _is_small_picture(fragment: Fragment) -> bool:
-    """Картинка меньше `_TEXT_DOC_MIN_FIGURE_AREA` листа (bbox в долях листа)."""
+def _page_area_share(fragment: Fragment) -> Optional[float]:
+    """
+    Доля площади листа, которую занимает фрагмент, по его bbox в долях
+    листа. None, когда bbox отсутствует или задан не в долях: размер
+    фрагмента относительно листа тогда неизвестен.
+    """
     bbox = fragment.position.bbox if fragment.position is not None else None
     if not bbox or len(bbox) != 4:
-        return False
+        return None
     x0, y0, x1, y1 = (float(v) for v in bbox)
     if max(x0, y0, x1, y1) > 1.0 or min(x0, y0, x1, y1) < 0.0:
-        return False      # не в долях листа — размер неизвестен
-    return abs(x1 - x0) * abs(y1 - y0) < _TEXT_DOC_MIN_FIGURE_AREA
+        return None
+    return abs(x1 - x0) * abs(y1 - y0)
+
+
+def _is_small_picture(fragment: Fragment) -> bool:
+    """Картинка меньше `_TEXT_DOC_MIN_FIGURE_AREA` листа (bbox в долях листа)."""
+    share = _page_area_share(fragment)
+    return share is not None and share < _TEXT_DOC_MIN_FIGURE_AREA
 
 
 def _render_pdf_page(data: bytes, page: int):
