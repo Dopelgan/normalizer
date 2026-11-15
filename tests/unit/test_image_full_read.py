@@ -181,6 +181,97 @@ class TestSmallCropsSkipped:
         assert [f.content.image_ref for f in out] == [CROP_URI]
 
 
+class TwoScalesQwen(FakeQwen):
+    """
+    Модель, которая одну надпись читает по-разному на вырезке вида и на
+    самой странице: вырезка крупнее, и знак отклонения на ней сохраняется.
+    Порядок вызовов тот же, что в работе, — сначала вырезки, потом страница.
+    """
+
+    def __init__(self, crop_values, sheet_values, lines=None):
+        super().__init__(lines=lines)
+        self.crop_values, self.sheet_values = crop_values, sheet_values
+
+    def read_sheet(self, image, hint=""):
+        self.asked.append("sheet")
+        first = self.asked.count("sheet") == 1
+        return reading(*(self.crop_values if first else self.sheet_values))
+
+
+def values_of(fragment):
+    return [f.value for f in fragment.content.structured_drawing_fields]
+
+
+class TestSignsAcrossFragments:
+    """
+    Знак отклонения, прочитанный на вырезке вида, доходит до прочтения самой
+    страницы: это разные вызовы `process()`, и `merge_readings` их не
+    сводит (core/providers/dimension_fidelity.py, `adopt_page_signs`).
+    """
+
+    @pytest.fixture
+    def fidelity(self, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_DIMENSION_FIDELITY", True)
+
+    def two_scales(self, storage, **kwargs):
+        qwen = TwoScalesQwen(lines=LINES, **kwargs)
+        return DrawingProcessor(storage, qwen=qwen), qwen
+
+    def test_sign_from_the_crop_reaches_the_page(self, storage, full_read, fidelity):
+        processor, _ = self.two_scales(
+            storage, crop_values=["1087±3"], sheet_values=["1087+3"],
+        )
+        out = processor.enrich_fragments([crop_fragment()], metadata())
+        sheet_fragment, crop_out = out[0], out[1]
+        assert sheet_fragment.content.image_ref == SHEET_URI
+        # До правки у страницы оставалось «1087+3», и в индекс попадали оба
+        # варианта одной надписи сразу.
+        assert values_of(sheet_fragment) == ["1087±3"]
+        assert values_of(crop_out) == ["1087±3"]
+
+    def test_fidelity_off_changes_nothing(self, storage, full_read):
+        processor, _ = self.two_scales(
+            storage, crop_values=["1087±3"], sheet_values=["1087+3"],
+        )
+        out = processor.enrich_fragments([crop_fragment()], metadata())
+        assert values_of(out[0]) == ["1087+3"]
+
+    def test_the_page_does_not_take_a_worse_sign(self, storage, full_read, fidelity):
+        # Обратной подмены модель не делает: «±» у страницы остаётся «±».
+        processor, _ = self.two_scales(
+            storage, crop_values=["1087+3"], sheet_values=["1087±3"],
+        )
+        out = processor.enrich_fragments([crop_fragment()], metadata())
+        assert values_of(out[0]) == ["1087±3"]
+
+    def test_a_crop_of_another_page_is_not_a_donor(self, storage, full_read, fidelity):
+        # Страница вырезки другая — это другая надпись, и знак не переносится.
+        processor, _ = self.two_scales(
+            storage, crop_values=["1087±3"], sheet_values=["1087+3"],
+        )
+        out = processor.enrich_fragments([crop_fragment(page=2)], metadata())
+        sheet_fragment = next(f for f in out if f.content.image_ref == SHEET_URI)
+        assert values_of(sheet_fragment) == ["1087+3"]
+
+    def test_tolerance_form_of_the_crop_is_not_moved_to_the_page(
+        self, storage, full_read, fidelity
+    ):
+        """
+        Форма допуска, прочитанная только на вырезке, на страницу не
+        переносится и в её фрагменте остаётся: «⌀6,6» и «⌀6,6-0,05» —
+        разные записи, а не два прочтения одного знака, и на листе это
+        могут быть две разные надписи. Значит, пропуск вызова модели на
+        вырезке эту запись теряет: широкий пропуск вырезок остаётся закрыт.
+        """
+        processor, _ = self.two_scales(
+            storage, crop_values=["⌀6,6-0,05"], sheet_values=["⌀6,6"],
+        )
+        out = processor.enrich_fragments([crop_fragment()], metadata())
+        sheet_fragment, crop_out = out[0], out[1]
+        assert values_of(sheet_fragment) == ["⌀6,6"]
+        assert values_of(crop_out) == ["⌀6,6-0,05"]
+
+
 class TestSheetCalledText:
     def test_flag_off_text_sheet_skips_the_model(self, storage):
         processor, qwen = model(storage)
