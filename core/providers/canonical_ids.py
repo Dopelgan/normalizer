@@ -130,7 +130,13 @@ def _split_token(token: str) -> Optional[Tuple[str, str]]:
     match = _SERIES_START.search(token)
     if match is None:
         return None
-    return token[:match.start()], token[match.start():]
+    prefix, series = token[:match.start()], token[match.start():]
+    # Знак номера в прочтении короткий («№», «1№», «#», «МС» на месте «№С»),
+    # а в шифре поверителя не меньше двух букв: конец слова вроде «ВЕС-Т» или
+    # «abc-12» серией не считается.
+    if len(prefix) > 3 or sum(ch.isalpha() for ch in series[2:]) < 2:
+        return None
+    return prefix, series
 
 
 def _tail_key(date: str, number: str) -> str:
@@ -186,9 +192,11 @@ _DIGIT_LOOKALIKES = str.maketrans({
     "о": "0", "О": "0", "o": "0", "O": "0",
     "З": "3", "з": "3",
     "б": "6",
-    "l": "1", "I": "1", "|": "1",
+    "l": "1", "I": "1",
 })
-_SERIAL = re.compile(r"(?<![\w/.,-])([0-9оОoOЗзбlI|]{5,8})(?![\w/])")
+# Первый знак — цифра: разделитель таблицы или буква перед номером цифрой
+# не становится.
+_SERIAL = re.compile(r"(?<![\w/.,|-])(\d[0-9оОoOЗзбlI]{4,7})(?![\w/|])")
 # Диапазон шире этого — не партия изделий, а что-то другое (годы, коды).
 _MAX_RANGE = 10_000
 
@@ -245,11 +253,15 @@ def _fold_letters(code: str) -> str:
 
 
 def name_designation(name: str) -> Optional[str]:
-    """Обозначение из имени файла кириллицей, если оно там одно."""
+    """
+    Обозначение из имени файла, если оно там одно и код в нём записан
+    прописной кириллицей, как требует ГОСТ 2.201. Код латиницей или
+    строчными сам под вопросом и эталоном служить не может.
+    """
     found = {
-        f"{_fold_letters(m.group(1))} {m.group(3)}"
+        f"{m.group(1)} {m.group(3)}"
         for m in _DESIGNATION.finditer(name or "")
-        if re.fullmatch(r"[А-ЯЁ]{2,4}", _fold_letters(m.group(1)))
+        if re.fullmatch(r"[А-ЯЁ]{2,4}", m.group(1))
     }
     return found.pop() if len(found) == 1 else None
 
@@ -488,9 +500,12 @@ def _drawing_designation(fragment, from_name: str, facts: list) -> int:
             _record(fragment, "designation", match.group(0), fixed, "file_name")
             changed += 1
     for drawing_field in fragment.content.structured_drawing_fields or []:
-        value, found = _rewrite_designations(drawing_field.value, from_name, [])
+        value, found = _rewrite_designations(drawing_field.value, from_name, facts)
         if found:
             drawing_field.value = value
+            for before, after, evidence in found:
+                _record(fragment, "designation", before, after, evidence)
+                changed += 1
     return changed
 
 

@@ -19,6 +19,8 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from core.config import settings
 from core.facts.extractor import extract_facts
 from core.models.contract import Fragment
@@ -226,10 +228,15 @@ def finalize_fragments(
             # обозначения. После идентификаторов: `fragment_id` считается по
             # прочтению, и включение флага его не меняет. До сборки записи
             # чертежа: запись собирается уже из канонической графы.
-            canonical_ids.apply(
-                fragments, source_name=source_name,
-                series=canonical_ids.profile_series(), file_id=s3_fileid,
-            )
+            try:
+                canonical_ids.apply(
+                    fragments, source_name=source_name,
+                    series=canonical_ids.profile_series(), file_id=s3_fileid,
+                )
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 — запись номера не важнее документа
+                logger.warning("Канонические номера %s не записаны: %s", doc_id, exc)
         drawing_record.apply(fragments)
         if settings.DRAWING_DIAGNOSTICS_NOT_INDEXED:
             for fragment in fragments:

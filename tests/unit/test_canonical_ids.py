@@ -211,3 +211,33 @@ def test_shipped_profile_has_no_series():
         assert canonical_ids.profile_series() == []
     finally:
         gateway_profile.reset_cache()
+
+
+def test_latin_file_name_code_is_not_a_reference():
+    fragment = scan("KMT 123456.001 и КМТ 123456.001")
+    canonical_ids.apply([fragment], source_name="KMT 123456.001 сборка.pdf")
+    assert fragment.content.text == "KMT 123456.001 и КМТ 123456.001"
+
+
+@pytest.mark.parametrize("text", ["зав № 22075| дата", "|22075о|", "I22075о"])
+def test_separator_is_not_a_digit(text):
+    fragment = scan(text)
+    canonical_ids.apply([fragment], source_name="СБ210 зав. №№ 220723-220772.pdf")
+    assert fragment.content.text == text
+
+
+@pytest.mark.parametrize("text", ["abc-12/27-09-2022/189200853", "ВЕС-Т/27-09-2022/189200853"])
+def test_word_ending_is_not_a_series(text):
+    fragment = scan(text)
+    canonical_ids.apply([fragment], series=["С-ВЫГ", "С-ТТ"])
+    assert fragment.content.text == text
+    assert not fragment.extracted_facts
+
+
+def test_failure_does_not_break_finalize(enabled, monkeypatch):
+    def broken(*args, **kwargs):
+        raise ValueError("сбой")
+
+    monkeypatch.setattr(canonical_ids, "apply", broken)
+    finalized, _ = finalize_fragments([scan("С-ВЫТ/27-09-2022/189200853")], "doc-1", "f.pdf")
+    assert finalized[0].content.text == "С-ВЫТ/27-09-2022/189200853"
