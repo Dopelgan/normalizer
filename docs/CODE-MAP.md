@@ -198,6 +198,9 @@
 | `S3_READONLY` | `true` | `core/providers/storage.py` |
 | `PARSE_REQUEUE_ON_OUTAGE` | `false` | `core/outage.py`; бросают `core/ladder/strategies/recognition.py::LayoutStrategy.applicable`, `core/providers/mineru_parser.py::parse`, `core/drawing_processor.py::enrich_fragments` (итог вызовов из `qwen_client._post`); ловит и ставит в очередь `ingest/tasks.py::process_document` |
 | `GPU_GATE_ENABLED`, `GPU_GATE_YIELD_ON_WAITING` | `false`, `true` | `core/providers/gpu_gate.py`; места берут `core/providers/qwen_client.py::_post`, `core/providers/mineru_parser.py::_parse_with_mineru`, `core/ladder/strategies/recognition.py::VlmEscalationStrategy.run`; часы бюджета листа — `core/drawing_processor.py` |
+| `PARSE_LAYOUT_UNAVAILABLE_NOTE` | `false` | `core/ladder/router.py` (`LAYOUT_UNAVAILABLE`; признак — `core/ladder/strategies/recognition.py::LayoutStrategy.skipped_as_unavailable`) |
+| `DRAWING_LOST_SHEETS_SKIPPED` | `false` | `core/drawing_processor.py` (`_sheet_drawings`) |
+| `SCAN_CANONICAL_IDS` | `false` | `core/contract_finalize.py` → `core/providers/canonical_ids.py`; список серий — `core/gateway/profile.load_section("scan_identity")`; факты — `core/facts/extractor.identity_fact` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
 
