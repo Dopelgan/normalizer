@@ -40,12 +40,13 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import deadline
+from core import deadline, telemetry
 from core.config import settings
 from core.ladder import drawing_route
 from core.ladder.base import Strategy, text_chars
@@ -67,6 +68,7 @@ from core.ladder.strategies.tabular import SpreadsheetStrategy
 from core.models.parse_result import ParseResult
 from core.providers.storage import StorageProvider
 from core.providers.document_parser import DocumentParserProvider, ParserFailed
+from core.providers.mineru_parser import MINERU_HTTP_MS
 from core.providers.tesseract_fallback import ocr_memo
 
 logger = logging.getLogger(__name__)
@@ -136,6 +138,21 @@ class Attempt:
         if self.error:
             payload["error"] = self.error
         return payload
+
+
+def _record_level_time(level: int, started: float, http_before: float) -> None:
+    """
+    Время уровней 4 и 5 в тайминги документа. Уровень 5 делится на запрос
+    к MinerU и всё после него (сшивка, OCR-слой): только так видно, куда
+    уходит `parse.document` на скане и что даст каждая правка скорости.
+    """
+    elapsed = (time.perf_counter() - started) * 1000
+    if level == 4:
+        telemetry.add("parse.level4_ms", elapsed)
+    elif level == 5:
+        http = max(0.0, telemetry.value(MINERU_HTTP_MS) - http_before)
+        telemetry.add("parse.level5_http_ms", http)
+        telemetry.add("parse.level5_post_ms", max(0.0, elapsed - http))
 
 
 class LadderRouter:
@@ -222,6 +239,8 @@ class LadderRouter:
                 attempts.append(Attempt(strategy.level, strategy.name,
                                         error="нет бюджета времени задачи"))
                 continue
+            run_started = time.perf_counter()
+            http_before = telemetry.value(MINERU_HTTP_MS)
             try:
                 result = strategy.run(context)
             except SoftTimeLimitExceeded:
@@ -240,6 +259,8 @@ class LadderRouter:
                 )
                 attempts.append(Attempt(strategy.level, strategy.name, error=str(exc)))
                 continue
+            finally:
+                _record_level_time(strategy.level, run_started, http_before)
 
             chars = text_chars(result)
             source_count = context.source_page_count or result.source_page_count

@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 
-from core import deadline
+from core import deadline, telemetry
 from core.config import settings
 from core.providers import title_block
 
@@ -905,6 +905,21 @@ class QwenVisionClient:
         return answer
 
     def _post(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Один вызов модели вместе с повторами — и его учёт в таймингах
+        документа: число вызовов, их суммарное время и число неудач. Без
+        этого время ветки чертежей не делилось на ожидание модели и свою
+        работу, и замер скорости шёл разбором логов.
+        """
+        started = time.perf_counter()
+        payload = self._post_attempts(body)
+        telemetry.add("parse.vlm_calls", 1)
+        telemetry.add("parse.vlm_call_ms_sum", (time.perf_counter() - started) * 1000)
+        if payload is None:
+            telemetry.add("parse.vlm_failed_calls", 1)
+        return payload
+
+    def _post_attempts(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Ответ модели текстом. Повторяется только то, что имеет смысл
         повторять: обрыв связи, таймаут и 5xx (vLLM отвечает так, пока

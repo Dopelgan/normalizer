@@ -42,7 +42,7 @@ import requests
 from core import filetypes
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import deadline
+from core import deadline, telemetry
 from core.config import settings
 from core.models.parse_result import ParsedBlock, ParseResult
 from core.providers.document_parser import (
@@ -423,6 +423,10 @@ def parse_table_html(html: str) -> Optional[Dict[str, Any]]:
 
 class ParserTimedOut(ParserUnavailable):
     """MinerU доступен, но не уложился в таймаут: деградация документа, не сервиса."""
+
+
+# Сумма времени запросов к MinerU за документ (все уровни, что к нему ходят).
+MINERU_HTTP_MS = "parse.mineru_http_ms"
 
 
 class MinerUParserProvider(DocumentParserProvider):
@@ -815,6 +819,7 @@ class MinerUParserProvider(DocumentParserProvider):
         logger.info(
             "MinerU: %s file=%s size=%d B timeout=%ds", url, filename, len(file_bytes), timeout
         )
+        started = time.perf_counter()
         try:
             response = requests.post(url, files=files, data=data, timeout=timeout)
         except requests.ReadTimeout as exc:
@@ -825,6 +830,10 @@ class MinerUParserProvider(DocumentParserProvider):
         except requests.RequestException as exc:
             self.mark_unavailable()
             raise ParserUnavailable(f"нет связи с MinerU: {exc}") from exc
+        finally:
+            # Время запроса к сервису отдельно от сшивки и OCR-слоя: из него
+            # лестница выводит `parse.level5_http_ms` / `parse.level5_post_ms`.
+            telemetry.add(MINERU_HTTP_MS, (time.perf_counter() - started) * 1000)
 
         if response.status_code >= 500:
             raise ParserUnavailable(f"MinerU вернул {response.status_code}: {response.text[:300]}")

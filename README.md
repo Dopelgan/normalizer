@@ -1218,6 +1218,8 @@ docker compose logs intake_worker \
 | `quality_gate.read`, `.technical`, `.duplicates`, `.freshness`, `.readability`, `.routing` | этапы проверки пригодности |
 | `convert.office` | конвертация `.doc` в `.docx` |
 | `parse.locate`, `.document`, `.normalize`, `.drawings`, `.file_hash`, `.save` | разбор документа |
+| `parse.level4_ms`, `parse.level5_http_ms`, `parse.level5_post_ms` | только в `extra_data.timings_ms`: уровень 4 (Tesseract) целиком; уровень 5 — запрос к MinerU и всё после него (сшивка, OCR-слой). `parse.mineru_http_ms` — все запросы к MinerU за документ, вместе с уровнем 6 |
+| `parse.vlm_calls`, `parse.vlm_call_ms_sum`, `parse.vlm_failed_calls` | только в `extra_data.timings_ms`: вызовы Qwen-VL за документ (вызов = запрос с повторами), их суммарное время (у параллельных листов больше стены) и неудачи |
 
 ## Структура проекта
 
