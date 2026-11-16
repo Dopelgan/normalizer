@@ -9,6 +9,8 @@
 синтетические.
 """
 
+import time
+
 import pytest
 
 from core.config import settings
@@ -45,14 +47,14 @@ class TestSplitGluedNumber:
         assert split_glued_number("".join(SERIALS), lines_of(*SERIALS)) == SERIALS
 
     def test_pieces_must_come_from_different_lines(self):
-        # Оба куска только в одной строке слоя — это одна запись, не две строки ячейки.
-        assert split_glued_number("4585445855", lines_of("45854 45855")) is None
-        assert split_glued_number("4585445854", lines_of("45854")) is None
+        six = ["458541", "458542", "458543"]
+        assert split_glued_number("".join(six), lines_of(" ".join(six))) is None
+        assert split_glued_number("458541458541458541", lines_of("458541")) is None
 
     def test_number_present_in_layer_even_with_stray_space_is_kept(self):
-        # Счёт с лишним пробелом в слое — тот же счёт, а не два числа.
-        assert split_glued_number("40702810338290030", lines_of("40702810 338290030")) is None
-        assert split_glued_number("4585445855", lines_of("4585445855", "45854", "45855")) is None
+        assert split_glued_number("".join(SERIALS), lines_of(" ".join(SERIALS[:2]) + "x",
+                                                             "".join(SERIALS[:3]) + " " + "".join(SERIALS[3:]),
+                                                             *SERIALS)) is None
 
     def test_account_like_twenty_digits_never_split(self):
         assert split_glued_number("40702810338290030371",
@@ -62,15 +64,49 @@ class TestSplitGluedNumber:
         assert split_glued_number("16112026", lines_of("1611", "2026")) is None
         assert split_glued_number("20261116", lines_of("2026", "1116")) is None
 
+    @pytest.mark.parametrize("core, parts", [
+        ("1027700132195", ["1027700", "132195"]),     # ОГРН, 13 цифр
+        ("770708389301", ["77070838", "9301"]),       # ИИН/ИНН, 12 цифр
+        ("87272345678", ["8727", "2345678"]),         # телефон, 11 цифр
+        ("044525225", ["0445", "25225"]),             # БИК, 9 цифр
+        ("312345678901234", ["31234567", "8901234"]),  # ОГРНИП, 15 цифр
+    ])
+    def test_requisites_wrapped_in_narrow_cell_are_kept(self, core, parts):
+        assert split_glued_number(core, lines_of(*parts)) is None
+
+    def test_wrapped_long_number_is_not_a_stack(self):
+        # Перенос: продолжение с того же края, первая строка заполняет ячейку.
+        first = line("12345678", 0.10, x=0.5, width=0.12)
+        rest = line("1234", 0.13, x=0.5, width=0.06)
+        assert split_glued_number("123456781234", [first, rest]) is None
+        stack = [line(n, 0.10 + i * 0.03, x=0.5, width=0.06) for i, n in enumerate(
+            ["4581", "4582", "4583", "4584", "4585"])]
+        assert split_glued_number("45814582458345844585", stack) is None  # 20 цифр — счёт
+        stack = stack[:3] + [line("4586", 0.22, x=0.5, width=0.06), line("4587", 0.25, x=0.5, width=0.06),
+                             line("4588", 0.28, x=0.5, width=0.06)]
+        assert split_glued_number("458145824583458645874588", stack) == [
+            "4581", "4582", "4583", "4586", "4587", "4588"]
+
+    def test_rows_must_not_overlap_vertically(self):
+        same_row = [line(n, 0.10, x=0.1 + i * 0.15, width=0.1) for i, n in enumerate(SERIALS)]
+        assert split_glued_number("".join(SERIALS), same_row) is None
+
+    def test_two_long_halves_are_not_split(self):
+        assert split_glued_number("12345671234567", lines_of("1234567", "1234567")) is None
+
     def test_piece_missing_from_layer_keeps_number(self):
         assert split_glued_number("".join(SERIALS), lines_of(*SERIALS[:-1])) is None
 
     def test_short_layer_numbers_do_not_cut(self):
         assert split_glued_number("25300000000", lines_of("253", "0000", "25", "300")) is None
 
-    def test_fewest_pieces_win(self):
-        assert split_glued_number("123456789012", lines_of("1234", "5678", "12345678", "9012")) == [
-            "12345678", "9012"]
+    def test_long_run_is_fast(self):
+        # Ревью: перебор разбиений без памяти зависал на длинной серии цифр.
+        lines = lines_of(*["1111", "11111", "111111", "1111111"] * 3)
+        started = time.perf_counter()
+        for size in (61, 120, 200):
+            split_glued_number("1" * size, lines)
+        assert time.perf_counter() - started < 0.5
 
 
 class TestScope:

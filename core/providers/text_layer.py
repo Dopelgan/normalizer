@@ -105,8 +105,16 @@ _GLUED_NUMBER_PIECE_MIN = 4
 _DIGITS_RE = re.compile(r"^[0-9]+$")
 # Склеенное число в тексте ячейки: цифры без соседних букв и цифр.
 _GLUED_DIGITS_RE = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])[0-9]{8,}(?![0-9A-Za-zА-Яа-яЁё])")
-# Счёт в банке (р/с, к/с) — ровно 20 цифр: такая склейка не режется.
-_ACCOUNT_DIGITS = 20
+# Длины реквизитов: БИК 9, ИНН 10 и 12, телефон 11, ОГРН 13, ОГРНИП 15,
+# счёт 20. Склейка такой длины неотличима от самого реквизита и не режется.
+_REQUISITE_DIGITS = frozenset({9, 10, 11, 12, 13, 15, 20})
+# Два куска — только у коротких номеров: длинное число из двух половин чаще
+# всего перенесено в узкой ячейке.
+_GLUED_PAIR_MAX_PIECE = 6
+# Допуски геометрии строк слоя в долях листа: пересечение рядов по высоте и
+# совпадение левого края / разница ширины у переноса.
+_ROW_OVERLAP_SLACK = 0.002
+_WRAP_EDGE_SLACK = 0.004
 # Знаки, которые снимаются с краёв слова слоя при сборке словаря.
 _WORD_EDGE = "|.,;:!?()[]{}<>«»\"'*_-–—/\\"
 _MARKUP_RE = re.compile(r"(<[^>]*>)")
@@ -1754,59 +1762,70 @@ def split_glued_number(core: str, lines: Sequence["TextLine"]) -> Optional[List[
     """
     Склеенные числа ячейки таблицы по строкам слоя этой таблицы или None.
 
-    Доказательство берётся только из строк слоя внутри рамки таблицы, а не из
-    словаря всей страницы. Число режется, если:
+    Режется только столбик одинаковых по длине номеров (заводские номера
+    партии, инвентарные номера), который модель таблиц склеила в одно число.
+    Доказательство берётся из строк слоя внутри рамки таблицы:
 
-    - оно целиком раскладывается на числа, каждое из которых стоит в какой-то
-      строке слоя отдельным словом, не короче `_GLUED_NUMBER_PIECE_MIN` цифр;
-    - все куски взяты из разных строк слоя (номер на своей строке ячейки);
-    - само число не стоит ни в одной строке слоя, даже с пробелом внутри
-      («4070281033 8290030371» — тот же счёт с лишним пробелом);
-    - оно не похоже на счёт (ровно 20 цифр) или дату ДДММГГГГ: такие склейки
-      неотличимы от настоящего значения и не режутся вовсе.
+    - число делится на не меньше двух кусков одной длины (от
+      `_GLUED_NUMBER_PIECE_MIN` цифр); два куска — только короткие номера
+      (до `_GLUED_PAIR_MAX_PIECE` цифр), иначе это обычно одно число,
+      перенесённое в узкой ячейке;
+    - каждый кусок стоит отдельным словом на своей строке слоя, строки идут
+      одна под другой и по высоте не пересекаются;
+    - соседние строки — не перенос: продолжение переноса начинается с того же
+      края, а первая строка шире следующей (заполняет ячейку);
+    - само число не стоит ни в одной строке слоя, даже с пробелом внутри;
+    - длина числа не совпадает с длиной реквизита (БИК, ИНН, телефон, ОГРН,
+      ОГРНИП, счёт — `_REQUISITE_DIGITS`) и число не похоже на дату.
 
-    Из разложений берётся то, где кусков меньше.
+    Без перебора разбиений: длина куска перебирается по делителям длины числа.
     """
-    if (len(core) < _GLUED_NUMBER_MIN_LEN or len(core) > _GLUED_MAX_LEN
-            or not _DIGITS_RE.match(core) or len(core) == _ACCOUNT_DIGITS
+    size = len(core)
+    if (size < _GLUED_NUMBER_MIN_LEN or size > _GLUED_MAX_LEN
+            or not _DIGITS_RE.match(core) or size in _REQUISITE_DIGITS
             or _looks_like_date(core)):
         return None
-    owners: Dict[str, set] = {}
-    for index, line in enumerate(lines):
+    owners: Dict[str, List["TextLine"]] = {}
+    for line in lines:
         text = line.text or ""
         if core in "".join(text.split()):
             return None
         for word in text.split():
             word = word.strip(_WORD_EDGE)
             if len(word) >= _GLUED_NUMBER_PIECE_MIN and _DIGITS_RE.match(word):
-                owners.setdefault(word, set()).add(index)
+                owners.setdefault(word, []).append(line)
     if not owners:
         return None
-    lengths = sorted({len(number) for number in owners}, reverse=True)
-    size = len(core)
-    best: Optional[List[str]] = None
-
-    def search(start: int, pieces: List[str], used: set) -> None:
-        nonlocal best
-        if best is not None and len(pieces) + 1 >= len(best):
-            return
-        for length in lengths:
-            stop = start + length
-            if stop > size:
-                continue
-            piece = core[start:stop]
-            free = owners.get(piece, set()) - used
+    for length in sorted({len(number) for number in owners}):
+        if size % length or size // length < 2:
+            continue
+        count = size // length
+        if count == 2 and length > _GLUED_PAIR_MAX_PIECE:
+            continue
+        pieces = [core[i:i + length] for i in range(0, size, length)]
+        chosen: List["TextLine"] = []
+        for piece in pieces:
+            free = [line for line in owners.get(piece, []) if all(line is not c for c in chosen)]
             if not free:
-                continue
-            line = min(free)
-            if stop == size:
-                if pieces and (best is None or len(pieces) + 1 < len(best)):
-                    best = pieces + [piece]
-                continue
-            search(stop, pieces + [piece], used | {line})
+                break
+            chosen.append(min(free, key=lambda line: line.bbox[1]))
+        else:
+            if _stacked_rows(chosen):
+                return pieces
+    return None
 
-    search(0, [], set())
-    return best
+
+def _stacked_rows(chosen: Sequence["TextLine"]) -> bool:
+    """Строки — отдельные ряды столбика, а не перенос одного значения."""
+    rows = sorted(chosen, key=lambda line: line.bbox[1])
+    for upper, lower in zip(rows, rows[1:]):
+        if lower.bbox[1] < upper.bbox[3] - _ROW_OVERLAP_SLACK:
+            return False                      # по высоте строки пересекаются
+        same_start = abs(upper.bbox[0] - lower.bbox[0]) <= _WRAP_EDGE_SLACK
+        upper_wider = (upper.bbox[2] - upper.bbox[0]) > (lower.bbox[2] - lower.bbox[0]) + _WRAP_EDGE_SLACK
+        if same_start and upper_wider:
+            return False                      # перенос: первая строка заполняет ячейку
+    return True
 
 
 def _looks_like_date(core: str) -> bool:
