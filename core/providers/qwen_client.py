@@ -49,7 +49,7 @@ from requests.adapters import HTTPAdapter
 
 from core import deadline, outage, telemetry
 from core.config import settings
-from core.providers import gpu_gate, title_block
+from core.providers import disputed_reread, gpu_gate, title_block
 
 logger = logging.getLogger(__name__)
 
@@ -449,6 +449,24 @@ _TRANSCRIBE_PROMPT = """Перепиши весь текст, который е�
 """
 
 
+# Дочитывание спорных надписей вырезками (`DRAWING_DISPUTED_REREAD`).
+_VALUES_PROMPT = """На картинке {count} пронумерованных вырезок с чертежа: номер — слева в рамке,
+справа — одна надпись (размер, допуск, резьба, шероховатость или графа штампа).
+Перепиши надпись каждой вырезки символ в символ и верни JSON:
+
+{{"values": [{{"n": 1, "text": "надпись как на вырезке"}}]}}
+
+Правила:
+- Знак отклонения — ровно тот, что напечатан: «+», «−» или «±». Верхнее и
+  нижнее отклонения пиши сразу за размером, верхнее первым, каждое со своим
+  знаком: «⌀18+0,25+0,10», «40−0,25», «⌀4,5+0,2».
+- Десятичную запятую не теряй и не добавляй: «M18x1,5», «1,5*», «1349».
+- Знак диаметра — «⌀», градусы — «°», справочная звёздочка — «*».
+- Буквы — как напечатаны, кириллицей: «Э» не путай с «З» и цифрой «3»,
+  «п» — с латинской «n».
+- Если на вырезке надписи нет или она не читается — пропусти этот номер.
+"""
+
 # Знак отклонения и справочная звёздочка (`DRAWING_DIMENSION_FIDELITY`).
 # В транскрипции листа «30±10*» приходило как «30+10*», а на вырезке вида
 # знак был верный: модель подменяет «±» на «+» сама, и правится это запросом.
@@ -591,6 +609,10 @@ class QwenVisionClient:
         prompt = self._sheet_prompt(hint)
         if settings.DRAWING_SMALL_PRINT_CARE:
             image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
+        if disputed_reread.needs_native_tiles(image):
+            # Крупный лист (A1/A2) ужимается до QWEN_SHEET_MAX_SIDE так, что
+            # мелкий шрифт не читается: плитки — сразу, без вызова по листу.
+            return self._read_sheet_tiles(image, prompt, SheetReading(), until, native=True)
         whole = self._read_sheet_piece(image, prompt)
         if whole is not None and settings.DRAWING_SHEET_GUARDED and whole.rejected:
             # Оборванный или зациклившийся ответ дочитывается частями всегда:
@@ -736,7 +758,8 @@ class QwenVisionClient:
 
     def _read_sheet_tiles(
         self, image, prompt: str, whole: SheetReading, until: Optional[float],
-    ) -> SheetReading:
+        native: bool = False,
+    ) -> Optional[SheetReading]:
         """
         Лист, ответ по которому оборвался, частями с перекрытием. Сетка та
         же, что у прохода «весь текст листа» (`tile_boxes`): часть листа
@@ -749,10 +772,13 @@ class QwenVisionClient:
         """
         boxes = tile_boxes([0.0, 0.0, 1.0, 1.0], settings.DRAWING_SHEET_TILE_GRID,
                            settings.DRAWING_SHEET_TILE_OVERLAP)
-        logger.warning(
-            "Надписи листа не поместились в ответ (%d до обрыва): лист "
-            "дочитывается %d частями", len(whole.annotations), len(boxes),
-        )
+        if native:
+            logger.info("Лист ужат ниже порога читаемости: читается %d частями сразу", len(boxes))
+        else:
+            logger.warning(
+                "Надписи листа не поместились в ответ (%d до обрыва): лист "
+                "дочитывается %d частями", len(whole.annotations), len(boxes),
+            )
         limit = threading.Semaphore(max(1, settings.DRAWING_TRANSCRIBE_TILE_PARALLEL))
 
         def read(part):
@@ -782,12 +808,14 @@ class QwenVisionClient:
 
         parts: List[List[Dict[str, Any]]] = []
         failed: List[List[float]] = []
+        kinds: List[str] = []
         read_count, lost = 0, 0
         for box, part in zip(boxes, answers):
             if part is None:
                 failed.append([round(value, 4) for value in box])
                 continue
             read_count += 1
+            kinds.append(part.sheet_type)
             lost += part.lost
             parts.append([place_in_sheet(a, box) for a in part.annotations])
             if part.cut or part.rejected == REJECT_LOOP:
@@ -800,8 +828,15 @@ class QwenVisionClient:
             "Надписи листа дочитаны частями: частей %d, не прочитано %d, надписей %d",
             read_count, len(failed), len(merged),
         )
+        sheet_type = whole.sheet_type
+        if native:
+            # Вызова по листу не было: род чертежа — тот, что назвали части.
+            known = [kind for kind in kinds if kind != "unknown"]
+            sheet_type = max(set(known), key=known.count) if known else "unknown"
+            if not read_count:
+                return None
         return SheetReading(
-            sheet_type=whole.sheet_type,
+            sheet_type=sheet_type,
             annotations=merged,
             raw=whole.raw,
             cut=whole.cut,
@@ -903,6 +938,17 @@ class QwenVisionClient:
             logger.warning("Таблица листа прочитана не целиком (строк %d при %d у MinerU): спрашивается ещё раз",
                            len(_string_rows(data.get("rows"))), expect_rows)
         return best
+
+    def read_values(self, image, count: int) -> Optional[Dict[int, str]]:
+        """
+        Картинка пронумерованных вырезок надписей (DRAWING_DISPUTED_REREAD)
+        -> {номер: надпись символ в символ}. `None` — ответа нет.
+        """
+        data = self._ask(image, _VALUES_PROMPT.format(count=count),
+                         settings.DRAWING_REREAD_MAX_SIDE, max_tokens=64 + 48 * count)
+        if data is None:
+            return None
+        return disputed_reread.parse_values(data, count)
 
     def transcribe(self, image) -> Optional[List[str]]:
         """Весь текст листа строками: штамп, графы, примечания, таблицы."""
