@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from core import filetypes
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import deadline
+from core import deadline, outage
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
@@ -767,6 +767,10 @@ class DrawingProcessor:
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
         if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
             result.extend(self._rescan_poor_pages(result, metadata))
+        # Модель не ответила документу ни разу и отказывала как сервис:
+        # непрочитанные листы — свойство минуты, а не документа. С
+        # PARSE_REQUEUE_ON_OUTAGE документ ставится в очередь (ServiceOutage).
+        outage.check_vlm()
         if settings.DRAWING_TRANSCRIPT_FIXES_OCR:
             result = apply_transcripts(result)
         if settings.DRAWING_SUPPRESS_STALE_ON_FULL_READ:

@@ -194,6 +194,7 @@
 | `DOC_CONVERT_ENABLED` | `true` | `core/providers/office_convert.py` |
 | `INTAKE_FORWARD_TO_PARSER` | `false` | `core/intake/pipeline.py`, `gateway/api.py`, `quality/api.py` |
 | `S3_READONLY` | `true` | `core/providers/storage.py` |
+| `PARSE_REQUEUE_ON_OUTAGE` | `false` | `core/outage.py`; бросают `core/ladder/strategies/recognition.py::LayoutStrategy.applicable`, `core/providers/mineru_parser.py::parse`, `core/drawing_processor.py::enrich_fragments` (итог вызовов из `qwen_client._post`); ловит и ставит в очередь `ingest/tasks.py::process_document` |
 | `GPU_GATE_ENABLED`, `GPU_GATE_YIELD_ON_WAITING` | `false`, `true` | `core/providers/gpu_gate.py`; места берут `core/providers/qwen_client.py::_post`, `core/providers/mineru_parser.py::_parse_with_mineru`, `core/ladder/strategies/recognition.py::VlmEscalationStrategy.run`; часы бюджета листа — `core/drawing_processor.py` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
@@ -233,6 +234,7 @@
 | `PARSE_DEADLINE_RESERVE` | `120` | `ingest/tasks.py` | резерв на финал |
 | `PARSE_STALE_MARGIN_SECONDS` | `300` | `core/result_aggregator.py` | когда файл признан потерянным |
 | `CELERY_TASK_MAX_RETRIES` | `3` | `ingest/tasks.py` | — |
+| `PARSE_OUTAGE_RETRY_SECONDS`, `PARSE_OUTAGE_MAX_WAIT_SECONDS` | `120`/`3600` | `ingest/tasks.py`, `core/outage.py` | пауза перед повтором при отказе сервиса и предел ожидания с первого отказа |
 | `CELERY_ML_QUEUE`, `CELERY_INTERACTIVE_QUEUE`, `CELERY_INTAKE_QUEUE` | — | `core/celery_app.py`, `ingest/api.py`, `ingest/tasks.py` | маршрутизация по очередям |
 | `RESULT_TTL_SECONDS`, `RESULT_DELIVERY_TYPE`, `RESULT_CALLBACK_URL` | — | `core/result_aggregator.py`, `core/result_delivery.py`, `ingest/api.py` | — |
 | `QG_SIMILARITY_THRESHOLD`, `QG_MAX_AGE_DAYS`, `QG_OCR_WARN_CONFIDENCE`, `QG_OCR_BLOCK_CONFIDENCE`, `QG_OCR_PAGES`, `QG_OCR_UNREADABLE_SHARE`, `QG_MAX_SIZE_BYTES` | — | `core/quality/service.py` | гейт качества |

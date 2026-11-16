@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from core import filetypes
+from core import filetypes, outage
 from core.config import settings
 from core.ladder.base import Strategy
 from core.ladder.context import SOURCE_RASTER, DocumentContext
@@ -104,6 +104,12 @@ class LayoutStrategy(Strategy):
         # который уже сделал уровень 4, только потратив на него вдвое больше
         # времени. Лучше честно пропустить уровень: деградация уже отмечена.
         if not MinerUParserProvider.is_available():
+            # Растровому документу без MinerU остаётся плоский OCR: с
+            # PARSE_REQUEUE_ON_OUTAGE он ставится в очередь, а не уходит
+            # в индекс таким навсегда (бросает ServiceOutage).
+            if (context.kind == filetypes.KIND_IMAGE
+                    or context.classification.source == SOURCE_RASTER):
+                outage.mineru_down("сервис помечен недоступным")
             logger.warning(
                 "Уровень %d пропущен: MinerU недоступен, разбор остаётся на OCR",
                 self.level,

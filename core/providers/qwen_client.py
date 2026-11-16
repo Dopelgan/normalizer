@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 
-from core import deadline
+from core import deadline, outage
 from core.config import settings
 from core.providers import gpu_gate, title_block
 
@@ -977,6 +977,12 @@ class QwenVisionClient:
             except requests.RequestException as exc:
                 self._log_attempt(exc, attempt, last)
                 if last:
+                    # Нет связи — отказ сервиса; таймаут чтения — свойство
+                    # этого вызова (плотный лист), не сервиса
+                    # (PARSE_REQUEUE_ON_OUTAGE).
+                    if (isinstance(exc, requests.ConnectionError)
+                            and not isinstance(exc, requests.ReadTimeout)):
+                        outage.note_vlm(ok=False)
                     return None
                 time.sleep(min(5.0, 1.0 * (attempt + 1)))
                 continue
@@ -986,6 +992,7 @@ class QwenVisionClient:
                     f"{response.status_code} {response.text[:200]}", attempt, last
                 )
                 if last:
+                    outage.note_vlm(ok=False)
                     return None
                 time.sleep(min(5.0, 1.0 * (attempt + 1)))
                 continue
@@ -1004,6 +1011,7 @@ class QwenVisionClient:
             if not isinstance(payload, dict):
                 logger.error("Qwen вернул ответ не того вида: %.200s", payload)
                 return None
+            outage.note_vlm(ok=True)
             return payload
         return None
 

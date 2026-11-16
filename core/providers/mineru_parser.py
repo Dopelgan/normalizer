@@ -42,7 +42,7 @@ import requests
 from core import filetypes
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import deadline
+from core import deadline, outage
 from core.config import settings
 from core.models.parse_result import ParsedBlock, ParseResult
 from core.providers.document_parser import (
@@ -477,6 +477,10 @@ class MinerUParserProvider(DocumentParserProvider):
             # молча и на всём потоке сразу.
             note = (f"mineru_timeout: {exc}" if isinstance(exc, ParserTimedOut)
                     else f"mineru_unavailable: {exc}")
+            if layer is None and not isinstance(exc, ParserTimedOut):
+                # Растр без MinerU — плоский OCR навсегда; с
+                # PARSE_REQUEUE_ON_OUTAGE документ ставится в очередь.
+                outage.mineru_down(str(exc))
             if layer is not None:
                 logger.error(
                     "MinerU недоступен (%s), но у %s есть текстовый слой — читаем его", exc, uri
