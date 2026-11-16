@@ -94,6 +94,15 @@ _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 # предела: дальше перебор разбиений дорог, а склейки такой длины не бывает.
 _GLUED_MIN_ALNUM = 6
 _GLUED_MAX_LEN = 200
+# Склейка чисел. Многострочную ячейку с номерами (заводские номера партии,
+# «р/с» + «БИК» + «к/с» в платёжке) модель таблиц отдаёт одним числом без
+# пробелов: «4585445855…», и ни один номер в поиске уже не находится. Внутри
+# числа граница по слою ставится, только если каждый кусок стоит в слое той
+# же страницы отдельным словом буква в букву и не короче
+# `_GLUED_NUMBER_PIECE_MIN` цифр (TABLE_SPLIT_GLUED_NUMBERS).
+_GLUED_NUMBER_MIN_LEN = 8
+_GLUED_NUMBER_PIECE_MIN = 4
+_DIGITS_RE = re.compile(r"^[0-9]+$")
 # Знаки, которые снимаются с краёв слова слоя при сборке словаря.
 _WORD_EDGE = "|.,;:!?()[]{}<>«»\"'*_-–—/\\"
 _MARKUP_RE = re.compile(r"(<[^>]*>)")
@@ -163,6 +172,9 @@ _STEEL_GRADE_RE = re.compile(r"^\d{1,3}(?:[ABCEHKMPTXАВСЕНКМРТХ]\d{0,2
 # повтор содержимого ячеек или мусор от линий сетки.
 _TABLE_LINE_MIN_NEW_WORDS = 2
 _TABLE_LINE_MIN_NEW_SHARE = 0.5
+# Число в строке векторного слоя считается новым словом от стольких цифр:
+# короче — номера позиций и количества, которые в ячейках и так есть.
+_TABLE_LINE_MIN_DIGITS = 4
 
 # Пары визуально неразличимых букв латиницы и кириллицы. Распознавание
 # постоянно их путает — `rps` превращается в `грs`, `БД` в `БD`, — и для
@@ -1316,9 +1328,12 @@ def _fix_table(
     if vocab is None:
         return [], []
     _split_glued_cells(block, vocab, stats, exact, turn)
-    if exact:
+    if exact and not settings.TABLE_VECTOR_LINES_KEPT:
         return [], []
-    kept = _lines_with_new_words(unused, block)
+    # Векторный слой — сам текст файла, обрывков сетки в нём нет: новым
+    # считается и одно слово, и число от `_TABLE_LINE_MIN_DIGITS` цифр
+    # (БИК, счёт и сумма прописью, потерянные моделью таблиц).
+    kept = _lines_with_new_words(unused, block, vector=exact)
     stats.table_lines_kept += len(kept)
     return [], kept
 
@@ -1729,12 +1744,61 @@ def _split_token(
     return pieces[::-1]
 
 
+def split_glued_number(core: str, vocab: Dict[str, str]) -> Optional[List[str]]:
+    """
+    Склеенные числа ячейки по числам слоя или None.
+
+    Число режется, только если оно целиком раскладывается на числа, которые
+    слой страницы знает отдельными словами (`vocab.verbatim`, буква в букву:
+    свёртка букв сравнивает «3» и «з» как одно), каждое не короче
+    `_GLUED_NUMBER_PIECE_MIN` цифр, и кусков не меньше двух. Само число,
+    которое стоит в слое целиком, не трогается. Из разложений берётся то, где
+    кусков меньше.
+    """
+    if (len(core) < _GLUED_NUMBER_MIN_LEN or len(core) > _GLUED_MAX_LEN
+            or not _DIGITS_RE.match(core)):
+        return None
+    words = getattr(vocab, "verbatim", None) or ()
+    numbers = {word for word in words
+               if len(word) >= _GLUED_NUMBER_PIECE_MIN and _DIGITS_RE.match(word)}
+    if not numbers or core in numbers:
+        return None
+    lengths = sorted({len(number) for number in numbers})
+    size = len(core)
+    # best[конец] — (кусков, начало последнего куска) лучшего разбора core[:конец].
+    best: Dict[int, Tuple[int, int]] = {0: (0, -1)}
+    for start in range(size):
+        if start not in best:
+            continue
+        for length in lengths:
+            stop = start + length
+            if stop > size:
+                break
+            if core[start:stop] in numbers and (
+                    stop not in best or best[stop][0] > best[start][0] + 1):
+                best[stop] = (best[start][0] + 1, start)
+    if size not in best or best[size][0] < 2:
+        return None
+    pieces: List[str] = []
+    stop = size
+    while stop:
+        start = best[stop][1]
+        pieces.append(core[start:stop])
+        stop = start
+    return pieces[::-1]
+
+
 def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
     """
     Токен ячейки: алфавит выправлен, склейка разрезана по словам слоя, а
     куски и целые слова взяты в написании слоя, если слою можно верить.
     """
     core = token.strip(_WORD_EDGE)
+    if settings.TABLE_SPLIT_GLUED_NUMBERS:
+        numbers = split_glued_number(core, vocab)
+        if numbers:
+            start = token.index(core)
+            return token[:start] + " ".join(numbers) + token[start + len(core):]
     label = _stamp_label(core, vocab)
     if label is not None:
         # Подпись штампа — из закрытого словаря целиком: цифра в ней («И3м.»)
@@ -1887,7 +1951,9 @@ def _looks_like_word(word: str) -> bool:
     return any(ch in _VOWELS for ch in letters)
 
 
-def _lines_with_new_words(lines: Sequence[TextLine], block: ParsedBlock) -> List[TextLine]:
+def _lines_with_new_words(
+    lines: Sequence[TextLine], block: ParsedBlock, vector: bool = False,
+) -> List[TextLine]:
     """
     Строки слоя из рамки таблицы, чьих слов в ячейках нет.
 
@@ -1902,13 +1968,17 @@ def _lines_with_new_words(lines: Sequence[TextLine], block: ParsedBlock) -> List
         cells.extend(str(c) for c in row)
     known = {_fold_word(w) for w in _TOKEN_RE.findall(" ".join(cells))}
     kept: List[TextLine] = []
+    min_new = 1 if vector else _TABLE_LINE_MIN_NEW_WORDS
     for line in lines:
         words = [w for w in _TOKEN_RE.findall(line.text or "") if len(w) >= 3]
         # Новым считается только настоящее слово: обрывки линий сетки
-        # Tesseract читает как «ООО», «ОИ», «ne».
+        # Tesseract читает как «ООО», «ОИ», «ne». У векторного слоя — ещё и
+        # длинное число.
         new = [_fold_word(w) for w in words
-               if _fold_word(w) not in known and _looks_like_word(w)]
-        if len(new) >= _TABLE_LINE_MIN_NEW_WORDS and len(new) >= len(words) * _TABLE_LINE_MIN_NEW_SHARE:
+               if _fold_word(w) not in known and (
+                   _looks_like_word(w)
+                   or (vector and w.isdigit() and len(w) >= _TABLE_LINE_MIN_DIGITS))]
+        if len(new) >= min_new and len(new) >= len(words) * _TABLE_LINE_MIN_NEW_SHARE:
             kept.append(line)
             known.update(new)
     return kept
