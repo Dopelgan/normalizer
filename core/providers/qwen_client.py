@@ -241,6 +241,43 @@ _SHEET_PROMPT = """Прочитай чертёж и верни JSON:
 - Не повторяй одну надпись дважды и не выдумывай надписей, которых нет.{hint}
 """
 
+# Тот же проход в сжатом виде (DRAWING_SHEET_COMPACT_JSON). Надпись —
+# массив `[код, надпись, x1, y1, x2, y2]` вместо объекта с тремя именами
+# полей, рамка — целые тысячные доли вместо дробей с плавающей точкой: на
+# листе в сотню надписей это заметная доля ответа модели, а проход «лист
+# целиком» — две трети всего времени модели на чертежах. Разбор переводит
+# ответ в те же объекты `{category, value, bbox}`, дальше ничего не
+# меняется. Список остаётся под ключом `annotations`, чтобы спасение
+# оборванного ответа (`salvage_list`) работало и здесь.
+_COMPACT_CODES = {
+    "s": "size", "t": "tolerance", "r": "roughness", "th": "thread", "rd": "radius",
+    "m": "material", "tb": "title_block", "c": "callout", "p": "position", "n": "note",
+}
+_COMPACT_LEGEND = (
+    "s — размер, t — допуск, r — шероховатость, th — резьба, rd — радиус, "
+    "m — материал, tb — основная надпись (штамп), c — надпись у выноски, "
+    "p — номер позиции у выноски, n — примечание"
+)
+
+_SHEET_PROMPT_COMPACT = """Прочитай чертёж и верни JSON:
+
+{{"sheet_type": "detail|assembly|scheme|unknown",
+  "annotations": [
+    ["<код>", "надпись как на листе", x1, y1, x2, y2]
+  ]}}
+
+Коды: {codes}.
+
+Правила:
+- x1, y1, x2, y2 — целые тысячные доли стороны листа от 0 до 1000, порядок: лево, верх, право, низ.
+- Знак диаметра пиши как ⌀, допуск как ±, шероховатость как Ra/Rz.
+- Размер, посадку и допуск пиши одной надписью, как на листе: «⌀44H7», «20±0,1».
+- p — номер позиции у выноски на сборочном чертеже.
+- tb — надписи основной надписи (штампа).
+- Служебные графы бланка («Инв. № подл.», «Взам. инв. №», «Подп. и дата») пропускай.
+- Не повторяй одну надпись дважды и не выдумывай надписей, которых нет.{hint}
+"""
+
 _TITLE_BLOCK_PROMPT = """На картинке — основная надпись (штамп) чертежа, вырезанная с листа.
 Верни JSON:
 
@@ -472,10 +509,11 @@ class QwenVisionClient:
 
     def _sheet_prompt(self, hint: str) -> str:
         """Запрос прохода «лист целиком». Один и тот же для листа и частей."""
-        prompt = _SHEET_PROMPT.format(
-            categories=", ".join(CATEGORIES),
-            hint=f"\n- Подсказка по разметке листа: {hint}" if hint else "",
-        )
+        hint_rule = f"\n- Подсказка по разметке листа: {hint}" if hint else ""
+        if settings.DRAWING_SHEET_COMPACT_JSON:
+            prompt = _SHEET_PROMPT_COMPACT.format(codes=_COMPACT_LEGEND, hint=hint_rule)
+        else:
+            prompt = _SHEET_PROMPT.format(categories=", ".join(CATEGORIES), hint=hint_rule)
         if settings.DRAWING_DIMENSION_FIDELITY:
             prompt += _SIGN_RULE + _CAREFUL_LETTERS_RULE
         if settings.DRAWING_SMALL_PRINT_CARE:
@@ -528,7 +566,7 @@ class QwenVisionClient:
         if not isinstance(annotations, list):
             logger.warning("Модель вернула JSON без списка annotations")
             annotations = []
-        readable, lost = as_annotations(annotations)
+        readable, lost = as_annotations(annotations, compact=settings.DRAWING_SHEET_COMPACT_JSON)
         if lost:
             # Вид элемента называется в логе: каким именно он был, по
             # сохранённому ответу уже не узнать — сырые ответы модели нигде
@@ -1162,7 +1200,33 @@ def _is_bbox_fraction(text: str) -> bool:
     return 0.0 <= value <= 1.0
 
 
-def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+def compact_annotation(item: Any) -> Optional[Dict[str, Any]]:
+    """
+    Надпись сжатого вида `[код, надпись, x1, y1, x2, y2]` -> объект
+    `{category, value, bbox}`; не тот вид — None. Рамка в тысячных долях
+    делится на 1000; рамка, пришедшая дробями до 1, остаётся как есть.
+    Неизвестный код остаётся категорией как есть: дальше его разбирают
+    правила, как любую выдуманную моделью категорию.
+    """
+    if not isinstance(item, (list, tuple)) or len(item) != 6:
+        return None
+    code, value, *box = item
+    if not isinstance(code, str) or isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in box):
+        return None
+    whole = all(float(v).is_integer() for v in box)
+    scale = 1000.0 if whole or max(box) > 1.0 else 1.0
+    return {
+        "category": _COMPACT_CODES.get(code.strip(), code.strip()),
+        "value": value if isinstance(value, str) else str(value),
+        "bbox": [round(float(v) / scale, 4) for v in box],
+    }
+
+
+def as_annotations(
+    items: Sequence[Any], compact: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Элементы списка `annotations` в надписи. Возвращает надписи и счётчик
     видов, которые надписью стать не смогли.
@@ -1201,6 +1265,10 @@ def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str
     Обе разновидности считаются потерянными, а не выбрасываются: счётчик
     виден в логе и в payload, поэтому если правило начнёт отказывать
     настоящим прочтениям, это будет заметно по числу, а не по тишине.
+
+    `compact` — запрос был сжатого вида (DRAWING_SHEET_COMPACT_JSON):
+    массив `[код, надпись, x1, y1, x2, y2]` — это надпись, а не вложенный
+    список; код в одиночку — слово схемы. Объекты принимаются и тогда.
     """
     annotations: List[Dict[str, Any]] = []
     lost: Dict[str, int] = {}
@@ -1209,6 +1277,14 @@ def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str
         if isinstance(item, dict):
             annotations.append(item)
             return
+        if compact:
+            unpacked = compact_annotation(item)
+            if unpacked is not None:
+                annotations.append(unpacked)
+                return
+            if isinstance(item, str) and item.strip() in _COMPACT_CODES:
+                lost["слово схемы"] = lost.get("слово схемы", 0) + 1
+                return
         if isinstance(item, str):
             text = item.strip()
             if not text:

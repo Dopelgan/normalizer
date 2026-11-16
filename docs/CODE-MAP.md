@@ -177,6 +177,7 @@
 | `DRAWING_FIELD_CATEGORY_STRICT` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_CATEGORY_PROSE_GUARD` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_SMALL_PRINT_CARE` | `false` | `core/providers/qwen_client.py` |
+| `DRAWING_SHEET_COMPACT_JSON` | `false` | `core/providers/qwen_client.py` (`_sheet_prompt`, `as_annotations`, `compact_annotation`) |
 | `DRAWING_AUTO_ROTATE` | `true` | `core/providers/drawing_vision.py` |
 | `RASTER_FRAME_THIN_LINES` | `false` | `core/providers/raster_drawing.py` |
 | `FRAME_TABLE_GUARD_ENABLED` | `false` | `core/providers/mineru_parser.py` |

@@ -893,6 +893,14 @@ class Settings(BaseSettings):
     # DRAWING_PASSES_PARALLEL x DRAWING_TRANSCRIBE_TILE_PARALLEL, поэтому на
     # проде — только вместе с GPU_GATE_ENABLED. На проде предлагается 3.
     DRAWING_PASSES_PARALLEL: int = 1
+    # Сжатый ответ прохода «лист целиком» (core/providers/qwen_client.py,
+    # `_SHEET_PROMPT_COMPACT`): надпись — массив `[код, надпись, x1, y1, x2,
+    # y2]` с рамкой в целых тысячных долях листа вместо объекта
+    # `{"category", "value", "bbox"}` с дробями. Меньше токенов ответа у
+    # самого дорогого прохода. Разбор принимает оба вида и сводит к тем же
+    # объектам, дальше всё прежнее; точность рамки — 0,001 стороны листа.
+    # Текст запроса другой, поэтому и ключи кэша ответов другие.
+    DRAWING_SHEET_COMPACT_JSON: bool = False
     # Места на видеокарте для фоновых вызовов разбора
     # (core/providers/gpu_gate.py). Один счётчик на все воркеры в Redis
     # Celery: днём (GPU_GATE_BUSY_HOURS_UTC, «4-13» — с 4:00 до 12:59 UTC,
