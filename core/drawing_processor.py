@@ -378,10 +378,15 @@ class DrawingProcessor:
             if lines:
                 payload["transcript_lines"] = lines
             if reading is not None and settings.DRAWING_SHEET_GUARDED:
-                reading = self._guard_empty_sheet(
-                    layout, reading, max(len(lines or []), self._layer_lines.get(int(page), 0)),
-                    budget_started,
+                # Слой распознавания — только у листа целиком: у вырезки вида
+                # `page` всегда 1, и чужая страница решала бы за неё.
+                layer = self._layer_lines.get(int(page), 0) if log_page is None else 0
+                guarded = self._guard_empty_sheet(
+                    layout, reading, max(len(lines or []), layer), budget_started,
                 )
+                if guarded is not reading:
+                    reading = guarded
+                    self._sheet_record(reading, payload)
                 guard = _guard_note(reading)
                 if guard:
                     payload["sheet_guard"] = guard

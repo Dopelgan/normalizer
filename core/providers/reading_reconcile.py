@@ -215,9 +215,15 @@ def choose(readings: Sequence[Dict[str, str]], primary: str) -> Tuple[str, str]:
     def rank(key: str) -> tuple:
         return (len(support[key]), plausible(first[key]), key in primary_keys)
 
-    ordered = sorted(support, key=rank, reverse=True)
-    best, runner = ordered[0], ordered[1]
-    if len(support[best]) > len(support[runner]) and len(support[best]) >= 2:
+    # Текст без мест (строки листа, слой распознавания) сам значение не
+    # меняет: «15» в тексте может быть другой надписью, чем «1,5» на листе.
+    # Чужое прочтение побеждает, только если его видел проход с местом.
+    placed = {SHEET, CROP, VECTOR}
+    contenders = [key for key in support if support[key] & placed]
+    ordered = sorted(contenders, key=rank, reverse=True)
+    best = ordered[0]
+    runner = max(len(support[key]) for key in support if key != best)
+    if len(support[best]) > runner and len(support[best]) >= 2:
         return first[best], AGREED
     return first[best], CONFLICT
 
@@ -258,7 +264,10 @@ def reconcile_page(drawings: List[Fragment], layer_lines: Sequence[str]) -> None
     model = [f for f in drawings if f not in vector]
     if not model:
         return
-    primary = max(model, key=lambda f: (_is_whole_sheet(f), len(f.content.structured_drawing_fields or [])))
+    whole = [f for f in model if _is_whole_sheet(f)]
+    if not whole:
+        return      # без листа целиком рамки вырезок сравнивать не с чем
+    primary = max(whole, key=lambda f: len(f.content.structured_drawing_fields or []))
     crops = [f for f in model if f is not primary]
     transcript = expressions((primary.content.text or "").split("\n"))
     layer = expressions(layer_lines)
@@ -293,8 +302,11 @@ def reconcile_page(drawings: List[Fragment], layer_lines: Sequence[str]) -> None
             value = _text_reading(field.value, candidates)
             if value is not None:
                 readings.append({"source": source, "value": value})
+        here = _centre(field.bbox)
         for other in vector_fields:
-            if same_inscription(other.value, field.value):
+            there = _centre(other.bbox)
+            if (same_inscription(other.value, field.value) and here is not None
+                    and there is not None and math.dist(here, there) <= NEAR):
                 readings.append({"source": VECTOR, "value": other.value})
                 break
         value, agreement = choose(readings, SHEET)

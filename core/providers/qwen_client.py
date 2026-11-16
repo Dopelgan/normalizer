@@ -640,6 +640,7 @@ class QwenVisionClient:
         схема ответа, срок от потолка токенов, в кэш — только принятый ответ.
         Отказ vLLM принять схему — тот же вызов без схемы.
         """
+        _rejection.status = None
         limit = self._sheet_max_tokens() or settings.QWEN_MAX_TOKENS
         timeout = max(int(self.timeout),
                       -(-int(limit) // max(1, int(settings.QWEN_MIN_TOKENS_PER_SECOND))))
@@ -1010,7 +1011,9 @@ class QwenVisionClient:
         key = cache_key(self._base(), body, encoded)
         image_url["url"] = encoded
         cached = cache_get(key)
-        if cached is None and settings.VLM_CACHE_V1_FALLBACK:
+        # Ключ прежней версии не знал формата ответа: под схемой (ограждённый
+        # проход листа) старый ответ без схемы не берётся.
+        if cached is None and settings.VLM_CACHE_V1_FALLBACK and response_format is None:
             # Временно (VLM_CACHE_V1_FALLBACK): промах по новому ключу
             # проверяется по ключу прежней версии. Тело запроса у неё было
             # из тех же полей, и все её записи сделаны одним сервером прода,
@@ -1018,7 +1021,7 @@ class QwenVisionClient:
             # переписывается под новый ключ и дальше берётся оттуда; старый
             # файл не трогается.
             cached = cache_get(cache_key_v1(self.model, limit, prompt, encoded))
-            if cached is not None:
+            if cached is not None and (accept is None or accept(*cached)):
                 cache_put(key, cached)
         if cached is not None and accept is not None and not accept(*cached):
             # Замороженный сбой прежнего разбора (пустой, зацикленный,

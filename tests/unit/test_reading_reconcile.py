@@ -117,6 +117,27 @@ class TestSources:
         assert size.value == "⌀4,5+0,2" and size.agreement == VECTOR
         assert size.confidence < 0.95       # подтверждает только человек
 
+    def test_far_vector_text_is_another_inscription(self):
+        sheet = drawing([field("M6x0,75", [0.1, 0.1, 0.14, 0.12], category="thread")])
+        layer = drawing([field("M6x1", [0.8, 0.8, 0.84, 0.82], category="thread")],
+                        method="vector_text_layer", name="vector")
+        reading_reconcile.apply([sheet, layer])
+        assert sheet.content.structured_drawing_fields[0].value == "M6x0,75"
+
+    def test_text_alone_does_not_change_the_value(self):
+        sheet = drawing([field("1,5*", [0.9, 0.73, 0.92, 0.75])], text="15*")
+        fragments = [sheet, ocr("15*")]
+        reading_reconcile.apply(fragments)
+        size = sheet.content.structured_drawing_fields[0]
+        assert size.value == "1,5*" and size.agreement == CONFLICT
+
+    def test_page_without_whole_sheet_is_left_as_is(self):
+        one = drawing([field("⌀18", [0.1, 0.1, 0.2, 0.2])], bbox=(0.0, 0.0, 0.5, 0.5), name="a")
+        two = drawing([field("⌀18", [0.2, 0.2, 0.4, 0.4])], bbox=(0.0, 0.0, 0.5, 0.5), name="b")
+        reading_reconcile.apply([one, two])
+        assert len(two.content.structured_drawing_fields) == 1
+        assert one.content.structured_drawing_fields[0].agreement is None
+
     def test_notation_difference_is_agreement(self):
         sheet = drawing([field("⌀6,6−0,05", [0.16, 0.25, 0.18, 0.33])], text="⌀6,6-0.05")
         reading_reconcile.apply([sheet])
