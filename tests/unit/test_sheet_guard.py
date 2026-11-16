@@ -104,6 +104,16 @@ class TestVerdict:
         values = ["⌀8"] * 4 + [f"{n}" for n in range(20)]
         assert sheet_verdict("stop", [{"value": v} for v in values]) is None
 
+    def test_four_holes_on_a_small_sheet_are_not_a_loop(self):
+        values = ["⌀6"] * 4 + [str(n) for n in range(8)]
+        assert sheet_verdict("stop", [{"value": v} for v in values]) is None
+
+    def test_loop_keeps_the_same_text_in_other_places(self):
+        same = {"category": "size", "value": "⌀8", "bbox": [0.1, 0.1, 0.2, 0.2]}
+        elsewhere = {"category": "size", "value": "⌀8", "bbox": [0.7, 0.7, 0.8, 0.8]}
+        kept = qwen_client._first_of_each([same] * 10 + [elsewhere, {"value": "⌀10"}])
+        assert kept == [same, elsewhere, {"value": "⌀10"}]
+
     def test_short_list_is_never_a_loop(self):
         assert sheet_verdict("stop", [{"value": "⌀8"}] * 9) is None
 

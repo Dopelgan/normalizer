@@ -467,9 +467,10 @@ REJECT_LOOP = "loop"      # модель зациклилась на одной 
 REJECT_EMPTY = "empty"    # надписей нет, а текст на листе есть
 
 # Зацикленный ответ: одно значение у большей доли надписей, чем эта, при
-# списке не короче _LOOP_MIN_ITEMS. Настоящий лист так не выглядит: «⌀8» у
-# каждого из восьми отверстий — восемь из сотни, а не треть списка.
-_LOOP_SHARE = 0.3
+# списке не короче _LOOP_MIN_ITEMS. Порог — половина, а не треть: на малом
+# листе «⌀6» у четырёх отверстий из двенадцати надписей — треть, и это
+# настоящий лист.
+_LOOP_SHARE = 0.5
 _LOOP_MIN_ITEMS = 10
 # Строк текста на листе, при которых пустой ответ по надписям — сбой, а не
 # пустой лист.
@@ -1243,17 +1244,22 @@ def sheet_answer_accepted(content: str, finish: Optional[str]) -> bool:
 def _first_of_each(annotations: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Хвост зацикленного ответа отбрасывается: у значения, которое занимает
-    больше _LOOP_SHARE списка, остаётся первое прочтение. Прочие надписи —
-    и повторы среди них («⌀8» у каждого отверстия) — не трогаются.
+    больше _LOOP_SHARE списка, убираются повторы на том же месте (та же
+    рамка или рамка по умолчанию — места у повтора нет). Тот же текст в
+    другом месте листа остаётся: «⌀6» стоит у каждого отверстия.
     """
     values = [_item_value(annotation) for annotation in annotations]
     looping = {value for value in set(values) if values.count(value) > _LOOP_SHARE * len(values)}
     seen, kept = set(), []
     for annotation, value in zip(annotations, values):
         if value in looping:
-            if value in seen:
+            box = annotation.get("bbox") if isinstance(annotation, dict) else None
+            place = tuple(box) if isinstance(box, (list, tuple)) and len(box) == 4 else None
+            if place == (0.0, 0.0, 1.0, 1.0):
+                place = None
+            if (value, place) in seen or (place is None and any(v == value for v, _ in seen)):
                 continue
-            seen.add(value)
+            seen.add((value, place))
         kept.append(annotation)
     return kept
 

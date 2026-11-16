@@ -124,6 +124,21 @@ class TestSources:
         reading_reconcile.apply([sheet, layer])
         assert sheet.content.structured_drawing_fields[0].value == "M6x0,75"
 
+    def test_vector_digits_without_decimal_form_are_another_inscription(self):
+        sheet = drawing([field("1,5", [0.30, 0.30, 0.33, 0.32])])
+        layer = drawing([field("15", [0.31, 0.30, 0.33, 0.32]), field("1,5", [0.60, 0.60, 0.63, 0.62])],
+                        method="vector_text_layer", name="vector")
+        reading_reconcile.apply([sheet, layer])
+        size = sheet.content.structured_drawing_fields[0]
+        assert size.value == "1,5" and size.agreement == SINGLE
+
+    def test_nearest_vector_field_is_taken(self):
+        sheet = drawing([field("⌀4,5-0,2", [0.46, 0.39, 0.48, 0.46])])
+        layer = drawing([field("⌀4,5+0,2", [0.49, 0.40, 0.51, 0.47]), field("⌀4,5-0,2", [0.46, 0.39, 0.48, 0.46])],
+                        method="vector_text_layer", name="vector")
+        reading_reconcile.apply([sheet, layer])
+        assert sheet.content.structured_drawing_fields[0].value == "⌀4,5-0,2"
+
     def test_text_alone_does_not_change_the_value(self):
         sheet = drawing([field("1,5*", [0.9, 0.73, 0.92, 0.75])], text="15*")
         fragments = [sheet, ocr("15*")]

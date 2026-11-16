@@ -53,8 +53,8 @@ VECTOR = "vector"          # текстовый слой векторного PD
 
 AGREED, SINGLE, CONFLICT = "agreed", "single", "conflict"
 
-# Уверенность по согласию. Текстовый слой — не 0.99, а ниже порога
-# подтверждения (0.95, core/drawing_quality.py): подтверждает только человек.
+# Уверенность по согласию. Текстовый слой — 0.94, ниже порога подтверждения
+# 0.95 (core/drawing_quality.py): подтверждает только человек.
 CONFIDENCE = {VECTOR: 0.94, AGREED: 0.9, SINGLE: 0.7, CONFLICT: 0.4}
 
 # Два прочтения — одна надпись, если центры рамок ближе этой доли листа.
@@ -261,7 +261,8 @@ def apply(fragments: List[Fragment]) -> List[Fragment]:
 def reconcile_page(drawings: List[Fragment], layer_lines: Sequence[str]) -> None:
     """Поля чертёжных фрагментов одной страницы."""
     vector = [f for f in drawings if f.provenance.method == "vector_text_layer"]
-    model = [f for f in drawings if f not in vector]
+    vector_ids = {id(f) for f in vector}
+    model = [f for f in drawings if id(f) not in vector_ids]
     if not model:
         return
     whole = [f for f in model if _is_whole_sheet(f)]
@@ -302,13 +303,9 @@ def reconcile_page(drawings: List[Fragment], layer_lines: Sequence[str]) -> None
             value = _text_reading(field.value, candidates)
             if value is not None:
                 readings.append({"source": source, "value": value})
-        here = _centre(field.bbox)
-        for other in vector_fields:
-            there = _centre(other.bbox)
-            if (same_inscription(other.value, field.value) and here is not None
-                    and there is not None and math.dist(here, there) <= NEAR):
-                readings.append({"source": VECTOR, "value": other.value})
-                break
+        layer_twin = _vector_twin(field, vector_fields)
+        if layer_twin is not None:
+            readings.append({"source": VECTOR, "value": layer_twin.value})
         value, agreement = choose(readings, SHEET)
         _set(field, value, readings, agreement)
 
@@ -336,6 +333,35 @@ def reconcile_page(drawings: List[Fragment], layer_lines: Sequence[str]) -> None
                 _set(field, field.value, [{"source": CROP, "value": field.value}], SINGLE)
             kept.append(field)
         crop.content.structured_drawing_fields = kept
+
+
+def _numbers(value: Any) -> List[str]:
+    """Числа записи с десятичной точкой: «1,5» -> ["1.5"], «15» -> ["15"]."""
+    return [number.replace(",", ".") for number in _GROUP.findall(str(value or ""))]
+
+
+def _vector_twin(field: DrawingField, vector_fields: Sequence[DrawingField]) -> Optional[DrawingField]:
+    """
+    Поле текстового слоя той же надписи: те же числа с той же десятичной
+    записью («1,5» не «15»), тот же вид, ближайшее к полю и не дальше
+    размера его рамки (не больше NEAR). Текстовый слой побеждает в выборе
+    значения, поэтому совпадения только по цифрам здесь мало.
+    """
+    here = _centre(field.bbox)
+    if here is None:
+        return None
+    x1, y1, x2, y2 = (float(v) for v in field.bbox)
+    radius = min(NEAR, max(x2 - x1, y2 - y1))
+    numbers, shape = _numbers(field.value), kind(field.value)
+    best, best_distance = None, None
+    for other in vector_fields:
+        there = _centre(other.bbox)
+        if there is None or kind(other.value) != shape or _numbers(other.value) != numbers:
+            continue
+        distance = math.dist(here, there)
+        if distance <= radius and (best_distance is None or distance < best_distance):
+            best, best_distance = other, distance
+    return best
 
 
 def _nearest(field: DrawingField, crop_fields: Sequence[tuple], taken: set,
