@@ -44,6 +44,7 @@
 | **Задача разбора — главный оркестратор** | `ingest/tasks.py` | `process_document` (358) |
 | Поиск файла по `s3_fileid` | `core/providers/file_locator.py` | `FileLocator.locate` (64); перебор расширений `_candidates` (120), вложения чата `_locate_attachment` (127) |
 | Хранилище (S3/локальное, запись только в свой том) | `core/providers/storage.py` | — |
+| Срок хранения `raw_parse`/`assets`/`chunks` (SC9, CLI, по умолчанию отчёт) | `ingest/retention.py` | `classify`, `run`, `main`; список нужного — из RAG `scripts/db_retention.py parser-keep-list` |
 | Срок задачи и его резерв | `core/deadline.py` | `scope` (26), `remaining` (35), `bounded` (41) |
 
 ### 1.3. Лестница уровней — где решается, какой уровень выбран
