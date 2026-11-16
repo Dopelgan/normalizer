@@ -25,7 +25,7 @@ from core.config import settings
 from core.ladder.base import Strategy
 from core.ladder.context import SOURCE_RASTER, DocumentContext
 from core.models.parse_result import ParsedBlock, ParseResult
-from core.providers.mineru_parser import MinerUParserProvider
+from core.providers.mineru_parser import MinerUParserProvider, MinerUPrefetch
 from core.providers.storage import StorageProvider
 from core.providers.tesseract_fallback import TesseractFallbackProvider
 
@@ -110,8 +110,19 @@ class LayoutStrategy(Strategy):
             return False
         return True
 
-    def run(self, context: DocumentContext) -> ParseResult:
-        result = self.provider.parse(context.uri, context.file_type, context.metadata)
+    def prefetch(self, context: DocumentContext) -> MinerUPrefetch:
+        """Начать запрос к MinerU заранее — только HTTP, в одном потоке."""
+        return self.provider.prefetch(context.uri, context.file_type, context.metadata)
+
+    def run(
+        self, context: DocumentContext, prefetched: Optional[MinerUPrefetch] = None,
+    ) -> ParseResult:
+        if prefetched is None:
+            result = self.provider.parse(context.uri, context.file_type, context.metadata)
+        else:
+            result = self.provider.parse(
+                context.uri, context.file_type, context.metadata, prefetched=prefetched
+            )
         if not result.blocks:
             raise ValueError("Разбор с детекцией областей не дал блоков")
         result.parser_name = result.parser_name or self.name
