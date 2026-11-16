@@ -97,12 +97,16 @@ _GLUED_MAX_LEN = 200
 # Склейка чисел. Многострочную ячейку с номерами (заводские номера партии,
 # «р/с» + «БИК» + «к/с» в платёжке) модель таблиц отдаёт одним числом без
 # пробелов: «4585445855…», и ни один номер в поиске уже не находится. Внутри
-# числа граница по слою ставится, только если каждый кусок стоит в слое той
-# же страницы отдельным словом буква в букву и не короче
-# `_GLUED_NUMBER_PIECE_MIN` цифр (TABLE_SPLIT_GLUED_NUMBERS).
+# числа граница ставится только по строкам слоя в рамке той же таблицы
+# (split_glued_number), куски не короче `_GLUED_NUMBER_PIECE_MIN` цифр
+# (TABLE_SPLIT_GLUED_NUMBERS).
 _GLUED_NUMBER_MIN_LEN = 8
 _GLUED_NUMBER_PIECE_MIN = 4
 _DIGITS_RE = re.compile(r"^[0-9]+$")
+# Склеенное число в тексте ячейки: цифры без соседних букв и цифр.
+_GLUED_DIGITS_RE = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])[0-9]{8,}(?![0-9A-Za-zА-Яа-яЁё])")
+# Счёт в банке (р/с, к/с) — ровно 20 цифр: такая склейка не режется.
+_ACCOUNT_DIGITS = 20
 # Знаки, которые снимаются с краёв слова слоя при сборке словаря.
 _WORD_EDGE = "|.,;:!?()[]{}<>«»\"'*_-–—/\\"
 _MARKUP_RE = re.compile(r"(<[^>]*>)")
@@ -1325,6 +1329,8 @@ def _fix_table(
         stats.repaired_tables += 1
 
     unused = _repair_table_cells(block, matched, stats)
+    if settings.TABLE_SPLIT_GLUED_NUMBERS:
+        _split_glued_number_cells(block, matched, stats)
     if vocab is None:
         return [], []
     _split_glued_cells(block, vocab, stats, exact, turn)
@@ -1744,48 +1750,110 @@ def _split_token(
     return pieces[::-1]
 
 
-def split_glued_number(core: str, vocab: Dict[str, str]) -> Optional[List[str]]:
+def split_glued_number(core: str, lines: Sequence["TextLine"]) -> Optional[List[str]]:
     """
-    Склеенные числа ячейки по числам слоя или None.
+    Склеенные числа ячейки таблицы по строкам слоя этой таблицы или None.
 
-    Число режется, только если оно целиком раскладывается на числа, которые
-    слой страницы знает отдельными словами (`vocab.verbatim`, буква в букву:
-    свёртка букв сравнивает «3» и «з» как одно), каждое не короче
-    `_GLUED_NUMBER_PIECE_MIN` цифр, и кусков не меньше двух. Само число,
-    которое стоит в слое целиком, не трогается. Из разложений берётся то, где
-    кусков меньше.
+    Доказательство берётся только из строк слоя внутри рамки таблицы, а не из
+    словаря всей страницы. Число режется, если:
+
+    - оно целиком раскладывается на числа, каждое из которых стоит в какой-то
+      строке слоя отдельным словом, не короче `_GLUED_NUMBER_PIECE_MIN` цифр;
+    - все куски взяты из разных строк слоя (номер на своей строке ячейки);
+    - само число не стоит ни в одной строке слоя, даже с пробелом внутри
+      («4070281033 8290030371» — тот же счёт с лишним пробелом);
+    - оно не похоже на счёт (ровно 20 цифр) или дату ДДММГГГГ: такие склейки
+      неотличимы от настоящего значения и не режутся вовсе.
+
+    Из разложений берётся то, где кусков меньше.
     """
     if (len(core) < _GLUED_NUMBER_MIN_LEN or len(core) > _GLUED_MAX_LEN
-            or not _DIGITS_RE.match(core)):
+            or not _DIGITS_RE.match(core) or len(core) == _ACCOUNT_DIGITS
+            or _looks_like_date(core)):
         return None
-    words = getattr(vocab, "verbatim", None) or ()
-    numbers = {word for word in words
-               if len(word) >= _GLUED_NUMBER_PIECE_MIN and _DIGITS_RE.match(word)}
-    if not numbers or core in numbers:
+    owners: Dict[str, set] = {}
+    for index, line in enumerate(lines):
+        text = line.text or ""
+        if core in "".join(text.split()):
+            return None
+        for word in text.split():
+            word = word.strip(_WORD_EDGE)
+            if len(word) >= _GLUED_NUMBER_PIECE_MIN and _DIGITS_RE.match(word):
+                owners.setdefault(word, set()).add(index)
+    if not owners:
         return None
-    lengths = sorted({len(number) for number in numbers})
+    lengths = sorted({len(number) for number in owners}, reverse=True)
     size = len(core)
-    # best[конец] — (кусков, начало последнего куска) лучшего разбора core[:конец].
-    best: Dict[int, Tuple[int, int]] = {0: (0, -1)}
-    for start in range(size):
-        if start not in best:
-            continue
+    best: Optional[List[str]] = None
+
+    def search(start: int, pieces: List[str], used: set) -> None:
+        nonlocal best
+        if best is not None and len(pieces) + 1 >= len(best):
+            return
         for length in lengths:
             stop = start + length
             if stop > size:
-                break
-            if core[start:stop] in numbers and (
-                    stop not in best or best[stop][0] > best[start][0] + 1):
-                best[stop] = (best[start][0] + 1, start)
-    if size not in best or best[size][0] < 2:
-        return None
-    pieces: List[str] = []
-    stop = size
-    while stop:
-        start = best[stop][1]
-        pieces.append(core[start:stop])
-        stop = start
-    return pieces[::-1]
+                continue
+            piece = core[start:stop]
+            free = owners.get(piece, set()) - used
+            if not free:
+                continue
+            line = min(free)
+            if stop == size:
+                if pieces and (best is None or len(pieces) + 1 < len(best)):
+                    best = pieces + [piece]
+                continue
+            search(stop, pieces + [piece], used | {line})
+
+    search(0, [], set())
+    return best
+
+
+def _looks_like_date(core: str) -> bool:
+    """Восемь цифр датой ДДММГГГГ или ГГГГММДД."""
+    if len(core) != 8:
+        return False
+    day, month, year = int(core[:2]), int(core[2:4]), int(core[4:])
+    if 1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2100:
+        return True
+    year, month, day = int(core[:4]), int(core[4:6]), int(core[6:])
+    return 1900 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31
+
+
+def _split_glued_number_cells(
+    block: ParsedBlock, matched: Sequence["TextLine"], stats: "ReconcileStats",
+) -> None:
+    """Склеенные числа в ячейках, HTML и тексте таблицы (TABLE_SPLIT_GLUED_NUMBERS)."""
+    cache: Dict[str, Optional[List[str]]] = {}
+
+    def fix_text(text: str) -> str:
+        def fix(match: "re.Match[str]") -> str:
+            core = match.group(0)
+            if core not in cache:
+                cache[core] = split_glued_number(core, matched)
+            pieces = cache[core]
+            if not pieces:
+                return core
+            stats.split_tokens += 1
+            return " ".join(pieces)
+        return _GLUED_DIGITS_RE.sub(fix, text)
+
+    table = block.table_data or {}
+    if table:
+        table["headers"] = [fix_text(h) if isinstance(h, str) else h for h in (table.get("headers") or [])]
+        table["rows"] = [[fix_text(c) if isinstance(c, str) else c for c in row]
+                         for row in (table.get("rows") or [])]
+        block.table_data = table
+    if block.table_html:
+        parts = _MARKUP_RE.split(block.table_html)
+        for index in range(0, len(parts), 2):
+            parts[index] = fix_text(parts[index])
+        block.table_html = "".join(parts)
+    if block.text:
+        parts = _MARKUP_RE.split(block.text)
+        for index in range(0, len(parts), 2):
+            parts[index] = fix_text(parts[index])
+        block.text = "".join(parts)
 
 
 def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
@@ -1794,11 +1862,6 @@ def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
     куски и целые слова взяты в написании слоя, если слою можно верить.
     """
     core = token.strip(_WORD_EDGE)
-    if settings.TABLE_SPLIT_GLUED_NUMBERS:
-        numbers = split_glued_number(core, vocab)
-        if numbers:
-            start = token.index(core)
-            return token[:start] + " ".join(numbers) + token[start + len(core):]
     label = _stamp_label(core, vocab)
     if label is not None:
         # Подпись штампа — из закрытого словаря целиком: цифра в ней («И3м.»)
@@ -1967,6 +2030,11 @@ def _lines_with_new_words(
     for row in table.get("rows") or []:
         cells.extend(str(c) for c in row)
     known = {_fold_word(w) for w in _TOKEN_RE.findall(" ".join(cells))}
+    if vector:
+        # Число в ячейке и в строке слоя записано по-разному («30 000,00» и
+        # «30000,00»): сравниваются цифры без пробелов внутри.
+        known |= {_fold_word(w) for cell in cells
+                  for w in _TOKEN_RE.findall(re.sub(r"(?<=\d)\s+(?=\d)", "", cell))}
     kept: List[TextLine] = []
     min_new = 1 if vector else _TABLE_LINE_MIN_NEW_WORDS
     for line in lines:

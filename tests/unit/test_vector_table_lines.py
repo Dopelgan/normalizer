@@ -109,3 +109,14 @@ def test_ocr_layer_rules_unchanged(enabled):
     lay = TextLayer(pages={1: [line("Итого:", 0.50, x=0.69, width=0.05)]}, page_count=1)
     blocks, stats = reconcile_with_text_layer([table], lay, source=OCR_LAYER)
     assert "Итого" not in " ".join(texts(blocks))
+
+
+def test_number_formatted_differently_is_not_new(enabled):
+    # Ревью 16.11: в ячейке «30 000,00», в слое «30000,00» — строка позиции не
+    # должна возвращаться текстом повтором всей строки таблицы.
+    table = goods_table()
+    lay = TextLayer(pages={1: [line("1 Ресертификационный аудит 1 усл 30000,00 30000,00", 0.47)]},
+                    page_count=1)
+    blocks, stats = reconcile_with_text_layer([table], lay)
+    assert "Ресертификационный" not in " ".join(texts(blocks))
+    assert stats.table_lines_kept == 0
