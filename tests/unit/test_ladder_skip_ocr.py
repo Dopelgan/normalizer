@@ -160,3 +160,16 @@ class TestRouterSkip:
         assert result.ladder["chosen_level"] == 5
         assert result.fallback_reserve is not None
         assert result.fallback_reserve.parser_name == "fixed-2"
+
+    def test_level2_failure_keeps_level4_as_safety_net(self, skip_on):
+        ocr = Fixed(4, fallback=True)
+        result = ladder(Fixed(2, fail=True), ocr, Fixed(5, fail=True)).parse(context())
+        assert ocr.ran
+        assert result.ladder["chosen_level"] == 4
+
+    def test_later_level_errors_do_not_mark_a_layer_win(self, skip_on):
+        """Ошибка уровня 6/7 при живом уровне 5 — не деградация слоя."""
+        result = ladder(Fixed(2, chars=1000), Fixed(4, fallback=True),
+                        Fixed(5, chars=100, structured=True), Fixed(6, fail=True)).parse(context())
+        assert result.ladder["chosen_level"] == 2
+        assert result.ladder["fallback_won"] is False

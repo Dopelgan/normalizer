@@ -213,19 +213,15 @@ class LadderRouter:
         classification = context.classification
         # Полный текстовый слой: уровень 4 не запускается, его роль (мерка
         # сохранности и запас для чертёжной ветки) отдаётся уровню 2 — явно,
-        # без пометки `is_fallback` на самом результате.
+        # без пометки `is_fallback` на самом результате. Пропуск решается,
+        # только когда уровень 2 уже дал результат: не справился он — уровень
+        # 4 работает как прежде и остаётся страховкой.
         substitute_level: Optional[int] = None
-        if settings.LADDER_SKIP_OCR_ON_TEXT_LAYER and any(s.level == 4 for s in applicable):
-            layer = complete_text_layer(context)
-            levels = {s.level for s in applicable}
-            if layer is not None and 2 in levels:
-                applicable = [s for s in applicable if s.level != 4]
+        complete_layer = None
+        if settings.LADDER_SKIP_OCR_ON_TEXT_LAYER and {2, 4} <= {s.level for s in applicable}:
+            complete_layer = complete_text_layer(context)
+            if complete_layer is not None:
                 substitute_level = 2
-                telemetry.add("parse.level4_ms", 0.0)
-                logger.info(
-                    "Уровень 4 пропущен для %s: текстовый слой полный — страниц %d, символов %d",
-                    context.uri, layer.pages, layer.chars,
-                )
         # Скан: запрос к MinerU уходит до уровня 4 и идёт, пока Tesseract
         # читает те же страницы. Ответ забирает уровень 5, остальное — как
         # без флага (`LADDER_PARALLEL_LAYOUT`).
@@ -272,6 +268,13 @@ class LadderRouter:
             return (int(retains), unit_coverage, int(structured and retains), evaluated.value)
 
         for strategy in applicable:
+            if strategy.level == 4 and substitute is not None:
+                telemetry.add("parse.level4_ms", 0.0)
+                logger.info(
+                    "Уровень 4 пропущен для %s: текстовый слой полный — страниц %d, символов %d",
+                    context.uri, complete_layer.pages, complete_layer.chars,
+                )
+                continue
             left = deadline.remaining()
             if left is not None and left < settings.LADDER_MIN_REMAINING:
                 logger.warning("Уровень %d пропущен: до срока задачи %.0f с", strategy.level, left)
@@ -425,12 +428,10 @@ class LadderRouter:
         # выглядит разобранным, а в индекс уехала каша.
         fallback_won = best.is_fallback and structural_seen
         if substitute is not None and best is substitute:
-            # Слой файла стоит на месте распознавания: если уровень структуры
-            # после него не справился, это та же деградация, что победа
-            # фоллбэка, и помечается она так же.
-            fallback_won = any(
-                a.error and a.level > substitute_level for a in attempts
-            )
+            # Слой файла стоит на месте распознавания: если уровень 5 после
+            # него не справился, это та же деградация, что победа фоллбэка, и
+            # помечается она так же.
+            fallback_won = any(a.error and a.level == 5 for a in attempts)
         if fallback_won:
             # Балл победителя пересчитывается честно: структуру на этом
             # документе кто-то вернул, значит её отсутствие здесь — не
