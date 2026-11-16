@@ -61,16 +61,16 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core import filetypes
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import deadline
+from core import deadline, outage
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
-    dimension_fidelity, drawing_text, drawing_vision, raster_drawing, title_block,
+    dimension_fidelity, drawing_text, drawing_vision, gpu_gate, raster_drawing, title_block,
     vector_drawing,
 )
 from core.providers.qwen_client import CATEGORIES, QwenVisionClient
@@ -128,6 +128,72 @@ _NO_TIME = object()
 _PDF_RENDER_LOCK = threading.Lock()
 
 
+class _Either:
+    """Отмена, если поставлено любое из событий (`deadline.check_cancelled`)."""
+
+    def __init__(self, *events: Optional[threading.Event]):
+        self.events = [event for event in events if event is not None]
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self.events)
+
+
+class _Deferred:
+    """Проход, который выполняется там, где берётся его результат."""
+
+    def __init__(self, function):
+        self.function = function
+
+    def result(self):
+        return self.function()
+
+
+class _Passes:
+    """
+    Проходы одного листа (DRAWING_PASSES_PARALLEL). При 1 проход
+    выполняется в момент `result()`, то есть в прежнем порядке. Больше 1 —
+    проходы стартуют сразу в пуле этого размера, а результаты всё равно
+    берутся по одному в фиксированном порядке.
+
+    Отмена: проход в потоке не делает следующего вызова модели, если
+    отменена работа листа снаружи (`_read_sheets`) или сам лист закончился
+    (`close`) — например, лист оказался пустым и остальные проходы уже не
+    нужны, или задача оборвалась, пока лист ждал ответов.
+    """
+
+    def __init__(self, workers: int):
+        self.abort = threading.Event()
+        self.pool: Optional[ThreadPoolExecutor] = None
+        if workers > 1:
+            self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="drawing-pass")
+            # Отмена снаружи хранится в контексте потока листа; проходам
+            # нужна и она, и своя.
+            self.cancel = _Either(deadline._cancel.get(), self.abort)
+
+    def add(self, function):
+        if self.pool is None:
+            return _Deferred(function)
+        # Срок задачи, часы бюджета листа и сборщик таймингов живут в
+        # contextvars: потоку нужна копия контекста.
+        return self.pool.submit(contextvars.copy_context().run, self._run, function)
+
+    def _run(self, function):
+        with deadline.cancel_on(self.cancel):
+            deadline.check_cancelled()
+            return function()
+
+    def wait(self) -> None:
+        """Дождаться начатых и стоящих в очереди проходов."""
+        if self.pool is not None:
+            self.pool.shutdown(wait=True)
+
+    def close(self) -> None:
+        """Лист закончен: проходы из очереди не начинаются, начатые не зовут модель."""
+        self.abort.set()
+        if self.pool is not None:
+            self.pool.shutdown(wait=False, cancel_futures=True)
+
+
 class DrawingProcessor:
     """Изображение чертежа -> структурированные поля -> фрагмент `drawing`."""
 
@@ -139,6 +205,9 @@ class DrawingProcessor:
         self.storage = storage or StorageProviderFactory.default()
         self.qwen = qwen or QwenVisionClient()
         self.vision_enabled = settings.DRAWING_VISION_ENABLED
+        # Таблицы MinerU по страницам: (bbox, строк). Только для строки учёта
+        # прохода по таблице (`_log_table_pass`), на разбор не влияет.
+        self._mineru_tables: Dict[int, List[Tuple[List[float], int]]] = {}
 
     # ------------------------------------------------------------- публичное
     def process(
@@ -162,6 +231,17 @@ class DrawingProcessor:
         прохода по странице (`dimension_fidelity.adopt_page_signs`). Без
         него (None) сведение остаётся в точности прежним, внутри вызова.
         """
+        # Бюджет листа меряется часами без ожидания мест на видеокарте
+        # (GPU_GATE_ENABLED); у каждого листа свои часы.
+        with gpu_gate.budget_clock():
+            return self._process(image_ref, metadata, page, transcribe, log_page,
+                                 text_only, page_fields)
+
+    def _process(
+        self, image_ref: str, metadata: Dict[str, Any], page: int,
+        transcribe: bool, log_page: Optional[int], text_only: bool,
+        page_fields: Optional[List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
         if not self.qwen.available:
             logger.error(
                 "QWEN_ENDPOINT не задан — чертёж %s не разобран. Ветка чертежей "
@@ -174,6 +254,8 @@ class DrawingProcessor:
             return _empty(MODE_NONE)
 
         started = time.monotonic()
+        # Начало бюджета листа: без ожидания мест на видеокарте.
+        budget_started = gpu_gate.budget_now()
         sheet = page if log_page is None else log_page
         layout = (
             drawing_vision.analyse(image) if self.vision_enabled
@@ -189,8 +271,15 @@ class DrawingProcessor:
         # у модели только текст страницы: надписи по категориям, штамп и
         # таблицы на такой странице уже прочитаны своей ветвью, и второй раз
         # платить за них временем незачем.
-        reading = None
-        if not text_only:
+        #
+        # Штамп важнее прочих таблиц: если времени хватит не на все области,
+        # прочитан будет он.
+        regions = [] if text_only else sorted(
+            layout.regions,
+            key=lambda r: r.kind != drawing_vision.KIND_TITLE_BLOCK,
+        )
+
+        def sheet_pass():
             pass_started = time.monotonic()
             budget = settings.DRAWING_TIME_BUDGET
             # Срок передаётся только когда лист и правда может читаться частями:
@@ -201,7 +290,7 @@ class DrawingProcessor:
             # листа» времени не остаётся, и документ уходит человеку из-за
             # transcript_tile — хотя человеку качество чтения листа не адресовано.
             deadline_kwargs = (
-                {"until": started + budget - settings.DRAWING_SHEET_TILE_RESERVE}
+                {"until": budget_started + budget - settings.DRAWING_SHEET_TILE_RESERVE}
                 if settings.DRAWING_SHEET_TILES and budget else {}
             )
             reading = self.qwen.read_sheet(
@@ -212,66 +301,112 @@ class DrawingProcessor:
                 self._sheet_produced(reading) if reading is not None
                 else "лист не прочитан",
             )
-            if reading is not None:
-                self._sheet_record(reading, payload)
+            return reading
+
         # Весь текст листа отдельным проходом (DRAWING_IMAGE_FULL_READ):
         # разметка надписей по категориям теряет штамп, графы, номер листа
         # и примечания, а без них лист нельзя найти ни по обозначению, ни
         # по требованиям.
-        lines = None
-        if transcribe:
+        def transcribe_pass():
             pass_started = time.monotonic()
-            lines = self._transcribe(layout.image, payload, missing_regions, started)
-            tiles = int(payload.get("transcript_tiles") or 0)
+            own_payload: Dict[str, Any] = {}
+            own_missing: List[Dict[str, Any]] = []
+            lines = self._transcribe(layout.image, own_payload, own_missing, budget_started)
+            tiles = int(own_payload.get("transcript_tiles") or 0)
             self._log_pass(
                 sheet, "весь текст листа", pass_started,
                 ("строк текста %d%s" % (len(lines), ", частей %d" % tiles if tiles else ""))
                 if lines else "текст не прочитан",
             )
-        if lines:
-            payload["transcript_lines"] = lines
-        if reading is None and not lines:
-            logger.error("Модель не прочитала лист %s", image_ref)
-            self._log_sheet(image_ref, sheet, MODE_NONE, 0, 0, 0, 0, started)
-            return _empty(MODE_NONE)
-        if reading is not None:
-            payload["sheet_type"] = reading.sheet_type
-            fields.extend(self._fields_from_annotations(reading.annotations))
+            return lines, own_payload, own_missing
 
-        # Штамп важнее прочих таблиц: если времени хватит не на все области,
-        # прочитан будет он.
-        regions = [] if text_only else sorted(
-            layout.regions,
-            key=lambda r: r.kind != drawing_vision.KIND_TITLE_BLOCK,
-        )
-        regions_read, skipped = 0, 0
-        for region in regions:
-            if self._out_of_time(started):
-                skipped += 1
-                missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "time_budget"})
-                continue
+        def region_pass(region):
+            # Срок проверяется, когда проход начинается, а не когда встал в
+            # очередь: как и в цикле по очереди.
+            if self._out_of_time(budget_started):
+                return None
             pass_started = time.monotonic()
-            before = len(fields)
+            own_fields: List[Dict[str, Any]] = []
+            own_payload: Dict[str, Any] = {"tables": []}
             if region.kind == drawing_vision.KIND_TITLE_BLOCK:
-                read = self._read_title_block(layout, region, fields, payload)
-                with_side = bool((payload.get("side_column") or {}).get("read"))
+                read = self._read_title_block(layout, region, own_fields, own_payload)
+                with_side = bool((own_payload.get("side_column") or {}).get("read"))
                 self._log_pass(
                     sheet, "штамп", pass_started,
-                    ("граф %d%s" % (len(fields) - before,
+                    ("граф %d%s" % (len(own_fields),
                                     ", с боковой колонкой" if with_side else ""))
                     if read else "штамп не прочитан",
                 )
             else:
                 piece = drawing_vision.crop(layout.image, region.bbox)
-                read = self._read_table(piece, region, payload)
+                read = self._read_table(piece, region, own_payload)
                 self._log_pass(
                     sheet, "таблица", pass_started,
-                    ("строк %d" % len(payload["tables"][-1]["rows"])) if read
+                    ("строк %d" % len(own_payload["tables"][-1]["rows"])) if read
                     else "таблица не прочитана",
                 )
-            regions_read += int(read)
-            if not read:
-                missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "region_not_read"})
+                self._log_table_pass(sheet, page, region, own_payload if read else None,
+                                     pass_started)
+            return read, own_fields, own_payload
+
+        # Проходы листа друг от друга не зависят: каждый читает свою вырезку
+        # и пишет в своё. С DRAWING_PASSES_PARALLEL > 1 они идут разом, а
+        # результаты сводятся ниже в прежнем порядке, поэтому запись листа
+        # та же, что и по очереди. С 1 проход выполняется ровно там, где
+        # берётся его результат, — порядок и сроки прежние.
+        passes = _Passes(int(settings.DRAWING_PASSES_PARALLEL))
+        try:
+            sheet_job = None if text_only else passes.add(sheet_pass)
+            transcribe_job = passes.add(transcribe_pass) if transcribe else None
+            region_jobs = [passes.add(lambda region=region: region_pass(region)) for region in regions]
+
+            reading = None
+            if sheet_job is not None:
+                reading = sheet_job.result()
+                if reading is not None:
+                    self._sheet_record(reading, payload)
+            lines = None
+            if transcribe_job is not None:
+                lines, own_payload, own_missing = transcribe_job.result()
+                payload.update(own_payload)
+                missing_regions.extend(own_missing)
+            if lines:
+                payload["transcript_lines"] = lines
+            if reading is None and not lines:
+                logger.error("Модель не прочитала лист %s", image_ref)
+                self._log_sheet(image_ref, sheet, MODE_NONE, 0, 0, 0, 0, started)
+                return _empty(MODE_NONE)
+            if reading is not None:
+                payload["sheet_type"] = reading.sheet_type
+                fields.extend(self._fields_from_annotations(reading.annotations))
+
+            regions_read, skipped = 0, 0
+            for region, job in zip(regions, region_jobs):
+                outcome = job.result()
+                if outcome is None:
+                    skipped += 1
+                    missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "time_budget"})
+                    continue
+                read, own_fields, own_payload = outcome
+                fields.extend(own_fields)
+                for key, value in own_payload.items():
+                    if key == "tables":
+                        payload["tables"].extend(value)
+                    else:
+                        payload[key] = value
+                regions_read += int(read)
+                if not read:
+                    missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "region_not_read"})
+        except (SoftTimeLimitExceeded, deadline.Cancelled):
+            # Обрыв задачи или отмена листа: соседей не ждать (`close`).
+            raise
+        except Exception:
+            # Отказ одного прохода не обрывает соседние: они доходят до конца,
+            # и лист падает так же, как упал бы при чтении по очереди.
+            passes.wait()
+            raise
+        finally:
+            passes.close()
         if skipped:
             logger.warning(
                 "На %d областей листа %s не хватило бюджета времени (%d с)",
@@ -444,6 +579,30 @@ class DrawingProcessor:
             sheet, kind, produced, self.qwen.model, time.monotonic() - started,
         )
 
+    def _log_table_pass(
+        self, sheet: Any, page: int, region: drawing_vision.Region,
+        payload: Optional[Dict[str, Any]], started: float,
+    ) -> None:
+        """
+        Учёт прохода по таблице листа: размер области, что геометрия нашла в
+        ней, сколько строк у MinerU в той же области и что дал проход. По этим
+        строкам за день прода выбирается правило, какие проходы по таблице
+        бесполезны (DRAWING_TABLE_PASS_GATE); само правило здесь не решается.
+        """
+        x1, y1, x2, y2 = (list(region.bbox) + [0.0] * 4)[:4]
+        best_rows, best_share = 0, 0.0
+        for bbox, rows in self._mineru_tables.get(int(page), []):
+            share = _overlap_share(region.bbox, bbox)
+            if share > best_share:
+                best_rows, best_share = rows, share
+        outcome = ("строк %d" % len(payload["tables"][-1]["rows"])) if payload else "пусто"
+        logger.info(
+            "Qwen-VL таблица: стр. %s, область %.4f листа (%.3f x %.3f), сетка %dx%d, "
+            "у MinerU строк %d (перекрытие %.2f), итог %s, %.1f с",
+            sheet, region.area, x2 - x1, y2 - y1, region.rows, region.cols,
+            best_rows, best_share, outcome, time.monotonic() - started,
+        )
+
     def _log_sheet(
         self, image_ref: str, sheet: Any, mode: str, fields: int, lines: int,
         regions_read: int, regions: int, started: float,
@@ -608,6 +767,10 @@ class DrawingProcessor:
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
         if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
             result.extend(self._rescan_poor_pages(result, metadata))
+        # Модель не ответила документу ни разу и отказывала как сервис:
+        # непрочитанные листы — свойство минуты, а не документа. С
+        # PARSE_REQUEUE_ON_OUTAGE документ ставится в очередь (ServiceOutage).
+        outage.check_vlm()
         if settings.DRAWING_TRANSCRIPT_FIXES_OCR:
             result = apply_transcripts(result)
         if settings.DRAWING_SUPPRESS_STALE_ON_FULL_READ:
@@ -752,6 +915,7 @@ class DrawingProcessor:
             None if page_fields is None else page_fields.setdefault(int(page), [])
             for page in chosen
         ]
+        self._mineru_tables = _tables_by_page(fragments)
         readings = self._read_sheets(source_uri, metadata, chosen, full_read, fields_of)
         # Фрагменты собираются строго в порядке страниц, в каком бы порядке
         # ни закончились вызовы модели.
@@ -976,7 +1140,7 @@ class DrawingProcessor:
 
     def _out_of_time(self, started: float) -> bool:
         budget = settings.DRAWING_TIME_BUDGET
-        return bool(budget) and (time.monotonic() - started) > budget
+        return bool(budget) and (gpu_gate.budget_now() - started) > budget
 
     # ------------------------------------------------------------ чтение
     def _read_title_block(
@@ -1198,6 +1362,30 @@ def _is_text_document(fragments: List[Fragment], metadata: Dict[str, Any]) -> bo
                 cells = list(table.headers) + [cell for row in table.rows for cell in row]
                 chars += sum(_visible_chars(str(cell)) for cell in cells if cell is not None)
     return bool(pages) and chars / len(pages) >= _TEXT_DOC_MIN_CHARS_PER_PAGE
+
+
+def _tables_by_page(fragments: List[Fragment]) -> Dict[int, List[Tuple[List[float], int]]]:
+    """Таблицы MinerU документа по страницам: рамка в долях листа и число строк."""
+    tables: Dict[int, List[Tuple[List[float], int]]] = {}
+    for fragment in fragments:
+        data = fragment.content.table_data if fragment.content is not None else None
+        if fragment.type != "table" or data is None or fragment.position is None:
+            continue
+        bbox = list(fragment.position.bbox or [])
+        if len(bbox) != 4 or max(bbox) > 1.5:
+            continue          # рамка не в долях листа: сравнить не с чем
+        tables.setdefault(int(fragment.position.page), []).append((bbox, len(data.rows or [])))
+    return tables
+
+
+def _overlap_share(region: Sequence[float], other: Sequence[float]) -> float:
+    """Доля площади `region`, накрытая `other` (обе рамки в долях листа)."""
+    width = min(region[2], other[2]) - max(region[0], other[0])
+    height = min(region[3], other[3]) - max(region[1], other[1])
+    area = (region[2] - region[0]) * (region[3] - region[1])
+    if width <= 0 or height <= 0 or area <= 0:
+        return 0.0
+    return width * height / area
 
 
 def _visible_chars(text: str) -> int:

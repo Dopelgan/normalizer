@@ -895,6 +895,46 @@ class Settings(BaseSettings):
     # ключи кэша, сроки вызовов и разбор отказа листа те же. На проде
     # предлагается 3: с частями по 4 это не больше ~12 запросов разом.
     VLM_SHEET_CONCURRENCY: int = 1
+    # Сколько проходов одного листа идут разом (core/drawing_processor.py,
+    # `_process`): лист целиком, весь текст листа, штамп (с боковой колонкой
+    # после него) и каждая таблица — независимые вызовы модели по своим
+    # вырезкам. 1 — по очереди, в точности как раньше. Больше — проходы
+    # стартуют разом, а результаты сводятся в прежнем порядке, поэтому
+    # запись листа та же; меняется только то, что области листа теперь
+    # успевают в бюджет DRAWING_TIME_BUDGET, который раньше съедали первые
+    # проходы. Запросов к vLLM разом — до VLM_SHEET_CONCURRENCY x
+    # DRAWING_PASSES_PARALLEL x DRAWING_TRANSCRIBE_TILE_PARALLEL, поэтому на
+    # проде — только вместе с GPU_GATE_ENABLED. На проде предлагается 3.
+    DRAWING_PASSES_PARALLEL: int = 1
+    # Сжатый ответ прохода «лист целиком» (core/providers/qwen_client.py,
+    # `_SHEET_PROMPT_COMPACT`): надпись — массив `[код, надпись, x1, y1, x2,
+    # y2]` с рамкой в целых тысячных долях листа вместо объекта
+    # `{"category", "value", "bbox"}` с дробями. Меньше токенов ответа у
+    # самого дорогого прохода. Разбор принимает оба вида и сводит к тем же
+    # объектам, дальше всё прежнее; точность рамки — 0,001 стороны листа.
+    # Текст запроса другой, поэтому и ключи кэша ответов другие.
+    DRAWING_SHEET_COMPACT_JSON: bool = False
+    # Места на видеокарте для фоновых вызовов разбора
+    # (core/providers/gpu_gate.py). Один счётчик на все воркеры в Redis
+    # Celery: днём (GPU_GATE_BUSY_HOURS_UTC, «4-13» — с 4:00 до 12:59 UTC,
+    # рабочий день заказчика) разбор держит не больше *_DAY запросов к
+    # vLLM и MinerU разом, ночью — *_NIGHT. С GPU_GATE_YIELD_ON_WAITING
+    # вызов Qwen-VL сначала смотрит `vllm:num_requests_waiting` и, пока у
+    # модели очередь, ждёт до 30 с. Ожидание места не идёт в бюджет листа
+    # DRAWING_TIME_BUDGET, оно пишется в тайминги `parse.gate_wait_ms`.
+    # Выключено — вызовы и тела запросов в точности прежние.
+    GPU_GATE_ENABLED: bool = False
+    GPU_GATE_VLM_SLOTS_DAY: int = 2
+    GPU_GATE_VLM_SLOTS_NIGHT: int = 10
+    GPU_GATE_MINERU_SLOTS_DAY: int = 2
+    GPU_GATE_MINERU_SLOTS_NIGHT: int = 6
+    GPU_GATE_BUSY_HOURS_UTC: str = "4-13"
+    GPU_GATE_YIELD_ON_WAITING: bool = True
+    # Приоритет запроса Qwen-VL в vLLM (поле `priority`; меньше — раньше).
+    # Не задан — поле не отправляется. vLLM принимает его только с
+    # `--scheduling-policy priority`, иначе отвечает 400: задавать вместе.
+    # В ключ кэша ответов поле не входит.
+    QWEN_REQUEST_PRIORITY: Optional[int] = None
     # Режим сегментации страницы Tesseract (`--psm`) для полного OCR.
     # 6 — «страница это один однородный блок», значение сегодняшнего кода
     # (`PSM_BLOCK` в core/providers/tesseract_fallback.py). На чертёжном
@@ -1062,6 +1102,18 @@ class Settings(BaseSettings):
     # синхронного разбора будут лежать в очереди без исполнителя.
     CELERY_INTERACTIVE_QUEUE: str = ""
     CELERY_TASK_MAX_RETRIES: int = 3
+    # Отказ сервиса разбора — повод разобрать документ позже, а не хуже
+    # (core/outage.py). Растровый документ при лежащем MinerU (нет связи или
+    # 5xx; таймаут — свойство документа) и документ, которому модель
+    # Qwen-VL не ответила ни разу и отказывала как сервис, ставятся в
+    # очередь заново через PARSE_OUTAGE_RETRY_SECONDS новой задачей: повторы
+    # CELERY_TASK_MAX_RETRIES не тратятся, результат файла не пишется, и
+    # RAG видит его «в обработке». Если за PARSE_OUTAGE_MAX_WAIT_SECONDS с
+    # первого отказа сервис не поднялся — разбор как сегодня, с прежней
+    # пометкой о деградации. Выключено — всё как сегодня.
+    PARSE_REQUEUE_ON_OUTAGE: bool = False
+    PARSE_OUTAGE_RETRY_SECONDS: int = 120
+    PARSE_OUTAGE_MAX_WAIT_SECONDS: int = 3600
 
     # ------------------------------------------------------ Результат запроса
     # Сколько держать готовый результат для GET /internal/v1/parse/results/{id}

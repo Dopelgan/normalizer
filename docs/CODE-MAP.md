@@ -93,6 +93,7 @@
 |---|---|---|
 | **Вся ветка чертежей** | `core/drawing_processor.py` | `DrawingProcessor.process` (131), `enrich_fragments` (489) — вызывается из `ingest/tasks.py:598` |
 | Разметка листа геометрией | `core/drawing_processor.py` | `_sheet_drawings` (645) |
+| Проходы листа (лист, текст, штамп, таблицы) и их сведение | `core/drawing_processor.py` | `_process`: проходы — замыкания `sheet_pass`, `transcribe_pass`, `region_pass`, исполнитель — `_Passes` (`DRAWING_PASSES_PARALLEL`) |
 | Проход «перепиши лист целиком» | `core/drawing_processor.py` | `_transcribe` (768) → `core/providers/qwen_client.py` |
 | Проход по штампу | `core/drawing_processor.py` | `_read_title_block` (803), `_read_title_block_fields` (846); канонические метки — `core/providers/title_block.py` `LABELS` |
 | Проход по боковым графам | `core/drawing_processor.py` | `_read_side_column` (911) |
@@ -178,6 +179,7 @@
 | `DRAWING_FIELD_CATEGORY_STRICT` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_CATEGORY_PROSE_GUARD` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_SMALL_PRINT_CARE` | `false` | `core/providers/qwen_client.py` |
+| `DRAWING_SHEET_COMPACT_JSON` | `false` | `core/providers/qwen_client.py` (`_sheet_prompt`, `as_annotations`, `compact_annotation`) |
 | `DRAWING_AUTO_ROTATE` | `true` | `core/providers/drawing_vision.py` |
 | `RASTER_FRAME_THIN_LINES` | `false` | `core/providers/raster_drawing.py` |
 | `FRAME_TABLE_GUARD_ENABLED` | `false` | `core/providers/mineru_parser.py` |
@@ -194,6 +196,8 @@
 | `DOC_CONVERT_ENABLED` | `true` | `core/providers/office_convert.py` |
 | `INTAKE_FORWARD_TO_PARSER` | `false` | `core/intake/pipeline.py`, `gateway/api.py`, `quality/api.py` |
 | `S3_READONLY` | `true` | `core/providers/storage.py` |
+| `PARSE_REQUEUE_ON_OUTAGE` | `false` | `core/outage.py`; бросают `core/ladder/strategies/recognition.py::LayoutStrategy.applicable`, `core/providers/mineru_parser.py::parse`, `core/drawing_processor.py::enrich_fragments` (итог вызовов из `qwen_client._post`); ловит и ставит в очередь `ingest/tasks.py::process_document` |
+| `GPU_GATE_ENABLED`, `GPU_GATE_YIELD_ON_WAITING` | `false`, `true` | `core/providers/gpu_gate.py`; места берут `core/providers/qwen_client.py::_post`, `core/providers/mineru_parser.py::_parse_with_mineru`, `core/ladder/strategies/recognition.py::VlmEscalationStrategy.run`; часы бюджета листа — `core/drawing_processor.py` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
 
@@ -208,6 +212,8 @@
 | `DRAWING_TIME_BUDGET` | `420` | `core/drawing_processor.py` (`_out_of_time` 587, `_transcribe` 566), `core/providers/qwen_client.py` | бюджет **на лист** (не на документ) |
 | `DRAWING_MAX_SHEETS` | `6` | `core/drawing_processor.py` | сколько листов читается моделью |
 | `VLM_SHEET_CONCURRENCY` | `1` | `core/drawing_processor.py` (`_read_sheets`) | сколько листов документа читается одновременно; порядок и результат не меняются |
+| `DRAWING_PASSES_PARALLEL` | `1` | `core/drawing_processor.py` (`_process`, `_Passes`); пул соединений — `core/providers/qwen_client.py::pool_size` | сколько проходов одного листа идут разом; запись листа не меняется |
+| `GPU_GATE_*_SLOTS_DAY/_NIGHT`, `GPU_GATE_BUSY_HOURS_UTC`, `QWEN_REQUEST_PRIORITY` | `2/10`, `2/6`, `4-13`, не задан | `core/providers/gpu_gate.py`; приоритет — `core/providers/qwen_client.py::_post` | сколько фоновых вызовов vLLM и MinerU разом на все воркеры; поле `priority` в vLLM |
 | `DRAWING_MAX_REGIONS` | `4` | `core/drawing_processor.py`, `core/providers/drawing_vision.py` | сколько областей на лист |
 | `DRAWING_RENDER_DPI` | `200` | `core/drawing_processor.py` | — |
 | `DRAWING_TRANSCRIBE_MAX_SIDE` / `_MAX_TOKENS` | `2800` / `8192` | `core/providers/qwen_client.py` | — |
@@ -230,6 +236,7 @@
 | `PARSE_DEADLINE_RESERVE` | `120` | `ingest/tasks.py` | резерв на финал |
 | `PARSE_STALE_MARGIN_SECONDS` | `300` | `core/result_aggregator.py` | когда файл признан потерянным |
 | `CELERY_TASK_MAX_RETRIES` | `3` | `ingest/tasks.py` | — |
+| `PARSE_OUTAGE_RETRY_SECONDS`, `PARSE_OUTAGE_MAX_WAIT_SECONDS` | `120`/`3600` | `ingest/tasks.py`, `core/outage.py` | пауза перед повтором при отказе сервиса и предел ожидания с первого отказа |
 | `CELERY_ML_QUEUE`, `CELERY_INTERACTIVE_QUEUE`, `CELERY_INTAKE_QUEUE` | — | `core/celery_app.py`, `ingest/api.py`, `ingest/tasks.py` | маршрутизация по очередям |
 | `RESULT_TTL_SECONDS`, `RESULT_DELIVERY_TYPE`, `RESULT_CALLBACK_URL` | — | `core/result_aggregator.py`, `core/result_delivery.py`, `ingest/api.py` | — |
 | `QG_SIMILARITY_THRESHOLD`, `QG_MAX_AGE_DAYS`, `QG_OCR_WARN_CONFIDENCE`, `QG_OCR_BLOCK_CONFIDENCE`, `QG_OCR_PAGES`, `QG_OCR_UNREADABLE_SHARE`, `QG_MAX_SIZE_BYTES` | — | `core/quality/service.py` | гейт качества |

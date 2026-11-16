@@ -44,7 +44,7 @@ import requests
 from core import filetypes
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import deadline, telemetry
+from core import deadline, outage, telemetry
 from core.config import settings
 from core.models.parse_result import ParsedBlock, ParseResult
 from core.providers.document_parser import (
@@ -52,7 +52,7 @@ from core.providers.document_parser import (
     ParserFailed,
     ParserUnavailable,
 )
-from core.providers import blank_table_ocr, dimension_fidelity, ocr_cleanup
+from core.providers import blank_table_ocr, dimension_fidelity, gpu_gate, ocr_cleanup
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.tesseract_fallback import TesseractFallbackProvider
 from core.providers.vector_drawing import (
@@ -585,6 +585,10 @@ class MinerUParserProvider(DocumentParserProvider):
             # молча и на всём потоке сразу.
             note = (f"mineru_timeout: {exc}" if isinstance(exc, ParserTimedOut)
                     else f"mineru_unavailable: {exc}")
+            if layer is None and not isinstance(exc, ParserTimedOut):
+                # Растр без MinerU — плоский OCR навсегда; с
+                # PARSE_REQUEUE_ON_OUTAGE документ ставится в очередь.
+                outage.mineru_down(str(exc))
             if layer is not None:
                 logger.error(
                     "MinerU недоступен (%s), но у %s есть текстовый слой — читаем его", exc, uri
@@ -955,7 +959,8 @@ class MinerUParserProvider(DocumentParserProvider):
         """Сам запрос и разбор ответа на уровне протокола — без записи и сшивки."""
         started = time.perf_counter()
         try:
-            response = (session or requests).post(url, files=files, data=data, timeout=timeout)
+            response = gpu_gate.call(gpu_gate.MINERU, timeout + 30, (session or requests).post,
+                                     url, files=files, data=data, timeout=timeout)
         except requests.ReadTimeout as exc:
             # Долгий разбор большого скана — свойство документа, а не отказ
             # сервиса. Если по таймауту помечать MinerU недоступным на минуту, все

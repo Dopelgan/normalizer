@@ -20,11 +20,12 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from core import filetypes
+from core import filetypes, outage
 from core.config import settings
 from core.ladder.base import Strategy
 from core.ladder.context import SOURCE_RASTER, DocumentContext
 from core.models.parse_result import ParsedBlock, ParseResult
+from core.providers import gpu_gate
 from core.providers.mineru_parser import MinerUParserProvider, MinerUPrefetch
 from core.providers.storage import StorageProvider
 from core.providers.tesseract_fallback import TesseractFallbackProvider
@@ -103,6 +104,15 @@ class LayoutStrategy(Strategy):
         # который уже сделал уровень 4, только потратив на него вдвое больше
         # времени. Лучше честно пропустить уровень: деградация уже отмечена.
         if not MinerUParserProvider.is_available():
+            # Растровому документу без MinerU остаётся плоский OCR: с
+            # PARSE_REQUEUE_ON_OUTAGE уровень остаётся в лестнице, а `run`
+            # ставит документ в очередь. Решает именно `run`: документ,
+            # которому хватило уровня 4, до уровня 5 не дойдёт и ждать
+            # сервис не будет.
+            if (outage.requeue_allowed()
+                    and (context.kind == filetypes.KIND_IMAGE
+                         or context.classification.source == SOURCE_RASTER)):
+                return True
             logger.warning(
                 "Уровень %d пропущен: MinerU недоступен, разбор остаётся на OCR",
                 self.level,
@@ -117,6 +127,10 @@ class LayoutStrategy(Strategy):
     def run(
         self, context: DocumentContext, prefetched: Optional[MinerUPrefetch] = None,
     ) -> ParseResult:
+        if not MinerUParserProvider.is_available():
+            # Сюда без сервиса доходит только растр под PARSE_REQUEUE_ON_OUTAGE
+            # (`applicable`): документ в очередь (ServiceOutage).
+            outage.mineru_down("сервис помечен недоступным")
         if prefetched is None:
             result = self.provider.parse(context.uri, context.file_type, context.metadata)
         else:
@@ -289,7 +303,8 @@ class VlmEscalationStrategy(Strategy):
             "prompt": settings.VLM_PROMPT,
         }
         try:
-            response = requests.post(
+            response = gpu_gate.call(
+                gpu_gate.VLM, settings.VLM_TIMEOUT + 30, requests.post,
                 f"{settings.VLM_ENDPOINT.rstrip('/')}/parse",
                 json=payload, timeout=settings.VLM_TIMEOUT,
             )
