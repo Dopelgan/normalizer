@@ -58,6 +58,7 @@ _NEAR = 0.05          # два прочтения ближе этого — од
 _SIGN = re.compile(r"\d\s*[+\-−±*]\s*\d|[+\-−±]\s*\d+[,.]\d")
 _COMMA = re.compile(r"\d[,.]\d")
 _THREAD = re.compile(r"^\s*[MМ]\s?\d|\d\s*[xх×]\s*\d")
+_SIGNS = re.compile(r"[+\-−–±]")
 _LETTER = re.compile(r"[nпNЭэЗз]\.?\s?\d")
 
 # Знаки, в которых ошибается чтение мелкого шрифта. Две записи, равные после
@@ -126,39 +127,35 @@ def targets(fields: Sequence[Dict[str, Any]]) -> List[Tuple[List[int], List[floa
     сначала такие расхождения, потом одиночные спорные; срез по
     DRAWING_REREAD_MAX_CROPS.
     """
-    with_agreement = any("agreement" in f for f in fields)
     conflicts: List[Tuple[List[int], List[float]]] = []
     singles: List[Tuple[List[int], List[float]]] = []
     taken: set = set()
     candidates = [n for n, f in enumerate(fields) if eligible(f) and _place(f.get("bbox"))]
-
-    if with_agreement:
-        # Список D3: его согласие уже посчитано по всем проходам листа.
-        for n in candidates:
-            agreement = fields[n].get("agreement")
-            if agreement in DISPUTED_AGREEMENT:
-                (conflicts if agreement == "conflict" else singles).append(
-                    ([n], _place(fields[n]["bbox"])))
-    else:
-        for n in candidates:
-            if n in taken:
+    for n in candidates:
+        if n in taken:
+            continue
+        key = _skeleton(fields[n]["value"])
+        here = _centre(fields[n]["bbox"])
+        group = [n]
+        for m in candidates:
+            if m <= n or m in taken or fields[m]["category"] != fields[n]["category"]:
                 continue
-            key = _skeleton(fields[n]["value"])
-            here = _centre(fields[n]["bbox"])
-            group = [n]
-            for m in candidates:
-                if m <= n or m in taken or fields[m]["category"] != fields[n]["category"]:
-                    continue
-                there = _centre(fields[m]["bbox"])
-                if (key and _skeleton(fields[m]["value"]) == key
-                        and not _same(fields[m]["value"], fields[n]["value"])
-                        and math.dist(here, there) <= _NEAR):
-                    group.append(m)
-            if len(group) > 1:
-                taken.update(group)
-                conflicts.append((group, _union([_place(fields[m]["bbox"]) for m in group])))
-            elif risky(str(fields[n]["value"])):
-                singles.append(([n], _place(fields[n]["bbox"])))
+            there = _centre(fields[m]["bbox"])
+            if (key and _skeleton(fields[m]["value"]) == key
+                    and not _same(fields[m]["value"], fields[n]["value"])
+                    and math.dist(here, there) <= _NEAR):
+                group.append(m)
+        if len(group) > 1:
+            taken.update(group)
+            conflicts.append((group, _union([_place(fields[m]["bbox"]) for m in group])))
+            continue
+        # Согласие прочтений (D3 или сведение N чтений) — по полю: где оно
+        # есть, решает оно; где нет — своё правило по записи.
+        agreement = fields[n].get("agreement")
+        disputed = (agreement in DISPUTED_AGREEMENT if agreement is not None
+                    else risky(str(fields[n]["value"])))
+        if disputed:
+            (conflicts if agreement == "conflict" else singles).append(([n], _place(fields[n]["bbox"])))
     limit = max(0, int(settings.DRAWING_REREAD_MAX_CROPS))
     return (conflicts + singles)[:limit]
 
@@ -267,6 +264,10 @@ def decide(current: str, reread: str) -> Optional[str]:
     if not reread or _same(current, reread):
         return None
     if current.translate(_MINOR).casefold() != reread.translate(_MINOR).casefold():
+        return None
+    # Знак отклонения можно заменить или дописать, но не потерять: «40−0,25»,
+    # прочитанное вырезкой как «400,25», — недочитанная вырезка, а не поправка.
+    if len(_SIGNS.findall(reread)) < len(_SIGNS.findall(current)):
         return None
     return reread
 
@@ -387,7 +388,8 @@ def consensus(runs: Sequence[Sequence[Dict[str, Any]]], near: float = _NEAR) -> 
         for annotation in run:
             if not isinstance(annotation, dict):
                 continue
-            key = re.sub(r"\s+", "", drawing_text.normalize(str(annotation.get("value") or ""))).casefold()
+            value = str(annotation.get("value") or "")
+            key = re.sub(r"\s+", "", drawing_text.normalize(value)).casefold()
             spot = _centre(annotation.get("bbox"))
             for group in groups:
                 if group["key"] != key or run_index in group["runs"]:
