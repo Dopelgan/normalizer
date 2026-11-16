@@ -103,6 +103,7 @@
 | Геометрия и повороты листа | `core/providers/drawing_vision.py`, `core/providers/raster_drawing.py` | — |
 | Выправка размеров построчно | `core/providers/dimension_fidelity.py` | `repair_lines` |
 | Нормализация строки чертежа (⌀, ±, гомоглифы) | `core/providers/drawing_text.py` | `normalize` |
+| Сведение прочтений поля по странице (`DRAWING_READINGS_RECONCILED`) | `core/providers/reading_reconcile.py` | `apply`, `reconcile_page`, `choose` |
 | **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
 | Качество фрагмента чертежа | `core/drawing_quality.py` | `apply_drawing_quality` (7), `document_quality` (71) |
 | Правка абзацев OCR по строкам листа | `core/drawing_transcript.py` | `_page_transcripts` (88) |
@@ -201,6 +202,8 @@
 | `PARSE_LAYOUT_UNAVAILABLE_NOTE` | `false` | `core/ladder/router.py` (`LAYOUT_UNAVAILABLE`; признак — `core/ladder/strategies/recognition.py::LayoutStrategy.skipped_as_unavailable`) |
 | `DRAWING_LOST_SHEETS_SKIPPED` | `false` | `core/drawing_processor.py` (`_sheet_drawings`) |
 | `SCAN_CANONICAL_IDS` | `false` | `core/contract_finalize.py` → `core/providers/canonical_ids.py`; список серий — `core/gateway/profile.load_section("scan_identity")`; факты — `core/facts/extractor.identity_fact` |
+| `DRAWING_SHEET_GUARDED`, `DRAWING_SHEET_SCHEMA` | `false`, `true` | `core/providers/qwen_client.py` (`read_sheet`, `_ask_sheet_guarded`, `sheet_verdict`, `sheet_answer_accepted`; кэш — `accept` в `_ask_text`); пустой ответ — `core/drawing_processor.py::_guard_empty_sheet`; отчёт по кэшу — `tools/vlm_cache_guard_report.py` |
+| `DRAWING_READINGS_RECONCILED` | `false` | `core/drawing_processor.py::enrich_fragments` → `core/providers/reading_reconcile.apply`; пометка в записи — `core/drawing_record._with_tolerance` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
 
