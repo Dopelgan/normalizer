@@ -882,6 +882,27 @@ class Settings(BaseSettings):
     # ключи кэша, сроки вызовов и разбор отказа листа те же. На проде
     # предлагается 3: с частями по 4 это не больше ~12 запросов разом.
     VLM_SHEET_CONCURRENCY: int = 1
+    # Места на видеокарте для фоновых вызовов разбора
+    # (core/providers/gpu_gate.py). Один счётчик на все воркеры в Redis
+    # Celery: днём (GPU_GATE_BUSY_HOURS_UTC, «4-13» — с 4:00 до 12:59 UTC,
+    # рабочий день заказчика) разбор держит не больше *_DAY запросов к
+    # vLLM и MinerU разом, ночью — *_NIGHT. С GPU_GATE_YIELD_ON_WAITING
+    # вызов Qwen-VL сначала смотрит `vllm:num_requests_waiting` и, пока у
+    # модели очередь, ждёт до 30 с. Ожидание места не идёт в бюджет листа
+    # DRAWING_TIME_BUDGET, оно пишется в тайминги `parse.gate_wait_ms`.
+    # Выключено — вызовы и тела запросов в точности прежние.
+    GPU_GATE_ENABLED: bool = False
+    GPU_GATE_VLM_SLOTS_DAY: int = 2
+    GPU_GATE_VLM_SLOTS_NIGHT: int = 10
+    GPU_GATE_MINERU_SLOTS_DAY: int = 2
+    GPU_GATE_MINERU_SLOTS_NIGHT: int = 6
+    GPU_GATE_BUSY_HOURS_UTC: str = "4-13"
+    GPU_GATE_YIELD_ON_WAITING: bool = True
+    # Приоритет запроса Qwen-VL в vLLM (поле `priority`; меньше — раньше).
+    # Не задан — поле не отправляется. vLLM принимает его только с
+    # `--scheduling-policy priority`, иначе отвечает 400: задавать вместе.
+    # В ключ кэша ответов поле не входит.
+    QWEN_REQUEST_PRIORITY: Optional[int] = None
     # Режим сегментации страницы Tesseract (`--psm`) для полного OCR.
     # 6 — «страница это один однородный блок», значение сегодняшнего кода
     # (`PSM_BLOCK` в core/providers/tesseract_fallback.py). На чертёжном

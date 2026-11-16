@@ -192,6 +192,7 @@
 | `DOC_CONVERT_ENABLED` | `true` | `core/providers/office_convert.py` |
 | `INTAKE_FORWARD_TO_PARSER` | `false` | `core/intake/pipeline.py`, `gateway/api.py`, `quality/api.py` |
 | `S3_READONLY` | `true` | `core/providers/storage.py` |
+| `GPU_GATE_ENABLED`, `GPU_GATE_YIELD_ON_WAITING` | `false`, `true` | `core/providers/gpu_gate.py`; места берут `core/providers/qwen_client.py::_post`, `core/providers/mineru_parser.py::_parse_with_mineru`, `core/ladder/strategies/recognition.py::VlmEscalationStrategy.run`; часы бюджета листа — `core/drawing_processor.py` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
 
@@ -206,6 +207,7 @@
 | `DRAWING_TIME_BUDGET` | `420` | `core/drawing_processor.py` (`_out_of_time` 587, `_transcribe` 566), `core/providers/qwen_client.py` | бюджет **на лист** (не на документ) |
 | `DRAWING_MAX_SHEETS` | `6` | `core/drawing_processor.py` | сколько листов читается моделью |
 | `VLM_SHEET_CONCURRENCY` | `1` | `core/drawing_processor.py` (`_read_sheets`) | сколько листов документа читается одновременно; порядок и результат не меняются |
+| `GPU_GATE_*_SLOTS_DAY/_NIGHT`, `GPU_GATE_BUSY_HOURS_UTC`, `QWEN_REQUEST_PRIORITY` | `2/10`, `2/6`, `4-13`, не задан | `core/providers/gpu_gate.py`; приоритет — `core/providers/qwen_client.py::_post` | сколько фоновых вызовов vLLM и MinerU разом на все воркеры; поле `priority` в vLLM |
 | `DRAWING_MAX_REGIONS` | `4` | `core/drawing_processor.py`, `core/providers/drawing_vision.py` | сколько областей на лист |
 | `DRAWING_RENDER_DPI` | `200` | `core/drawing_processor.py` | — |
 | `DRAWING_TRANSCRIBE_MAX_SIDE` / `_MAX_TOKENS` | `2800` / `8192` | `core/providers/qwen_client.py` | — |

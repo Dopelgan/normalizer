@@ -25,6 +25,7 @@ from core.config import settings
 from core.ladder.base import Strategy
 from core.ladder.context import SOURCE_RASTER, DocumentContext
 from core.models.parse_result import ParsedBlock, ParseResult
+from core.providers import gpu_gate
 from core.providers.mineru_parser import MinerUParserProvider
 from core.providers.storage import StorageProvider
 from core.providers.tesseract_fallback import TesseractFallbackProvider
@@ -278,7 +279,8 @@ class VlmEscalationStrategy(Strategy):
             "prompt": settings.VLM_PROMPT,
         }
         try:
-            response = requests.post(
+            response = gpu_gate.call(
+                gpu_gate.VLM, settings.VLM_TIMEOUT + 30, requests.post,
                 f"{settings.VLM_ENDPOINT.rstrip('/')}/parse",
                 json=payload, timeout=settings.VLM_TIMEOUT,
             )

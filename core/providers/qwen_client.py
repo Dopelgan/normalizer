@@ -49,7 +49,7 @@ from requests.adapters import HTTPAdapter
 
 from core import deadline
 from core.config import settings
-from core.providers import title_block
+from core.providers import gpu_gate, title_block
 
 logger = logging.getLogger(__name__)
 
@@ -454,8 +454,8 @@ class QwenVisionClient:
         Плотный лист не помещается в потолок ответа: JSON обрывается посреди
         списка надписей. С DRAWING_SHEET_TILES такой лист читается заново
         частями с перекрытием, а списки надписей сливаются без повторов.
-        `until` — момент time.monotonic(), после которого части листа уже не
-        читаются (бюджет листа DRAWING_TIME_BUDGET).
+        `until` — момент по часам `gpu_gate.budget_now()`, после которого
+        части листа уже не читаются (бюджет листа DRAWING_TIME_BUDGET).
         """
         prompt = self._sheet_prompt(hint)
         if settings.DRAWING_SMALL_PRINT_CARE:
@@ -580,7 +580,7 @@ class QwenVisionClient:
                 # вызов, который vLLM выполняет не параллельно с другими, —
                 # поэтому срез по одному VLM_TIMEOUT ограничивает всю
                 # четвёрку частей, а не одну.
-                if until is not None and time.monotonic() + settings.VLM_TIMEOUT > until:
+                if until is not None and gpu_gate.budget_now() + settings.VLM_TIMEOUT > until:
                     return None
                 return self._read_sheet_piece(crop_box(image, part), prompt)
 
@@ -699,8 +699,8 @@ class QwenVisionClient:
         Плотная схема не помещается в потолок ответа: JSON обрывается. Строки,
         которые модель успела вернуть, не выбрасываются, а лист читается
         заново частями с перекрытием; оборванная часть делится ещё раз.
-        `None` — модель не ответила на лист вовсе. `until` — момент
-        time.monotonic(), после которого части листа уже не читаются
+        `None` — модель не ответила на лист вовсе. `until` — момент по часам
+        `gpu_gate.budget_now()`, после которого части листа уже не читаются
         (бюджет листа DRAWING_TIME_BUDGET).
         """
         lines, cut = self._transcribe_piece(image)
@@ -742,7 +742,7 @@ class QwenVisionClient:
                 left = deadline.remaining()
                 if left is not None and left < settings.VLM_TIMEOUT:
                     return None, TILE_NO_TIME
-                if until is not None and time.monotonic() > until:
+                if until is not None and gpu_gate.budget_now() > until:
                     return None, TILE_NO_TIME
                 lines, cut = self._transcribe_piece(crop_box(image, part))
             if lines is None:
@@ -916,14 +916,21 @@ class QwenVisionClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         url = f"{self._base()}/chat/completions"
+        if settings.QWEN_REQUEST_PRIORITY is not None:
+            # Ключ кэша уже посчитан (`_ask_text`): приоритет в него не входит,
+            # и тело вызывающего не меняется.
+            body = {**body, "priority": int(settings.QWEN_REQUEST_PRIORITY)}
         for attempt in range(self.retries + 1):
             last = attempt >= self.retries
             if attempt:
                 deadline.check_cancelled()
             try:
-                response = self.session.post(
-                    url, json=body, headers=headers, timeout=self.timeout
-                )
+                # Место на видеокарте — на одну попытку: пауза перед повтором
+                # места не держит (GPU_GATE_ENABLED).
+                with gpu_gate.slot(gpu_gate.VLM, lease=self.timeout + 30):
+                    response = self.session.post(
+                        url, json=body, headers=headers, timeout=self.timeout
+                    )
             except requests.RequestException as exc:
                 self._log_attempt(exc, attempt, last)
                 if last:

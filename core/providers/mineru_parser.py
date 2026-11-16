@@ -50,7 +50,7 @@ from core.providers.document_parser import (
     ParserFailed,
     ParserUnavailable,
 )
-from core.providers import blank_table_ocr, dimension_fidelity, ocr_cleanup
+from core.providers import blank_table_ocr, dimension_fidelity, gpu_gate, ocr_cleanup
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.tesseract_fallback import TesseractFallbackProvider
 from core.providers.vector_drawing import (
@@ -816,7 +816,8 @@ class MinerUParserProvider(DocumentParserProvider):
             "MinerU: %s file=%s size=%d B timeout=%ds", url, filename, len(file_bytes), timeout
         )
         try:
-            response = requests.post(url, files=files, data=data, timeout=timeout)
+            response = gpu_gate.call(gpu_gate.MINERU, timeout + 30, requests.post,
+                                     url, files=files, data=data, timeout=timeout)
         except requests.ReadTimeout as exc:
             # Долгий разбор большого скана — свойство документа, а не отказ
             # сервиса. Если по таймауту помечать MinerU недоступным на минуту, все

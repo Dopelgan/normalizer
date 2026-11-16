@@ -70,7 +70,7 @@ from core import deadline
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
-    dimension_fidelity, drawing_text, drawing_vision, raster_drawing, title_block,
+    dimension_fidelity, drawing_text, drawing_vision, gpu_gate, raster_drawing, title_block,
     vector_drawing,
 )
 from core.providers.qwen_client import CATEGORIES, QwenVisionClient
@@ -162,6 +162,17 @@ class DrawingProcessor:
         прохода по странице (`dimension_fidelity.adopt_page_signs`). Без
         него (None) сведение остаётся в точности прежним, внутри вызова.
         """
+        # Бюджет листа меряется часами без ожидания мест на видеокарте
+        # (GPU_GATE_ENABLED); у каждого листа свои часы.
+        with gpu_gate.budget_clock():
+            return self._process(image_ref, metadata, page, transcribe, log_page,
+                                 text_only, page_fields)
+
+    def _process(
+        self, image_ref: str, metadata: Dict[str, Any], page: int,
+        transcribe: bool, log_page: Optional[int], text_only: bool,
+        page_fields: Optional[List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
         if not self.qwen.available:
             logger.error(
                 "QWEN_ENDPOINT не задан — чертёж %s не разобран. Ветка чертежей "
@@ -174,6 +185,8 @@ class DrawingProcessor:
             return _empty(MODE_NONE)
 
         started = time.monotonic()
+        # Начало бюджета листа: без ожидания мест на видеокарте.
+        budget_started = gpu_gate.budget_now()
         sheet = page if log_page is None else log_page
         layout = (
             drawing_vision.analyse(image) if self.vision_enabled
@@ -201,7 +214,7 @@ class DrawingProcessor:
             # листа» времени не остаётся, и документ уходит человеку из-за
             # transcript_tile — хотя человеку качество чтения листа не адресовано.
             deadline_kwargs = (
-                {"until": started + budget - settings.DRAWING_SHEET_TILE_RESERVE}
+                {"until": budget_started + budget - settings.DRAWING_SHEET_TILE_RESERVE}
                 if settings.DRAWING_SHEET_TILES and budget else {}
             )
             reading = self.qwen.read_sheet(
@@ -221,7 +234,7 @@ class DrawingProcessor:
         lines = None
         if transcribe:
             pass_started = time.monotonic()
-            lines = self._transcribe(layout.image, payload, missing_regions, started)
+            lines = self._transcribe(layout.image, payload, missing_regions, budget_started)
             tiles = int(payload.get("transcript_tiles") or 0)
             self._log_pass(
                 sheet, "весь текст листа", pass_started,
@@ -246,7 +259,7 @@ class DrawingProcessor:
         )
         regions_read, skipped = 0, 0
         for region in regions:
-            if self._out_of_time(started):
+            if self._out_of_time(budget_started):
                 skipped += 1
                 missing_regions.append({"kind": region.kind, "bbox": region.bbox, "reason": "time_budget"})
                 continue
@@ -976,7 +989,7 @@ class DrawingProcessor:
 
     def _out_of_time(self, started: float) -> bool:
         budget = settings.DRAWING_TIME_BUDGET
-        return bool(budget) and (time.monotonic() - started) > budget
+        return bool(budget) and (gpu_gate.budget_now() - started) > budget
 
     # ------------------------------------------------------------ чтение
     def _read_title_block(
