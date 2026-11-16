@@ -310,8 +310,17 @@ class DrawingProcessor:
                 # Режим приёмки (D4): лист читается ещё reads−1 раз, надписи
                 # сводятся по значению и месту с пометкой согласия.
                 runs = [reading.annotations]
-                for _ in range(reads - 1):
-                    more = self.qwen.read_sheet(layout.image, hint=layout.hint(), **deadline_kwargs)
+                budget = settings.DRAWING_TIME_BUDGET
+                for run in range(2, reads + 1):
+                    if budget and gpu_gate.budget_now() + settings.VLM_TIMEOUT > budget_started + budget:
+                        break
+                    # Номер чтения в подсказке: иначе при нулевой температуре
+                    # и кэше ответов повтор — тот же ответ, и сведение
+                    # пометило бы согласием всё подряд.
+                    more = self.qwen.read_sheet(
+                        layout.image, hint=f"{layout.hint()} (чтение {run} из {reads})".strip(),
+                        **deadline_kwargs,
+                    )
                     if more is not None:
                         runs.append(more.annotations)
                 reading.annotations = disputed_reread.consensus(runs)
@@ -1431,7 +1440,8 @@ class DrawingProcessor:
                 bbox=_bbox(annotation.get("bbox")),
                 confidence=confidence,
             )
-            if annotation.get("agreement"):
+            if (settings.DRAWING_CONSENSUS_READS > 1
+                    and annotation.get("agreement") in ("agree", "single", "conflict")):
                 # Согласие чтений листа (DRAWING_CONSENSUS_READS): по нему
                 # дочитывание выбирает спорные поля.
                 field["agreement"] = annotation["agreement"]

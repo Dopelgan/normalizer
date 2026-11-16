@@ -201,3 +201,23 @@ def test_reread_flag_off_makes_no_call(monkeypatch):
     monkeypatch.setattr(settings, "DRAWING_DISPUTED_REREAD", False)
     assert settings.DRAWING_CONSENSUS_READS == 1
     assert not dr.needs_native_tiles(Image.new("RGB", (6622, 4677)))
+
+
+def test_decide_does_not_accept_a_lost_sign():
+    assert dr.decide("40−0,25", "400,25") is None
+    assert dr.decide("30±10", "3010") is None
+
+
+def test_sign_variants_from_different_reads_become_one_field(sheet):
+    runs = [[{"value": "⌀4,5+0,2", "bbox": [0.5, 0.5, 0.52, 0.55]}],
+            [{"value": "⌀4,5-0,2", "bbox": [0.5, 0.5, 0.52, 0.55]}]]
+    fields = [field("size", a["value"], a["bbox"], agreement=a["agreement"]) for a in dr.consensus(runs)]
+    assert [members for members, _ in dr.targets(fields)] == [[0, 1]]
+    result, _ = dr.apply(FakeReader(["⌀4,5+0,2"]), sheet, fields)
+    assert [f["value"] for f in result] == ["⌀4,5+0,2"]
+
+
+def test_fields_without_agreement_use_own_rule():
+    fields = [field("size", "⌀315", [0.42, 0.35, 0.45, 0.41], agreement="agree"),
+              field("size", "⌀4,5-0,2", [0.5, 0.5, 0.52, 0.55])]
+    assert [members for members, _ in dr.targets(fields)] == [[1]]
