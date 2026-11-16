@@ -70,8 +70,8 @@ from core import deadline, outage
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
-    dimension_fidelity, drawing_text, drawing_vision, gpu_gate, raster_drawing, title_block,
-    vector_drawing,
+    dimension_fidelity, disputed_reread, drawing_text, drawing_vision, gpu_gate, raster_drawing,
+    title_block, vector_drawing,
 )
 from core.providers.qwen_client import CATEGORIES, QwenVisionClient
 from core.providers.storage import StorageProvider, StorageProviderFactory
@@ -296,6 +296,17 @@ class DrawingProcessor:
             reading = self.qwen.read_sheet(
                 layout.image, hint=layout.hint(), **deadline_kwargs,
             )
+            reads = int(settings.DRAWING_CONSENSUS_READS or 1)
+            if reading is not None and reads > 1:
+                # Режим приёмки (D4): лист читается ещё reads−1 раз, надписи
+                # сводятся по значению и месту с пометкой согласия.
+                runs = [reading.annotations]
+                for _ in range(reads - 1):
+                    more = self.qwen.read_sheet(layout.image, hint=layout.hint(), **deadline_kwargs)
+                    if more is not None:
+                        runs.append(more.annotations)
+                reading.annotations = disputed_reread.consensus(runs)
+                reading.raw = {**reading.raw, "consensus_reads": len(runs)}
             self._log_pass(
                 sheet, "лист целиком", pass_started,
                 self._sheet_produced(reading) if reading is not None
@@ -427,6 +438,12 @@ class DrawingProcessor:
                 dimension_fidelity.adopt_transcript_signs(
                     fields, payload.get("transcript_lines")
                 )
+        if settings.DRAWING_DISPUTED_REREAD and fields:
+            # Третье свидетельство по спорным числам (D4): вырезки в родном
+            # разрешении. Здесь — после сведения прочтений листа и до того,
+            # как поля уйдут соседним фрагментам страницы и привязке к виду.
+            fields = self._reread_disputed(layout.image, fields, payload, budget_started)
+        if settings.DRAWING_DIMENSION_FIDELITY:
             if page_fields is not None:
                 # Тот же размер, прочитанный в другом вызове `process()` по
                 # той же странице: лист целиком и вырезка вида с него — это
@@ -1327,12 +1344,35 @@ class DrawingProcessor:
             claimed = str(annotation.get("category") or "").strip().lower()
             by_rules, _ = vector_drawing.classify(text)
             category, confidence = _reconcile(claimed, by_rules, text)
-            fields.append(_field(
+            field = _field(
                 category=category,
                 text=text,
                 bbox=_bbox(annotation.get("bbox")),
                 confidence=confidence,
-            ))
+            )
+            if annotation.get("agreement"):
+                # Согласие чтений листа (DRAWING_CONSENSUS_READS): по нему
+                # дочитывание выбирает спорные поля.
+                field["agreement"] = annotation["agreement"]
+            fields.append(field)
+        return fields
+
+    def _reread_disputed(
+        self, image, fields: List[Dict[str, Any]], payload: Dict[str, Any], started: float,
+    ) -> List[Dict[str, Any]]:
+        """Спорные поля листа — вырезками в родном разрешении (DRAWING_DISPUTED_REREAD)."""
+        budget = settings.DRAWING_TIME_BUDGET
+        try:
+            fields, stats = disputed_reread.apply(
+                self.qwen, image, fields, until=started + budget if budget else None,
+            )
+        except (SoftTimeLimitExceeded, deadline.Cancelled):
+            raise
+        except Exception as exc:  # noqa: BLE001 — дочитывание не роняет лист
+            logger.error("Дочитывание спорных надписей не удалось: %s", exc)
+            return fields
+        if stats["crops"]:
+            payload["disputed_reread"] = stats
         return fields
 
     # ------------------------------------------------------------ хранилище
