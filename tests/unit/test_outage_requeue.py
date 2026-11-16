@@ -239,3 +239,84 @@ def test_task_without_flag_is_unchanged(pipeline, task_db, fake_redis, mocker, m
     init_request_state("req-plain", ["file-plain"])
     assert process_document("req-plain", "file-plain")["status"] == "success"
     requeue.assert_not_called()
+
+
+# ------------------------------------------- пометка LAYOUT_UNAVAILABLE
+def _ladder_with_ocr():
+    from tests.unit.test_ladder import FakeStrategy
+
+    return LadderRouter(strategies=[FakeStrategy(4, confidence=1.0, fallback=True),
+                                    LayoutStrategy()], threshold=0.75)
+
+
+@pytest.fixture
+def note_on(monkeypatch):
+    monkeypatch.setattr(settings, "PARSE_LAYOUT_UNAVAILABLE_NOTE", True)
+    MinerUParserProvider.reset_availability()
+    yield
+    MinerUParserProvider.reset_availability()
+
+
+def test_scan_left_on_ocr_is_marked(note_on, monkeypatch):
+    from core.ladder.router import LAYOUT_UNAVAILABLE
+
+    monkeypatch.setattr(settings, "PARSE_REQUEUE_ON_OUTAGE", False)
+    MinerUParserProvider.mark_unavailable()
+    with outage.scope():
+        result = _ladder_with_ocr().parse(_image_context())
+    assert result.ladder["chosen_level"] == 4
+    assert LAYOUT_UNAVAILABLE in result.degraded
+    assert LAYOUT_UNAVAILABLE in result.ladder["degraded"]
+
+
+def test_scan_marked_after_outage_wait_ran_out(note_on, monkeypatch):
+    from core.ladder.router import LAYOUT_UNAVAILABLE
+
+    monkeypatch.setattr(settings, "PARSE_REQUEUE_ON_OUTAGE", True)
+    monkeypatch.setattr(settings, "PARSE_OUTAGE_MAX_WAIT_SECONDS", 3600)
+    MinerUParserProvider.mark_unavailable()
+    with outage.scope(time.time() - 3601):
+        result = _ladder_with_ocr().parse(_image_context())
+    assert LAYOUT_UNAVAILABLE in result.degraded
+
+
+def test_no_mark_without_flag(monkeypatch):
+    monkeypatch.setattr(settings, "PARSE_REQUEUE_ON_OUTAGE", False)
+    MinerUParserProvider.mark_unavailable()
+    try:
+        with outage.scope():
+            result = _ladder_with_ocr().parse(_image_context())
+    finally:
+        MinerUParserProvider.reset_availability()
+    assert result.degraded == []
+
+
+def test_scan_marked_when_layout_level_failed(note_on, monkeypatch):
+    # MinerU отклонил задачу (409 с нехваткой памяти) или не дал блоков:
+    # скан остался плоским OCR — тоже с пометкой.
+    def run(self, context, prefetched=None):
+        raise ValueError("нет блоков")
+
+    monkeypatch.setattr(LayoutStrategy, "run", run)
+    with outage.scope():
+        result = _ladder_with_ocr().parse(_image_context())
+    assert result.ladder["chosen_level"] == 4
+    assert "LAYOUT_UNAVAILABLE" in result.degraded
+
+
+def test_no_mark_when_layout_level_delivered(note_on, monkeypatch):
+    from tests.unit.test_ladder import FakeStrategy
+
+    with outage.scope():
+        result = LadderRouter(strategies=[FakeStrategy(4, confidence=1.0, fallback=True),
+                                          FakeStrategy(5, confidence=1.0, structured=True)],
+                              threshold=0.75).parse(_image_context())
+    assert result.ladder["chosen_level"] == 5
+    assert "LAYOUT_UNAVAILABLE" not in result.degraded
+
+
+def test_vector_pdf_is_not_marked(note_on):
+    context = DocumentContext(uri="documents/x.pdf", file_type="pdf", data=b"%PDF-1.4")
+    context._classification = type("C", (), {"source": "vector_text"})()
+    MinerUParserProvider.mark_unavailable()
+    assert LayoutStrategy().skipped_as_unavailable(context) is False

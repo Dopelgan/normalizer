@@ -120,6 +120,20 @@ class LayoutStrategy(Strategy):
             return False
         return True
 
+    def skipped_as_unavailable(self, context: DocumentContext) -> bool:
+        """
+        Растровый документ, которому уровень не достаётся только потому, что
+        MinerU помечен недоступным: без уровня 5 скан остаётся плоским OCR
+        (`PARSE_LAYOUT_UNAVAILABLE_NOTE`). Вектор сюда не попадает — он
+        читается по слою, и это не потеря.
+        """
+        if context.kind not in (filetypes.KIND_PDF, filetypes.KIND_IMAGE):
+            return False
+        if MinerUParserProvider.is_available():
+            return False
+        return (context.kind == filetypes.KIND_IMAGE
+                or context.classification.source == SOURCE_RASTER)
+
     def prefetch(self, context: DocumentContext) -> MinerUPrefetch:
         """Начать запрос к MinerU заранее — только HTTP, в одном потоке."""
         return self.provider.prefetch(context.uri, context.file_type, context.metadata)

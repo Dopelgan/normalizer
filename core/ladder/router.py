@@ -46,7 +46,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import deadline, telemetry
+from core import deadline, filetypes, telemetry
 from core.config import settings
 from core.ladder import drawing_route
 from core.ladder.base import Strategy, text_chars
@@ -73,6 +73,11 @@ from core.providers.mineru_parser import MINERU_HTTP_MS, MinerUParserProvider
 from core.providers.tesseract_fallback import ocr_memo
 
 logger = logging.getLogger(__name__)
+
+# Пометка в `degraded`: скан остался на плоском OCR, потому что MinerU был
+# недоступен (`PARSE_LAYOUT_UNAVAILABLE_NOTE`). Строка постоянная — по ней
+# ищется список документов на повторный разбор.
+LAYOUT_UNAVAILABLE = "LAYOUT_UNAVAILABLE"
 
 
 # Уровни платформы по возрастанию стоимости. Здесь только типы: создавать
@@ -210,6 +215,16 @@ class LadderRouter:
                 f"(тип {context.file_type!r}, род {context.kind!r})"
             )
 
+        # Уровень 5 не попал в лестницу из-за лежащего MinerU: скан, который
+        # кончится плоским OCR, должен сказать об этом сам
+        # (`PARSE_LAYOUT_UNAVAILABLE_NOTE`). Решается здесь, а не в конце:
+        # срок недоступности короткий и к концу разбора может истечь.
+        layout_unavailable = settings.PARSE_LAYOUT_UNAVAILABLE_NOTE and any(
+            strategy not in applicable
+            and getattr(strategy, "skipped_as_unavailable", None) is not None
+            and strategy.skipped_as_unavailable(context)
+            for strategy in self.strategies
+        )
         classification = context.classification
         # Полный текстовый слой: уровень 4 не запускается, его роль (мерка
         # сохранности и запас для чертёжной ветки) отдаётся уровню 2 — явно,
@@ -452,6 +467,23 @@ class LadderRouter:
             if note not in best.degraded:
                 best.degraded.append(note)
             logger.warning("Разбор %s деградировал: %s", context.uri, note)
+
+        # Уровень 5 запускался и упал (MinerU отклонил задачу — на проде это
+        # 409 с нехваткой памяти видеокарты, — не дал блоков, не хватило
+        # срока): скан тоже остался плоским OCR, и тоже молча.
+        layout_failed = (
+            settings.PARSE_LAYOUT_UNAVAILABLE_NOTE
+            and (context.kind == filetypes.KIND_IMAGE or classification.source == SOURCE_RASTER)
+            and any(a.level == 5 and a.error for a in attempts)
+        )
+        if ((layout_unavailable or layout_failed) and best.is_fallback
+                and LAYOUT_UNAVAILABLE not in best.degraded):
+            # Плоский OCR вместо разбора с таблицами — из-за сервиса, а не из-за
+            # документа. Имя пометки не входит в советы RAG: документ виден
+            # неполным, а запрос к базе по `degraded` находит его для
+            # повторного разбора.
+            best.degraded.append(LAYOUT_UNAVAILABLE)
+            logger.warning("Разбор %s остался на OCR: уровень 5 не дал результата", context.uri)
 
         # Старшинство выдано авансом: лист ещё не прочитан. Лучший фоллбэк
         # уезжает вместе с результатом, и после чтения листа моделью объём

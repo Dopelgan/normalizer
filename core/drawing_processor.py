@@ -917,6 +917,9 @@ class DrawingProcessor:
         ]
         self._mineru_tables = _tables_by_page(fragments)
         readings = self._read_sheets(source_uri, metadata, chosen, full_read, fields_of)
+        # Листы, начатые и потерянные (исключение листа, таймаут чтения
+        # модели, пустой ответ), — DRAWING_LOST_SHEETS_SKIPPED.
+        lost: List[Any] = []
         # Фрагменты собираются строго в порядке страниц, в каком бы порядке
         # ни закончились вызовы модели.
         for index, (page, drawing_result) in enumerate(zip(chosen, readings)):
@@ -924,6 +927,7 @@ class DrawingProcessor:
                 skipped = pages[index:]
                 break
             if drawing_result is None:
+                lost.append(page)
                 continue
             anchor = Fragment(
                 # Нулевой номер: лист целиком идёт перед своими фрагментами и не
@@ -939,11 +943,26 @@ class DrawingProcessor:
             sheet = self.build_fragment(drawing_result, anchor, metadata)
             if sheet is not None:
                 sheets.append(sheet)
-        if skipped and sheets:
+            else:
+                lost.append(page)
+        if settings.DRAWING_LOST_SHEETS_SKIPPED and lost:
+            # Потерянный лист — тот же непрочитанный лист, что и лист за
+            # пределом: без этого он пропадал молча.
+            logger.warning("Листы %s стр. %s прочитать не удалось", source_uri,
+                           ", ".join(str(page) for page in lost))
+            skipped = sorted({int(page) for page in list(lost) + list(skipped)})
+        carrier = sheets[0] if sheets else None
+        if (carrier is None and skipped and settings.DRAWING_LOST_SHEETS_SKIPPED
+                and lost and fragments):
+            # Ни один лист не прочитан, но у документа есть другие фрагменты
+            # (вырезки MinerU, текст): пометка встаёт на первый из них, иначе
+            # потеря листов не доходит до предупреждений документа.
+            carrier = fragments[0]
+        if skipped and carrier is not None:
             # Неразобранные листы не пропадают молча: пометка ведёт на проверку.
             note = "DRAWING_SHEETS_SKIPPED:" + ",".join(str(page) for page in skipped)
-            sheets[0].review_required = True
-            sheets[0].warnings = list(dict.fromkeys(sheets[0].warnings + [note]))
+            carrier.review_required = True
+            carrier.warnings = list(dict.fromkeys(carrier.warnings + [note]))
         return sheets
 
     def _read_sheets(
