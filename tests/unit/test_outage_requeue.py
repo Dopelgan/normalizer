@@ -75,7 +75,19 @@ def test_layout_level_raises_for_raster_when_mineru_is_down(requeue_on):
     MinerUParserProvider.mark_unavailable()
     with outage.scope(), pytest.raises(outage.ServiceOutage):
         # Через лестницу: общий перехват неудачи уровня его не глотает.
-        LadderRouter(strategies=[LayoutStrategy()])._applicable(_image_context())
+        LadderRouter(strategies=[LayoutStrategy()]).parse(_image_context())
+
+
+def test_document_finished_below_level5_does_not_wait(requeue_on):
+    # Уровню 4 хватило оценки — до уровня 5 лестница не доходит, и лежащий
+    # MinerU документ не задерживает.
+    from tests.unit.test_ladder import FakeStrategy
+
+    MinerUParserProvider.mark_unavailable()
+    with outage.scope():
+        result = LadderRouter(strategies=[FakeStrategy(4, confidence=1.0), LayoutStrategy()],
+                              threshold=0.75).parse(_image_context())
+    assert result.ladder["chosen_level"] == 4
 
 
 def test_layout_level_skipped_as_before_without_flag(monkeypatch):

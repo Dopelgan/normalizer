@@ -235,6 +235,60 @@ def test_parallel_waits_count_once(redis_client):
     assert clock.waited() == pytest.approx(time.monotonic() - started, abs=0.03)
 
 
+def test_running_call_keeps_budget_clock_going(redis_client):
+    # Пока один проход листа работает с моделью, ожидание другого не
+    # вычитается из бюджета: лист движется.
+    clock = gpu_gate._WaitClock()
+    clock.start_call()
+    clock.enter()
+    time.sleep(0.1)
+    clock.leave()
+    clock.end_call()
+    assert clock.waited() == 0.0
+    # Вызов кончился, а ожидание осталось — лист стоит.
+    clock.enter()
+    time.sleep(0.1)
+    clock.leave()
+    assert clock.waited() >= 0.09
+
+
+def test_short_lease_does_not_shorten_key(redis_client):
+    assert gpu_gate.try_acquire(gpu_gate.MINERU, "long", lease=1470, slots=6)
+    assert gpu_gate.try_acquire(gpu_gate.MINERU, "short", lease=10, slots=6)
+    assert redis_client.ttl("normalizer:gpu_gate:mineru") >= 1470
+
+
+def test_no_wait_past_task_deadline(redis_client):
+    from core import deadline
+
+    assert gpu_gate.try_acquire(gpu_gate.VLM, "other", lease=600, slots=1)
+    with deadline.scope(5):
+        started = time.monotonic()
+        with gpu_gate.slot(gpu_gate.VLM, lease=60):
+            pass
+    assert time.monotonic() - started < 1.0
+
+
+def test_redis_down_is_remembered(monkeypatch):
+    calls = []
+
+    class Broken:
+        def pipeline(self, *args, **kwargs):
+            calls.append(1)
+            raise ConnectionError("redis down")
+
+    gpu_gate.set_client(Broken())
+    monkeypatch.setattr(settings, "GPU_GATE_ENABLED", True)
+    monkeypatch.setattr(settings, "GPU_GATE_YIELD_ON_WAITING", False)
+    try:
+        for _ in range(3):
+            with gpu_gate.slot(gpu_gate.VLM, lease=60):
+                pass
+        assert len(calls) == 1
+    finally:
+        gpu_gate.set_client(None)
+
+
 def test_yield_waits_while_vllm_has_queue(redis_client, monkeypatch):
     monkeypatch.setattr(settings, "GPU_GATE_YIELD_ON_WAITING", True)
     answers = iter([3.0, 1.0, 0.0])

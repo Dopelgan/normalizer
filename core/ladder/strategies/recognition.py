@@ -105,11 +105,14 @@ class LayoutStrategy(Strategy):
         # времени. Лучше честно пропустить уровень: деградация уже отмечена.
         if not MinerUParserProvider.is_available():
             # Растровому документу без MinerU остаётся плоский OCR: с
-            # PARSE_REQUEUE_ON_OUTAGE он ставится в очередь, а не уходит
-            # в индекс таким навсегда (бросает ServiceOutage).
-            if (context.kind == filetypes.KIND_IMAGE
-                    or context.classification.source == SOURCE_RASTER):
-                outage.mineru_down("сервис помечен недоступным")
+            # PARSE_REQUEUE_ON_OUTAGE уровень остаётся в лестнице, а `run`
+            # ставит документ в очередь. Решает именно `run`: документ,
+            # которому хватило уровня 4, до уровня 5 не дойдёт и ждать
+            # сервис не будет.
+            if (outage.requeue_allowed()
+                    and (context.kind == filetypes.KIND_IMAGE
+                         or context.classification.source == SOURCE_RASTER)):
+                return True
             logger.warning(
                 "Уровень %d пропущен: MinerU недоступен, разбор остаётся на OCR",
                 self.level,
@@ -118,6 +121,10 @@ class LayoutStrategy(Strategy):
         return True
 
     def run(self, context: DocumentContext) -> ParseResult:
+        if not MinerUParserProvider.is_available():
+            # Сюда без сервиса доходит только растр под PARSE_REQUEUE_ON_OUTAGE
+            # (`applicable`): документ в очередь (ServiceOutage).
+            outage.mineru_down("сервис помечен недоступным")
         result = self.provider.parse(context.uri, context.file_type, context.metadata)
         if not result.blocks:
             raise ValueError("Разбор с детекцией областей не дал блоков")

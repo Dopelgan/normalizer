@@ -24,7 +24,9 @@ Redis недоступен — вызов идёт без места (одно �
 
 Время ожидания места не съедает бюджет листа `DRAWING_TIME_BUDGET`: ветка
 чертежей меряет бюджет часами `budget_now()`, из которых вычтено время,
-когда хоть один поток этого листа ждал места. В тайминги документа оно
+когда лист стоял: его потоки ждали места и ни один его вызов модели не
+шёл. Ждать места дольше остатка срока задачи вызов не станет — пойдёт без
+места, чтобы документ не упал по сроку. В тайминги документа ожидание
 идёт отдельным ключом `parse.gate_wait_ms`. С выключенным флагом часы
 совпадают с `time.monotonic()`, и ничего не меняется.
 """
@@ -56,6 +58,13 @@ MINERU = "mineru"
 _KEY = "normalizer:gpu_gate:{kind}"
 # Пауза между попытками взять место; случайная добавка разводит воркеры.
 _POLL_SECONDS = 0.25
+# Срок жизни ключа: дольше любой аренды и только продлевается — иначе
+# короткая аренда укоротила бы ключ под длинной, и счёт пропал бы вместе
+# с ним, пока длинный вызов ещё идёт.
+_KEY_TTL = 4 * 3600
+# Сколько не ходить в лежащий Redis после отказа: каждая попытка — это
+# таймаут соединения на каждом вызове модели.
+_REDIS_RETRY_SECONDS = 30.0
 # Сколько ждать, пока у vLLM есть очередь, прежде чем идти всё равно.
 _YIELD_MAX_SECONDS = 30.0
 # Сколько считать прочитанное число ждущих запросов vLLM свежим.
@@ -65,6 +74,7 @@ _WAITING = re.compile(r"^vllm:num_requests_waiting(?:\{[^}]*\})?\s+([0-9.eE+-]+)
 _client_lock = threading.Lock()
 _client: Any = None
 _warned = False
+_redis_down_until = 0.0
 _metrics_lock = threading.Lock()
 _metrics_cache: Tuple[float, float] = (0.0, 0.0)  # (когда прочитано, сколько ждут)
 _timings_lock = threading.Lock()
@@ -88,14 +98,16 @@ def _redis():
 
 def set_client(client: Any) -> None:
     """Подмена клиента (тесты с fakeredis); None — вернуть настоящий."""
-    global _client, _warned
+    global _client, _warned, _redis_down_until
     with _client_lock:
         _client = client
     _warned = False
+    _redis_down_until = 0.0
 
 
 def _fail_open(exc: Exception) -> None:
-    global _warned
+    global _warned, _redis_down_until
+    _redis_down_until = time.monotonic() + _REDIS_RETRY_SECONDS
     if not _warned:
         _warned = True
         logger.warning("Места на видеокарте не учитываются — Redis недоступен: %s", exc)
@@ -152,8 +164,8 @@ def try_acquire(kind: str, token: str, lease: float, slots: Optional[int] = None
     pipe.zremrangebyscore(key, "-inf", now)
     pipe.zadd(key, {token: now + lease})
     pipe.zcard(key)
-    # Ключ живёт не дольше самой длинной аренды: брошенный ключ уберётся сам.
-    pipe.expire(key, int(lease) + 60)
+    # Брошенный ключ уберётся сам; срок только продлевается.
+    pipe.expire(key, max(_KEY_TTL, int(lease) + 60))
     count = pipe.execute()[2]
     if count <= (slots if slots is not None else limit(kind)):
         return True
@@ -219,7 +231,7 @@ def slot(kind: str, lease: float) -> Iterator[None]:
     Место на видеокарте на один вызов. `lease` — на сколько секунд берётся
     аренда: таймаут вызова плюс запас. Без флага — ничего не делает.
     """
-    if not settings.GPU_GATE_ENABLED:
+    if not settings.GPU_GATE_ENABLED or time.monotonic() < _redis_down_until:
         yield
         return
     token = uuid.uuid4().hex
@@ -240,6 +252,14 @@ def slot(kind: str, lease: float) -> Iterator[None]:
                 _fail_open(exc)
                 break
             deadline.check_cancelled()
+            left = deadline.remaining()
+            if left is not None and left < lease:
+                # Дальше ждать — значит не успеть сам вызов до срока задачи:
+                # документ упал бы по сроку вместо обычной деградации. Вызов
+                # идёт без места.
+                logger.warning("Место %s не дождались: до срока задачи %.0f с, вызов идёт без места",
+                               kind, left)
+                break
             time.sleep(_POLL_SECONDS * (1.0 + random.random()))
     finally:
         if clock is not None:
@@ -247,9 +267,13 @@ def slot(kind: str, lease: float) -> Iterator[None]:
         waited_ms = (time.monotonic() - started) * 1000.0
         with _timings_lock:
             telemetry.add("parse.gate_wait_ms", waited_ms)
+    if clock is not None:
+        clock.start_call()
     try:
         yield
     finally:
+        if clock is not None:
+            clock.end_call()
         if held:
             release(kind, token)
 
@@ -266,32 +290,50 @@ def call(kind: str, lease: float, function: Callable[..., Any], *args: Any, **kw
 
 class _WaitClock:
     """
-    Сколько секунд хоть один поток листа ждал места. Объединение отрезков, а
-    не сумма: части листа ждут параллельно, и три потока, ждавшие одну и ту
-    же минуту, отняли у листа минуту, а не три.
+    Сколько секунд лист стоял из-за мест: кто-то из его потоков ждал места,
+    и ни один вызов листа при этом не шёл. Пока хоть один проход или часть
+    листа работает с моделью, лист движется, и это время идёт в бюджет —
+    иначе при параллельных проходах кто-то ждёт почти всегда, и бюджет листа
+    фактически выключен. Три потока, ждавшие одну минуту, — минута, не три.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._waiting = 0
-        self._since = 0.0
+        self._calls = 0
+        self._since = 0.0       # начало текущего простоя
         self._total = 0.0
 
-    def enter(self) -> None:
+    def _stalled(self) -> bool:
+        return self._waiting > 0 and self._calls == 0
+
+    def _change(self, waiting: int = 0, calls: int = 0) -> None:
         with self._lock:
-            if self._waiting == 0:
-                self._since = time.monotonic()
-            self._waiting += 1
+            before = self._stalled()
+            self._waiting += waiting
+            self._calls += calls
+            after = self._stalled()
+            now = time.monotonic()
+            if not before and after:
+                self._since = now
+            elif before and not after:
+                self._total += now - self._since
+
+    def enter(self) -> None:
+        self._change(waiting=1)
 
     def leave(self) -> None:
-        with self._lock:
-            self._waiting -= 1
-            if self._waiting == 0:
-                self._total += time.monotonic() - self._since
+        self._change(waiting=-1)
+
+    def start_call(self) -> None:
+        self._change(calls=1)
+
+    def end_call(self) -> None:
+        self._change(calls=-1)
 
     def waited(self) -> float:
         with self._lock:
-            extra = time.monotonic() - self._since if self._waiting else 0.0
+            extra = time.monotonic() - self._since if self._stalled() else 0.0
             return self._total + extra
 
 
