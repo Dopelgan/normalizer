@@ -19,7 +19,7 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_serializer, model_validator
 
 FragmentType = Literal["text", "table", "formula", "drawing", "image", "structured"]
 DocumentStatus = Literal["pending", "indexed", "error"]
@@ -225,6 +225,20 @@ class DrawingField(BaseModel):
         "detected_from_annotation", "reference_table", "expert_verified",
         "full_page_ocr", "vector_text_layer",
     ] = "detected_from_annotation"
+    # Сведение прочтений (DRAWING_READINGS_RECONCILED): все прочтения поля
+    # разными проходами `[{"source", "value"}]` и согласие между ними —
+    # «vector» (значение из текстового слоя), «agreed», «single», «conflict».
+    # Без флага ключей нет в ответе вовсе (см. `_without_unset_readings`).
+    readings: Optional[List[Dict[str, str]]] = None
+    agreement: Optional[Literal["vector", "agreed", "single", "conflict"]] = None
+
+    @model_serializer(mode="wrap")
+    def _without_unset_readings(self, handler):
+        data = handler(self)
+        for key in ("readings", "agreement"):
+            if isinstance(data, dict) and data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class Content(BaseModel):

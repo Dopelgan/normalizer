@@ -70,10 +70,12 @@ from core import deadline, outage
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
-    dimension_fidelity, drawing_text, drawing_vision, gpu_gate, raster_drawing, title_block,
-    vector_drawing,
+    dimension_fidelity, drawing_text, drawing_vision, gpu_gate, raster_drawing, reading_reconcile,
+    title_block, vector_drawing,
 )
-from core.providers.qwen_client import CATEGORIES, QwenVisionClient
+from core.providers.qwen_client import (
+    CATEGORIES, GUARD_MIN_TEXT_LINES, REJECT_EMPTY, QwenVisionClient,
+)
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.vector_drawing import structure_ratio
 from core.drawing_quality import apply_drawing_quality
@@ -208,6 +210,9 @@ class DrawingProcessor:
         # Таблицы MinerU по страницам: (bbox, строк). Только для строки учёта
         # прохода по таблице (`_log_table_pass`), на разбор не влияет.
         self._mineru_tables: Dict[int, List[Tuple[List[float], int]]] = {}
+        # Строк слоя распознавания по страницам: по ним ограждённый проход
+        # листа отличает пустой лист от пустого ответа (DRAWING_SHEET_GUARDED).
+        self._layer_lines: Dict[int, int] = {}
 
     # ------------------------------------------------------------- публичное
     def process(
@@ -372,6 +377,15 @@ class DrawingProcessor:
                 missing_regions.extend(own_missing)
             if lines:
                 payload["transcript_lines"] = lines
+            if reading is not None and settings.DRAWING_SHEET_GUARDED:
+                reading = self._guard_empty_sheet(
+                    layout, reading, max(len(lines or []), self._layer_lines.get(int(page), 0)),
+                    budget_started,
+                )
+                guard = _guard_note(reading)
+                if guard:
+                    payload["sheet_guard"] = guard
+                    self._sheet_record(reading, payload)
             if reading is None and not lines:
                 logger.error("Модель не прочитала лист %s", image_ref)
                 self._log_sheet(image_ref, sheet, MODE_NONE, 0, 0, 0, 0, started)
@@ -477,6 +491,22 @@ class DrawingProcessor:
         }
 
     # ------------------------------------------------- оборванный ответ листа
+    def _guard_empty_sheet(self, layout, reading, text_lines: int, budget_started: float):
+        """
+        Пустой ответ по надписям при непустом листе (DRAWING_SHEET_GUARDED):
+        у прохода «весь текст листа» или слоя распознавания страницы не меньше
+        GUARD_MIN_TEXT_LINES строк. Такой ответ — сбой, а не чистый лист: он
+        отбраковывается, и лист перечитывается частями один раз.
+        """
+        if reading.annotations or reading.tiles or text_lines < GUARD_MIN_TEXT_LINES:
+            return reading
+        logger.warning("Пустой ответ по надписям при %d строках текста листа: лист "
+                       "перечитывается частями", text_lines)
+        reading.rejected = REJECT_EMPTY
+        budget = settings.DRAWING_TIME_BUDGET
+        until = budget_started + budget - settings.DRAWING_SHEET_TILE_RESERVE if budget else None
+        return self.qwen.reread_sheet_by_tiles(layout.image, reading, hint=layout.hint(), until=until)
+
     @staticmethod
     def _sheet_produced(reading) -> str:
         """Что дал проход «лист целиком» — для строки лога."""
@@ -765,6 +795,10 @@ class DrawingProcessor:
             for fragment in result:
                 fragment.review_required = True
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
+        if settings.DRAWING_READINGS_RECONCILED:
+            # До правки абзацев распознавания: слой страницы — одно из
+            # прочтений, и сводится он в том виде, в каком его дал движок.
+            reading_reconcile.apply(result)
         if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
             result.extend(self._rescan_poor_pages(result, metadata))
         # Модель не ответила документу ни разу и отказывала как сервис:
@@ -916,6 +950,7 @@ class DrawingProcessor:
             for page in chosen
         ]
         self._mineru_tables = _tables_by_page(fragments)
+        self._layer_lines = _layer_lines_by_page(fragments)
         readings = self._read_sheets(source_uri, metadata, chosen, full_read, fields_of)
         # Листы, начатые и потерянные (исключение листа, таймаут чтения
         # модели, пустой ответ), — DRAWING_LOST_SHEETS_SKIPPED.
@@ -1395,6 +1430,31 @@ def _tables_by_page(fragments: List[Fragment]) -> Dict[int, List[Tuple[List[floa
             continue          # рамка не в долях листа: сравнить не с чем
         tables.setdefault(int(fragment.position.page), []).append((bbox, len(data.rows or [])))
     return tables
+
+
+def _layer_lines_by_page(fragments: List[Fragment]) -> Dict[int, int]:
+    """Непустых строк текста распознавания (текстовые фрагменты) по страницам."""
+    lines: Dict[int, int] = {}
+    for fragment in fragments:
+        if fragment.type != "text" or fragment.position is None or not fragment.content.text:
+            continue
+        page = int(fragment.position.page)
+        lines[page] = lines.get(page, 0) + sum(
+            1 for line in fragment.content.text.splitlines() if line.strip()
+        )
+    return lines
+
+
+def _guard_note(reading) -> Optional[Dict[str, Any]]:
+    """
+    Пометка листа, ответ по которому отбракован и не дочитан и частями
+    (DRAWING_SHEET_GUARDED): причина и непрочитанные части. Лист принят или
+    дочитан — пометки нет.
+    """
+    if reading is None or not reading.rejected or reading.complete:
+        return None
+    return {"rejected": reading.rejected, "tiles": reading.tiles,
+            "unread_tiles": [list(box) for box in reading.failed]}
 
 
 def _overlap_share(region: Sequence[float], other: Sequence[float]) -> float:

@@ -77,7 +77,9 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from core.config import settings
 from core.models.contract import Fragment
+from core.providers import reading_reconcile
 from core.providers.title_block import (
     AS_READ, HANDWRITTEN_MARK, LABELS, canonical, label,
 )
@@ -364,7 +366,8 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
         return content.text
     fields = [
         {"category": f.category, "value": f.value, "tolerance": f.tolerance,
-         "unit": f.unit, "confirmed": f.confirmed}
+         "unit": f.unit, "confirmed": f.confirmed,
+         "agreement": f.agreement, "readings": f.readings}
         for f in (content.structured_drawing_fields or [])
     ]
     lines = [line for line in (content.text or "").split("\n")]
@@ -1098,14 +1101,18 @@ def _with_tolerance(field: Dict[str, Any]) -> str:
     """
     value = _clean(field.get("value"))
     tolerance = _clean(field.get("tolerance"))
+    # Сведённое поле с расходящимися прочтениями (DRAWING_READINGS_RECONCILED)
+    # называет их все: одна строка с пометкой вместо двух молча спорящих.
+    note = (reading_reconcile.conflict_note(field)
+            if value and settings.DRAWING_READINGS_RECONCILED else "")
     if not (value and tolerance):
-        return value
+        return value + note
     # Отклонение уже внутри значения — второй раз не называется. Но голая
     # цифра совпадает с чем угодно: допуск «2» входит в «⌀200», и отклонение
     # пропало бы молча. Поглощённым считается только отклонение со знаком.
     if tolerance in value and not tolerance.isdigit():
-        return value
-    return f"{value} (допуск {tolerance})"
+        return value + note
+    return f"{value} (допуск {tolerance})" + note
 
 
 def _values(fields: Sequence[Dict[str, Any]], category: str) -> List[str]:
