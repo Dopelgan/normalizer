@@ -52,6 +52,7 @@ from core.ladder import drawing_route
 from core.ladder.base import Strategy, text_chars
 from core.ladder.context import DocumentContext
 from core.ladder.scoring import Score, score_result
+from core.ladder.text_layer_complete import complete_text_layer
 from core.ladder.strategies.cad_source import CadSourceStrategy
 from core.ladder.strategies.native_text import (
     DocxStrategy,
@@ -198,6 +199,21 @@ class LadderRouter:
             )
 
         classification = context.classification
+        # Полный текстовый слой: уровень 4 не запускается, его роль (мерка
+        # сохранности и запас для чертёжной ветки) отдаётся уровню 2 — явно,
+        # без пометки `is_fallback` на самом результате.
+        substitute_level: Optional[int] = None
+        if settings.LADDER_SKIP_OCR_ON_TEXT_LAYER and any(s.level == 4 for s in applicable):
+            layer = complete_text_layer(context)
+            levels = {s.level for s in applicable}
+            if layer is not None and 2 in levels:
+                applicable = [s for s in applicable if s.level != 4]
+                substitute_level = 2
+                telemetry.add("parse.level4_ms", 0.0)
+                logger.info(
+                    "Уровень 4 пропущен для %s: текстовый слой полный — страниц %d, символов %d",
+                    context.uri, layer.pages, layer.chars,
+                )
         logger.info(
             "Лестница для %s: источник=%s жанр=%s качество=%s, уровни %s",
             context.uri, classification.source, classification.genre,
@@ -210,6 +226,7 @@ class LadderRouter:
         best_score: Optional[Score] = None
         best_strategy: Optional[Strategy] = None
         candidates: List[tuple[ParseResult, Score, Strategy, float]] = []
+        substitute: Optional[ParseResult] = None
 
         # Объём лучшего фоллбэка — мерка сохранности для структурных
         # уровней: фоллбэк читает страницу целиком и годится как нижняя
@@ -315,6 +332,11 @@ class LadderRouter:
                     )
             else:
                 fallback_chars = max(fallback_chars, chars)
+            if strategy.level == substitute_level:
+                # Слой файла вместо пропущенного распознавания: он и есть
+                # нижняя граница текста страницы.
+                substitute = result
+                fallback_chars = max(fallback_chars, chars)
 
             # Старшинство структурного разбора. Балл здесь не при чём: он
             # меряет объём текста и уверенность, а фоллбэк на странице с
@@ -369,6 +391,13 @@ class LadderRouter:
         # а не нормальный исход. Молчать о ней нельзя: снаружи документ
         # выглядит разобранным, а в индекс уехала каша.
         fallback_won = best.is_fallback and structural_seen
+        if substitute is not None and best is substitute:
+            # Слой файла стоит на месте распознавания: если уровень структуры
+            # после него не справился, это та же деградация, что победа
+            # фоллбэка, и помечается она так же.
+            fallback_won = any(
+                a.error and a.level > substitute_level for a in attempts
+            )
         if fallback_won:
             # Балл победителя пересчитывается честно: структуру на этом
             # документе кто-то вернул, значит её отсутствие здесь — не
@@ -396,7 +425,7 @@ class LadderRouter:
         reserve: Optional[ParseResult] = None
         if (sheet_read_later and not best.is_fallback
                 and not self._keeps_content(text_chars(best), fallback_chars)):
-            fallbacks = [c for c in candidates if c[0].is_fallback]
+            fallbacks = [c for c in candidates if c[0].is_fallback or c[0] is substitute]
             if fallbacks:
                 reserve = max(fallbacks, key=lambda c: (text_chars(c[0]), c[1].value))[0]
                 best.fallback_reserve = reserve

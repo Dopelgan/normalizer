@@ -146,6 +146,7 @@
 
 | Флаг | По умолчанию | Читает |
 |---|---|---|
+| `LADDER_SKIP_OCR_ON_TEXT_LAYER` | `false` | `core/ladder/router.py` (условие — `core/ladder/text_layer_complete.py`) |
 | `LADDER_DRAWING_OVER_OCR` | `false` | `core/ladder/drawing_route.py`, `core/ladder/router.py`, `core/models/parse_result.py`, `ingest/tasks.py` |
 | `DRAWING_VISION_ENABLED` | `true` | `core/drawing_processor.py` |
 | `DRAWING_TEXT_IN_FRAME_ENABLED` | `false` | `core/drawing_processor.py`, `core/providers/vector_drawing.py` |
