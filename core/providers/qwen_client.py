@@ -68,8 +68,12 @@ def shared_session() -> requests.Session:
         if _shared is None:
             _shared = requests.Session()
             # Пул соединений не меньше, чем запросов к модели разом: листы
-            # документа (VLM_SHEET_CONCURRENCY) по частям листа
-            # (DRAWING_TRANSCRIBE_TILE_PARALLEL). У requests по умолчанию 10,
+            # документа (VLM_SHEET_CONCURRENCY) по проходам листа
+            # (DRAWING_PASSES_PARALLEL) по частям листа
+            # (DRAWING_TRANSCRIBE_TILE_PARALLEL). Сессия requests общая для
+            # всех этих потоков: пул urllib3 потокобезопасен, а состояние,
+            # которое Session меняет на запросе (куки), здесь пусто — vLLM
+            # их не ставит. У requests по умолчанию 10,
             # и лишние соединения сверх пула закрывались бы после ответа
             # с предупреждением «Connection pool is full».
             size = max(10, pool_size())
@@ -82,8 +86,9 @@ def shared_session() -> requests.Session:
 def pool_size() -> int:
     """Сколько запросов к модели может идти из одного документа разом."""
     sheets = max(1, int(settings.VLM_SHEET_CONCURRENCY))
+    passes = max(1, int(settings.DRAWING_PASSES_PARALLEL))
     tiles = max(1, int(settings.DRAWING_TRANSCRIBE_TILE_PARALLEL))
-    return sheets * tiles
+    return sheets * passes * tiles
 
 
 def close_shared_session() -> None:

@@ -93,6 +93,7 @@
 |---|---|---|
 | **Вся ветка чертежей** | `core/drawing_processor.py` | `DrawingProcessor.process` (131), `enrich_fragments` (489) — вызывается из `ingest/tasks.py:598` |
 | Разметка листа геометрией | `core/drawing_processor.py` | `_sheet_drawings` (645) |
+| Проходы листа (лист, текст, штамп, таблицы) и их сведение | `core/drawing_processor.py` | `_process`: проходы — замыкания `sheet_pass`, `transcribe_pass`, `region_pass`, исполнитель — `_Passes` (`DRAWING_PASSES_PARALLEL`) |
 | Проход «перепиши лист целиком» | `core/drawing_processor.py` | `_transcribe` (768) → `core/providers/qwen_client.py` |
 | Проход по штампу | `core/drawing_processor.py` | `_read_title_block` (803), `_read_title_block_fields` (846); канонические метки — `core/providers/title_block.py` `LABELS` |
 | Проход по боковым графам | `core/drawing_processor.py` | `_read_side_column` (911) |
@@ -207,6 +208,7 @@
 | `DRAWING_TIME_BUDGET` | `420` | `core/drawing_processor.py` (`_out_of_time` 587, `_transcribe` 566), `core/providers/qwen_client.py` | бюджет **на лист** (не на документ) |
 | `DRAWING_MAX_SHEETS` | `6` | `core/drawing_processor.py` | сколько листов читается моделью |
 | `VLM_SHEET_CONCURRENCY` | `1` | `core/drawing_processor.py` (`_read_sheets`) | сколько листов документа читается одновременно; порядок и результат не меняются |
+| `DRAWING_PASSES_PARALLEL` | `1` | `core/drawing_processor.py` (`_process`, `_Passes`); пул соединений — `core/providers/qwen_client.py::pool_size` | сколько проходов одного листа идут разом; запись листа не меняется |
 | `GPU_GATE_*_SLOTS_DAY/_NIGHT`, `GPU_GATE_BUSY_HOURS_UTC`, `QWEN_REQUEST_PRIORITY` | `2/10`, `2/6`, `4-13`, не задан | `core/providers/gpu_gate.py`; приоритет — `core/providers/qwen_client.py::_post` | сколько фоновых вызовов vLLM и MinerU разом на все воркеры; поле `priority` в vLLM |
 | `DRAWING_MAX_REGIONS` | `4` | `core/drawing_processor.py`, `core/providers/drawing_vision.py` | сколько областей на лист |
 | `DRAWING_RENDER_DPI` | `200` | `core/drawing_processor.py` | — |
