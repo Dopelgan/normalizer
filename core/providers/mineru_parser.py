@@ -27,11 +27,13 @@
 """
 
 import base64
+import contextvars
 import json
 import logging
 import os
 import re
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
@@ -429,6 +431,78 @@ class ParserTimedOut(ParserUnavailable):
 MINERU_HTTP_MS = "parse.mineru_http_ms"
 
 
+class MinerUPrefetch:
+    """
+    Запрос к MinerU, начатый заранее, пока уровень 4 читает тот же скан
+    (`LADDER_PARALLEL_LAYOUT`). В потоке — только HTTP: ни OCR, ни записи
+    в хранилище, ни сшивки; всё это после ответа делает `parse` в потоке
+    задачи, как и без флага. Файл и его разбор (слой, листы, страницы)
+    прочитаны один раз и уезжают в `parse` вместе с ответом.
+    """
+
+    def __init__(self, uri: str, file_bytes: Optional[bytes], layer, verdicts, pages: int):
+        self.uri = uri
+        self.file_bytes = file_bytes
+        self.layer = layer
+        self.verdicts = verdicts
+        self.pages = pages
+        self.http_ms = 0.0
+        self.waited_ms = 0.0
+        self.abandoned = False
+        self.consumed = False
+        self._session = requests.Session()
+        self._future: Optional[Future] = None
+
+    @property
+    def started(self) -> bool:
+        return self._future is not None
+
+    def start(self, call) -> "MinerUPrefetch":
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mineru-prefetch")
+        # Копия контекста: тайминги документа видны потоку. Срок задачи потоку
+        # не нужен — таймаут запроса посчитан до старта и передан явно.
+        self._future = pool.submit(contextvars.copy_context().run, self._timed, call)
+        # Поток единственный и после этой задачи не нужен: пул закрывается
+        # сразу, без ожидания, и не держит задачу.
+        pool.shutdown(wait=False)
+        return self
+
+    def _timed(self, call):
+        started = time.perf_counter()
+        try:
+            return call(self._session)
+        finally:
+            self.http_ms = (time.perf_counter() - started) * 1000
+
+    def payload(self) -> Dict[str, Any]:
+        """Ответ MinerU; ошибка запроса поднимается здесь, как без флага."""
+        if self._future is None:
+            raise RuntimeError("запрос к MinerU не начат")
+        self.consumed = True
+        started = time.perf_counter()
+        try:
+            return self._future.result()
+        finally:
+            self.waited_ms = (time.perf_counter() - started) * 1000
+            self._session.close()
+
+    def abandon(self) -> None:
+        """
+        Результат не нужен (срок задачи, отмена, уровень 5 не начат). Сессия
+        закрывается — висящий запрос обрывается на сокете, и ответ, если
+        придёт, никуда не идёт.
+        """
+        if self.abandoned or self.consumed:
+            return
+        self.abandoned = True
+        if self._future is not None:
+            self._future.cancel()
+        try:
+            self._session.close()
+        except Exception:  # noqa: BLE001 — закрытие не роняет задачу
+            pass
+
+
 class MinerUParserProvider(DocumentParserProvider):
     # Когда сервис не отвечает, об этом помнит весь процесс: иначе каждый
     # уровень лестницы заново ждёт таймаут соединения и заново прогоняет
@@ -457,23 +531,51 @@ class MinerUParserProvider(DocumentParserProvider):
         self.timeout = settings.MINERU_TIMEOUT
 
     # ------------------------------------------------------------- публичное
+    def prefetch(
+        self,
+        uri: str,
+        file_type: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> MinerUPrefetch:
+        """Начать запрос к MinerU в отдельном потоке; ответ заберёт `parse`."""
+        metadata = metadata or {}
+        file_bytes = self._read_source(uri)
+        layer, drawing_verdicts, pages = self._read_pdf(file_bytes, file_type)
+        handle = MinerUPrefetch(uri, file_bytes, layer, drawing_verdicts, pages)
+        if file_bytes is None:
+            # Ошибку чтения поднимет `parse`, как без флага: запроса нет.
+            return handle
+        request = self._mineru_request(uri, file_type, metadata, file_bytes, pages)
+        return handle.start(lambda session: self._request_mineru(
+            *request, session=session, abandoned=lambda: handle.abandoned))
+
     def parse(
         self,
         uri: str,
         file_type: str,
         metadata: Optional[Dict[str, Any]] = None,
+        prefetched: Optional[MinerUPrefetch] = None,
     ) -> ParseResult:
         metadata = metadata or {}
+        if prefetched is not None and not prefetched.started:
+            prefetched = None
 
         # Текстовый слой читается до похода в MinerU: он нужен и как источник
         # истины по тексту, и как страховка, если MinerU недоступен. Вместе с
         # ним с того же открытого документа снимается вердикт по чертёжным
         # листам — файл за проход открывается один раз.
-        file_bytes = self._read_source(uri)
-        layer, drawing_verdicts, pages = self._read_pdf(file_bytes, file_type)
+        if prefetched is not None:
+            file_bytes = prefetched.file_bytes
+            layer, drawing_verdicts, pages = prefetched.layer, prefetched.verdicts, prefetched.pages
+        else:
+            file_bytes = self._read_source(uri)
+            layer, drawing_verdicts, pages = self._read_pdf(file_bytes, file_type)
 
         try:
-            result = self._parse_with_mineru(uri, file_type, metadata, file_bytes, pages)
+            result = self._parse_with_mineru(
+                uri, file_type, metadata, file_bytes, pages,
+                payload=prefetched.payload() if prefetched is not None else None,
+            )
         except ParserUnavailable as exc:
             # Недоступность сервиса — это деградация системы, а не свойство
             # документа, и путать их нельзя: лежащий mineru-api иначе
@@ -794,15 +896,38 @@ class MinerUParserProvider(DocumentParserProvider):
         metadata: Dict[str, Any],
         file_bytes: Optional[bytes] = None,
         pages: int = 1,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> ParseResult:
-        if file_bytes is None:
-            try:
-                file_bytes = self.storage.read_bytes(uri)
-            except Exception as exc:
-                raise ParserFailed(
-                    f"Не удалось прочитать файл из хранилища: {uri}: {exc}"
-                ) from exc
+        if payload is None:
+            if file_bytes is None:
+                try:
+                    file_bytes = self.storage.read_bytes(uri)
+                except Exception as exc:
+                    raise ParserFailed(
+                        f"Не удалось прочитать файл из хранилища: {uri}: {exc}"
+                    ) from exc
+            payload = self._request_mineru(
+                *self._mineru_request(uri, file_type, metadata, file_bytes, pages)
+            )
 
+        asset_prefix = metadata.get("asset_prefix") or settings.ASSETS_PREFIX
+        blocks, page_count = self._extract(payload, asset_prefix)
+
+        is_image = filetypes.is_image(file_type)
+        return ParseResult(
+            blocks=blocks,
+            is_fallback=False,
+            parser_name="mineru",
+            source_kind="image" if is_image else "vector_pdf",
+            raw_output=payload,
+            failed_pages=[],
+            page_count=page_count or (1 if is_image else len({b.page for b in blocks})),
+        )
+
+    def _mineru_request(
+        self, uri: str, file_type: str, metadata: Dict[str, Any], file_bytes: bytes, pages: int,
+    ) -> Tuple[str, Dict[str, Any], list, int]:
+        """Адрес, поля, файл и таймаут запроса — в потоке задачи (срок задачи здесь)."""
         filename = self._filename(uri, file_type)
         url = f"{self.mineru_endpoint}/file_parse"
         data = {
@@ -819,16 +944,26 @@ class MinerUParserProvider(DocumentParserProvider):
         logger.info(
             "MinerU: %s file=%s size=%d B timeout=%ds", url, filename, len(file_bytes), timeout
         )
+        return url, data, files, timeout
+
+    def _request_mineru(
+        self, url: str, data: Dict[str, Any], files: list, timeout: int, session=None,
+        abandoned=None,
+    ) -> Dict[str, Any]:
+        """Сам запрос и разбор ответа на уровне протокола — без записи и сшивки."""
         started = time.perf_counter()
         try:
-            response = requests.post(url, files=files, data=data, timeout=timeout)
+            response = (session or requests).post(url, files=files, data=data, timeout=timeout)
         except requests.ReadTimeout as exc:
             # Долгий разбор большого скана — свойство документа, а не отказ
             # сервиса. Если по таймауту помечать MinerU недоступным на минуту, все
             # соседние документы уйдут в плоский OCR без таблиц.
             raise ParserTimedOut(f"MinerU не уложился в {timeout} с: {exc}") from exc
         except requests.RequestException as exc:
-            self.mark_unavailable()
+            # Обрыв брошенного заранее начатого запроса — наше решение, а не
+            # отказ сервиса: соседние документы не должны уйти в плоский OCR.
+            if not (abandoned is not None and abandoned()):
+                self.mark_unavailable()
             raise ParserUnavailable(f"нет связи с MinerU: {exc}") from exc
         finally:
             # Время запроса к сервису отдельно от сшивки и OCR-слоя: из него
@@ -843,23 +978,9 @@ class MinerUParserProvider(DocumentParserProvider):
             )
 
         try:
-            payload = response.json()
+            return response.json()
         except ValueError as exc:
             raise ParserFailed(f"MinerU вернул не-JSON: {response.text[:300]}") from exc
-
-        asset_prefix = metadata.get("asset_prefix") or settings.ASSETS_PREFIX
-        blocks, page_count = self._extract(payload, asset_prefix)
-
-        is_image = filetypes.is_image(file_type)
-        return ParseResult(
-            blocks=blocks,
-            is_fallback=False,
-            parser_name="mineru",
-            source_kind="image" if is_image else "vector_pdf",
-            raw_output=payload,
-            failed_pages=[],
-            page_count=page_count or (1 if is_image else len({b.page for b in blocks})),
-        )
 
     def _timeout_for(self, pages: int) -> int:
         """

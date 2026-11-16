@@ -50,7 +50,7 @@ from core import deadline, telemetry
 from core.config import settings
 from core.ladder import drawing_route
 from core.ladder.base import Strategy, text_chars
-from core.ladder.context import DocumentContext
+from core.ladder.context import SOURCE_RASTER, DocumentContext
 from core.ladder.scoring import Score, score_result
 from core.ladder.text_layer_complete import complete_text_layer
 from core.ladder.strategies.cad_source import CadSourceStrategy
@@ -69,7 +69,7 @@ from core.ladder.strategies.tabular import SpreadsheetStrategy
 from core.models.parse_result import ParseResult
 from core.providers.storage import StorageProvider
 from core.providers.document_parser import DocumentParserProvider, ParserFailed
-from core.providers.mineru_parser import MINERU_HTTP_MS
+from core.providers.mineru_parser import MINERU_HTTP_MS, MinerUParserProvider
 from core.providers.tesseract_fallback import ocr_memo
 
 logger = logging.getLogger(__name__)
@@ -141,15 +141,20 @@ class Attempt:
         return payload
 
 
-def _record_level_time(level: int, started: float, http_before: float) -> None:
+def _record_level_time(level: int, started: float, http_before: float, prefetched=None) -> None:
     """
     Время уровней 4 и 5 в тайминги документа. Уровень 5 делится на запрос
     к MinerU и всё после него (сшивка, OCR-слой): только так видно, куда
     уходит `parse.document` на скане и что даст каждая правка скорости.
+    Запрос, начатый заранее (`LADDER_PARALLEL_LAYOUT`), идёт вместе с
+    уровнем 4: его время — своё, а из уровня 5 вычитается только ожидание.
     """
     elapsed = (time.perf_counter() - started) * 1000
     if level == 4:
         telemetry.add("parse.level4_ms", elapsed)
+    elif level == 5 and prefetched is not None:
+        telemetry.add("parse.level5_http_ms", prefetched.http_ms)
+        telemetry.add("parse.level5_post_ms", max(0.0, elapsed - prefetched.waited_ms))
     elif level == 5:
         http = max(0.0, telemetry.value(MINERU_HTTP_MS) - http_before)
         telemetry.add("parse.level5_http_ms", http)
@@ -188,9 +193,16 @@ class LadderRouter:
         # Уровни 4 и 5 читают одни и те же страницы скана: в пределах
         # документа каждая распознаётся один раз (результат тот же).
         with ocr_memo():
-            return self._parse(context)
+            pending: List[Any] = []
+            try:
+                return self._parse(context, pending)
+            finally:
+                # Заранее начатый запрос к MinerU, который уровень 5 не забрал
+                # (срок задачи, отмена, уровень 5 не начат): ответ не нужен.
+                for handle in pending:
+                    handle.abandon()
 
-    def _parse(self, context: DocumentContext) -> ParseResult:
+    def _parse(self, context: DocumentContext, pending: Optional[List[Any]] = None) -> ParseResult:
         applicable = self._applicable(context)
         if not applicable:
             raise ParserFailed(
@@ -214,6 +226,16 @@ class LadderRouter:
                     "Уровень 4 пропущен для %s: текстовый слой полный — страниц %d, символов %d",
                     context.uri, layer.pages, layer.chars,
                 )
+        # Скан: запрос к MinerU уходит до уровня 4 и идёт, пока Tesseract
+        # читает те же страницы. Ответ забирает уровень 5, остальное — как
+        # без флага (`LADDER_PARALLEL_LAYOUT`).
+        prefetcher: Optional[Strategy] = None
+        if (settings.LADDER_PARALLEL_LAYOUT and classification.source == SOURCE_RASTER
+                and MinerUParserProvider.is_available()):
+            by_level = {s.level: s for s in applicable}
+            if 4 in by_level and hasattr(by_level.get(5), "prefetch"):
+                prefetcher = by_level[5]
+        prefetched = None
         logger.info(
             "Лестница для %s: источник=%s жанр=%s качество=%s, уровни %s",
             context.uri, classification.source, classification.genre,
@@ -256,10 +278,21 @@ class LadderRouter:
                 attempts.append(Attempt(strategy.level, strategy.name,
                                         error="нет бюджета времени задачи"))
                 continue
+            if prefetcher is not None and strategy.level == 4 and prefetched is None:
+                try:
+                    prefetched = prefetcher.prefetch(context)
+                except Exception as exc:  # noqa: BLE001 — без запроса заранее уровень 5 спросит сам
+                    logger.warning("Запрос к MinerU заранее не начат: %s", exc)
+                    prefetcher = None
+                else:
+                    if pending is not None:
+                        pending.append(prefetched)
+            handed = prefetched if strategy is prefetcher else None
             run_started = time.perf_counter()
             http_before = telemetry.value(MINERU_HTTP_MS)
             try:
-                result = strategy.run(context)
+                result = strategy.run(context) if handed is None else strategy.run(
+                    context, prefetched=handed)
             except SoftTimeLimitExceeded:
                 # Лимит задачи — не «неудача уровня». Если кандидат уже есть,
                 # он сохраняется с пометкой; иначе лимит обрабатывает задача.
@@ -277,7 +310,7 @@ class LadderRouter:
                 attempts.append(Attempt(strategy.level, strategy.name, error=str(exc)))
                 continue
             finally:
-                _record_level_time(strategy.level, run_started, http_before)
+                _record_level_time(strategy.level, run_started, http_before, handed)
 
             chars = text_chars(result)
             source_count = context.source_page_count or result.source_page_count
