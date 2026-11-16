@@ -499,10 +499,10 @@ def process_document(
             )
             return {"status": "error", "doc_id": doc_id, "reason": "source_not_found"}
 
+        source_name = original_name(s3_fileid, storage, located.uri)
         logger.info(
             "Документ %s: снимок %s, исходное имя «%s», тип .%s",
-            doc_id, s3_fileid,
-            original_name(s3_fileid, storage, located.uri) or "неизвестно",
+            doc_id, s3_fileid, source_name or "неизвестно",
             located.file_type or "?",
         )
 
@@ -624,7 +624,9 @@ def process_document(
         # она заменяет фрагменты и вставляет разбор листа целиком, и только
         # теперь состав документа окончателен.
         with telemetry.measure("parse.facts", doc_id=doc_id) as span:
-            fragments, id_map = finalize_fragments(fragments, doc_id, s3_fileid)
+            fragments, id_map = finalize_fragments(
+                fragments, doc_id, s3_fileid, source_name=source_name,
+            )
             span["facts"] = sum(len(f.extracted_facts) for f in fragments)
         flags_by_id = {
             id_map.get(fragment_id, fragment_id): extra

@@ -25,7 +25,7 @@ from core.models.contract import Fragment
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import apply_drawing_quality
 from core import document_furniture, drawing_record
-from core.providers import designation_repair, mixed_script
+from core.providers import canonical_ids, designation_repair, mixed_script
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,7 @@ def finalize_fragments(
     doc_id: str,
     s3_fileid: str = "",
     extract: bool = True,
+    source_name: str = "",
 ) -> Tuple[List[Fragment], Dict[str, str]]:
     """
     Проставляет стабильные идентификаторы, дополняет provenance и извлекает
@@ -220,6 +221,15 @@ def finalize_fragments(
     # заказчик. `extract=True` ставит только финализация после ветки
     # чертежей, то есть ровно то место, где собирать и надо.
     if extract:
+        if settings.SCAN_CANONICAL_IDS:
+            # Одна запись номера свидетельства, заводского номера и
+            # обозначения. После идентификаторов: `fragment_id` считается по
+            # прочтению, и включение флага его не меняет. До сборки записи
+            # чертежа: запись собирается уже из канонической графы.
+            canonical_ids.apply(
+                fragments, source_name=source_name,
+                series=canonical_ids.profile_series(), file_id=s3_fileid,
+            )
         drawing_record.apply(fragments)
         if settings.DRAWING_DIAGNOSTICS_NOT_INDEXED:
             for fragment in fragments:

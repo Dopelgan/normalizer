@@ -166,6 +166,29 @@ def load_profile(path: Optional[str] = None) -> GatewayProfile:
     return profile
 
 
+_SECTIONS: Dict[str, Dict[str, Any]] = {}
+
+
+def load_section(name: str, path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Другая секция того же файла профиля установки (не `data_gateway`):
+    например `scan_identity` со списком серий свидетельств. Нет файла,
+    секции или она не словарь — пустой словарь.
+    """
+    from core.config import settings
+
+    path = path or settings.GATEWAY_PROFILE_PATH
+    if not path:
+        return {}
+    key = f"{path}::{name}"
+    if key not in _SECTIONS:
+        source = _source_file(path)
+        raw = _read_yaml(source) if source is not None else None
+        section = (raw or {}).get(name) if isinstance(raw, dict) else None
+        _SECTIONS[key] = section if isinstance(section, dict) else {}
+    return _SECTIONS[key]
+
+
 def _source_file(path: str) -> Optional[str]:
     """Сам файл, иначе поставляемый образец рядом с ним, иначе ничего."""
     if os.path.exists(path):
@@ -178,6 +201,7 @@ def _source_file(path: str) -> Optional[str]:
 def reset_cache() -> None:
     """Сбрасывает кеш профиля — нужен тестам и горячей перезагрузке правил."""
     _CACHE.clear()
+    _SECTIONS.clear()
 
 
 def _read_yaml(path: str) -> Optional[Dict[str, Any]]:
