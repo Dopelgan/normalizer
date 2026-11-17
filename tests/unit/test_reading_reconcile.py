@@ -239,3 +239,19 @@ class TestFlagOff:
 ])
 def test_plausible_notation(value, plausible):
     assert reading_reconcile.plausible(value) is plausible
+
+
+class TestItemReferences:
+    """Пилот 17.11: «п.10» в тексте и полях листа прочитано латинской «n»."""
+
+    def test_latin_n_item_reference_becomes_cyrillic(self):
+        sheet = drawing([field("n.6", [0.1, 0.1, 0.12, 0.12], category="position")],
+                        text="Установить по n.10, n. 11\nRun.5 и n.a")
+        reading_reconcile.apply([sheet])
+        assert sheet.content.text == "Установить по п.10, п. 11\nRun.5 и n.a"
+        assert sheet.content.structured_drawing_fields[0].value == "п.6"
+
+    def test_other_fragments_untouched(self):
+        text = ocr("см. n.3")
+        reading_reconcile.apply([text])
+        assert text.content.text == "см. n.3"

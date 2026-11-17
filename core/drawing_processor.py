@@ -344,7 +344,7 @@ class DrawingProcessor:
                 )
             else:
                 piece = drawing_vision.crop(layout.image, region.bbox)
-                read = self._read_table(piece, region, own_payload)
+                read = self._read_table(piece, region, own_payload, int(sheet or 1))
                 self._log_pass(
                     sheet, "таблица", pass_started,
                     ("строк %d" % len(own_payload["tables"][-1]["rows"])) if read
@@ -1327,15 +1327,25 @@ class DrawingProcessor:
         payload["side_column"] = {"bbox": bbox, "read": parsed is not None}
         return parsed
 
+    def _mineru_rows(self, region: drawing_vision.Region, page: int) -> int:
+        """Строк у таблицы MinerU, которая накрывает область не меньше чем наполовину."""
+        best_rows, best_share = 0, 0.0
+        for bbox, rows in self._mineru_tables.get(int(page), []):
+            share = _overlap_share(region.bbox, bbox)
+            if share > best_share:
+                best_rows, best_share = rows, share
+        return best_rows if best_share >= 0.5 else 0
+
     def _read_table(
-        self, piece, region: drawing_vision.Region, payload: Dict[str, Any]
+        self, piece, region: drawing_vision.Region, payload: Dict[str, Any], page: int = 1,
     ) -> bool:
         """
         Таблица со листа (спецификация, ведомость) уходит в payload целиком.
         Полей вида «строка спецификации» в контракте нет, и раскладывать её
         по `note` значило бы засорять индекс мусором.
         """
-        table = self.qwen.read_table(piece)
+        expected = self._mineru_rows(region, page) if settings.DRAWING_SHEET_GUARDED else 0
+        table = self.qwen.read_table(piece, expect_rows=expected) if expected else self.qwen.read_table(piece)
         if table is None or not table.get("rows"):
             return False
         payload["tables"].append({

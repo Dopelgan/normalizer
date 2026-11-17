@@ -241,8 +241,26 @@ def _page(fragment: Fragment) -> Optional[int]:
     return int(fragment.position.page)
 
 
+# Ссылка на пункт технических требований «п.10», прочитанная латинской «n»:
+# в русском листе «n.10» не пишется, а поиск по «п.10» её не находит. На
+# пилоте 17.11 так «пропали» девять ссылок одного листа.
+_ITEM_REF = re.compile(r"(?<![A-Za-zА-Яа-яЁё0-9])n\.\s?(?=\d)")
+
+
+def item_refs(text: str) -> str:
+    """«n.10» -> «п.10»; прочее не трогается."""
+    return _ITEM_REF.sub(lambda m: "п" + m.group(0)[1:], text) if text and "n." in text else text
+
+
 def apply(fragments: List[Fragment]) -> List[Fragment]:
     """Сводит прочтения полей чертёжных фрагментов по страницам; список тот же."""
+    for fragment in fragments:
+        if fragment.type != "drawing":
+            continue
+        if fragment.content.text:
+            fragment.content.text = item_refs(fragment.content.text)
+        for field in fragment.content.structured_drawing_fields or []:
+            field.value = item_refs(field.value)
     pages: Dict[int, List[Fragment]] = {}
     texts: Dict[int, List[str]] = {}
     for fragment in fragments:

@@ -537,6 +537,9 @@ REJECT_EMPTY = "empty"    # надписей нет, а текст на лист
 # настоящий лист.
 _LOOP_SHARE = 0.5
 _LOOP_MIN_ITEMS = 10
+# Строк у MinerU в области таблицы, начиная с которых ответ модели из
+# одной шапки — сбой чтения (DRAWING_SHEET_GUARDED, `read_table`).
+_TABLE_EXPECT_MIN_ROWS = 5
 # Строк текста на листе, при которых пустой ответ по надписям — сбой, а не
 # пустой лист.
 GUARD_MIN_TEXT_LINES = 5
@@ -855,9 +858,19 @@ class QwenVisionClient:
             return None
         return title_block.parse(data)
 
-    def read_table(self, image) -> Optional[Dict[str, Any]]:
-        """Вырезанная таблица -> заголовок, шапка и строки."""
-        data = self._ask(image, _TABLE_PROMPT, settings.QWEN_REGION_MAX_SIDE)
+    def read_table(self, image, expect_rows: int = 0) -> Optional[Dict[str, Any]]:
+        """
+        Вырезанная таблица -> заголовок, шапка и строки.
+
+        `expect_rows` — строк у MinerU в той же области (DRAWING_SHEET_GUARDED):
+        ответ, в котором строк меньше трети этого, — сбой чтения, а не
+        таблица из шапки. Он не кэшируется, и таблица спрашивается ещё раз;
+        берётся ответ, где строк больше. Без ограды вызов прежний.
+        """
+        if settings.DRAWING_SHEET_GUARDED and expect_rows >= _TABLE_EXPECT_MIN_ROWS:
+            data = self._read_table_guarded(image, expect_rows)
+        else:
+            data = self._ask(image, _TABLE_PROMPT, settings.QWEN_REGION_MAX_SIDE)
         if data is None:
             return None
         headers = data.get("headers")
@@ -866,6 +879,30 @@ class QwenVisionClient:
             "headers": [str(h) for h in headers] if isinstance(headers, list) else [],
             "rows": _string_rows(data.get("rows")),
         }
+
+    def _read_table_guarded(self, image, expect_rows: int) -> Optional[Dict[str, Any]]:
+        def enough(content: str, finish: Optional[str]) -> bool:
+            data = extract_json(content)
+            rows = _string_rows(data.get("rows")) if isinstance(data, dict) else []
+            return len(rows) * 3 >= expect_rows
+
+        best: Optional[Dict[str, Any]] = None
+        for _ in range(2):
+            if not self.available:
+                return None
+            answer = self._ask_text(image, _TABLE_PROMPT, settings.QWEN_REGION_MAX_SIDE, accept=enough)
+            if answer is None:
+                continue
+            data = extract_json(answer[0])
+            if not isinstance(data, dict):
+                continue
+            if best is None or len(_string_rows(data.get("rows"))) > len(_string_rows(best.get("rows"))):
+                best = data
+            if enough(*answer):
+                break
+            logger.warning("Таблица листа прочитана не целиком (строк %d при %d у MinerU): спрашивается ещё раз",
+                           len(_string_rows(data.get("rows"))), expect_rows)
+        return best
 
     def transcribe(self, image) -> Optional[List[str]]:
         """Весь текст листа строками: штамп, графы, примечания, таблицы."""

@@ -275,3 +275,26 @@ class TestWhitespaceCut:
     def test_flag_off_keeps_the_old_answer(self):
         blank = reply("{\n" + " \n" * 50, finish="length")
         assert client(Model(blank)).read_sheet(image()) is None
+
+
+class TestTableGuard:
+    """Пилот 17.11: проход по таблице вернул одну шапку при 16 строках у MinerU."""
+
+    @staticmethod
+    def table(rows):
+        return reply(json.dumps({"title": "", "headers": ["Цвет"], "rows": [[f"Rt{n}"] for n in range(rows)]}))
+
+    def test_short_table_is_not_cached_and_asked_again(self, guarded, tmp_path):
+        model = Model(self.table(1), self.table(16))
+        table = client(model).read_table(image(), expect_rows=16)
+        assert len(table["rows"]) == 16 and len(model.bodies) == 2
+        assert len(cached_files(tmp_path)) == 1
+
+    def test_second_short_answer_keeps_the_longer_one(self, guarded):
+        model = Model(self.table(2), self.table(1))
+        assert len(client(model).read_table(image(), expect_rows=16)["rows"]) == 2
+
+    def test_without_guard_one_call_as_before(self, tmp_path):
+        model = Model(self.table(1))
+        assert len(client(model).read_table(image(), expect_rows=16)["rows"]) == 1
+        assert len(model.bodies) == 1 and len(cached_files(tmp_path)) == 1
