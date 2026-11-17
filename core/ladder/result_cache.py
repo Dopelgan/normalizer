@@ -328,7 +328,7 @@ def get(key: str, storage, uri: str, file_type: str,
         logger.warning("Кэш лестницы: запись %s не перенесена на %s — промах: %s",
                        path.name, uri, exc)
         return None
-    except (ValueError, TypeError) as exc:
+    except Exception as exc:  # noqa: BLE001 — битая запись любого вида — промах
         logger.warning("Кэш лестницы: битая запись %s — промах: %s", path.name, exc)
         return None
     return result
@@ -421,20 +421,39 @@ _prune_lock = threading.Lock()
 
 
 def prune(now: Optional[float] = None) -> int:
-    """Удалить записи старше LADDER_RESULT_CACHE_DAYS (по времени файла)."""
+    """
+    Удалить записи старше LADDER_RESULT_CACHE_DAYS (по времени файла), а
+    если оставшиеся больше LADDER_RESULT_CACHE_MAX_GB — самые старые, пока
+    объём не уложится в предел.
+    """
     now = time.time() if now is None else now
     limit = settings.LADDER_RESULT_CACHE_DAYS * 86400
     removed = 0
     root = cache_dir()
     if not root.is_dir():
         return 0
+    kept: List[Tuple[float, int, Path]] = []
     for path in _entries(root):
         try:
-            if now - path.stat().st_mtime > limit:
+            stat = path.stat()
+            if now - stat.st_mtime > limit:
                 path.unlink()
                 removed += 1
+            else:
+                kept.append((stat.st_mtime, stat.st_size, path))
         except OSError:
             continue
+    total = sum(size for _, size, _ in kept)
+    cap = settings.LADDER_RESULT_CACHE_MAX_GB * 1024 ** 3
+    for _, size, path in sorted(kept, key=lambda item: item[0]):
+        if total <= cap:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        removed += 1
     if removed:
         logger.info("Кэш лестницы: удалено устаревших записей %d", removed)
     return removed
@@ -458,7 +477,7 @@ def _maybe_prune() -> None:
         _last_prune = now
     try:
         prune(now)
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001 — уборка не должна ронять разбор
         logger.warning("Кэш лестницы: уборка не удалась: %s", exc)
 
 
@@ -472,13 +491,35 @@ def parse(parser, storage, uri: str, file_type: str, metadata: Dict[str, Any],
     """
     if not settings.LADDER_RESULT_CACHE or not file_sha256:
         return parser.parse(uri, file_type, metadata)
-    key = cache_key(file_sha256, file_type, metadata)
-    cached = get(key, storage, uri, file_type, metadata)
+    # Отказ кэша никогда не роняет разбор: любая его ошибка — промах.
+    key: Optional[str] = None
+    cached: Optional[ParseResult] = None
+    try:
+        key = cache_key(file_sha256, file_type, metadata)
+        cached = get(key, storage, uri, file_type, metadata)
+    except Exception as exc:  # noqa: BLE001
+        _warn_once(f"Кэш лестницы недоступен, разбор без кэша: {exc}")
+        key, cached = None, None
     if cached is not None:
         telemetry.add(HIT_STAGE, 1)
         logger.info("Кэш лестницы: результат %s взят из кэша (%s)", uri, key[:12])
         return cached
     result = parser.parse(uri, file_type, metadata)
-    if put(key, result, uri, file_type, metadata):
-        _maybe_prune()
+    if key is not None:
+        try:
+            if put(key, result, uri, file_type, metadata):
+                _maybe_prune()
+        except Exception as exc:  # noqa: BLE001
+            _warn_once(f"Кэш лестницы: запись не удалась: {exc}")
     return result
+
+
+_warned = False
+
+
+def _warn_once(message: str) -> None:
+    """Одно предупреждение на процесс: сломанный кэш не засоряет лог."""
+    global _warned
+    if not _warned:
+        _warned = True
+        logger.warning(message)

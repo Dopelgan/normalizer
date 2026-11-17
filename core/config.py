@@ -720,6 +720,8 @@ class Settings(BaseSettings):
     # момент; после обновления образов MinerU или Tesseract — нужно.
     LADDER_RESULT_CACHE_DIR: str = ""
     LADDER_RESULT_CACHE_DAYS: int = 30
+    # Предел объёма каталога; сверх него уборка удаляет самые старые записи.
+    LADDER_RESULT_CACHE_MAX_GB: float = 50.0
 
     # Разметка листа зрением: выравнивание, рамка формата, сетки таблиц.
     # Выключение оставляет только чтение листа целиком.

@@ -226,6 +226,38 @@ class TestStore:
         assert parser.calls == 2
 
 
+class TestCacheFailureNeverFailsParse:
+    def test_key_error_falls_back_to_ladder(self, cache_on, temp_storage, monkeypatch):
+        def broken(*args, **kwargs):
+            raise RuntimeError("исходники не читаются")
+        monkeypatch.setattr(result_cache, "cache_key", broken)
+        parser = CountingParser(_mineru_like(temp_storage))
+        result = _parse(parser, temp_storage)
+        assert parser.calls == 1 and result.blocks
+
+    def test_entry_with_wrong_shapes_is_a_miss(self, cache_on, temp_storage):
+        parser = CountingParser(_mineru_like(temp_storage))
+        _parse(parser, temp_storage, meta=_meta("doc-a"), uri="documents/a/scan.pdf")
+        (entry,) = list(cache_on.rglob("*.json"))
+        data = json.loads(entry.read_text(encoding="utf-8"))
+        data["result"]["raw_output"] = ["не словарь"]
+        entry.write_text(json.dumps(data), encoding="utf-8")
+        result = _parse(parser, temp_storage, meta=_meta("doc-b"), uri="documents/b/copy.pdf")
+        assert parser.calls == 2 and result.blocks
+
+    def test_size_cap_removes_oldest_first(self, cache_on, monkeypatch):
+        shard = cache_on / "ab"
+        shard.mkdir(parents=True)
+        now = time.time()
+        for age, name in ((300, "old"), (200, "mid"), (100, "new")):
+            path = shard / f"{name}.json"
+            path.write_bytes(b"x" * 1000)
+            os.utime(path, (now - age, now - age))
+        monkeypatch.setattr(settings, "LADDER_RESULT_CACHE_MAX_GB", 2500 / 1024 ** 3)
+        assert result_cache.prune(now) == 1
+        assert sorted(p.stem for p in shard.glob("*.json")) == ["mid", "new"]
+
+
 class TestOtherDocument:
     def test_duplicate_gets_its_own_assets_and_name(self, cache_on, temp_storage):
         parser = CountingParser(_mineru_like(temp_storage))
