@@ -165,7 +165,45 @@ def cache_get(key: str) -> Optional[Tuple[str, Optional[str]]]:
     """Сохранённый ответ или None. Битый файл — это промах, не ошибка."""
     if not settings.VLM_RESPONSE_CACHE:
         return None
-    path = _cache_dir() / key[:2] / f"{key}.json"
+    answer = _read_answer(_cache_dir() / key[:2] / f"{key}.json")
+    if answer is not None:
+        logger.info("Ответ модели взят из кэша (%s)", key[:12])
+    return answer
+
+
+def cache_put(key: str, answer: Tuple[str, Optional[str]]) -> None:
+    """Записать ответ (см. `_write_answer`)."""
+    if not settings.VLM_RESPONSE_CACHE:
+        return
+    _write_answer(_cache_dir() / key[:2] / f"{key}.json", key, answer)
+
+
+# Отложенные отказы (VLM_SAME_REQUEST_ONCE): оборванный или зациклившийся
+# ответ ограждённого прохода листа, который повтор того же запроса
+# воспроизведёт. Лежат рядом с кэшем под своим расширением: в кэш они не
+# попадают, и отчёт по кэшу (`tools/vlm_cache_guard_report.py`, *.json) их
+# не считает. Только при температуре 0: иначе повтор вправе ответить иначе.
+def _keeps_rejected() -> bool:
+    return bool(settings.VLM_RESPONSE_CACHE and settings.VLM_SAME_REQUEST_ONCE
+                and not settings.QWEN_TEMPERATURE)
+
+
+def rejected_get(key: str) -> Optional[Tuple[str, Optional[str]]]:
+    if not _keeps_rejected():
+        return None
+    answer = _read_answer(_cache_dir() / key[:2] / f"{key}.rejected")
+    if answer is not None:
+        logger.info("Отказ модели на этот же запрос уже был (%s): вызов не повторяется", key[:12])
+    return answer
+
+
+def rejected_put(key: str, answer: Tuple[str, Optional[str]]) -> None:
+    if not _keeps_rejected():
+        return
+    _write_answer(_cache_dir() / key[:2] / f"{key}.rejected", key, answer)
+
+
+def _read_answer(path: Path) -> Optional[Tuple[str, Optional[str]]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         content = data["content"]
@@ -174,24 +212,20 @@ def cache_get(key: str) -> Optional[Tuple[str, Optional[str]]]:
     if not isinstance(content, str):
         return None
     finish = data.get("finish")
-    logger.info("Ответ модели взят из кэша (%s)", key[:12])
     return content, finish if isinstance(finish, str) else None
 
 
-def cache_put(key: str, answer: Tuple[str, Optional[str]]) -> None:
+def _write_answer(path: Path, key: str, answer: Tuple[str, Optional[str]]) -> None:
     """
-    Записать ответ. Запись идёт во временный файл рядом и переименованием:
-    два воркера пишут в один том, и половина файла, прочитанная третьим,
-    стала бы молчаливым промахом с мусором вместо ответа.
+    Запись идёт во временный файл рядом и переименованием: два воркера
+    пишут в один том, и половина файла, прочитанная третьим, стала бы
+    молчаливым промахом с мусором вместо ответа.
 
     Временный файл у каждого писателя свой (mkstemp), а не по номеру
     процесса: потоки одного процесса пишут один ключ одновременно, и общий
     временный файл одного переписывал бы и уносил запись другого.
     """
-    if not settings.VLM_RESPONSE_CACHE:
-        return
     content, finish = answer
-    path = _cache_dir() / key[:2] / f"{key}.json"
     tmp: Optional[str] = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +244,37 @@ def cache_put(key: str, answer: Tuple[str, Optional[str]]) -> None:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+class _Flight:
+    """Запрос, который уже задан модели в этом процессе, и его ответ."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.answer: Optional[Tuple[str, Optional[str]]] = None
+
+
+# Запросы в полёте по ключу кэша (VLM_SAME_REQUEST_ONCE).
+_flights_lock = threading.Lock()
+_flights: Dict[str, _Flight] = {}
+
+
+def _join_flight(key: str) -> Tuple[_Flight, bool]:
+    """Полёт этого запроса и правда ли, что задаёт его этот поток (первый)."""
+    with _flights_lock:
+        flight = _flights.get(key)
+        if flight is not None:
+            return flight, False
+        flight = _flights[key] = _Flight()
+        return flight, True
+
+
+def _land_flight(key: str, flight: _Flight) -> None:
+    with _flights_lock:
+        if _flights.get(key) is flight:
+            del _flights[key]
+    flight.done.set()
+
 
 # Категории полей чертежа, которые модель имеет право назвать. Всё прочее
 # сводится к правилам разбора: выдуманная категория в индекс не попадает.
@@ -647,7 +712,8 @@ class QwenVisionClient:
                       -(-int(limit) // max(1, int(settings.QWEN_MIN_TOKENS_PER_SECOND))))
         schema = (sheet_schema() if settings.DRAWING_SHEET_SCHEMA
                   and not settings.DRAWING_SHEET_COMPACT_JSON else None)
-        guarded = {"accept": sheet_answer_accepted, "timeout": timeout, "read_timeout_retries": 1}
+        guarded = {"accept": sheet_answer_accepted, "keep_rejected": sheet_answer_repeats,
+                   "timeout": timeout, "read_timeout_retries": 1}
         if schema is not None:
             answer = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE, limit,
                                     response_format=schema, **guarded)
@@ -972,6 +1038,7 @@ class QwenVisionClient:
         accept: Optional[Callable[[str, Optional[str]], bool]] = None,
         timeout: Optional[int] = None,
         read_timeout_retries: Optional[int] = None,
+        keep_rejected: Optional[Callable[[str, Optional[str]], bool]] = None,
     ) -> Optional[Tuple[str, Optional[str]]]:
         """
         Текст ответа и finish_reason («length» — упёрся в потолок токенов).
@@ -980,7 +1047,10 @@ class QwenVisionClient:
         `response_format` — схема ответа вместо свободного JSON; `accept` —
         проверка ответа: непринятый не пишется в кэш, а непринятый из кэша
         не берётся; `timeout` и `read_timeout_retries` — свой срок вызова и
-        не больше стольких повторов таймаута чтения. Без них вызов прежний.
+        не больше стольких повторов таймаута чтения; `keep_rejected` —
+        непринятый ответ, который повтор запроса воспроизведёт: с
+        VLM_SAME_REQUEST_ONCE он откладывается и берётся вместо вызова.
+        Без них вызов прежний.
         """
         if not self.available:
             logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
@@ -1031,6 +1101,42 @@ class QwenVisionClient:
             cached = None
         if cached is not None:
             return cached
+        if not (settings.VLM_SAME_REQUEST_ONCE and settings.VLM_RESPONSE_CACHE):
+            return self._answer(body, key, accept, keep_rejected, timeout, read_timeout_retries)
+        flight, first = _join_flight(key)
+        if not first:
+            # Такой же запрос уже в модели: ждать его ответа дешевле, чем
+            # задать второй. Неудача первого не наследуется — спросить самим.
+            flight.done.wait()
+            deadline.check_cancelled()
+            if flight.answer is not None:
+                logger.info("Ответ модели взят у такого же запроса в полёте (%s)", key[:12])
+                telemetry.add("parse.vlm_reused", 1)
+                return flight.answer
+            return self._answer(body, key, accept, keep_rejected, timeout, read_timeout_retries)
+        try:
+            # Такой же запрос мог завершиться между чтением кэша и этой строкой.
+            answer = cache_get(key)
+            if answer is not None and accept is not None and not accept(*answer):
+                answer = None
+            if answer is None and keep_rejected is not None:
+                answer = rejected_get(key)
+                if answer is not None:
+                    telemetry.add("parse.vlm_reused", 1)
+            if answer is None:
+                answer = self._answer(body, key, accept, keep_rejected, timeout, read_timeout_retries)
+            flight.answer = answer
+            return answer
+        finally:
+            _land_flight(key, flight)
+
+    def _answer(
+        self, body: Dict[str, Any], key: str,
+        accept: Optional[Callable[[str, Optional[str]], bool]],
+        keep_rejected: Optional[Callable[[str, Optional[str]], bool]],
+        timeout: Optional[int], read_timeout_retries: Optional[int],
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        """Вызов модели и запись ответа: принятый — в кэш, отказ, который повтор воспроизведёт, — в сторону."""
         extra: Dict[str, Any] = {}
         if timeout is not None:
             extra["timeout"] = timeout
@@ -1045,6 +1151,8 @@ class QwenVisionClient:
         answer = (content, _finish_of(payload))
         if accept is None or accept(*answer):
             cache_put(key, answer)
+        elif keep_rejected is not None and keep_rejected(*answer):
+            rejected_put(key, answer)
         return answer
 
     def _post(self, body: Dict[str, Any], **limits: Any) -> Optional[Dict[str, Any]]:
@@ -1062,6 +1170,15 @@ class QwenVisionClient:
         telemetry.add("parse.vlm_call_ms_sum", (time.perf_counter() - started) * 1000)
         if payload is None:
             telemetry.add("parse.vlm_failed_calls", 1)
+            return payload
+        # Токены вызова (карточка T5): цена прохода меряется ими, а не
+        # секундами — секунды зависят от соседей по видеокарте.
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            for name in ("prompt_tokens", "completion_tokens"):
+                count = usage.get(name)
+                if isinstance(count, (int, float)) and not isinstance(count, bool):
+                    telemetry.add(f"parse.vlm_{name}", count)
         return payload
 
     def _post_attempts(
@@ -1232,13 +1349,30 @@ def sheet_answer_accepted(content: str, finish: Optional[str]) -> bool:
     зациклен и не пуст. Пустой ответ стоит десяток токенов, а замороженный в
     кэше пустой лист теряется при каждом следующем разборе.
     """
+    annotations = _sheet_items(content)
+    if not annotations:
+        return False
+    return sheet_verdict(finish, annotations) is None
+
+
+def sheet_answer_repeats(content: str, finish: Optional[str]) -> bool:
+    """
+    Отказ по ответу листа, который повтор того же запроса воспроизведёт
+    (температура 0): оборванный потолком токенов или зациклившийся. Пустой
+    сюда не входит: он стоит десяток токенов, а повтор бывает непустым.
+    """
+    if finish == "length":
+        return True
+    annotations = _sheet_items(content)
+    return bool(annotations) and sheet_verdict(finish, annotations) is not None
+
+
+def _sheet_items(content: str) -> List[Any]:
     data = extract_json(content)
     annotations = data.get("annotations") if isinstance(data, dict) else None
     if not isinstance(annotations, list):
         annotations = salvage_list(content, "annotations")
-    if not annotations:
-        return False
-    return sheet_verdict(finish, annotations) is None
+    return annotations
 
 
 def _first_of_each(annotations: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
