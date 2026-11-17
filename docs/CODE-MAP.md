@@ -188,6 +188,8 @@
 | `OCR_LAYER_ENABLED` | `true` | `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |
 | `OCR_LAYER_DROP_LOW_CONFIDENCE` | `false` | `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |
 | `OCR_LAYER_DROP_REPEATED` | `false` | `core/providers/mineru_parser.py` |
+| `OCR_ORDINAL_SUFFIX_FIX` | `false` | `core/providers/ocr_cleanup.py` |
+| `OCR_RUS_SECOND_MODEL` | `""` | `core/providers/ocr_model.py` (`languages`), `core/providers/tesseract_fallback.py` |
 | `OCR_WORD_FIX_ENABLED` | `false` | `core/providers/ocr_cleanup.py`, `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |
 | `OCR_KEEP_STRUCTURED_TABLES` | `false` | `core/providers/mineru_parser.py` |
 | `OCR_SPLIT_WIDE_GAPS` | `false` | `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |

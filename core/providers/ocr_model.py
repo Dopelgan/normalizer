@@ -74,6 +74,43 @@ def tessdata_option() -> str:
     return f" --tessdata-dir {shlex.quote(directory)}" if directory else ""
 
 
+def languages(lang: str) -> str:
+    """
+    Строка языков Tesseract со второй русской моделью (`OCR_RUS_SECOND_MODEL`).
+
+    Модель ставится последней: Tesseract читает слово первой моделью и
+    берёт следующую, только если прочтение плохое, поэтому вторая модель —
+    запасная, а не равная. Сразу за `rus` её ставить нельзя: тогда латиница
+    (адрес сайта, «RA.RU») уходит к ней раньше `eng` и читается кириллицей. Нужна она из-за дообучения под шрифт ГОСТ:
+    чертёжный шрифт читается лучше, а машинопись свидетельств и писем —
+    местами хуже («С-ВЫТ» вместо «С-ВЫГ», «бесперепективно», «3-ro»).
+
+    Модель ищется только в своём каталоге (`OCR_TESSDATA_DIR`): у системного
+    каталога путь не известен, а неизвестный язык роняет весь вызов
+    Tesseract. Нет каталога или файла — строка возвращается как есть.
+    """
+    name = (getattr(settings, "OCR_RUS_SECOND_MODEL", "") or "").strip()
+    parts = lang.split("+")
+    if not name or "rus" not in parts or name in parts:
+        return lang
+    directory = tessdata_dir()
+    if not directory or not os.path.isfile(os.path.join(directory, f"{name}.traineddata")):
+        _warn_model(name, directory)
+        return lang
+    return "+".join(parts + [name])
+
+
+def _warn_model(name: str, directory: Optional[str]) -> None:
+    key = f"model:{name}:{directory}"
+    if key in _warned:
+        return
+    _warned.add(key)
+    logger.warning(
+        "OCR_RUS_SECOND_MODEL=%r не используется: нет %s.traineddata в каталоге %r",
+        name, name, directory,
+    )
+
+
 def _warn(directory: str, reason: str) -> None:
     """Предупредить один раз на каталог: иначе лог забивается постранично."""
     if directory in _warned:
