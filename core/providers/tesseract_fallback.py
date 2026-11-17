@@ -554,7 +554,7 @@ class TesseractFallbackProvider:
             image = prepared.image
         try:
             data = pytesseract.image_to_data(
-                image, lang=lang or self.lang,
+                image, lang=ocr_model.languages(lang or self.lang),
                 config=f"--psm {psm}{ocr_model.tessdata_option()}",
                 output_type=pytesseract.Output.DICT,
             )
@@ -670,7 +670,7 @@ class TesseractFallbackProvider:
             image = prepared.image
         try:
             return pytesseract.image_to_string(
-                image, lang=self.lang,
+                image, lang=ocr_model.languages(self.lang),
                 config=f"--psm {_page_psm()}{ocr_model.tessdata_option()}",
             )
         except Exception as exc:  # noqa: BLE001

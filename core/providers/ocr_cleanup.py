@@ -40,6 +40,7 @@ from dataclasses import dataclass, replace
 from celery.exceptions import SoftTimeLimitExceeded
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
+from core.config import settings
 from core.providers import ocr_model
 
 logger = logging.getLogger(__name__)
@@ -356,6 +357,31 @@ def _upper_designation(core: str) -> Optional[str]:
     return core.upper()
 
 
+# Порядковое числительное с окончанием латиницей: «3-ro», «72-x»
+# (`OCR_ORDINAL_SUFFIX_FIX`). Цифры такое слово прячут от выправки по словарю,
+# а латинский язык в связке `rus+eng` охотно читает короткое окончание
+# своими буквами. Окончание переводится по первому прочтению похожих букв и
+# принимается, только если вышло русское окончание из списка: «03-a» в
+# обозначениях («а» не окончание) и коды вроде «0005-t» не трогаются.
+# Только строчные: заглавная после дефиса («0001-E», «2445-M») — литера
+# обозначения, а не окончание.
+_ORDINAL_RE = re.compile(r"^(\d{1,4})-([a-z]{1,3})$")
+_ORDINAL_ENDINGS = frozenset({
+    "го", "му", "м", "й", "я", "е", "х", "ми", "ти", "ой", "ый", "ий",
+    "ая", "ое", "ые", "ых", "ым", "ую", "ом",
+})
+
+
+def _fix_ordinal(core: str) -> Optional[str]:
+    match = _ORDINAL_RE.match(core)
+    if not match:
+        return None
+    ending = "".join(_LATIN_TO_CYR.get(ch, ("",))[0] for ch in match.group(2))
+    if len(ending) != len(match.group(2)) or ending not in _ORDINAL_ENDINGS:
+        return None
+    return f"{match.group(1)}-{ending}"
+
+
 def cyrillic_share(text: str) -> float:
     letters = [ch for ch in text if ch.isalpha()]
     if not letters:
@@ -397,7 +423,11 @@ def clean_text(text: str, vocab: Vocabulary, cyr_share: Optional[float] = None) 
         match = _CORE_RE.match(part)
         lead, core, tail = match.group(1), match.group(2), match.group(3)
         fixed = None
-        if core and share >= 0.5:
+        if core and share >= 0.5 and settings.OCR_ORDINAL_SUFFIX_FIX:
+            fixed = _fix_ordinal(core)
+            if fixed is not None:
+                stats.latin_words += 1
+        if fixed is None and core and share >= 0.5:
             fixed = _fix_latin(core, vocab, share)
             if fixed is not None:
                 stats.latin_words += 1
