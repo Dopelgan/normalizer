@@ -666,6 +666,11 @@ class QwenVisionClient:
                 data = salvaged
         if data is None:
             logger.error("Модель вернула не-JSON (%d символов): %.200s", len(content), content)
+            if settings.DRAWING_SHEET_GUARDED and finish == "length":
+                # Весь потолок ушёл на ответ без единой надписи (на проде под
+                # схемой — 12 тыс. токенов пробелов): это обрыв, и лист
+                # дочитывается частями, а не теряется целиком.
+                return SheetReading(cut=True, rejected=REJECT_CUT)
             return None
         annotations = data.get("annotations")
         if not isinstance(annotations, list):

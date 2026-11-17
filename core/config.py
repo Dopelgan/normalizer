@@ -949,10 +949,13 @@ class Settings(BaseSettings):
     #   DRAWING_SHEET_VALUE_MAX_CHARS). Тело запроса другое — ключи кэша
     #   другие, и листы читаются моделью заново. Отказ vLLM принять схему
     #   (4xx) — повтор того же вызова без схемы, лист не теряется.
+    #   Выключен (опыт D1, 17.11): vLLM прода схему принимает, но под ней
+    #   модель на листе S08 выдала 12 288 токенов пробелов (424 с) и ни одной
+    #   надписи — грамматика JSON допускает пробелы без предела.
     # Вторая отбраковка (части тоже оборваны или зациклены) — пометка листа
     # `sheet_guard` в completeness_mechanisms; новых имён предупреждений нет.
     DRAWING_SHEET_GUARDED: bool = False
-    DRAWING_SHEET_SCHEMA: bool = True
+    DRAWING_SHEET_SCHEMA: bool = False
     DRAWING_SHEET_MAX_ITEMS: int = 400
     DRAWING_SHEET_VALUE_MAX_CHARS: int = 300
     QWEN_MIN_TOKENS_PER_SECOND: int = 25
