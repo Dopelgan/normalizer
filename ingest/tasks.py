@@ -32,7 +32,7 @@ from core.drawing_quality import document_quality
 from core.contract_finalize import finalize_fragments, normalized_content_hash
 from core.db.session import SessionLocal
 from core.drawing_processor import DrawingProcessor
-from core.ladder import drawing_route
+from core.ladder import drawing_route, result_cache
 from core.mappers import document_to_metadata, fragment_to_row, row_to_fragment
 from core.models.contract import (
     DocumentMetadata,
@@ -582,11 +582,20 @@ def process_document(
             "asset_prefix": f"{settings.ASSETS_PREFIX.rstrip('/')}/{doc_id}/",
         }
 
+        # Хеш байтов до лестницы — ключ кэша её результата
+        # (LADDER_RESULT_CACHE). Без флага хеш считается после, как раньше.
+        cache_hash: Optional[str] = None
+        if settings.LADDER_RESULT_CACHE:
+            with telemetry.measure("parse.file_hash"):
+                cache_hash = result_cache.content_sha256(storage, located.uri)
+
         parser = DocumentParserFactory.get_parser(storage)
         with telemetry.measure(
             "parse.document", doc_id=doc_id, file_type=located.file_type
         ) as span:
-            parse_result = parser.parse(located.uri, located.file_type, metadata)
+            parse_result = result_cache.parse(
+                parser, storage, located.uri, located.file_type, metadata, cache_hash
+            )
             span["pages"] = parse_result.page_count or len(parse_result.pages())
             span["parser"] = parse_result.parser_name
         metadata["source_kind"] = parse_result.source_kind
@@ -634,8 +643,13 @@ def process_document(
         }
 
         # ----------------------------------------- 4. Сохранение (транзакция)
-        with telemetry.measure("parse.file_hash"):
-            file_hash = compute_file_hash(storage, located.uri)
+        if cache_hash and not located.uri.startswith("s3://"):
+            # Тот же sha256, что дал бы compute_file_hash; для S3 поле, как
+            # и прежде, пустое.
+            file_hash = cache_hash
+        else:
+            with telemetry.measure("parse.file_hash"):
+                file_hash = compute_file_hash(storage, located.uri)
         raw_uri = f"{settings.RAW_PARSE_S3_PREFIX.rstrip('/')}/{doc_id}.json"
 
         report = page_report(parse_result)

@@ -157,6 +157,7 @@
 | `DRAWING_TITLE_BLOCK_PASS` | `false` | `core/drawing_processor.py`, `core/providers/qwen_client.py` |
 | `DRAWING_SIDE_COLUMN_READ` | `true` | `core/drawing_processor.py` |
 | `VLM_RESPONSE_CACHE` | `false` | `core/providers/qwen_client.py` (`cache_key`/`cache_get`/`cache_put`, вызов из `_ask_text` 781) |
+| `LADDER_RESULT_CACHE` (+ `_DIR`, `_DAYS`) | `false` | `core/ladder/result_cache.py` (`parse` — вызов из `ingest/tasks.py::process_document` вместо `parser.parse`; ключ — `cache_key`, список настроек — `KEY_SETTINGS`/`NOT_IN_KEY`) |
 | `DRAWING_IMAGE_FULL_READ` | `false` | `core/drawing_processor.py`, `core/drawing_quality.py`, `core/ladder/drawing_route.py` |
 | `DRAWING_PDF_FULL_READ` | `false` | `core/drawing_processor.py`, `core/drawing_quality.py` |
 | `DRAWING_TRANSCRIBE_TILES` | `false` | `core/providers/qwen_client.py`, `core/drawing_processor.py`, `core/drawing_quality.py` |
