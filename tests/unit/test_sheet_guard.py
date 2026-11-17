@@ -91,6 +91,7 @@ def setup(monkeypatch, tmp_path):
 @pytest.fixture
 def guarded(monkeypatch):
     monkeypatch.setattr(settings, "DRAWING_SHEET_GUARDED", True)
+    monkeypatch.setattr(settings, "DRAWING_SHEET_SCHEMA", True)
 
 
 class TestVerdict:
@@ -254,3 +255,23 @@ class TestEmptySheet:
         assert result["parsed_fields"] == []
         # Пустой лист — не сбой: частями не читается.
         assert sum('"lines"' not in b["messages"][1]["content"][1]["text"] for b in model.bodies) == 1
+
+
+class TestWhitespaceCut:
+    """
+    Опыт D1 на проде: под схемой модель выдала весь потолок пробелами — ни
+    одной надписи, finish=length. Прежде такой лист терялся целиком (None),
+    хотя обрыв под оградой дочитывается частями.
+    """
+
+    def test_cut_answer_without_items_is_read_by_tiles(self, guarded):
+        blank = reply("{\n" + " \n" * 50 + "\"sheet_type\": \"scheme\", \"annotations\": [ {", finish="length")
+        model = Model(blank, sheet(GOOD))
+        reading = client(model).read_sheet(image())
+        assert reading is not None
+        assert reading.rejected == REJECT_CUT and reading.tiles == 4
+        assert [a["value"] for a in reading.annotations][:len(GOOD)] == GOOD
+
+    def test_flag_off_keeps_the_old_answer(self):
+        blank = reply("{\n" + " \n" * 50, finish="length")
+        assert client(Model(blank)).read_sheet(image()) is None

@@ -60,6 +60,8 @@ HIT_STAGE = "parse.ladder_cache_hit"
 # Настройки, которые читает код лестницы и которые меняют её результат.
 KEY_SETTINGS: Tuple[str, ...] = (
     "ASSETS_PREFIX",
+    # OCR (17.11): меняют текст распознавания; OCR_RUS_SECOND_MODEL читается через getattr — тест его не видит
+    "OCR_ORDINAL_SUFFIX_FIX", "OCR_RUS_SECOND_MODEL",
     "BLANK_TABLE_OCR_DPI", "BLANK_TABLE_OCR_ENABLED", "BLANK_TABLE_OCR_MAX_PIXELS",
     "BLANK_TABLE_OCR_MAX_REGIONS", "BLANK_TABLE_OCR_MIN_ALPHA_SHARE",
     "BLANK_TABLE_OCR_MIN_CHARS", "BLANK_TABLE_OCR_MIN_CONFIDENCE",
@@ -106,6 +108,7 @@ KEY_SETTINGS: Tuple[str, ...] = (
 # кэшируется).
 NOT_IN_KEY: Tuple[str, ...] = (
     "ARTIFACTS_MOUNT", "CELERY_BROKER_URL",
+    "VLM_SAME_REQUEST_ONCE",  # только повторное использование ответа модели, вывод тот же
     "DRAWING_PASSES_PARALLEL", "DRAWING_TRANSCRIBE_TILE_PARALLEL",
     "GPU_GATE_BUSY_HOURS_UTC", "GPU_GATE_ENABLED", "GPU_GATE_MINERU_SLOTS_DAY",
     "GPU_GATE_MINERU_SLOTS_NIGHT", "GPU_GATE_VLM_SLOTS_DAY", "GPU_GATE_VLM_SLOTS_NIGHT",

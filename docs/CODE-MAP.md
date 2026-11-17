@@ -205,7 +205,8 @@
 | `PARSE_LAYOUT_UNAVAILABLE_NOTE` | `false` | `core/ladder/router.py` (`LAYOUT_UNAVAILABLE`; признак — `core/ladder/strategies/recognition.py::LayoutStrategy.skipped_as_unavailable`) |
 | `DRAWING_LOST_SHEETS_SKIPPED` | `false` | `core/drawing_processor.py` (`_sheet_drawings`) |
 | `SCAN_CANONICAL_IDS` | `false` | `core/contract_finalize.py` → `core/providers/canonical_ids.py`; список серий — `core/gateway/profile.load_section("scan_identity")`; факты — `core/facts/extractor.identity_fact` |
-| `DRAWING_SHEET_GUARDED`, `DRAWING_SHEET_SCHEMA` | `false`, `true` | `core/providers/qwen_client.py` (`read_sheet`, `_ask_sheet_guarded`, `sheet_verdict`, `sheet_answer_accepted`; кэш — `accept` в `_ask_text`); пустой ответ — `core/drawing_processor.py::_guard_empty_sheet`; отчёт по кэшу — `tools/vlm_cache_guard_report.py` |
+| `DRAWING_SHEET_GUARDED`, `DRAWING_SHEET_SCHEMA` | `false`, `false` | `core/providers/qwen_client.py` (`read_sheet`, `_ask_sheet_guarded`, `sheet_verdict`, `sheet_answer_accepted`; кэш — `accept` в `_ask_text`); пустой ответ — `core/drawing_processor.py::_guard_empty_sheet`; отчёт по кэшу — `tools/vlm_cache_guard_report.py` |
+| `VLM_SAME_REQUEST_ONCE` | `false` | `core/providers/qwen_client.py` (`_ask_text`: `_join_flight`/`_land_flight` — одинаковые запросы в полёте; `rejected_get`/`rejected_put` и `sheet_answer_repeats` — отложенные отказы листа `<ключ>.rejected` рядом с кэшем); токены вызова — `_post` (`parse.vlm_prompt_tokens`, `parse.vlm_completion_tokens`, `parse.vlm_reused`) |
 | `DRAWING_READINGS_RECONCILED` | `false` | `core/drawing_processor.py::enrich_fragments` → `core/providers/reading_reconcile.apply`; пометка в записи — `core/drawing_record._with_tolerance` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
