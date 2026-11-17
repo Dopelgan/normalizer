@@ -507,7 +507,14 @@ def parse(parser, storage, uri: str, file_type: str, metadata: Dict[str, Any],
         telemetry.add(HIT_STAGE, 1)
         logger.info("Кэш лестницы: результат %s взят из кэша (%s)", uri, key[:12])
         return cached
-    result = parser.parse(uri, file_type, metadata)
+    with _OutageWatch() as watch:
+        result = parser.parse(uri, file_type, metadata)
+    if key is not None and watch.reason:
+        # Лестница могла уйти мимо сервиса (полный фоллбэк на Tesseract при
+        # лежащем MinerU, пропуск уровня 5, отказ модели), а выбранный
+        # результат об этом молчит: проигравший уровень унёс пометку с собой.
+        logger.info("Кэш лестницы: %s не кэшируется — %s", uri, watch.reason)
+        key = None
     if key is not None:
         try:
             if put(key, result, uri, file_type, metadata):
@@ -515,6 +522,52 @@ def parse(parser, storage, uri: str, file_type: str, metadata: Dict[str, Any],
         except Exception as exc:  # noqa: BLE001
             _warn_once(f"Кэш лестницы: запись не удалась: {exc}")
     return result
+
+
+class _OutageWatch(logging.Handler):
+    """
+    Следит за разбором: был ли отказ сервиса, пусть выбранный результат о нём
+    и не знает. Признаки (любой — результат не кэшируется):
+    - MinerU помечен недоступным до, во время или после разбора;
+    - модель отказала как сервис (`outage.note_vlm(False)`);
+    - любая запись уровня ERROR в логгерах `core.*` за время разбора — так
+      пишут полный фоллбэк на Tesseract, таймаут MinerU и прочие отказы.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.reason = ""
+        self._logger = logging.getLogger("core")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if not self.reason:
+            self.reason = f"ошибка в логе {record.name}"
+
+    def _state(self):
+        from core import outage
+        from core.providers.mineru_parser import MinerUParserProvider
+
+        state = outage._state.get()
+        return (MinerUParserProvider._unavailable_until,
+                MinerUParserProvider.is_available(),
+                state.vlm_down if state is not None else 0)
+
+    def __enter__(self) -> "_OutageWatch":
+        self._before = self._state()
+        if not self._before[1]:
+            self.reason = "MinerU помечен недоступным"
+        self._logger.addHandler(self)
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._logger.removeHandler(self)
+        until, available, vlm_down = self._state()
+        if self.reason:
+            return
+        if until != self._before[0] or not available:
+            self.reason = "MinerU отказал во время разбора"
+        elif vlm_down != self._before[2]:
+            self.reason = "модель отказала во время разбора"
 
 
 _warned = False

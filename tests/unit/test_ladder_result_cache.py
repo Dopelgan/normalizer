@@ -226,6 +226,83 @@ class TestStore:
         assert parser.calls == 2
 
 
+class TestOutageIsNotCached:
+    """Прод 17.11: MinerU лежал, лестница ушла в Tesseract, результат попал в кэш."""
+
+    @pytest.fixture(autouse=True)
+    def _mineru_up(self):
+        from core.providers.mineru_parser import MinerUParserProvider
+        MinerUParserProvider.reset_availability()
+        yield
+        MinerUParserProvider.reset_availability()
+
+    def _clean_ocr(self, meta, uri):
+        # То, что выбирает лестница: уровень 4, чистый на вид результат.
+        return ParseResult(
+            blocks=[ParsedBlock(type="text", text="плоский OCR", page=1)],
+            is_fallback=True, parser_name="tesseract_full", page_count=1,
+        )
+
+    def test_mineru_connection_failure_is_not_cached(self, cache_on, temp_storage, monkeypatch):
+        import requests
+
+        from core.providers import mineru_parser
+        from core.providers.document_parser import ParserUnavailable
+
+        def refused(*args, **kwargs):
+            raise requests.ConnectionError("Connection refused")
+        monkeypatch.setattr(mineru_parser.requests, "post", refused)
+
+        def ladder(meta, uri):
+            provider = mineru_parser.MinerUParserProvider(storage=temp_storage)
+            try:  # тот же вызов, что делает уровень 5
+                provider._request_mineru("http://mineru:8000/file_parse", {}, [], 10)
+            except ParserUnavailable:
+                logging.getLogger("core.providers.mineru_parser").error(
+                    "MinerU недоступен (%s), полный фоллбэк на Tesseract: %s", "refused", uri)
+            return self._clean_ocr(meta, uri)
+
+        parser = CountingParser(ladder)
+        _parse(parser, temp_storage)
+        assert not list(cache_on.rglob("*.json"))
+        mineru_parser.MinerUParserProvider.reset_availability()
+        _parse(parser, temp_storage)
+        assert parser.calls == 2
+
+    def test_mineru_marked_down_before_parse_is_not_cached(self, cache_on, temp_storage):
+        from core.providers.mineru_parser import MinerUParserProvider
+        MinerUParserProvider.mark_unavailable()  # уровень 5 пропущен молча
+        parser = CountingParser(self._clean_ocr)
+        _parse(parser, temp_storage)
+        assert not list(cache_on.rglob("*.json"))
+
+    def test_error_log_during_ladder_is_not_cached(self, cache_on, temp_storage):
+        # Таймаут MinerU недоступным его не помечает — остаётся только лог.
+        def ladder(meta, uri):
+            logging.getLogger("core.ladder.router").error("MinerU не уложился в 10 с")
+            return self._clean_ocr(meta, uri)
+        parser = CountingParser(ladder)
+        _parse(parser, temp_storage)
+        assert not list(cache_on.rglob("*.json"))
+
+    def test_vlm_down_during_ladder_is_not_cached(self, cache_on, temp_storage):
+        from core import outage
+
+        def ladder(meta, uri):
+            outage.note_vlm(False)
+            return self._clean_ocr(meta, uri)
+        parser = CountingParser(ladder)
+        with outage.scope(0.0):
+            _parse(parser, temp_storage)
+        assert not list(cache_on.rglob("*.json"))
+
+    def test_clean_run_is_still_cached(self, cache_on, temp_storage):
+        parser = CountingParser(self._clean_ocr)
+        _parse(parser, temp_storage)
+        _parse(parser, temp_storage)
+        assert parser.calls == 1
+
+
 class TestCacheFailureNeverFailsParse:
     def test_key_error_falls_back_to_ladder(self, cache_on, temp_storage, monkeypatch):
         def broken(*args, **kwargs):
