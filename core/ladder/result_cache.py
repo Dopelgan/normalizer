@@ -237,6 +237,10 @@ def _mineru_name(uri: str, file_type: str) -> str:
     return f"{stem}.{ext.lower()}"
 
 
+def _stem(name: str) -> str:
+    return name.rsplit(".", 1)[0]
+
+
 def cacheable(result: ParseResult) -> bool:
     """Только чистый результат: без деградаций, упавших страниц и неудач уровней."""
     if result.degraded or result.failed_pages:
@@ -360,10 +364,12 @@ def _rebind(entry, result_data, reserve_data, storage, uri, file_type, metadata)
             continue
         data = relocate(data)
         results = (data.get("raw_output") or {}).get("results")
-        if old_name != new_name and isinstance(results, dict) and old_name in results:
+        if old_name != new_name and isinstance(results, dict):
+            # MinerU ключует ответ именем файла без расширения; полное имя
+            # тоже принимается.
+            renames = {old_name: new_name, _stem(old_name): _stem(new_name)}
             data["raw_output"]["results"] = {
-                (new_name if name == old_name else name): value
-                for name, value in results.items()
+                renames.get(name, name): value for name, value in results.items()
             }
         blobs.append(data)
 
@@ -377,6 +383,8 @@ def _rebind(entry, result_data, reserve_data, storage, uri, file_type, metadata)
         traces.append(entry["uri"])
     if old_name and old_name != new_name:
         traces.append(json.dumps(old_name, ensure_ascii=False))
+        if _stem(old_name) != _stem(new_name):
+            traces.append(json.dumps(_stem(old_name), ensure_ascii=False))
     for trace in traces:
         if trace in text:
             raise _NotRebindable(f"в результате остался след {trace!r}")

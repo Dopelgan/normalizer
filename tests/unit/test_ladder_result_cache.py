@@ -75,7 +75,8 @@ def _mineru_like(storage):
     def make(metadata, uri):
         prefix = metadata["asset_prefix"]
         storage.write_file(f"{prefix}fig1.jpg", b"\xff\xd8 picture")
-        return _result(prefix=prefix, name=uri.rsplit("/", 1)[-1])
+        # MinerU ключует ответ именем файла без расширения.
+        return _result(prefix=prefix, name=uri.rsplit("/", 1)[-1].rsplit(".", 1)[0])
     return make
 
 
@@ -236,12 +237,12 @@ class TestOtherDocument:
         assert _dump(hit) == _dump(fresh)
         assert temp_storage.exists("assets/doc-b/fig1.jpg")
         assert "doc-a" not in _dump(hit)[0]
+        assert list(hit.raw_output["results"]) == ["copy"]
 
     def test_copied_asset_has_same_bytes(self, cache_on, temp_storage):
         parser = CountingParser(_mineru_like(temp_storage))
         _parse(parser, temp_storage, meta=_meta("doc-a"))
-        temp_storage.delete_file("assets/doc-b/fig1.jpg") if temp_storage.exists(
-            "assets/doc-b/fig1.jpg") else None
+        assert not temp_storage.exists("assets/doc-b/fig1.jpg")
         _parse(parser, temp_storage, meta=_meta("doc-b"))
         with temp_storage.get_stream("assets/doc-b/fig1.jpg") as stream:
             assert stream.read() == b"\xff\xd8 picture"
