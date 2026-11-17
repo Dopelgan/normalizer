@@ -34,7 +34,7 @@ import os
 import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
@@ -431,6 +431,72 @@ class ParserTimedOut(ParserUnavailable):
 MINERU_HTTP_MS = "parse.mineru_http_ms"
 
 
+@dataclass(frozen=True)
+class _PageSubset:
+    """
+    Временный PDF той же длины, что исходный: нужные страницы на своих
+    местах, вместо остальных — пустые листы того же размера.
+
+    Номера страниц не сдвигаются нарочно. MinerU называет вырезку картинки и
+    таблицы по номеру страницы в присланном файле (sha256 от пути с
+    `page_id`), а от имени вырезки зависят `image_ref`, `source_unit_id` и
+    `fragment_id`: со сдвинутыми номерами фрагменты отправленных страниц
+    получали бы новые идентификаторы. Пустой лист между несмежными
+    участками к тому же не даёт MinerU склеить таблицы далёких страниц, а
+    пустой лист MinerU почти ничего не стоит.
+    """
+
+    data: bytes
+    pages: List[int]
+
+    def original(self, page: int) -> Optional[int]:
+        """Номер страницы исходника; `None` — блок на пустом листе-заглушке."""
+        return page if page in self.pages else None
+
+
+def _page_subset(file_bytes: bytes, pages: List[int], total: int) -> Optional[_PageSubset]:
+    """
+    Временный PDF, где содержимое есть только у `pages`; `None` — собрать
+    не удалось или нужны все страницы (тогда файл уходит как есть, запрос
+    прежний). Ни одной нужной — пустой набор без файла.
+    """
+    wanted = sorted({p for p in pages if 1 <= p <= total})
+    if not wanted:
+        return _PageSubset(data=b"", pages=[])
+    if len(wanted) == total:
+        return None
+    source = open_pdf(file_bytes)
+    if source is None:
+        return None
+    try:
+        import pymupdf
+    except ImportError:  # pragma: no cover
+        import fitz as pymupdf
+    out = pymupdf.open()
+    try:
+        keep = set(wanted)
+        page = 1
+        while page <= total:
+            if page in keep:
+                last = page
+                while last + 1 in keep:
+                    last += 1
+                out.insert_pdf(source, from_page=page - 1, to_page=last - 1)
+                page = last + 1
+            else:
+                rect = source[page - 1].rect
+                out.new_page(width=rect.width, height=rect.height)
+                page += 1
+        data = out.tobytes()
+    except Exception as exc:  # noqa: BLE001 — без временного файла файл уходит целиком
+        logger.warning("Временный PDF из страниц %s не собран: %s", page_ranges(wanted), exc)
+        return None
+    finally:
+        out.close()
+        source.close()
+    return _PageSubset(data=data, pages=wanted)
+
+
 class MinerUPrefetch:
     """
     Запрос к MinerU, начатый заранее, пока уровень 4 читает тот же скан
@@ -557,7 +623,13 @@ class MinerUParserProvider(DocumentParserProvider):
         file_type: str,
         metadata: Optional[Dict[str, Any]] = None,
         prefetched: Optional[MinerUPrefetch] = None,
+        only_pages: Optional[List[int]] = None,
     ) -> ParseResult:
+        """
+        `only_pages` — номера страниц (с 1), которым нужен MinerU
+        (`core/ladder/layout_pages.py`); остальные страницы векторного PDF
+        получают строки слоя через ту же сшивку. `None` — весь файл.
+        """
         metadata = metadata or {}
         if prefetched is not None and not prefetched.started:
             prefetched = None
@@ -573,11 +645,24 @@ class MinerUParserProvider(DocumentParserProvider):
             file_bytes = self._read_source(uri)
             layer, drawing_verdicts, pages = self._read_pdf(file_bytes, file_type)
 
+        # Только нужные страницы (`LADDER_LAYOUT_PAGE_SUBSET`): решение
+        # принимает лестница, здесь — только векторный PDF со слоем. Без
+        # слоя пропущенные страницы остались бы без текста — тогда целиком.
+        subset = None
+        if (only_pages is not None and prefetched is None and layer is not None
+                and file_bytes is not None):
+            subset = _page_subset(file_bytes, only_pages, pages)
+
         try:
-            result = self._parse_with_mineru(
-                uri, file_type, metadata, file_bytes, pages,
-                payload=prefetched.payload() if prefetched is not None else None,
-            )
+            if subset is not None:
+                result = self._parse_page_subset(
+                    uri, file_type, metadata, subset, pages,
+                )
+            else:
+                result = self._parse_with_mineru(
+                    uri, file_type, metadata, file_bytes, pages,
+                    payload=prefetched.payload() if prefetched is not None else None,
+                )
         except ParserUnavailable as exc:
             # Недоступность сервиса — это деградация системы, а не свойство
             # документа, и путать их нельзя: лежащий mineru-api иначе
@@ -929,6 +1014,35 @@ class MinerUParserProvider(DocumentParserProvider):
             failed_pages=[],
             page_count=page_count or (1 if is_image else len({b.page for b in blocks})),
         )
+
+    def _parse_page_subset(
+        self,
+        uri: str,
+        file_type: str,
+        metadata: Dict[str, Any],
+        subset: "_PageSubset",
+        pages: int,
+    ) -> ParseResult:
+        """
+        MinerU читает только нужные страницы (остальные — пустые листы,
+        номера страниц те же). Ни одной нужной — запроса нет, результат
+        пустой (текст страниц вернёт сшивка со слоем).
+        """
+        telemetry.add("parse.layout_pages_total", float(pages))
+        telemetry.add("parse.layout_pages_sent", float(len(subset.pages)))
+        if not subset.pages:
+            logger.info("MinerU не нужен ни одной странице %s (%d стр.)", uri, pages)
+            return ParseResult(
+                blocks=[], is_fallback=False, parser_name="mineru",
+                source_kind="vector_pdf", raw_output={}, failed_pages=[],
+                page_count=pages,
+            )
+        logger.info("MinerU для %s: страницы %s из %d", uri, page_ranges(subset.pages), pages)
+        result = self._parse_with_mineru(uri, file_type, metadata, subset.data, pages)
+        # Блок на пустом листе-заглушке — содержимого там нет.
+        result.blocks = [b for b in result.blocks if subset.original(b.page) is not None]
+        result.page_count = pages
+        return result
 
     def _mineru_request(
         self, uri: str, file_type: str, metadata: Dict[str, Any], file_bytes: bytes, pages: int,

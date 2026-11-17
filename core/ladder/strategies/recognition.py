@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -140,12 +140,18 @@ class LayoutStrategy(Strategy):
 
     def run(
         self, context: DocumentContext, prefetched: Optional[MinerUPrefetch] = None,
+        pages: Optional[List[int]] = None,
     ) -> ParseResult:
+        """`pages` — только эти страницы в MinerU (`LADDER_LAYOUT_PAGE_SUBSET`)."""
         if not MinerUParserProvider.is_available():
             # Сюда без сервиса доходит только растр под PARSE_REQUEUE_ON_OUTAGE
             # (`applicable`): документ в очередь (ServiceOutage).
             outage.mineru_down("сервис помечен недоступным")
-        if prefetched is None:
+        if pages is not None:
+            result = self.provider.parse(
+                context.uri, context.file_type, context.metadata, only_pages=pages
+            )
+        elif prefetched is None:
             result = self.provider.parse(context.uri, context.file_type, context.metadata)
         else:
             result = self.provider.parse(

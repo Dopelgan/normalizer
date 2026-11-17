@@ -150,6 +150,7 @@
 |---|---|---|
 | `LADDER_SKIP_OCR_ON_TEXT_LAYER` | `false` | `core/ladder/router.py` (условие — `core/ladder/text_layer_complete.py`) |
 | `LADDER_PARALLEL_LAYOUT` | `false` | `core/ladder/router.py` (запрос заранее — `core/providers/mineru_parser.py::MinerUPrefetch`, `core/ladder/strategies/recognition.py::LayoutStrategy.prefetch`) |
+| `LADDER_LAYOUT_PAGE_SUBSET` | `false` | `core/ladder/router.py` (выбор страниц — `core/ladder/layout_pages.py::pages_for_layout`, временный PDF — `core/providers/mineru_parser.py::_page_subset`, `MinerUParserProvider._parse_page_subset`) |
 | `LADDER_DRAWING_OVER_OCR` | `false` | `core/ladder/drawing_route.py`, `core/ladder/router.py`, `core/models/parse_result.py`, `ingest/tasks.py` |
 | `DRAWING_VISION_ENABLED` | `true` | `core/drawing_processor.py` |
 | `DRAWING_TEXT_IN_FRAME_ENABLED` | `false` | `core/drawing_processor.py`, `core/providers/vector_drawing.py` |

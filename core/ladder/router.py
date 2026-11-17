@@ -52,6 +52,7 @@ from core.ladder import drawing_route
 from core.ladder.base import Strategy, text_chars
 from core.ladder.context import SOURCE_RASTER, DocumentContext
 from core.ladder.scoring import Score, score_result
+from core.ladder.layout_pages import pages_for_layout
 from core.ladder.text_layer_complete import complete_text_layer
 from core.ladder.strategies.cad_source import CadSourceStrategy
 from core.ladder.strategies.native_text import (
@@ -247,6 +248,13 @@ class LadderRouter:
             if 4 in by_level and hasattr(by_level.get(5), "prefetch"):
                 prefetcher = by_level[5]
         prefetched = None
+        # Векторный PDF с полным слоем: в MinerU уходят только страницы со
+        # структурой (`LADDER_LAYOUT_PAGE_SUBSET`, `layout_pages.py`), текст
+        # остальных сшивка берёт из слоя. `None` — файл целиком, как прежде.
+        layout_pages: Optional[List[int]] = None
+        if settings.LADDER_LAYOUT_PAGE_SUBSET and any(
+                isinstance(s, LayoutStrategy) for s in applicable):
+            layout_pages = pages_for_layout(context)
         logger.info(
             "Лестница для %s: источник=%s жанр=%s качество=%s, уровни %s",
             context.uri, classification.source, classification.genre,
@@ -309,8 +317,12 @@ class LadderRouter:
             run_started = time.perf_counter()
             http_before = telemetry.value(MINERU_HTTP_MS)
             try:
-                result = strategy.run(context) if handed is None else strategy.run(
-                    context, prefetched=handed)
+                if layout_pages is not None and isinstance(strategy, LayoutStrategy):
+                    result = strategy.run(context, pages=layout_pages)
+                elif handed is None:
+                    result = strategy.run(context)
+                else:
+                    result = strategy.run(context, prefetched=handed)
             except SoftTimeLimitExceeded:
                 # Лимит задачи — не «неудача уровня». Если кандидат уже есть,
                 # он сохраняется с пометкой; иначе лимит обрабатывает задача.
@@ -510,6 +522,11 @@ class LadderRouter:
             "fallback_won": fallback_won,
             "degraded": list(best.degraded),
         }
+        if layout_pages is not None:
+            best.ladder["layout_pages"] = {
+                "sent": layout_pages,
+                "total": context.source_page_count,
+            }
         if reserve is not None:
             best.ladder["drawing_deferred"] = {
                 "reserve_strategy": reserve.parser_name,
