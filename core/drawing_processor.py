@@ -283,6 +283,10 @@ class DrawingProcessor:
             layout.regions,
             key=lambda r: r.kind != drawing_vision.KIND_TITLE_BLOCK,
         )
+        gated = self._gate_table_regions(regions, page, sheet, whole_page=log_page is None)
+        if gated:
+            regions = [region for region in regions if not any(region is g for g in gated)]
+            payload["regions_gated"] = len(gated)
 
         def sheet_pass():
             pass_started = time.monotonic()
@@ -1326,6 +1330,33 @@ class DrawingProcessor:
         parsed = self.qwen.read_side_column(piece)
         payload["side_column"] = {"bbox": bbox, "read": parsed is not None}
         return parsed
+
+    def _gate_table_regions(
+        self, regions: List[drawing_vision.Region], page: int, sheet: Any, whole_page: bool,
+    ) -> List[drawing_vision.Region]:
+        """
+        Таблицы листа, проход по которым не нужен (DRAWING_TABLE_PASS_GATE):
+        MinerU страницу разобрал, а таблицы со строками в этой области нет.
+        Без слоя распознавания страницы (картинка без MinerU, сбой разбора)
+        и на вырезках не пропускается ничего: сравнивать не с чем.
+        """
+        if not settings.DRAWING_TABLE_PASS_GATE or not whole_page:
+            return []
+        if self._layer_lines.get(int(page), 0) <= 0:
+            return []
+        least = settings.DRAWING_TABLE_PASS_GATE_OVERLAP
+        tables = [bbox for bbox, rows in self._mineru_tables.get(int(page), []) if rows > 0]
+        gated = [
+            region for region in regions
+            if region.kind == drawing_vision.KIND_TABLE
+            and not any(_overlap_share(region.bbox, bbox) >= least for bbox in tables)
+        ]
+        for region in gated:
+            logger.info(
+                "Qwen-VL таблица: стр. %s, область %.4f листа, у MinerU таблицы нет — проход пропущен",
+                sheet, region.area,
+            )
+        return gated
 
     def _mineru_rows(self, region: drawing_vision.Region, page: int) -> int:
         """Строк у таблицы MinerU, которая накрывает область не меньше чем наполовину."""
