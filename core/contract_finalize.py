@@ -26,7 +26,7 @@ from core.facts.extractor import extract_facts
 from core.models.contract import Fragment
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import apply_drawing_quality
-from core import document_furniture, drawing_record
+from core import document_furniture, drawing_record, drawing_sheet_name
 from core.providers import canonical_ids, designation_repair, mixed_script
 
 logger = logging.getLogger(__name__)
@@ -142,6 +142,11 @@ def finalize_fragments(
     # должен получить ни идентификатора, ни порядкового номера
     # (`SCAN_DROP_FRAME_FURNITURE`, `SCAN_JOIN_HYPHENATED_WORDS`).
     fragments = document_furniture.apply(fragments)
+    # Наименование листа 1 — на листы 2+ с сокращённым штампом: до правки
+    # обозначений, чтобы перенесённое значение правилось вместе со своим
+    # листом, и до идентификаторов (`DRAWING_SHEET_NAME_CARRY`).
+    if settings.DRAWING_SHEET_NAME_CARRY:
+        drawing_sheet_name.apply(fragments)
 
     id_map: Dict[str, str] = {}
     seen: Dict[str, int] = {}
@@ -160,6 +165,11 @@ def finalize_fragments(
             mixed_script.repair_fragment(fragment)
         if settings.SCAN_DESIGNATION_REPAIR and fragment.type == "text":
             designation_repair.repair_fragment(fragment)
+        if settings.DRAWING_DESIGNATION_REPAIR and fragment.type == "drawing":
+            designation_repair.repair_drawing_fragment(
+                fragment,
+                designation_repair.known_names(settings.DESIGNATION_KNOWN_NAMES_PATH),
+            )
         if (fragment.position is not None
                 and len(fragment.content.text or "") != len(before_repairs)):
             fragment.position.text_offsets_exact = False

@@ -167,6 +167,8 @@
 | `DRAWING_DIMENSION_FIDELITY` | `false` | `core/providers/dimension_fidelity.py`, `core/providers/drawing_text.py`, `core/drawing_processor.py`, `core/providers/qwen_client.py`, `core/providers/mineru_parser.py`, `core/providers/vector_drawing.py` |
 | `DRAWING_MATERIAL_NO_TOLERANCE` | `false` | `core/drawing_processor.py` |
 | `DRAWING_SHEET_MISSING_PAGES` | `false` | `core/drawing_processor.py` |
+| `DRAWING_DESIGNATION_REPAIR` (+ `DESIGNATION_KNOWN_NAMES_PATH`) | `false` | `core/providers/designation_repair.py` (`repair_drawing_fragment`, `known_names`), `core/contract_finalize.py` |
+| `DRAWING_SHEET_NAME_CARRY` | `false` | `core/drawing_sheet_name.py`, `core/contract_finalize.py` |
 | `DRAWING_RECORD_COMPOSED` | `false` | `core/drawing_record.py`, `core/contract_finalize.py`, `core/document_parts.py` |
 | `DRAWING_VALUE_VIEW_LINKS` | `false` | `core/providers/drawing_views.py`, `core/drawing_processor.py` |
 | `DRAWING_DIAGNOSTICS_NOT_INDEXED` | `false` | `core/contract_finalize.py` |

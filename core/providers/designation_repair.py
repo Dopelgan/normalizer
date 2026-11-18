@@ -56,14 +56,30 @@
 справочник сами называют верный знак, и оставляет остальное сломанным —
 заметно сломанным.
 
+Названия исполнений (`DRAWING_DESIGNATION_REPAIR`). Чертёжное чтение
+листа путает «Э» с «З» и тройкой, «И» с латинской «U»: исполнение
+«ВОЛНА-ПЛЭ-КР» приходит как «ВОЛНА-ПЛЗ-КР» или «ВОЛНА-ПЛ3-КР». Формы у
+названия нет, поэтому правка только до точного совпадения с названием из
+справочника (`known_names`, файл `DESIGNATION_KNOWN_NAMES_PATH`, строка —
+название). Название, которое само есть в справочнике, не трогается: «З» в
+настоящем «МЗК-ДР» остаётся «З». Два совпадения — не правится. Названия
+короче трёх знаков не участвуют: «КЗ» — это ещё и короткое замыкание.
+Названий заказчика в коде нет — только в файле справочника.
+
 Связи. Вызывается из `core/contract_finalize.py` для каждого текстового
-фрагмента до извлечения фактов.
+фрагмента до извлечения фактов (`repair_fragment`) и, под
+`DRAWING_DESIGNATION_REPAIR`, для чертёжного фрагмента — текст, поля и
+графы штампа (`repair_drawing_fragment`).
 """
 
 from __future__ import annotations
 
+import functools
+import logging
 import re
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Ключ в `structured_payload` фрагмента: что именно было восстановлено.
 # Не пометка (`warnings`): для RAG пометка означает «текст неполный», а
@@ -343,8 +359,112 @@ _PATTERNS = (
     ("font", _FONT, _repair_font),
 )
 
+# ------------------------------------------------------ названия исполнений
+# Неразличимые знаки для сверки со справочником названий. Здесь, в отличие
+# от `_CLASSES`, цифра читается буквой и «З» — буквой «Э»: допустимо только
+# потому, что результат обязан совпасть с настоящим названием целиком.
+# Сверка без учёта регистра: всё приводится к прописным.
+_NAME_CLASSES: Tuple[str, ...] = (
+    "АA", "ВB", "ЕE", "КK", "МM", "НH", "ОO0", "РP", "СC", "ТT", "УY",
+    "ХX", "ЗЭ3", "ИU", "I1І", "ЅS", "ЈJ",
+)
+_NAME_REP: Dict[str, str] = {
+    char: group[0] for group in _NAME_CLASSES for char in group
+}
+# Название короче этого (без дефисов) не правится: короткое сочетание
+# слишком часто оказывается обычным сокращением.
+_MIN_NAME_CHARS = 3
+_NAME_TOKEN = re.compile(
+    r"(?<![0-9A-Za-zА-Яа-яЁё])[0-9A-Za-zА-Яа-яЁё]+(?:-[0-9A-Za-zА-Яа-яЁё]+)*"
+    r"(?![0-9A-Za-zА-Яа-яЁё])")
+_LETTER = re.compile(r"[A-Za-zА-Яа-яЁё]")
 
-def repair_text(text: str) -> Tuple[str, List[Change]]:
+
+def _name_fold(text: str) -> str:
+    """Запись, одинаковая у всех написаний, неразличимых на листе."""
+    return "".join(_NAME_REP.get(char.upper(), char.upper()) for char in text)
+
+
+@functools.lru_cache(maxsize=8)
+def known_names(path: str) -> Tuple[str, ...]:
+    """
+    Справочник названий из файла: строка — название, «#» — комментарий.
+    Нет файла — пустой справочник, правка названий не делается.
+    """
+    if not path:
+        return ()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError as error:
+        logger.warning("Справочник названий %s не прочитан: %s", path, error)
+        return ()
+    names = []
+    for line in lines:
+        name = line.split("#", 1)[0].strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+@functools.lru_cache(maxsize=8)
+def _name_index(names: Tuple[str, ...]) -> Tuple[frozenset, Dict[str, frozenset]]:
+    """Сами названия и «свёрнутая запись -> названия с этой записью»."""
+    index: Dict[str, set] = {}
+    for name in names:
+        if len(name.replace("-", "")) >= _MIN_NAME_CHARS and _LETTER.search(name):
+            index.setdefault(_name_fold(name), set()).add(name)
+    return frozenset(names), {key: frozenset(value) for key, value in index.items()}
+
+
+def _known_reading(piece: str, exact: frozenset,
+                   index: Dict[str, frozenset]) -> Optional[str]:
+    """Название, которым был кусок; сам кусок, если он и есть название."""
+    if piece in exact:
+        return piece
+    if not _LETTER.search(piece):
+        # Число не становится названием: «333» — это не «ЗЗЭ».
+        return None
+    found = index.get(_name_fold(piece))
+    if found and len(found) == 1:
+        return next(iter(found))
+    return None
+
+
+def _repair_names(text: str, names: Tuple[str, ...]) -> Tuple[str, List[Change]]:
+    """
+    Названия исполнений в тексте. Слово с дефисами проверяется целиком, а
+    потом по частям, от длинных к коротким: «ВОЛНА-ПЛЗ-КР» — сначала всё
+    название, потом «ПЛЗ», если в справочнике есть только «ПЛЭ».
+    """
+    exact, index = _name_index(names)
+    if not index:
+        return text, []
+    changes: List[Change] = []
+
+    def repair_token(match: "re.Match[str]") -> str:
+        parts = match.group(0).split("-")
+        out: List[str] = []
+        start = 0
+        while start < len(parts):
+            for end in range(len(parts), start, -1):
+                piece = "-".join(parts[start:end])
+                found = _known_reading(piece, exact, index)
+                if found is not None:
+                    if found != piece:
+                        changes.append(Change("known_name", piece, found))
+                    out.append(found)
+                    start = end
+                    break
+            else:
+                out.append(parts[start])
+                start += 1
+        return "-".join(out)
+
+    return _NAME_TOKEN.sub(repair_token, text), changes
+
+
+def repair_text(text: str, names: Sequence[str] = ()) -> Tuple[str, List[Change]]:
     """Текст с восстановленными обозначениями и список сделанных замен."""
     if not text:
         return text, []
@@ -371,7 +491,48 @@ def repair_text(text: str) -> Tuple[str, List[Change]]:
         if pieces:
             pieces.append(result[position:])
             result = "".join(pieces)
+    if names:
+        # Названия — последними: по справочнику, а не по форме, и после
+        # того, как форма обозначений уже восстановлена.
+        result, named = _repair_names(result, tuple(names))
+        changes.extend(named)
     return result, changes
+
+
+def _record(fragment, changes: List[Change]) -> None:
+    payload = fragment.content.structured_payload or {}
+    payload.setdefault(PAYLOAD_KEY, []).extend(
+        {"pattern": change.pattern, "before": change.before, "after": change.after}
+        for change in changes
+    )
+    fragment.content.structured_payload = payload
+
+
+def repair_drawing_fragment(fragment, names: Sequence[str] = ()) -> List[Change]:
+    """
+    Чертёжный фрагмент (`DRAWING_DESIGNATION_REPAIR`): текст листа, значения
+    полей и графы штампа — одной правкой, чтобы запись, поля и штамп
+    называли исполнение одинаково. Написание «как на листе» (`AS_READ`
+    штампа) не трогается: оно и должно остаться прочтением.
+    """
+    content = fragment.content
+    changes: List[Change] = []
+    if content.text:
+        content.text, found = repair_text(content.text, names)
+        changes += found
+    for field in content.structured_drawing_fields or []:
+        field.value, found = repair_text(field.value, names)
+        changes += found
+    block = (content.structured_payload or {}).get("title_block")
+    if isinstance(block, dict):
+        for key, value in list(block.items()):
+            if key == "designation_as_read" or not isinstance(value, str):
+                continue
+            block[key], found = repair_text(value, names)
+            changes += found
+    if changes:
+        _record(fragment, changes)
+    return changes
 
 
 def repair_fragment(fragment) -> List[Change]:
