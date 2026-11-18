@@ -170,3 +170,30 @@ def test_flags_off_identical(tmp_path, monkeypatch):
     out = _finalize(fragments)
     for got, before in zip(out, expected):
         assert got.content.model_dump() == before.content.model_dump()
+
+
+# ------------------------------------------------------------- после ревью
+
+def test_as_read_line_not_repaired(tmp_path):
+    names = designation_repair.known_names(_names_file(tmp_path))
+    sheet = _drawing(
+        "Клапан ВОЛНА-ПЛЗ-КР\nОбозначение (как на листе) — ВОЛНА-ПЛЗ-КР 12.\nЕщё ВОЛНА-ПЛЗ-КР 12",
+        block={"designation": "ВОЛНА-ПЛЭ-КР 12", "designation_as_read": "ВОЛНА-ПЛЗ-КР 12"})
+    designation_repair.repair_drawing_fragment(sheet, names)
+    assert sheet.content.text == (
+        "Клапан ВОЛНА-ПЛЭ-КР\nОбозначение (как на листе) — ВОЛНА-ПЛЗ-КР 12.\nЕщё ВОЛНА-ПЛЗ-КР 12")
+    assert sheet.content.structured_payload["title_block"]["designation_as_read"] == "ВОЛНА-ПЛЗ-КР 12"
+
+
+def test_lowercase_token_not_uppercased(tmp_path):
+    names = designation_repair.known_names(_names_file(tmp_path))
+    source = "исполнение волна-плз-кр и плэ"
+    assert designation_repair.repair_text(source, names)[0] == source
+
+
+def test_names_file_created_later_is_read(tmp_path):
+    designation_repair.known_names.cache_clear()
+    path = tmp_path / "later.txt"
+    assert designation_repair.known_names(str(path)) == ()
+    path.write_text("ПЛЭ\n", encoding="utf-8")
+    assert designation_repair.known_names(str(path)) == ("ПЛЭ",)

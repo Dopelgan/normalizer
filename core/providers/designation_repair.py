@@ -76,8 +76,11 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import re
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+from core.providers.title_block import AS_READ, LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -385,14 +388,26 @@ def _name_fold(text: str) -> str:
     return "".join(_NAME_REP.get(char.upper(), char.upper()) for char in text)
 
 
-@functools.lru_cache(maxsize=8)
 def known_names(path: str) -> Tuple[str, ...]:
     """
     Справочник названий из файла: строка — название, «#» — комментарий.
-    Нет файла — пустой справочник, правка названий не делается.
+    Нет файла — пустой справочник, правка названий не делается. Кэш — по
+    пути и времени изменения файла: файл, положенный или обновлённый после
+    первого вызова, читается без перезапуска, а отсутствие файла не
+    запоминается.
     """
     if not path:
         return ()
+    try:
+        stamp = os.stat(path).st_mtime_ns
+    except OSError as error:
+        logger.warning("Справочник названий %s не прочитан: %s", path, error)
+        return ()
+    return _load_names(path, stamp)
+
+
+@functools.lru_cache(maxsize=8)
+def _load_names(path: str, stamp: int) -> Tuple[str, ...]:
     try:
         with open(path, encoding="utf-8") as handle:
             lines = handle.read().splitlines()
@@ -405,6 +420,10 @@ def known_names(path: str) -> Tuple[str, ...]:
         if name and name not in names:
             names.append(name)
     return tuple(names)
+
+
+# Для тестов и ручного сброса — как у прежнего кэша.
+known_names.cache_clear = _load_names.cache_clear  # type: ignore[attr-defined]
 
 
 @functools.lru_cache(maxsize=8)
@@ -427,7 +446,12 @@ def _known_reading(piece: str, exact: frozenset,
         return None
     found = index.get(_name_fold(piece))
     if found and len(found) == 1:
-        return next(iter(found))
+        name = next(iter(found))
+        # Регистр сверяется как есть: строчное «плз» — не «ПЛЭ», и
+        # правильное строчное слово не становится прописным.
+        if all(a.isupper() == b.isupper() for a, b in zip(piece, name)
+               if a.isalpha() and b.isalpha()):
+            return name
     return None
 
 
@@ -508,6 +532,35 @@ def _record(fragment, changes: List[Change]) -> None:
     fragment.content.structured_payload = payload
 
 
+# Подпись строки записи с написанием «как на листе» — та же, что у
+# `drawing_record.AS_READ_TITLE` (оттуда не импортируется: запись зависит
+# от правки, а не наоборот).
+_AS_READ_LINE = f"{LABELS['designation']} (как на листе)"
+
+
+def _repair_sheet_text(text: str, names: Sequence[str],
+                       as_read: Optional[str]) -> Tuple[str, List[Change]]:
+    """
+    Текст листа без правки написания «как на листе»: строка записи с ним и
+    само прочтение, где бы оно ни стояло, остаются как были — это
+    прочтение, по нему лист ищут так, как он напечатан.
+    """
+    changes: List[Change] = []
+    out: List[str] = []
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith(_AS_READ_LINE):
+            out.append(line)
+            continue
+        pieces = line.split(as_read) if as_read else [line]
+        repaired = []
+        for piece in pieces:
+            fixed, found = repair_text(piece, names)
+            repaired.append(fixed)
+            changes += found
+        out.append((as_read or "").join(repaired))
+    return "".join(out), changes
+
+
 def repair_drawing_fragment(fragment, names: Sequence[str] = ()) -> List[Change]:
     """
     Чертёжный фрагмент (`DRAWING_DESIGNATION_REPAIR`): текст листа, значения
@@ -517,16 +570,17 @@ def repair_drawing_fragment(fragment, names: Sequence[str] = ()) -> List[Change]
     """
     content = fragment.content
     changes: List[Change] = []
+    block = (content.structured_payload or {}).get("title_block")
+    as_read = block.get(AS_READ) if isinstance(block, dict) else None
     if content.text:
-        content.text, found = repair_text(content.text, names)
+        content.text, found = _repair_sheet_text(content.text, names, as_read)
         changes += found
     for field in content.structured_drawing_fields or []:
         field.value, found = repair_text(field.value, names)
         changes += found
-    block = (content.structured_payload or {}).get("title_block")
     if isinstance(block, dict):
         for key, value in list(block.items()):
-            if key == "designation_as_read" or not isinstance(value, str):
+            if key == AS_READ or not isinstance(value, str):
                 continue
             block[key], found = repair_text(value, names)
             changes += found
