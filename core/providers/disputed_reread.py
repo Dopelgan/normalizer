@@ -27,6 +27,12 @@
 остальное (вырезка не той надписи, модель не прочитала, другое число)
 оставляет поле как было: вырезка — свидетельство, а не новый источник
 надписей. Неудачный вызов не меняет ничего.
+
+С D3 (DRAWING_READINGS_RECONCILED) дочитывание идёт после сведения по
+документу: в проходе листа сохраняются только вырезки (`cut_all`), спорные
+поля выбирает согласие D3, а прочтение вырезки становится ещё одним
+прочтением поля (`reading_reconcile.witness`). Своё сведение (группы двух
+записей рядом) для полей D3 не повторяется.
 """
 
 from __future__ import annotations
@@ -118,6 +124,11 @@ def _same(a: str, b: str) -> bool:
     return clean(a) == clean(b)
 
 
+def reconciled(field: Dict[str, Any]) -> bool:
+    """Поле сведено D3: есть его прочтения и согласие между ними."""
+    return isinstance(field.get("readings"), list) and field.get("agreement") is not None
+
+
 def targets(fields: Sequence[Dict[str, Any]]) -> List[Tuple[List[int], List[float]]]:
     """
     Что дочитывать: группы полей (номера в `fields`) и рамка вырезки.
@@ -134,11 +145,20 @@ def targets(fields: Sequence[Dict[str, Any]]) -> List[Tuple[List[int], List[floa
     for n in candidates:
         if n in taken:
             continue
+        if reconciled(fields[n]):
+            # Поле уже сведено D3 со всеми прочтениями страницы: второй раз
+            # его в группу не собирать, решает согласие D3.
+            disputed = fields[n].get("agreement") in DISPUTED_AGREEMENT
+            if disputed:
+                (conflicts if fields[n]["agreement"] == "conflict" else singles).append(
+                    ([n], _place(fields[n]["bbox"])))
+            continue
         key = _skeleton(fields[n]["value"])
         here = _centre(fields[n]["bbox"])
         group = [n]
         for m in candidates:
-            if m <= n or m in taken or fields[m]["category"] != fields[n]["category"]:
+            if (m <= n or m in taken or fields[m]["category"] != fields[n]["category"]
+                    or reconciled(fields[m])):
                 continue
             there = _centre(fields[m]["bbox"])
             if (key and _skeleton(fields[m]["value"]) == key
@@ -293,18 +313,45 @@ def _read_part(value: str, category: Optional[str]) -> str:
     return value
 
 
+def _key(box: Sequence[float]) -> Tuple[float, ...]:
+    return tuple(round(float(v), 6) for v in box)
+
+
+def cut_all(image, fields: Sequence[Dict[str, Any]]) -> Dict[Tuple[float, ...], Any]:
+    """
+    Вырезки всех полей, которые может понадобиться дочитать, по рамке поля.
+    Нужны, когда дочитывание идёт после сведения D3: к тому времени картинки
+    листа уже нет, а какие поля спорные, решит только D3.
+    """
+    pieces: Dict[Tuple[float, ...], Any] = {}
+    for f in fields:
+        box = _place(f.get("bbox")) if eligible(f) else None
+        if box is not None and _key(box) not in pieces:
+            pieces[_key(box)] = crop(image, box)
+    return pieces
+
+
 def apply(
     client: Any, image, fields: List[Dict[str, Any]], until: Optional[float] = None,
     rule: Callable[[str, str], Optional[str]] = decide,
+    pieces: Optional[Dict[Tuple[float, ...], Any]] = None,
+    reconcile: Optional[Callable[[Dict[str, Any], str], Tuple[Dict[str, Any], str]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Дочитывает спорные поля листа. Возвращает новый список полей и учёт:
     сколько вырезок и вызовов, сколько подтверждено, исправлено, снято
     повторов и не прочитано. `until` — момент по `gpu_gate.budget_now()`,
     после которого вызов не начинается (бюджет листа). `rule` — правило
-    значения; проход сведения D3 подставляет своё.
+    значения.
+
+    После сведения D3 картинки листа нет: вырезки берутся из `pieces`
+    (`cut_all`), а поле, сведённое D3 (есть `readings`), решает `reconcile`:
+    прочтение вырезки — ещё одно свидетельство в его прочтениях. Он
+    возвращает поле и исход: «agreed», «corrected» или «kept».
     """
     chosen = targets(fields)
+    if pieces is not None:
+        chosen = [item for item in chosen if _key(item[1]) in pieces]
     stats: Dict[str, Any] = {"crops": len(chosen), "calls": 0, "failed_calls": 0,
                              "agreed": 0, "corrected": 0, "dropped": 0, "unread": 0,
                              "skipped_time": 0, "changes": []}
@@ -317,7 +364,8 @@ def apply(
             stats["skipped_time"] += len(batch)
             continue
         try:
-            picture = grid([crop(image, box) for _, box in batch])
+            picture = grid([pieces[_key(box)] if pieces is not None else crop(image, box)
+                            for _, box in batch])
         except Exception as exc:  # noqa: BLE001 — битая вырезка не роняет лист
             logger.error("Вырезки спорных надписей не собраны: %s", exc)
             stats["failed_calls"] += 1
@@ -336,6 +384,15 @@ def apply(
         text = answers.get(index)
         if text is None:
             stats["unread"] += 1
+            continue
+        if reconcile is not None and len(members) == 1 and reconciled(result[members[0]]):
+            n = members[0]
+            before = str(result[n]["value"])
+            result[n], outcome = reconcile(result[n], text)
+            if outcome in ("agreed", "corrected"):
+                stats[outcome] += 1
+            if outcome == "corrected":
+                stats["changes"].append([before, str(result[n]["value"])])
             continue
         for n in members:
             readings = result[n].get("readings")

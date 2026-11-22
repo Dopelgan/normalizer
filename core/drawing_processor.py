@@ -199,6 +199,10 @@ class _Passes:
 class DrawingProcessor:
     """Изображение чертежа -> структурированные поля -> фрагмент `drawing`."""
 
+    # Вырезки для дочитывания после сведения D3 (`enrich_fragments`); вне
+    # документа — None, и лист дочитывается сам.
+    _reread_crops: Optional[Dict[Any, Any]] = None
+
     def __init__(
         self,
         storage: Optional[StorageProvider] = None,
@@ -470,11 +474,23 @@ class DrawingProcessor:
                 dimension_fidelity.adopt_transcript_signs(
                     fields, payload.get("transcript_lines")
                 )
-        if settings.DRAWING_DISPUTED_REREAD and fields:
+        crops = self._reread_crops
+        if settings.DRAWING_DISPUTED_REREAD and fields and crops is not None:
+            # Сведение D3 (DRAWING_READINGS_RECONCILED) идёт по всему документу
+            # после листов и само решает, какие поля спорные: дочитывание —
+            # после него (`_reread_reconciled`), а здесь только вырезки, пока
+            # картинка листа есть.
+            crops[(image_ref, sheet)] = disputed_reread.cut_all(layout.image, fields)
+        elif settings.DRAWING_DISPUTED_REREAD and fields:
             # Третье свидетельство по спорным числам (D4): вырезки в родном
             # разрешении. Здесь — после сведения прочтений листа и до того,
             # как поля уйдут соседним фрагментам страницы и привязке к виду.
             fields = self._reread_disputed(layout.image, fields, payload, budget_started)
+        if settings.DRAWING_CONSENSUS_READS > 1:
+            # Согласие N чтений листа нужно только выбору спорных полей выше;
+            # в контракт поля оно не выходит (у D3 там свои значения).
+            for item in fields:
+                item.pop("agreement", None)
         if settings.DRAWING_DIMENSION_FIDELITY:
             if page_fields is not None:
                 # Тот же размер, прочитанный в другом вызове `process()` по
@@ -747,6 +763,11 @@ class DrawingProcessor:
         чертежей: фрагмента `image` в таком документе нет.
         """
         result: List[Fragment] = []
+        # Вырезки полей листов для дочитывания после сведения D3 (оба флага):
+        # по (image_ref, страница) — так их находит фрагмент листа.
+        self._reread_crops = (
+            {} if settings.DRAWING_DISPUTED_REREAD and settings.DRAWING_READINGS_RECONCILED else None
+        )
         # Прочтения по страницам, накопленные вызовами `process()`: вырезка
         # вида и сама страница читаются разными вызовами, а надпись у них
         # одна. Вырезки идут до прохода по странице, поэтому страница видит
@@ -834,6 +855,10 @@ class DrawingProcessor:
             # До правки абзацев распознавания: слой страницы — одно из
             # прочтений, и сводится он в том виде, в каком его дал движок.
             reading_reconcile.apply(result)
+            if self._reread_crops is not None:
+                # D3 свёл прочтения, D4 дочитывает то, что осталось спорным.
+                self._reread_reconciled(result)
+        self._reread_crops = None
         if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
             result.extend(self._rescan_poor_pages(result, metadata))
         # Модель не ответила документу ни разу и отказывала как сервис:
@@ -1466,6 +1491,56 @@ class DrawingProcessor:
             payload["disputed_reread"] = stats
         return fields
 
+    def _reread_reconciled(self, fragments: List[Fragment]) -> None:
+        """
+        Дочитывание спорных полей после сведения D3: спорные — по его согласию
+        («conflict», «single»), прочтение вырезки — ещё одно его прочтение.
+        Каждое поле дочитывается один раз: в проходе листа вырезки только
+        сохранены, а повтор поля листа, оставленный D3 во фрагменте вырезки
+        вида (те же прочтения), получает итог поля листа без второго вызова.
+        """
+        done: Dict[Any, Dict[str, Any]] = {}
+        drawings = [f for f in fragments if f.type == "drawing" and f.content.structured_drawing_fields]
+        # Сначала листы целиком: их поля — те, чьи повторы есть у вырезок.
+        drawings.sort(key=lambda f: not reading_reconcile._is_whole_sheet(f))
+        for fragment in drawings:
+            page = fragment.position.page if fragment.position else 1
+            pieces = self._reread_crops.get((fragment.content.image_ref, page))
+            if not pieces:
+                continue
+            left = deadline.remaining()
+            if left is not None and left < settings.VLM_TIMEOUT:
+                logger.warning("Дочитывание спорных надписей пропущено: до срока задачи %.0f с", left)
+                return
+            fields = [f.model_dump() for f in fragment.content.structured_drawing_fields]
+            keys = [(page, _readings_key(f)) for f in fields]
+            pieces = dict(pieces)
+            for n, key in enumerate(keys):
+                if key[1] and key in done:
+                    fields[n] = {**done[key], "bbox": fields[n]["bbox"], "category": fields[n]["category"]}
+                    pieces.pop(disputed_reread._key(fields[n]["bbox"]), None)
+            try:
+                fields, stats = disputed_reread.apply(
+                    self.qwen, None, fields, pieces=pieces,
+                    reconcile=lambda item, text: reading_reconcile.witness(item, text, disputed_reread.decide),
+                )
+            except (SoftTimeLimitExceeded, deadline.Cancelled):
+                raise
+            except Exception as exc:  # noqa: BLE001 — дочитывание не роняет документ
+                logger.error("Дочитывание спорных надписей не удалось: %s", exc)
+                continue
+            # Поля D3 дочитывание не снимает (группы — только у несведённых
+            # полей), поэтому номера до и после совпадают.
+            if len(fields) == len(keys):
+                for key, item in zip(keys, fields):
+                    if key[1] and key not in done:
+                        done[key] = item
+            fragment.content.structured_drawing_fields = [DrawingField(**f) for f in fields]
+            if stats["crops"]:
+                payload = dict(fragment.content.structured_payload or {})
+                payload["disputed_reread"] = stats
+                fragment.content.structured_payload = payload
+
     # ------------------------------------------------------------ хранилище
     def _open(self, image_ref: str, page: int = 1):
         data = self._read(image_ref)
@@ -1600,6 +1675,14 @@ def _is_small_picture(fragment: Fragment) -> bool:
     """Картинка меньше `_TEXT_DOC_MIN_FIGURE_AREA` листа (bbox в долях листа)."""
     share = _page_area_share(fragment)
     return share is not None and share < _TEXT_DOC_MIN_FIGURE_AREA
+
+
+def _readings_key(field: Dict[str, Any]) -> str:
+    """Прочтения поля, сведённого D3 и прочитанного листом, одной строкой; иначе пусто."""
+    readings = field.get("readings")
+    if not isinstance(readings, list) or not any(r.get("source") == reading_reconcile.SHEET for r in readings):
+        return ""
+    return repr([(r.get("source"), r.get("value")) for r in readings])
 
 
 def _render_pdf_page(data: bytes, page: int):

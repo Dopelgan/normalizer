@@ -221,3 +221,97 @@ def test_fields_without_agreement_use_own_rule():
     fields = [field("size", "⌀315", [0.42, 0.35, 0.45, 0.41], agreement="agree"),
               field("size", "⌀4,5-0,2", [0.5, 0.5, 0.52, 0.55])]
     assert [members for members, _ in dr.targets(fields)] == [[1]]
+
+
+# ------------------------------------------------- D3 и D4 вместе (оба флага)
+class SheetAndCropQwen:
+    """Лист и вырезка вида читают одно число по-разному; вырезка D4 — по ответам."""
+
+    def __init__(self, readings, answers):
+        self.available = True
+        self.model = "fake-vl"
+        self.readings = dict(readings)
+        self.reader = FakeReader(answers)
+
+    def read_sheet(self, image, hint="", **_):
+        return SheetReading(sheet_type="detail", annotations=[self.readings[image.size]])
+
+    def read_title_block(self, image):
+        return None
+
+    def read_table(self, image):
+        return None
+
+    def read_values(self, image, count):
+        return self.reader.read_values(image, count)
+
+
+def _both_flags_document(temp_storage, monkeypatch, d4=True):
+    from core.drawing_processor import DrawingProcessor
+    from core.models.contract import Content, Fragment, Position, Provenance
+
+    monkeypatch.setattr(settings, "DRAWING_READINGS_RECONCILED", True)
+    monkeypatch.setattr(settings, "DRAWING_DISPUTED_REREAD", d4)
+    monkeypatch.setattr(settings, "DRAWING_VISION_ENABLED", False)
+    whole, view = Image.new("RGB", (1654, 1169), "white"), Image.new("RGB", (827, 1169), "white")
+    for name, picture in (("sheet.png", whole), ("view.png", view)):
+        from io import BytesIO
+        data = BytesIO()
+        picture.save(data, format="PNG")
+        temp_storage.write_file(f"assets/doc/{name}", data.getvalue())
+    # Лист прочитал «+», вырезка вида — «±»: у D3 ничьей, поле спорное.
+    qwen = SheetAndCropQwen(
+        {whole.size: {"category": "size", "value": "⌀280+0,3", "bbox": [0.30, 0.34, 0.32, 0.40]},
+         view.size: {"category": "size", "value": "⌀280±0,3", "bbox": [0.60, 0.34, 0.64, 0.40]}},
+        ["⌀280±0,3"],
+    )
+
+    def picture(name, bbox, order):
+        return Fragment(fragment_id=f"doc-frag-{order}", type="image", content=Content(image_ref=f"assets/doc/{name}"),
+                        position=Position(page=1, bbox=bbox, order=order), confidence=0.9, completeness=1.0,
+                        provenance=Provenance(method="mineru_image", strategy_level=2, source="vector_pdf"))
+
+    fragments = [picture("view.png", [0.0, 0.0, 0.5, 1.0], 1), picture("sheet.png", [0.0, 0.0, 1.0, 1.0], 2)]
+    out = DrawingProcessor(temp_storage, qwen=qwen).enrich_fragments(fragments, {})
+    sheet_fragment = next(f for f in out if f.content.image_ref == "assets/doc/sheet.png")
+    qwen.view = next(f for f in out if f.content.image_ref == "assets/doc/view.png")
+    return sheet_fragment, qwen
+
+
+def test_both_flags_reread_once_after_d3_and_reconciled_reading_wins(temp_storage, monkeypatch):
+    sheet_fragment, qwen = _both_flags_document(temp_storage, monkeypatch)
+    # Вырезка спорного числа — одна и один вызов: в проходе листа вырезки
+    # только сохранены, дочитывание — после сведения D3.
+    assert [count for _, count in qwen.reader.calls] == [1]
+    (f280,) = [f for f in sheet_fragment.content.structured_drawing_fields if "280" in f.value]
+    # Прочтение вырезки — третье свидетельство в прочтениях D3: у «±» теперь
+    # большинство (вырезка вида и дочитывание), и сведение выбирает его.
+    assert f280.value == "⌀280±0,3"
+    assert f280.agreement == "agreed"
+    assert [r["source"] for r in f280.readings] == ["sheet", "crop", "crop_reread"]
+    stats = sheet_fragment.content.structured_payload["disputed_reread"]
+    assert stats["calls"] == 1 and stats["corrected"] == 1
+    assert stats["changes"] == [["⌀280+0,3", "⌀280±0,3"]]
+    # Повтор поля во фрагменте вырезки вида (D3 оставляет его, чтобы
+    # фрагмент не опустел) получает тот же итог без второго вызова.
+    assert [(f.value, f.agreement) for f in qwen.view.content.structured_drawing_fields] == [
+        ("⌀280±0,3", "agreed")]
+
+
+def test_both_flags_conflict_without_majority_keeps_d3_value_unless_one_sign(sheet):
+    from core.providers import reading_reconcile as rr
+
+    base = field("size", "⌀280+0,3", [0.30, 0.34, 0.32, 0.40], agreement="conflict", confidence=0.4,
+                 readings=[{"source": "sheet", "value": "⌀280+0,3"}, {"source": "crop", "value": "⌀280±0,3"}])
+    # Вырезка прочитала третье — большинства нет; правило D4 не принимает
+    # другое число: значение D3 остаётся.
+    kept, outcome = rr.witness(base, "⌀28", dr.decide)
+    assert kept["value"] == "⌀280+0,3" and outcome == "kept" and kept["agreement"] == "conflict"
+
+
+def test_d3_alone_unchanged_by_d4_code(temp_storage, monkeypatch):
+    sheet_fragment, qwen = _both_flags_document(temp_storage, monkeypatch, d4=False)
+    assert qwen.reader.calls == []
+    (f280,) = [f for f in sheet_fragment.content.structured_drawing_fields if "280" in f.value]
+    assert f280.value == "⌀280+0,3" and f280.agreement == "conflict"
+    assert "disputed_reread" not in sheet_fragment.content.structured_payload

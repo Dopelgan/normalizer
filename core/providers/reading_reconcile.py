@@ -38,7 +38,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from core.models.contract import DrawingField, Fragment
 
@@ -50,6 +50,7 @@ CROP = "crop"              # вырезка вида MinerU той же стра
 TRANSCRIPT = "transcript"  # проход «весь текст листа»
 OCR = "ocr"                # слой распознавания страницы
 VECTOR = "vector"          # текстовый слой векторного PDF
+REREAD = "crop_reread"     # дочитывание вырезкой в родном разрешении (D4)
 
 AGREED, SINGLE, CONFLICT = "agreed", "single", "conflict"
 
@@ -218,7 +219,7 @@ def choose(readings: Sequence[Dict[str, str]], primary: str) -> Tuple[str, str]:
     # Текст без мест (строки листа, слой распознавания) сам значение не
     # меняет: «15» в тексте может быть другой надписью, чем «1,5» на листе.
     # Чужое прочтение побеждает, только если его видел проход с местом.
-    placed = {SHEET, CROP, VECTOR}
+    placed = {SHEET, CROP, VECTOR, REREAD}
     contenders = [key for key in support if support[key] & placed]
     ordered = sorted(contenders, key=rank, reverse=True)
     best = ordered[0]
@@ -407,7 +408,8 @@ def _nearest(field: DrawingField, crop_fields: Sequence[tuple], taken: set,
     return best
 
 
-def _set(field: DrawingField, value: str, readings: List[Dict[str, str]], agreement: str) -> None:
+def _set(field: DrawingField, value: str, readings: List[Dict[str, str]], agreement: str,
+         disputed: Optional[bool] = None) -> None:
     from core.providers import vector_drawing
 
     if value != field.value:
@@ -420,13 +422,44 @@ def _set(field: DrawingField, value: str, readings: List[Dict[str, str]], agreem
     # Уверенность по согласию; спор категории (модель против правил,
     # `drawing_processor._reconcile`: 0.6 и ниже) понижает её, как и прежде, —
     # в той же доле 0.6 / 0.9.
-    disputed = field.confidence <= _CATEGORY_DISPUTED
+    if disputed is None:
+        disputed = field.confidence <= _CATEGORY_DISPUTED
     field.confidence = round(CONFIDENCE[agreement] * (2 / 3 if disputed else 1), 3)
 
 
 # Уверенность поля, у которого модель и правила разошлись в категории
 # (`drawing_processor._DISAGREED`).
 _CATEGORY_DISPUTED = 0.6
+
+
+def witness(field: Dict[str, Any], value: str,
+            fallback: Callable[[str, str], Optional[str]]) -> Tuple[Dict[str, Any], str]:
+    """
+    Прочтение вырезки (D4, DRAWING_DISPUTED_REREAD) — ещё одно свидетельство
+    для поля, уже сведённого здесь. Значение выбирается заново по всем
+    прочтениям (`choose`): у какого прочтения теперь большинство, то и
+    остаётся. Большинства нет — значение меняет только правило D4
+    `fallback`: разница одним знаком, в котором ошибается мелкий шрифт.
+    Возвращает поле и исход: «agreed», «corrected» или «kept».
+    """
+    model = DrawingField(**field)
+    old = model.agreement
+    # Спор категории сохраняется: уверенность после сведения — доля от
+    # уверенности по согласию (`_set`).
+    disputed = old in CONFIDENCE and model.confidence < CONFIDENCE[old] * 0.9
+    readings = list(model.readings or []) + [{"source": REREAD, "value": value}]
+    chosen, agreement = choose(readings, SHEET)
+    if agreement == CONFLICT:
+        chosen = fallback(model.value, value) or model.value
+    before = model.value
+    _set(model, chosen, readings, agreement, disputed=disputed)
+    if notation(model.value) != notation(before):
+        outcome = "corrected"
+    elif notation(value) == notation(model.value):
+        outcome = "agreed"
+    else:
+        outcome = "kept"
+    return {**field, **model.model_dump()}, outcome
 
 
 def conflict_note(field: Dict[str, Any]) -> str:

@@ -103,7 +103,8 @@
 | Геометрия и повороты листа | `core/providers/drawing_vision.py`, `core/providers/raster_drawing.py` | — |
 | Выправка размеров построчно | `core/providers/dimension_fidelity.py` | `repair_lines` |
 | Нормализация строки чертежа (⌀, ±, гомоглифы) | `core/providers/drawing_text.py` | `normalize` |
-| Сведение прочтений поля по странице (`DRAWING_READINGS_RECONCILED`) | `core/providers/reading_reconcile.py` | `apply`, `reconcile_page`, `choose` |
+| Сведение прочтений поля по странице (`DRAWING_READINGS_RECONCILED`) | `core/providers/reading_reconcile.py` | `apply`, `reconcile_page`, `choose`; свидетельство вырезки D4 — `witness` |
+| Дочитывание спорных чисел вырезками (`DRAWING_DISPUTED_REREAD`) | `core/providers/disputed_reread.py` | `apply`, `targets`; без D3 — `DrawingProcessor._reread_disputed` в проходе листа, с D3 — `_reread_reconciled` после `reading_reconcile.apply` |
 | **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
 | Качество фрагмента чертежа | `core/drawing_quality.py` | `apply_drawing_quality` (7), `document_quality` (71) |
 | Правка абзацев OCR по строкам листа | `core/drawing_transcript.py` | `_page_transcripts` (88) |
