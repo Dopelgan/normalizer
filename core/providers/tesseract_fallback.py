@@ -527,10 +527,14 @@ class TesseractFallbackProvider:
             # Читается вне замка: страницы идут параллельно. Одинаковые
             # листы, попавшие в работу одновременно, прочитаются дважды —
             # результат тот же, теряются только секунды.
+            _READ_STATE.prepare_failed = False
             cached = self._read_lines(image, psm, lang)
             # Пустой ответ не запоминается: так же выглядит и сбой Tesseract,
-            # а его стоит повторить следующим проходом.
-            if cached:
+            # а его стоит повторить следующим проходом. Чтение исходного
+            # листа после сбоя подготовки — тоже: ключ — пиксели до
+            # подготовки, и запомненный запасной ответ занял бы место
+            # подготовленного во всех следующих проходах.
+            if cached and not _READ_STATE.prepare_failed:
                 with _MEMO_LOCK:
                     cached = memo.setdefault(key, cached)
         return [replace(line, bbox=list(line.bbox), parts=list(line.parts)) for line in cached]
@@ -649,6 +653,7 @@ class TesseractFallbackProvider:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("Подготовка листа к OCR не удалась, читаем как есть: %s", exc)
+            _READ_STATE.prepare_failed = True
             return None
         if prepared.orientation or prepared.skew:
             logger.info(
@@ -794,6 +799,10 @@ _MEMO: "contextvars.ContextVar[Optional[Dict[tuple, List[OcrLine]]]]" = (
 )
 # Память общая для потоков параллельного чтения страниц (`_map_pages`).
 _MEMO_LOCK = threading.Lock()
+# Сбой подготовки листа в текущем чтении этого потока: такое чтение
+# в память не попадает (см. `_lines_by_lang`). Свой у каждого потока,
+# потому что страницы читаются параллельно.
+_READ_STATE = threading.local()
 
 
 @contextlib.contextmanager

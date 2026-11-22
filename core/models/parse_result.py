@@ -17,6 +17,9 @@ class ParsedBlock(BaseModel):
 
     type: BlockType
     text: Optional[str] = None
+    # Свидетельства правок текста по геометрии (профиль v2). Во внутренний
+    # сырой дамп не пишутся: до фрагмента их доносит attach_source.
+    text_observations: List[Dict[str, Any]] = Field(default_factory=list, exclude=True)
     table_data: Optional[Dict[str, Any]] = None   # {headers, rows, total_row}
     table_html: Optional[str] = None              # исходный HTML таблицы от MinerU
     image_ref: Optional[str] = None               # URI изображения (для type=image)

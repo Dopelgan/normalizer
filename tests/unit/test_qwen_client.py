@@ -249,3 +249,235 @@ class TestExtractJson:
     ])
     def test_cases(self, text, expected):
         assert extract_json(text) == expected
+
+
+class TestResponseCache:
+    """Кэш ответов модели (VLM_RESPONSE_CACHE): что попадает в ключ."""
+
+    @pytest.fixture
+    def cache(self, mocker, tmp_path):
+        mocker.patch.object(qwen_client.settings, "VLM_RESPONSE_CACHE", True)
+        mocker.patch.object(
+            qwen_client.settings, "VLM_RESPONSE_CACHE_DIR", str(tmp_path)
+        )
+        return tmp_path
+
+    def test_second_same_sheet_does_not_reach_the_model(self, cache):
+        session = FakeSession(FakeResponse(answer({"annotations": [{"value": "20"}]})))
+        sheet = picture()
+        assert client(session).read_sheet(sheet).annotations[0]["value"] == "20"
+        # Второй клиент и пустая сессия: ответ может прийти только из кэша,
+        # а лишний запрос уронил бы FakeSession на пустом списке.
+        again = client(FakeSession()).read_sheet(sheet)
+        assert again.annotations[0]["value"] == "20"
+        assert len(session.requests) == 1
+
+    def test_cache_is_off_by_default(self, mocker, tmp_path):
+        mocker.patch.object(
+            qwen_client.settings, "VLM_RESPONSE_CACHE_DIR", str(tmp_path)
+        )
+        session = FakeSession(
+            FakeResponse(answer({"annotations": []})),
+            FakeResponse(answer({"annotations": []})),
+        )
+        sheet = picture()
+        client(session).read_sheet(sheet)
+        client(session).read_sheet(sheet)
+        assert len(session.requests) == 2
+        assert list(tmp_path.iterdir()) == []
+
+    def test_other_sheet_is_another_key(self, cache):
+        session = FakeSession(
+            FakeResponse(answer({"annotations": [{"value": "20"}]})),
+            FakeResponse(answer({"annotations": [{"value": "30"}]})),
+        )
+        own = client(session)
+        assert own.read_sheet(picture((400, 300))).annotations[0]["value"] == "20"
+        assert own.read_sheet(picture((401, 300))).annotations[0]["value"] == "30"
+        assert len(session.requests) == 2
+
+    def test_smaller_image_is_another_key(self, mocker, cache):
+        session = FakeSession(
+            FakeResponse(answer({"annotations": []})),
+            FakeResponse(answer({"annotations": []})),
+        )
+        sheet = picture((4000, 3000))
+        client(session).read_sheet(sheet)
+        mocker.patch.object(qwen_client.settings, "QWEN_SHEET_MAX_SIDE", 512)
+        client(session).read_sheet(sheet)
+        assert len(session.requests) == 2
+
+    def test_other_prompt_is_another_key(self, mocker, cache):
+        """Флаг, который меняет текст запроса, обязан промахнуться мимо кэша."""
+        session = FakeSession(
+            FakeResponse(answer({"annotations": []})),
+            FakeResponse(answer({"annotations": []})),
+        )
+        sheet = picture()
+        client(session).read_sheet(sheet)
+        mocker.patch.object(
+            qwen_client.settings, "DRAWING_DIMENSION_FIDELITY", True
+        )
+        client(session).read_sheet(sheet)
+        assert len(session.requests) == 2
+        first, second = (r["json"]["messages"][1]["content"][1]["text"]
+                         for r in session.requests)
+        assert first != second
+
+    def test_other_model_is_another_key(self, cache):
+        session = FakeSession(
+            FakeResponse(answer({"annotations": []})),
+            FakeResponse(answer({"annotations": []})),
+        )
+        sheet = picture()
+        client(session, model="Qwen/A").read_sheet(sheet)
+        client(session, model="Qwen/B").read_sheet(sheet)
+        assert len(session.requests) == 2
+
+    def test_other_token_ceiling_is_another_key(self, mocker, cache):
+        session = FakeSession(
+            FakeResponse(answer({"annotations": []})),
+            FakeResponse(answer({"annotations": []})),
+        )
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_HIGH_TOKENS", True)
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_MAX_TOKENS", 8192)
+        sheet = picture()
+        client(session).read_sheet(sheet)
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_MAX_TOKENS", 12288)
+        client(session).read_sheet(sheet)
+        assert len(session.requests) == 2
+
+    def test_failed_call_is_not_cached(self, cache):
+        """Кэш не продлевает жизнь отказу: модель спросят заново."""
+        session = FakeSession(
+            FakeResponse(status=400, text="bad request"),
+            FakeResponse(answer({"annotations": [{"value": "20"}]})),
+        )
+        sheet = picture()
+        assert client(session).read_sheet(sheet) is None
+        assert client(session).read_sheet(sheet).annotations[0]["value"] == "20"
+        assert len(session.requests) == 2
+
+    def test_truncated_answer_stays_truncated_on_replay(self, mocker, cache):
+        """`finish_reason` хранится вместе с ответом: дочитывание частями
+        должно вести себя на кэше ровно так же, как на свежем ответе."""
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_TILES", False)
+        cut = {"choices": [{"message": {"content": '{"annotations": [{"value": "20"}]'},
+                            "finish_reason": "length"}]}
+        session = FakeSession(FakeResponse(cut))
+        sheet = picture()
+        assert client(session).read_sheet(sheet).cut is True
+        assert client(FakeSession()).read_sheet(sheet).cut is True
+        assert len(session.requests) == 1
+
+    def test_other_endpoint_is_another_key(self, cache):
+        """Одно имя модели на другом сервере — другие веса: ответ одного
+        сервера не выдаётся за ответ другого."""
+        session = FakeSession(
+            FakeResponse(answer({"annotations": [{"value": "20"}]})),
+            FakeResponse(answer({"annotations": [{"value": "30"}]})),
+        )
+        sheet = picture()
+        own = client(session, endpoint="http://gpu-a:8000", model="qwen")
+        other = client(session, endpoint="http://gpu-b:8000", model="qwen")
+        assert own.read_sheet(sheet).annotations[0]["value"] == "20"
+        assert other.read_sheet(sheet).annotations[0]["value"] == "30"
+        assert len(session.requests) == 2
+
+    def test_overlapping_writers_of_one_key_do_not_lose_the_write(self, mocker, cache):
+        """Два писателя одного ключа в одном процессе (плитки идут потоками):
+        у каждого свой временный файл, ни одна запись не теряется и мусора
+        не остаётся."""
+        key = "ab" + "0" * 62
+        real_replace = qwen_client.os.replace
+        warnings = mocker.spy(qwen_client.logger, "warning")
+        nested = []
+
+        def overlapping_replace(src, dst):
+            # Второй писатель целиком успевает между записью и переименованием первого.
+            if not nested:
+                nested.append(True)
+                qwen_client.cache_put(key, ("второй", None))
+            return real_replace(src, dst)
+
+        mocker.patch.object(qwen_client.os, "replace", side_effect=overlapping_replace)
+        qwen_client.cache_put(key, ("первый", "stop"))
+
+        assert warnings.call_count == 0
+        assert qwen_client.cache_get(key) == ("первый", "stop")
+        assert [p.name for p in cache.rglob("*") if p.is_file()] == [f"{key}.json"]
+
+    def test_identical_body_gives_identical_key(self):
+        """Одно и то же тело запроса — один ключ, независимо от порядка полей
+        и от того, что это другой объект."""
+        def body(order):
+            fields = {
+                "model": "qwen", "temperature": 0.1, "max_tokens": 512,
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": ""}},
+                    {"type": "text", "text": "Перепиши лист"},
+                ]}],
+            }
+            return {name: fields[name] for name in order}
+
+        names = ["model", "temperature", "max_tokens", "response_format", "messages"]
+        first = qwen_client.cache_key("http://gpu:8000/v1", body(names), "data:x")
+        second = qwen_client.cache_key("http://gpu:8000/v1", body(names[::-1]), "data:x")
+        assert first == second
+        changed = body(names)
+        changed["max_tokens"] = 513
+        assert qwen_client.cache_key("http://gpu:8000/v1", changed, "data:x") != first
+
+    def test_v1_key_is_computed_as_the_old_code_did(self, mocker):
+        """Ключ прежней версии сверен с выводом старого cache_key на том же запросе."""
+        mocker.patch.object(qwen_client.settings, "QWEN_TEMPERATURE", 0.1)
+        key = qwen_client.cache_key_v1(
+            "Qwen/Qwen3.8-27B-FP8", 8192, "Перепиши весь текст листа.",
+            "data:image/png;base64,iVBORw0KGgo=",
+        )
+        assert key == "1a87ef451fb7f384cf7927394a32f052de55322320f00325350d6888313ea24c"
+
+    def test_v1_hit_is_migrated_once_then_served_from_v2(self, mocker, cache):
+        mocker.patch.object(qwen_client.settings, "VLM_CACHE_V1_FALLBACK", True)
+        v1_keys = mocker.spy(qwen_client, "cache_key_v1")
+        sheet = picture()
+        # Первый вызов: ключ v1 этого запроса, модель спрошена, файлы убраны.
+        client(FakeSession(FakeResponse(answer({"annotations": []})))).read_sheet(sheet)
+        old_key = v1_keys.spy_return
+        for path in cache.rglob("*.json"):
+            path.unlink()
+        # Запись старого кода лежит под ключом v1.
+        old_path = cache / old_key[:2] / f"{old_key}.json"
+        old_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.write_text(
+            '{"content": "{\\"annotations\\": [{\\"value\\": \\"20\\"}]}", "finish": "stop"}',
+            encoding="utf-8",
+        )
+        migrated = client(FakeSession()).read_sheet(sheet)
+        assert migrated.annotations[0]["value"] == "20"
+        assert old_path.exists()
+        # Без старого файла ответ берётся из v2, модель не спрашивается.
+        old_path.unlink()
+        calls = v1_keys.call_count
+        again = client(FakeSession()).read_sheet(sheet)
+        assert again.annotations[0]["value"] == "20"
+        assert v1_keys.call_count == calls
+
+    def test_without_v1_file_the_model_is_asked(self, mocker, cache):
+        mocker.patch.object(qwen_client.settings, "VLM_CACHE_V1_FALLBACK", True)
+        session = FakeSession(FakeResponse(answer({"annotations": [{"value": "30"}]})))
+        assert client(session).read_sheet(picture()).annotations[0]["value"] == "30"
+        assert len(session.requests) == 1
+
+    def test_broken_cache_file_is_a_miss(self, cache):
+        session = FakeSession(
+            FakeResponse(answer({"annotations": []})),
+            FakeResponse(answer({"annotations": []})),
+        )
+        sheet = picture()
+        client(session).read_sheet(sheet)
+        for path in cache.rglob("*.json"):
+            path.write_text("не json", encoding="utf-8")
+        client(session).read_sheet(sheet)
+        assert len(session.requests) == 2

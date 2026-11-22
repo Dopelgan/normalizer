@@ -30,21 +30,26 @@ from __future__ import annotations
 
 import base64
 import contextvars
+import hashlib
 import io
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 
-from core import deadline
+from core import deadline, outage, telemetry
 from core.config import settings
-from core.providers import title_block
+from core.providers import gpu_gate, title_block
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,9 @@ logger = logging.getLogger(__name__)
 # жизни. Пул соединений живёт столько же, сколько воркер.
 _session_lock = threading.Lock()
 _shared: Optional[requests.Session] = None
+# Код отказа 4xx последнего вызова потока: по нему ограждённый проход листа
+# отличает «модель не приняла схему» от «модель не ответила».
+_rejection = threading.local()
 
 
 def shared_session() -> requests.Session:
@@ -62,7 +70,28 @@ def shared_session() -> requests.Session:
     with _session_lock:
         if _shared is None:
             _shared = requests.Session()
+            # Пул соединений не меньше, чем запросов к модели разом: листы
+            # документа (VLM_SHEET_CONCURRENCY) по проходам листа
+            # (DRAWING_PASSES_PARALLEL) по частям листа
+            # (DRAWING_TRANSCRIBE_TILE_PARALLEL). Сессия requests общая для
+            # всех этих потоков: пул urllib3 потокобезопасен, а состояние,
+            # которое Session меняет на запросе (куки), здесь пусто — vLLM
+            # их не ставит. У requests по умолчанию 10,
+            # и лишние соединения сверх пула закрывались бы после ответа
+            # с предупреждением «Connection pool is full».
+            size = max(10, pool_size())
+            adapter = HTTPAdapter(pool_connections=10, pool_maxsize=size)
+            _shared.mount("http://", adapter)
+            _shared.mount("https://", adapter)
         return _shared
+
+
+def pool_size() -> int:
+    """Сколько запросов к модели может идти из одного документа разом."""
+    sheets = max(1, int(settings.VLM_SHEET_CONCURRENCY))
+    passes = max(1, int(settings.DRAWING_PASSES_PARALLEL))
+    tiles = max(1, int(settings.DRAWING_TRANSCRIBE_TILE_PARALLEL))
+    return sheets * passes * tiles
 
 
 def close_shared_session() -> None:
@@ -72,6 +101,115 @@ def close_shared_session() -> None:
         if _shared is not None:
             _shared.close()
             _shared = None
+
+
+# Кэш ответов модели (VLM_RESPONSE_CACHE). Подробно, от чего ключ зависит и
+# почему кэшируется именно сырой ответ, — в core/config.py у флага.
+def _cache_dir() -> Path:
+    name = settings.VLM_RESPONSE_CACHE_DIR or str(
+        Path(settings.ARTIFACTS_MOUNT) / "vlm-cache"
+    )
+    return Path(name)
+
+
+# Версия ключа. Ключи прежней версии (без адреса сервера и без тела запроса
+# целиком) с новыми не совпадают: старые файлы на томе остаются как есть и
+# просто не находятся.
+_CACHE_KEY_VERSION = b"vlm-cache-key-v2"
+
+
+def cache_key(base_url: str, body: Dict[str, Any], encoded: str) -> str:
+    """
+    Отпечаток вызова. В него входит всё, что уходит в модель: адрес
+    сервера (одно имя модели на другом сервере — другие веса), тело
+    запроса целиком — модель, потолок ответа, температура, формат ответа,
+    системный и пользовательский текст — и байты картинки в том виде, в
+    каком они уходят в модель. Тело хешируется целиком, без списка полей:
+    новое поле запроса само попадает в ключ, и неполный ключ не выдаст
+    чужой ответ. Картинка в `body` должна стоять пустой строкой и
+    хешируется отдельно, чтобы её длинная base64-строка не собиралась в
+    памяти второй раз.
+    """
+    digest = hashlib.sha256()
+    digest.update(_CACHE_KEY_VERSION)
+    digest.update(b"\0")
+    digest.update(base_url.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(
+        json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    )
+    digest.update(b"\0")
+    digest.update(encoded.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def cache_key_v1(model: str, max_tokens: int, prompt: str, encoded: str) -> str:
+    """
+    Ключ прежней версии — ровно как его считал старый код (до адреса сервера
+    и тела запроса целиком). Нужен только для переноса записей старого кэша
+    в новый (VLM_CACHE_V1_FALLBACK); убрать вместе с настройкой.
+    """
+    digest = hashlib.sha256()
+    digest.update(_SYSTEM.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(
+        f"{model}\0{max_tokens}\0{settings.QWEN_TEMPERATURE}\0".encode("utf-8")
+    )
+    digest.update(prompt.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(encoded.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def cache_get(key: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Сохранённый ответ или None. Битый файл — это промах, не ошибка."""
+    if not settings.VLM_RESPONSE_CACHE:
+        return None
+    path = _cache_dir() / key[:2] / f"{key}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        content = data["content"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(content, str):
+        return None
+    finish = data.get("finish")
+    logger.info("Ответ модели взят из кэша (%s)", key[:12])
+    return content, finish if isinstance(finish, str) else None
+
+
+def cache_put(key: str, answer: Tuple[str, Optional[str]]) -> None:
+    """
+    Записать ответ. Запись идёт во временный файл рядом и переименованием:
+    два воркера пишут в один том, и половина файла, прочитанная третьим,
+    стала бы молчаливым промахом с мусором вместо ответа.
+
+    Временный файл у каждого писателя свой (mkstemp), а не по номеру
+    процесса: потоки одного процесса пишут один ключ одновременно, и общий
+    временный файл одного переписывал бы и уносил запись другого.
+    """
+    if not settings.VLM_RESPONSE_CACHE:
+        return
+    content, finish = answer
+    path = _cache_dir() / key[:2] / f"{key}.json"
+    tmp: Optional[str] = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, tmp = tempfile.mkstemp(dir=path.parent, prefix=f"{key}.", suffix=".tmp")
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps({"content": content, "finish": finish}, ensure_ascii=False)
+            )
+        os.replace(tmp, path)
+        tmp = None
+    except OSError as exc:
+        logger.warning("Ответ модели не записан в кэш: %s", exc)
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 # Категории полей чертежа, которые модель имеет право назвать. Всё прочее
 # сводится к правилам разбора: выдуманная категория в индекс не попадает.
@@ -102,6 +240,43 @@ _SHEET_PROMPT = """Прочитай чертёж и верни JSON:
 - Размер, посадку и допуск пиши одной надписью, как на листе: «⌀44H7», «20±0,1».
 - position — номер позиции у выноски на сборочном чертеже.
 - title_block — надписи основной надписи (штампа).
+- Служебные графы бланка («Инв. № подл.», «Взам. инв. №», «Подп. и дата») пропускай.
+- Не повторяй одну надпись дважды и не выдумывай надписей, которых нет.{hint}
+"""
+
+# Тот же проход в сжатом виде (DRAWING_SHEET_COMPACT_JSON). Надпись —
+# массив `[код, надпись, x1, y1, x2, y2]` вместо объекта с тремя именами
+# полей, рамка — целые тысячные доли вместо дробей с плавающей точкой: на
+# листе в сотню надписей это заметная доля ответа модели, а проход «лист
+# целиком» — две трети всего времени модели на чертежах. Разбор переводит
+# ответ в те же объекты `{category, value, bbox}`, дальше ничего не
+# меняется. Список остаётся под ключом `annotations`, чтобы спасение
+# оборванного ответа (`salvage_list`) работало и здесь.
+_COMPACT_CODES = {
+    "s": "size", "t": "tolerance", "r": "roughness", "th": "thread", "rd": "radius",
+    "m": "material", "tb": "title_block", "c": "callout", "p": "position", "n": "note",
+}
+_COMPACT_LEGEND = (
+    "s — размер, t — допуск, r — шероховатость, th — резьба, rd — радиус, "
+    "m — материал, tb — основная надпись (штамп), c — надпись у выноски, "
+    "p — номер позиции у выноски, n — примечание"
+)
+
+_SHEET_PROMPT_COMPACT = """Прочитай чертёж и верни JSON:
+
+{{"sheet_type": "detail|assembly|scheme|unknown",
+  "annotations": [
+    ["<код>", "надпись как на листе", x1, y1, x2, y2]
+  ]}}
+
+Коды: {codes}.
+
+Правила:
+- x1, y1, x2, y2 — целые тысячные доли стороны листа от 0 до 1000, порядок: лево, верх, право, низ.
+- Знак диаметра пиши как ⌀, допуск как ±, шероховатость как Ra/Rz.
+- Размер, посадку и допуск пиши одной надписью, как на листе: «⌀44H7», «20±0,1».
+- p — номер позиции у выноски на сборочном чертеже.
+- tb — надписи основной надписи (штампа).
 - Служебные графы бланка («Инв. № подл.», «Взам. инв. №», «Подп. и дата») пропускай.
 - Не повторяй одну надпись дважды и не выдумывай надписей, которых нет.{hint}
 """
@@ -253,6 +428,9 @@ class SheetReading:
     tiles: int = 0
     failed: List[List[float]] = field(default_factory=list)
     lost: int = 0
+    # Почему ответ по листу отбракован (DRAWING_SHEET_GUARDED): REJECT_CUT,
+    # REJECT_LOOP или REJECT_EMPTY; пусто — ответ принят.
+    rejected: str = ""
 
     @property
     def complete(self) -> bool:
@@ -264,7 +442,7 @@ class SheetReading:
         """
         if self.failed or self.lost:
             return False
-        return not self.cut or bool(self.tiles)
+        return not (self.cut or self.rejected) or bool(self.tiles)
 
 
 @dataclass
@@ -282,6 +460,20 @@ class Transcript:
     def complete(self) -> bool:
         return not self.failed
 
+
+# Почему ответ прохода «лист целиком» отбракован (DRAWING_SHEET_GUARDED).
+REJECT_CUT = "cut"        # упёрся в потолок токенов
+REJECT_LOOP = "loop"      # модель зациклилась на одной надписи
+REJECT_EMPTY = "empty"    # надписей нет, а текст на листе есть
+
+# Зацикленный ответ: одно значение у большей доли надписей, чем эта, при
+# списке не короче _LOOP_MIN_ITEMS. Настоящий лист так не выглядит: «⌀8» у
+# каждого из восьми отверстий — восемь из сотни, а не треть списка.
+_LOOP_SHARE = 0.3
+_LOOP_MIN_ITEMS = 10
+# Строк текста на листе, при которых пустой ответ по надписям — сбой, а не
+# пустой лист.
+GUARD_MIN_TEXT_LINES = 5
 
 # Причины, по которым часть листа не прочитана целиком.
 TILE_CUT = "transcript_cut"            # ответ оборвался на потолке токенов
@@ -324,23 +516,40 @@ class QwenVisionClient:
         Плотный лист не помещается в потолок ответа: JSON обрывается посреди
         списка надписей. С DRAWING_SHEET_TILES такой лист читается заново
         частями с перекрытием, а списки надписей сливаются без повторов.
-        `until` — момент time.monotonic(), после которого части листа уже не
-        читаются (бюджет листа DRAWING_TIME_BUDGET).
+        `until` — момент по часам `gpu_gate.budget_now()`, после которого
+        части листа уже не читаются (бюджет листа DRAWING_TIME_BUDGET).
         """
         prompt = self._sheet_prompt(hint)
         if settings.DRAWING_SMALL_PRINT_CARE:
             image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
         whole = self._read_sheet_piece(image, prompt)
+        if whole is not None and settings.DRAWING_SHEET_GUARDED and whole.rejected:
+            # Оборванный или зациклившийся ответ дочитывается частями всегда:
+            # без этого лист остаётся с хвостом выдумки или без хвоста надписей.
+            return self._read_sheet_tiles(image, prompt, whole, until)
         if whole is None or not whole.cut or not settings.DRAWING_SHEET_TILES:
             return whole
         return self._read_sheet_tiles(image, prompt, whole, until)
 
+    def reread_sheet_by_tiles(
+        self, image, whole: SheetReading, hint: str = "", until: Optional[float] = None,
+    ) -> SheetReading:
+        """
+        Лист, ответ по которому отбракован уже после чтения (пустой при
+        непустом тексте листа, DRAWING_SHEET_GUARDED), — частями.
+        """
+        prompt = self._sheet_prompt(hint)
+        if settings.DRAWING_SMALL_PRINT_CARE:
+            image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
+        return self._read_sheet_tiles(image, prompt, whole, until)
+
     def _sheet_prompt(self, hint: str) -> str:
         """Запрос прохода «лист целиком». Один и тот же для листа и частей."""
-        prompt = _SHEET_PROMPT.format(
-            categories=", ".join(CATEGORIES),
-            hint=f"\n- Подсказка по разметке листа: {hint}" if hint else "",
-        )
+        hint_rule = f"\n- Подсказка по разметке листа: {hint}" if hint else ""
+        if settings.DRAWING_SHEET_COMPACT_JSON:
+            prompt = _SHEET_PROMPT_COMPACT.format(codes=_COMPACT_LEGEND, hint=hint_rule)
+        else:
+            prompt = _SHEET_PROMPT.format(categories=", ".join(CATEGORIES), hint=hint_rule)
         if settings.DRAWING_DIMENSION_FIDELITY:
             prompt += _SIGN_RULE + _CAREFUL_LETTERS_RULE
         if settings.DRAWING_SMALL_PRINT_CARE:
@@ -366,8 +575,11 @@ class QwenVisionClient:
         if not self.available:
             logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
             return None
-        answer = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE,
-                                self._sheet_max_tokens())
+        if settings.DRAWING_SHEET_GUARDED:
+            answer = self._ask_sheet_guarded(image, prompt)
+        else:
+            answer = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE,
+                                    self._sheet_max_tokens())
         if answer is None:
             return None
         content, finish = answer
@@ -393,7 +605,7 @@ class QwenVisionClient:
         if not isinstance(annotations, list):
             logger.warning("Модель вернула JSON без списка annotations")
             annotations = []
-        readable, lost = as_annotations(annotations)
+        readable, lost = as_annotations(annotations, compact=settings.DRAWING_SHEET_COMPACT_JSON)
         if lost:
             # Вид элемента называется в логе: каким именно он был, по
             # сохранённому ответу уже не узнать — сырые ответы модели нигде
@@ -405,13 +617,47 @@ class QwenVisionClient:
                 sum(lost.values()),
                 ", ".join(f"{name} — {count}" for name, count in sorted(lost.items())),
             )
-        return SheetReading(
+        reading = SheetReading(
             sheet_type=str(data.get("sheet_type") or "unknown"),
             annotations=[_with_fixed_grade(a) for a in readable],
             raw=data,
             cut=cut,
             lost=sum(lost.values()),
         )
+        if settings.DRAWING_SHEET_GUARDED:
+            reading.rejected = sheet_verdict(finish, annotations) or ""
+            if reading.rejected == REJECT_LOOP:
+                # Хвост цикла — выдумка: остаётся одно прочтение каждой надписи.
+                reading.annotations = _first_of_each(reading.annotations)
+            if reading.rejected:
+                logger.warning("Ответ по листу отбракован (%s): надписей %d",
+                               reading.rejected, len(annotations))
+        return reading
+
+    def _ask_sheet_guarded(self, image, prompt: str) -> Optional[Tuple[str, Optional[str]]]:
+        """
+        Вызов прохода «лист целиком» с оградой (DRAWING_SHEET_GUARDED):
+        схема ответа, срок от потолка токенов, в кэш — только принятый ответ.
+        Отказ vLLM принять схему — тот же вызов без схемы.
+        """
+        _rejection.status = None
+        limit = self._sheet_max_tokens() or settings.QWEN_MAX_TOKENS
+        timeout = max(int(self.timeout),
+                      -(-int(limit) // max(1, int(settings.QWEN_MIN_TOKENS_PER_SECOND))))
+        schema = (sheet_schema() if settings.DRAWING_SHEET_SCHEMA
+                  and not settings.DRAWING_SHEET_COMPACT_JSON else None)
+        guarded = {"accept": sheet_answer_accepted, "timeout": timeout, "read_timeout_retries": 1}
+        if schema is not None:
+            answer = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE, limit,
+                                    response_format=schema, **guarded)
+            if answer is not None or not self._rejected_now():
+                return answer
+            logger.warning("Модель не приняла схему ответа листа: лист читается без схемы")
+        return self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE, limit, **guarded)
+
+    def _rejected_now(self) -> bool:
+        """Последний вызов этого потока отклонён моделью как неверный запрос (4xx)."""
+        return bool(getattr(_rejection, "status", None))
 
     def _read_sheet_tiles(
         self, image, prompt: str, whole: SheetReading, until: Optional[float],
@@ -450,7 +696,7 @@ class QwenVisionClient:
                 # вызов, который vLLM выполняет не параллельно с другими, —
                 # поэтому срез по одному VLM_TIMEOUT ограничивает всю
                 # четвёрку частей, а не одну.
-                if until is not None and time.monotonic() + settings.VLM_TIMEOUT > until:
+                if until is not None and gpu_gate.budget_now() + settings.VLM_TIMEOUT > until:
                     return None
                 return self._read_sheet_piece(crop_box(image, part), prompt)
 
@@ -469,7 +715,7 @@ class QwenVisionClient:
             read_count += 1
             lost += part.lost
             parts.append([place_in_sheet(a, box) for a in part.annotations])
-            if part.cut:
+            if part.cut or part.rejected == REJECT_LOOP:
                 failed.append([round(value, 4) for value in box])
         # Части идут первыми — они покрывают весь лист; надписи оборванного
         # ответа по листу добавляются, если такой надписи нет ни в одной
@@ -489,6 +735,7 @@ class QwenVisionClient:
             # Непрочитанные по виду элементы листа дочитываются частями, а
             # вот такие же элементы самих частей дочитывать уже нечем.
             lost=lost,
+            rejected=whole.rejected,
         )
 
     def read_title_block(self, image) -> Optional[Dict[str, Any]]:
@@ -569,8 +816,8 @@ class QwenVisionClient:
         Плотная схема не помещается в потолок ответа: JSON обрывается. Строки,
         которые модель успела вернуть, не выбрасываются, а лист читается
         заново частями с перекрытием; оборванная часть делится ещё раз.
-        `None` — модель не ответила на лист вовсе. `until` — момент
-        time.monotonic(), после которого части листа уже не читаются
+        `None` — модель не ответила на лист вовсе. `until` — момент по часам
+        `gpu_gate.budget_now()`, после которого части листа уже не читаются
         (бюджет листа DRAWING_TIME_BUDGET).
         """
         lines, cut = self._transcribe_piece(image)
@@ -612,7 +859,7 @@ class QwenVisionClient:
                 left = deadline.remaining()
                 if left is not None and left < settings.VLM_TIMEOUT:
                     return None, TILE_NO_TIME
-                if until is not None and time.monotonic() > until:
+                if until is not None and gpu_gate.budget_now() > until:
                     return None, TILE_NO_TIME
                 lines, cut = self._transcribe_piece(crop_box(image, part))
             if lines is None:
@@ -671,9 +918,19 @@ class QwenVisionClient:
             # Модель сбилась на счёт («QF1», «QF2», … «QF1000»): хвост счёта —
             # выдумка, а не текст листа. Ответ считается оборванным на нём,
             # и часть листа дочитывается мельче.
+            #
+            # Сколько строк ряда оставить, решает его начало. Ряд, начавшийся со
+            # своего начала, мог быть настоящим и сорваться на счёт по ходу: его
+            # первые строки — скорее всего настоящие обозначения с листа, и они
+            # остаются. Ряд, начавшийся с середины, выдуман целиком: проверено на
+            # листе, где ряд шёл с «XT21» до «XT1131», а ни XT1, ни XT20 на листе
+            # не было. Прежде и из такого ряда оставались первые тридцать строк,
+            # и выдуманные обозначения попадали в текст чертежа, в индекс и в
+            # цитаты: поиск по «XT34» приводил на лист, где его нет.
+            keep = _COUNT_RUN if _run_starts_at_its_beginning(lines, start) else 0
             logger.warning("Модель сбилась на счёт с «%s»: %d строк отброшено",
-                           lines[start], len(lines) - start - _COUNT_RUN)
-            return lines[:start + _COUNT_RUN], True
+                           lines[start], len(lines) - start - keep)
+            return lines[:start + keep], True
         return lines, cut
 
     def health(self) -> bool:
@@ -710,57 +967,150 @@ class QwenVisionClient:
 
     def _ask_text(
         self, image, prompt: str, max_side: int, max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        accept: Optional[Callable[[str, Optional[str]], bool]] = None,
+        timeout: Optional[int] = None,
+        read_timeout_retries: Optional[int] = None,
     ) -> Optional[Tuple[str, Optional[str]]]:
-        """Текст ответа и finish_reason («length» — упёрся в потолок токенов)."""
+        """
+        Текст ответа и finish_reason («length» — упёрся в потолок токенов).
+
+        Только для ограждённого прохода листа (DRAWING_SHEET_GUARDED):
+        `response_format` — схема ответа вместо свободного JSON; `accept` —
+        проверка ответа: непринятый не пишется в кэш, а непринятый из кэша
+        не берётся; `timeout` и `read_timeout_retries` — свой срок вызова и
+        не больше стольких повторов таймаута чтения. Без них вызов прежний.
+        """
         if not self.available:
             logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
             return None
+        # Лист, чтение которого отменено (задача оборвалась, пока он шёл в
+        # потоке), следующего вызова модели не делает.
+        deadline.check_cancelled()
         encoded = encode_image(image, max_side)
         if not encoded:
             return None
 
+        limit = max_tokens or settings.QWEN_MAX_TOKENS
+        # Картинка встаёт в тело после подсчёта ключа: ключ берёт тело
+        # целиком, а её байты — отдельно (см. cache_key).
+        image_url: Dict[str, str] = {"url": ""}
         body = {
             "model": self.model,
             "temperature": settings.QWEN_TEMPERATURE,
-            "max_tokens": max_tokens or settings.QWEN_MAX_TOKENS,
-            "response_format": {"type": "json_object"},
+            "max_tokens": limit,
+            "response_format": response_format or {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": _SYSTEM},
                 {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": encoded}},
+                    {"type": "image_url", "image_url": image_url},
                     {"type": "text", "text": prompt},
                 ]},
             ],
         }
-        payload = self._post(body)
+        key = cache_key(self._base(), body, encoded)
+        image_url["url"] = encoded
+        cached = cache_get(key)
+        # Ключ прежней версии не знал формата ответа: под схемой (ограждённый
+        # проход листа) старый ответ без схемы не берётся.
+        if cached is None and settings.VLM_CACHE_V1_FALLBACK and response_format is None:
+            # Временно (VLM_CACHE_V1_FALLBACK): промах по новому ключу
+            # проверяется по ключу прежней версии. Тело запроса у неё было
+            # из тех же полей, и все её записи сделаны одним сервером прода,
+            # так что найденный ответ — ответ на этот же запрос. Он
+            # переписывается под новый ключ и дальше берётся оттуда; старый
+            # файл не трогается.
+            cached = cache_get(cache_key_v1(self.model, limit, prompt, encoded))
+            if cached is not None and (accept is None or accept(*cached)):
+                cache_put(key, cached)
+        if cached is not None and accept is not None and not accept(*cached):
+            # Замороженный сбой прежнего разбора (пустой, зацикленный,
+            # оборванный ответ): лист читается заново.
+            logger.warning("Ответ модели из кэша (%s) отбракован: лист читается заново", key[:12])
+            cached = None
+        if cached is not None:
+            return cached
+        extra: Dict[str, Any] = {}
+        if timeout is not None:
+            extra["timeout"] = timeout
+        if read_timeout_retries is not None:
+            extra["read_timeout_retries"] = read_timeout_retries
+        payload = self._post(body, **extra)
         if payload is None:
             return None
         content = _content_of(payload)
         if content is None:
             return None
-        return content, _finish_of(payload)
+        answer = (content, _finish_of(payload))
+        if accept is None or accept(*answer):
+            cache_put(key, answer)
+        return answer
 
-    def _post(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _post(self, body: Dict[str, Any], **limits: Any) -> Optional[Dict[str, Any]]:
+        """
+        Один вызов модели вместе с повторами — и его учёт в таймингах
+        документа: число вызовов, их суммарное время и число неудач. Без
+        этого время ветки чертежей не делилось на ожидание модели и свою
+        работу, и замер скорости шёл разбором логов. `limits` — свой срок
+        вызова (`timeout`) и предел повторов таймаута чтения
+        (`read_timeout_retries`) ограждённого прохода листа.
+        """
+        started = time.perf_counter()
+        payload = self._post_attempts(body, **limits)
+        telemetry.add("parse.vlm_calls", 1)
+        telemetry.add("parse.vlm_call_ms_sum", (time.perf_counter() - started) * 1000)
+        if payload is None:
+            telemetry.add("parse.vlm_failed_calls", 1)
+        return payload
+
+    def _post_attempts(
+        self, body: Dict[str, Any], timeout: Optional[int] = None,
+        read_timeout_retries: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Ответ модели текстом. Повторяется только то, что имеет смысл
         повторять: обрыв связи, таймаут и 5xx (vLLM отвечает так, пока
         грузит веса). Отказ 4xx — это неверный запрос или чужая модель,
         и повтор его не исправит.
         """
+        _rejection.status = None
+        timeout = timeout or self.timeout
+        read_timeouts = 0
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         url = f"{self._base()}/chat/completions"
+        if settings.QWEN_REQUEST_PRIORITY is not None:
+            # Ключ кэша уже посчитан (`_ask_text`): приоритет в него не входит,
+            # и тело вызывающего не меняется.
+            body = {**body, "priority": int(settings.QWEN_REQUEST_PRIORITY)}
         for attempt in range(self.retries + 1):
             last = attempt >= self.retries
+            if attempt:
+                deadline.check_cancelled()
             try:
-                response = self.session.post(
-                    url, json=body, headers=headers, timeout=self.timeout
-                )
+                # Место на видеокарте — на одну попытку: пауза перед повтором
+                # места не держит (GPU_GATE_ENABLED).
+                with gpu_gate.slot(gpu_gate.VLM, lease=timeout + 30):
+                    response = self.session.post(
+                        url, json=body, headers=headers, timeout=timeout
+                    )
             except requests.RequestException as exc:
+                if isinstance(exc, requests.ReadTimeout):
+                    read_timeouts += 1
+                    if read_timeout_retries is not None and read_timeouts > read_timeout_retries:
+                        # Тот же запрос, дважды не уложившийся в срок от
+                        # потолка токенов, третий раз не уложится тоже.
+                        last = True
                 self._log_attempt(exc, attempt, last)
                 if last:
+                    # Нет связи — отказ сервиса; таймаут чтения — свойство
+                    # этого вызова (плотный лист), не сервиса
+                    # (PARSE_REQUEUE_ON_OUTAGE).
+                    if (isinstance(exc, requests.ConnectionError)
+                            and not isinstance(exc, requests.ReadTimeout)):
+                        outage.note_vlm(ok=False)
                     return None
                 time.sleep(min(5.0, 1.0 * (attempt + 1)))
                 continue
@@ -770,6 +1120,7 @@ class QwenVisionClient:
                     f"{response.status_code} {response.text[:200]}", attempt, last
                 )
                 if last:
+                    outage.note_vlm(ok=False)
                     return None
                 time.sleep(min(5.0, 1.0 * (attempt + 1)))
                 continue
@@ -778,6 +1129,7 @@ class QwenVisionClient:
                 logger.error(
                     "Qwen отклонил запрос: %d %s", response.status_code, response.text[:200]
                 )
+                _rejection.status = response.status_code
                 return None
 
             try:
@@ -788,6 +1140,7 @@ class QwenVisionClient:
             if not isinstance(payload, dict):
                 logger.error("Qwen вернул ответ не того вида: %.200s", payload)
                 return None
+            outage.note_vlm(ok=True)
             return payload
         return None
 
@@ -813,6 +1166,96 @@ class QwenVisionClient:
 # тройку после «М» модель через раз пишет буквой «З» («Св-04Х19Н11МЗ») — по
 # такой записи марку не найти.
 _GRADE_M3 = re.compile(r"(\d{2}[ХXхx]\d{1,2}[НHнh]\d{1,2}[А-ЯA-Z0-9]*[МM])З(?![А-Яа-яA-Za-z0-9])")
+
+
+def sheet_schema() -> Dict[str, Any]:
+    """
+    Схема ответа прохода «лист целиком» (DRAWING_SHEET_SCHEMA): категории
+    списком, предел числа надписей и длины надписи. Свободный JSON допускал
+    и пустой объект, и бесконечный список.
+    """
+    return {"type": "json_schema", "json_schema": {"name": "sheet", "schema": {
+        "type": "object",
+        "properties": {
+            "sheet_type": {"type": "string", "enum": ["detail", "assembly", "scheme", "unknown"]},
+            "annotations": {
+                "type": "array",
+                "maxItems": int(settings.DRAWING_SHEET_MAX_ITEMS),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string", "enum": list(CATEGORIES)},
+                        "value": {"type": "string",
+                                  "maxLength": int(settings.DRAWING_SHEET_VALUE_MAX_CHARS)},
+                        "bbox": {"type": "array", "items": {"type": "number"},
+                                 "minItems": 4, "maxItems": 4},
+                    },
+                    "required": ["category", "value", "bbox"],
+                },
+            },
+        },
+        "required": ["sheet_type", "annotations"],
+    }}}
+
+
+def _item_value(item: Any) -> str:
+    """Текст надписи из элемента ответа любого вида (объект, сжатый массив, строка)."""
+    if isinstance(item, dict):
+        value = item.get("value")
+    elif isinstance(item, (list, tuple)) and len(item) > 1:
+        value = item[1]
+    else:
+        value = item
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def sheet_verdict(finish: Optional[str], annotations: Sequence[Any]) -> Optional[str]:
+    """
+    Причина отбраковать ответ прохода «лист целиком» или None. Пустой ответ
+    здесь не отбраковывается: пустым бывает и чистый лист, решает текст
+    листа (`drawing_processor`, GUARD_MIN_TEXT_LINES).
+    """
+    if finish == "length":
+        return REJECT_CUT
+    values = [value for value in map(_item_value, annotations) if value]
+    if len(values) >= _LOOP_MIN_ITEMS:
+        top = max(values.count(value) for value in set(values))
+        if top > _LOOP_SHARE * len(values):
+            return REJECT_LOOP
+    return None
+
+
+def sheet_answer_accepted(content: str, finish: Optional[str]) -> bool:
+    """
+    Пишется ли ответ листа в кэш и берётся ли из кэша: не оборван, не
+    зациклен и не пуст. Пустой ответ стоит десяток токенов, а замороженный в
+    кэше пустой лист теряется при каждом следующем разборе.
+    """
+    data = extract_json(content)
+    annotations = data.get("annotations") if isinstance(data, dict) else None
+    if not isinstance(annotations, list):
+        annotations = salvage_list(content, "annotations")
+    if not annotations:
+        return False
+    return sheet_verdict(finish, annotations) is None
+
+
+def _first_of_each(annotations: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Хвост зацикленного ответа отбрасывается: у значения, которое занимает
+    больше _LOOP_SHARE списка, остаётся первое прочтение. Прочие надписи —
+    и повторы среди них («⌀8» у каждого отверстия) — не трогаются.
+    """
+    values = [_item_value(annotation) for annotation in annotations]
+    looping = {value for value in set(values) if values.count(value) > _LOOP_SHARE * len(values)}
+    seen, kept = set(), []
+    for annotation, value in zip(annotations, values):
+        if value in looping:
+            if value in seen:
+                continue
+            seen.add(value)
+        kept.append(annotation)
+    return kept
 
 
 def _with_fixed_grade(annotation: Dict[str, Any]) -> Dict[str, Any]:
@@ -984,7 +1427,33 @@ def _is_bbox_fraction(text: str) -> bool:
     return 0.0 <= value <= 1.0
 
 
-def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+def compact_annotation(item: Any) -> Optional[Dict[str, Any]]:
+    """
+    Надпись сжатого вида `[код, надпись, x1, y1, x2, y2]` -> объект
+    `{category, value, bbox}`; не тот вид — None. Рамка в тысячных долях
+    делится на 1000; рамка, пришедшая дробями до 1, остаётся как есть.
+    Неизвестный код остаётся категорией как есть: дальше его разбирают
+    правила, как любую выдуманную моделью категорию.
+    """
+    if not isinstance(item, (list, tuple)) or len(item) != 6:
+        return None
+    code, value, *box = item
+    if not isinstance(code, str) or isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in box):
+        return None
+    whole = all(float(v).is_integer() for v in box)
+    scale = 1000.0 if whole or max(box) > 1.0 else 1.0
+    return {
+        "category": _COMPACT_CODES.get(code.strip(), code.strip()),
+        "value": value if isinstance(value, str) else str(value),
+        "bbox": [round(float(v) / scale, 4) for v in box],
+    }
+
+
+def as_annotations(
+    items: Sequence[Any], compact: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Элементы списка `annotations` в надписи. Возвращает надписи и счётчик
     видов, которые надписью стать не смогли.
@@ -1023,6 +1492,10 @@ def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str
     Обе разновидности считаются потерянными, а не выбрасываются: счётчик
     виден в логе и в payload, поэтому если правило начнёт отказывать
     настоящим прочтениям, это будет заметно по числу, а не по тишине.
+
+    `compact` — запрос был сжатого вида (DRAWING_SHEET_COMPACT_JSON):
+    массив `[код, надпись, x1, y1, x2, y2]` — это надпись, а не вложенный
+    список; код в одиночку — слово схемы. Объекты принимаются и тогда.
     """
     annotations: List[Dict[str, Any]] = []
     lost: Dict[str, int] = {}
@@ -1031,6 +1504,14 @@ def as_annotations(items: Sequence[Any]) -> Tuple[List[Dict[str, Any]], Dict[str
         if isinstance(item, dict):
             annotations.append(item)
             return
+        if compact:
+            unpacked = compact_annotation(item)
+            if unpacked is not None:
+                annotations.append(unpacked)
+                return
+            if isinstance(item, str) and item.strip() in _COMPACT_CODES:
+                lost["слово схемы"] = lost.get("слово схемы", 0) + 1
+                return
         if isinstance(item, str):
             text = item.strip()
             if not text:
@@ -1100,6 +1581,23 @@ def salvage_lines(content: str) -> List[str]:
 _COUNT_RUN = 30
 _COUNT_RUN_WHOLE = 200
 _NUMBERED = re.compile(r"^(.*?)(\d+)$")
+
+
+def _run_starts_at_its_beginning(lines: Sequence[str], start: int) -> bool:
+    """Начинается ли ряд с начала своей серии, а не с середины.
+
+    Да — только если первый его номер первый в серии. Нет — ряд возник из
+    ниоткуда: «XT21», которому ни XT1, ни XT20 на листе не предшествуют. От
+    этого зависит, сохранять ли голову ряда. Настоящий ряд, сорвавшийся на счёт
+    по ходу, начинается с единицы, и первые его строки настоящие. Ряд,
+    появившийся с середины, выдуман целиком, включая голову: проверено на листе,
+    где он шёл с «XT21» до «XT1131».
+
+    Искать предыдущий номер отдельной строкой выше бессмысленно: если он на
+    листе есть, `counting_run` включит его в тот же ряд, и ряд начнётся с него.
+    """
+    match = _NUMBERED.match(lines[start])
+    return bool(match) and int(match.group(2)) <= 1
 
 
 def counting_run(lines: Sequence[str], limit: int = _COUNT_RUN) -> Optional[int]:

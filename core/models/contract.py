@@ -19,7 +19,7 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_serializer, model_validator
 
 FragmentType = Literal["text", "table", "formula", "drawing", "image", "structured"]
 DocumentStatus = Literal["pending", "indexed", "error"]
@@ -185,6 +185,9 @@ class TableData(BaseModel):
     headers: List[str] = Field(default_factory=list)
     rows: List[List[Any]] = Field(default_factory=list)
     total_row: Optional[Dict[str, Any]] = None
+    # Исходная сетка `source_structure` (профиль v2) приходит дополнительным
+    # полем через extra="allow", а не объявленным: без флага STRUCTURAL_RAG_V2
+    # в выдаче не должно появиться даже `"source_structure": null`.
     table_id: Optional[str] = None
     row_start: int = Field(0, ge=0)
     row_end: Optional[int] = Field(None, ge=0)
@@ -225,6 +228,20 @@ class DrawingField(BaseModel):
         "detected_from_annotation", "reference_table", "expert_verified",
         "full_page_ocr", "vector_text_layer",
     ] = "detected_from_annotation"
+    # Сведение прочтений (DRAWING_READINGS_RECONCILED): все прочтения поля
+    # разными проходами `[{"source", "value"}]` и согласие между ними —
+    # «vector» (значение из текстового слоя), «agreed», «single», «conflict».
+    # Без флага ключей нет в ответе вовсе (см. `_without_unset_readings`).
+    readings: Optional[List[Dict[str, str]]] = None
+    agreement: Optional[Literal["vector", "agreed", "single", "conflict"]] = None
+
+    @model_serializer(mode="wrap")
+    def _without_unset_readings(self, handler):
+        data = handler(self)
+        for key in ("readings", "agreement"):
+            if isinstance(data, dict) and data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class Content(BaseModel):
@@ -362,6 +379,16 @@ class DocumentResult(BaseModel):
     schema_version: Literal["2.0"] = "2.0"
     processing_profile_version: Optional[str] = None
     review_required: bool = False
+    # Текст документа неполон — отдельно от вызова человека. Эти две вещи
+    # разошлись: качество разбора человека не касается (он решает только
+    # размещение, имя и редакцию), поэтому `review_required` у неполного
+    # документа снимается. Потребителю от этого полнота текста стала не видна,
+    # и документ с непрочитанными страницами проходил у него как полный.
+    # ``None`` — старая запись, признака в ней нет.
+    text_incomplete: Optional[bool] = None
+    # Страницы с блоками, но без прочитанного текста. Отдельно от
+    # `unknown_pages`: покрытие страниц у них полное, не прочитан текст.
+    unread_text_pages: List[int] = Field(default_factory=list)
     error: Optional[ParserError] = None
 
     @field_validator("error", mode="before")

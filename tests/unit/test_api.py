@@ -1,8 +1,11 @@
 """Ручки Parser по контракту RAG <-> Parser."""
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
+from core.models.contract import ResultsResponse
 from core.result_aggregator import init_request_state, put_document_result
 from ingest.api import app
 
@@ -17,6 +20,41 @@ def dispatched(mocker):
 def client(fake_redis, dispatched):
     with TestClient(app) as test_client:
         yield test_client
+
+
+def test_results_http_boundary_rejects_full_oversized_completed_envelope(client, monkeypatch):
+    from core.models.contract import Content, DocumentMetadata, DocumentResult, Fragment, Position, Provenance
+    from ingest import response_budget
+    fragment = Fragment(fragment_id="f", type="text", content=Content(text="я" * 2000),
+        position=Position(page=1), confidence=1, completeness=1,
+        provenance=Provenance(method="native", strategy_level=1, source="synthetic"))
+    document = DocumentResult(s3_fileid="large", document_metadata=DocumentMetadata(doc_id="d"),
+                              fragments=[fragment])
+    init_request_state("large-envelope", ["large"])
+    put_document_result("large-envelope", "large", document.model_dump(mode="json"))
+    monkeypatch.setattr(response_budget, "MAX_RESPONSE_BYTES", 2000)
+    response = client.get("/internal/v1/parse/results/large-envelope")
+    assert response.status_code == 413
+    body = response.json()
+    # Тело 413 — тот же ResultsResponse: request_id, статус error, без документов.
+    parsed = ResultsResponse.model_validate(body)
+    assert parsed.request_id == "large-envelope"
+    assert parsed.status == "error" and parsed.documents == []
+    assert parsed.error.message.startswith("PARSER_RESPONSE_RESOURCE_LIMIT")
+
+
+def test_sync_http_boundary_413_matches_parse_response(monkeypatch):
+    from core.models.contract import ParseResponse, SyncPendingResponse
+    from ingest import response_budget
+    model = ParseResponse(request_id="sync-large", dialog_id="dialog", documents=[])
+    monkeypatch.setattr(response_budget, "MAX_RESPONSE_BYTES", 10)
+    response = response_budget.bounded_response(model)
+    assert response.status_code == 413
+    body = json.loads(response.body)
+    assert ParseResponse.model_validate(body).request_id == "sync-large"
+    pending = SyncPendingResponse.model_validate(body)
+    assert pending.dialog_id == "dialog" and pending.status == "error"
+    assert pending.documents == [] and pending.error.reason_code == "TABLE_EXTRACTION_FAILED"
 
 
 def document(fileid, status="indexed", error=None):

@@ -26,9 +26,11 @@ import math
 import re
 import statistics
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from core.config import settings
 from core.models.parse_result import ParsedBlock
+from core.processing_contract import structural_v2
 from core.providers import latex_text, table_from_lines
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,9 @@ METHOD_OCR_LAYER_RECOVERED = "ocr_layer_recovered"
 METHOD_LATEX_DECODED = "latex_decoded"
 #: Таблица перечитана моделью зрения (уровень 7 лестницы стратегий).
 METHOD_VLM_TABLE = "vlm_escalation"
+# Пустая рамка таблицы, дочитанная Tesseract по рендеру страницы: метод
+# тот же, что у фоллбэка, — провенанс не должен выдавать её за слой.
+METHOD_BLANK_TABLE_OCR = "tesseract"
 
 _MONO_MARKERS = ("mono", "courier", "consol", "menlo", "inconsolata", "hack", "fira code")
 
@@ -90,6 +95,27 @@ _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 # предела: дальше перебор разбиений дорог, а склейки такой длины не бывает.
 _GLUED_MIN_ALNUM = 6
 _GLUED_MAX_LEN = 200
+# Склейка чисел. Многострочную ячейку с номерами (заводские номера партии,
+# «р/с» + «БИК» + «к/с» в платёжке) модель таблиц отдаёт одним числом без
+# пробелов: «4585445855…», и ни один номер в поиске уже не находится. Внутри
+# числа граница ставится только по строкам слоя в рамке той же таблицы
+# (split_glued_number), куски не короче `_GLUED_NUMBER_PIECE_MIN` цифр
+# (TABLE_SPLIT_GLUED_NUMBERS).
+_GLUED_NUMBER_MIN_LEN = 8
+_GLUED_NUMBER_PIECE_MIN = 4
+_DIGITS_RE = re.compile(r"^[0-9]+$")
+# Склеенное число в тексте ячейки: цифры без соседних букв и цифр.
+_GLUED_DIGITS_RE = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])[0-9]{8,}(?![0-9A-Za-zА-Яа-яЁё])")
+# Длины реквизитов: БИК 9, ИНН 10 и 12, телефон 11, ОГРН 13, ОГРНИП 15,
+# счёт 20. Склейка такой длины неотличима от самого реквизита и не режется.
+_REQUISITE_DIGITS = frozenset({9, 10, 11, 12, 13, 15, 20})
+# Два куска — только у коротких номеров: длинное число из двух половин чаще
+# всего перенесено в узкой ячейке.
+_GLUED_PAIR_MAX_PIECE = 6
+# Допуски геометрии строк слоя в долях листа: пересечение рядов по высоте и
+# совпадение левого края / разница ширины у переноса.
+_ROW_OVERLAP_SLACK = 0.002
+_WRAP_EDGE_SLACK = 0.004
 # Знаки, которые снимаются с краёв слова слоя при сборке словаря.
 _WORD_EDGE = "|.,;:!?()[]{}<>«»\"'*_-–—/\\"
 _MARKUP_RE = re.compile(r"(<[^>]*>)")
@@ -159,6 +185,9 @@ _STEEL_GRADE_RE = re.compile(r"^\d{1,3}(?:[ABCEHKMPTXАВСЕНКМРТХ]\d{0,2
 # повтор содержимого ячеек или мусор от линий сетки.
 _TABLE_LINE_MIN_NEW_WORDS = 2
 _TABLE_LINE_MIN_NEW_SHARE = 0.5
+# Число в строке векторного слоя считается новым словом от стольких цифр:
+# короче — номера позиций и количества, которые в ячейках и так есть.
+_TABLE_LINE_MIN_DIGITS = 4
 
 # Пары визуально неразличимых букв латиницы и кириллицы. Распознавание
 # постоянно их путает — `rps` превращается в `грs`, `БД` в `БD`, — и для
@@ -195,6 +224,8 @@ class TextLine:
     # не делится. Берутся вместо строки только на развороте с колонками
     # прозы (`column_lines`).
     parts: Tuple["TextLine", ...] = ()
+    raw_text: Optional[str] = None
+    text_edits: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def height(self) -> float:
@@ -332,6 +363,64 @@ def _largest_image_share(page: Any) -> float:
     return round(min(1.0, max(shares, default=0.0)), 3)
 
 
+def _span_text(spans, direction):
+    """Insert a separator only for a visible gap along the line's writing axis."""
+    if not structural_v2():
+        # Профиль v1: куски строки склеиваются как есть, без пробелов по геометрии.
+        text = "".join(span.get("text", "") for span in spans)
+        return text, text, []
+    raw, output, edits = [], [], []
+    previous = None
+    source_offset = output_offset = 0
+    try:
+        dx, dy = (float(v) for v in (direction or (1, 0)))
+        length = math.hypot(dx, dy)
+        axis = (dx / length, dy / length) if math.isfinite(length) and length else None
+    except (ValueError, TypeError):
+        axis = None
+
+    def extent(span):
+        try:
+            x0, y0, x1, y1 = (float(v) for v in span['bbox'])
+            size = float(span.get('size') or 0)
+            if not axis or not all(math.isfinite(v) for v in (x0,y0,x1,y1,size)) or size <= 0:
+                return None
+            points = [x*axis[0] + y*axis[1] for x,y in ((x0,y0),(x0,y1),(x1,y0),(x1,y1))]
+            return min(points), max(points), size
+        except (KeyError, ValueError, TypeError):
+            return None
+
+    for index, span in enumerate(spans):
+        text = span.get('text', '')
+        if not isinstance(text, str):
+            text = ''
+        if text and previous is not None and not previous[1][-1].isspace() and not text[0].isspace():
+            left, right = extent(previous[2]), extent(span)
+            if left is not None and right is not None:
+                gap = right[0] - left[1]
+                threshold = max(0.5, 0.2 * min(left[2],right[2]))
+                if gap >= threshold:
+                    output.append(' ')
+                    edits.append({'source_start':source_offset,'source_end':source_offset,
+                        'output_start':output_offset,'output_end':output_offset+1,'replacement':' ',
+                        'left_span':previous[0],'right_span':index,'gap_source_points':round(gap,4),
+                        'threshold_source_points':round(threshold,4)})
+                    output_offset += 1
+        raw.append(text)
+        output.append(text)
+        source_offset += len(text)
+        output_offset += len(text)
+        if text:
+            previous = (index,text,span)
+    return ''.join(raw), ''.join(output), edits
+
+
+def _line_observations(lines):
+    return [{'rule':'pdf-span-word-gap-v1','page':line.page,'bbox':list(line.bbox),
+             'raw':line.raw_text,'normalized':line.text,'edits':[dict(edit) for edit in line.text_edits]}
+            for line in lines if line.text_edits and line.raw_text is not None]
+
+
 def _lines_from_page(page: Any, page_no: int, width: float, height: float) -> List[TextLine]:
     """Строки страницы с нормализованными координатами."""
     if width <= 0 or height <= 0:
@@ -352,7 +441,7 @@ def _lines_from_page(page: Any, page_no: int, width: float, height: float) -> Li
             continue
         for line in block.get("lines") or []:
             spans = line.get("spans") or []
-            text = "".join(span.get("text", "") for span in spans)
+            raw_text, text, text_edits = _span_text(spans, line.get('dir'))
             if not text.strip():
                 continue
 
@@ -377,6 +466,8 @@ def _lines_from_page(page: Any, page_no: int, width: float, height: float) -> Li
                 rotation=_turn_back(_direction_to_degrees(line.get("dir")), turn),
                 color=statistics.mode(colors) if colors else 0,
                 mono=any(marker in fonts for marker in _MONO_MARKERS),
+                raw_text=raw_text,
+                text_edits=text_edits,
             ))
 
     return lines
@@ -688,6 +779,13 @@ class ReconcileStats:
     low_confidence_table_lines: int = 0
     #: Неразобранных таблиц, перечитанных моделью зрения (`table_reader`).
     vlm_tables: int = 0
+    #: Пустых рамок таблиц, дочитанных по рендеру страницы (`blank_table_ocr`).
+    blank_tables_read: int = 0
+    #: Пустых рамок, отклонённых затвором: их страницы помечаются непрочитанными.
+    blank_tables_rejected: int = 0
+    #: Страницы отклонённых рамок. Уезжают в `unread_text_pages` парсера:
+    #: без этого потеря содержимого рамки была бы снова молчаливой.
+    blank_table_unread_pages: Set[int] = field(default_factory=set)
     layer_chars_by_page: Dict[int, int] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -709,6 +807,9 @@ class ReconcileStats:
             "frame_tables": self.frame_tables,
             "low_confidence_table_lines": self.low_confidence_table_lines,
             "vlm_tables": self.vlm_tables,
+            "blank_tables_read": self.blank_tables_read,
+            "blank_tables_rejected": self.blank_tables_rejected,
+            "blank_table_unread_pages": sorted(self.blank_table_unread_pages),
         }
 
 
@@ -740,9 +841,18 @@ def reconcile_with_text_layer(
     `split_columns` — строки вне рамок собираются в абзацы по колонкам
     (`group_columns`).
 
-    `table_reader` — последняя попытка для таблицы, которую не удалось ни
-    выправить, ни собрать по строкам слоя: блок -> `table_data` или None.
-    Без него (или при None) таблица разбирается на текст, как раньше.
+    `table_reader` — последняя попытка для таблицы: блок -> прочитанное или
+    None. Один слот на два взаимоисключающих состояния блока:
+
+    * таблица со своим содержимым, которую не удалось ни выправить, ни
+      собрать по строкам слоя -> `table_data`;
+    * пустая рамка, в которой не оказалось ни содержимого, ни строк слоя
+      -> `{"text": ...}` (и необязательная `confidence` в долях единицы).
+
+    Без него (или при None) таблица разбирается на текст, как раньше, а
+    пустая рамка остаётся пустой. Дочитывание пустых рамок к тому же
+    стоит под `BLANK_TABLE_OCR_ENABLED`: при выключенном флаге сшивка
+    ведёт себя в точности как прежде.
     """
     stats = ReconcileStats(layer_chars_by_page=layer.char_counts_by_page())
     if frame_table_guard:
@@ -771,7 +881,12 @@ def reconcile_with_text_layer(
             page_lines = column_lines(page_lines)
 
         if not page_lines:
-            result.extend(page_blocks)
+            # Весь разбор ниже (`_assign_lines`, `page_turn`,
+            # `layer_vocabulary`, `group_lines`) считает, что строки есть,
+            # поэтому страница без слоя по-прежнему уходит как есть. Но
+            # пустые рамки на ней — ровно тот случай, ради которого
+            # дочитывание и сделано: содержимого нет ни у рамки, ни у слоя.
+            result.extend(_read_blank_frames(page_blocks, stats, table_reader))
             continue
 
         # Если MinerU отдал только `content_list`, координат у блоков нет и
@@ -837,7 +952,25 @@ def reconcile_with_text_layer(
                         # неуверенные строки в ней — та же таблица через сетку.
                         # Без разобранных таблиц слой — единственный источник.
                         fresh = _confident(fresh, line_floor, stats)
-                    if not fresh:
+                    # Рамка без собственного содержимого снимается независимо
+                    # от того, восстановились ли её строки. Прежде снятие стояло
+                    # под `if not fresh`, то есть ровно наоборот: удалось
+                    # восстановить — пустая рамка оставалась и уезжала в индекс
+                    # фрагментом без текста, без таблицы и без полей. На проде
+                    # таких 5629 из 6098 (у 469 есть вырезка, у 451 — HTML, и
+                    # все 451 с вырезкой), и примерно у 4176 текст уже лежит
+                    # рядом восстановленным блоком.
+                    #
+                    # Текста это не добавляет и не удваивает: строки уходят
+                    # только через `leftovers` ниже, уже просеянные
+                    # `_drop_duplicates` (продолжение многостраничной таблицы) и
+                    # `_confident` (повторное чтение по сетке), а `_assign_lines`
+                    # отдаёт каждую строку ровно одному блоку.
+                    #
+                    # Вырезка и сырой HTML — это содержимое, их рамку держим:
+                    # `_carries_own_text` смотрит только на `table_data` и про
+                    # `table_html` не знает, поэтому проверяем его здесь сами.
+                    if not block.image_ref and not block.table_html:
                         stats.dropped_empty_tables += 1
                         dropped.append(block)
                 else:
@@ -845,6 +978,16 @@ def reconcile_with_text_layer(
                     # может повторять строку таблицы на законных основаниях.
                     fresh = list(matched)
                 leftovers.extend(fresh)
+            elif (block.type == "table" and not matched
+                  and not _carries_own_text(block)):
+                # Пустая рамка на странице, у которой строки слоя есть, но
+                # не внутри этой рамки (`not matched`). Случай тот же, что
+                # на странице вовсе без слоя, — только добрался сюда через
+                # общий цикл, поэтому вторая точка входа нужна отдельно.
+                fresh_block = _read_blank_frame(block, stats, table_reader)
+                if fresh_block is not None:
+                    extra_blocks.append(fresh_block)
+                    dropped.append(block)
 
         if dropped:
             page_blocks = [b for b in page_blocks if not any(b is d for d in dropped)]
@@ -864,6 +1007,7 @@ def reconcile_with_text_layer(
                 bbox=merge_line_bboxes(group),
                 confidence=source.confidence_of(group),
                 method=source.recovered_method,
+                text_observations=_line_observations(group),
             ))
 
         page_blocks.sort(key=lambda block: _block_reading_key(block, turn))
@@ -1044,6 +1188,7 @@ def _rebuild_text_block(
         return
 
     block.text = rebuilt
+    block.text_observations = _line_observations(matched)
     block.bbox = merge_line_bboxes(matched)
     block.method = source.method
     block.confidence = source.confidence_of(matched)
@@ -1076,6 +1221,7 @@ def _fix_formula(
     if rebuilt:
         block.type = "text"
         block.text = rebuilt
+        block.text_observations = _line_observations(matched)
         block.bbox = merge_line_bboxes(matched)
         block.method = source.method
         block.confidence = source.confidence_of(matched)
@@ -1140,6 +1286,70 @@ def fold_homoglyphs(text: str) -> str:
     return "".join(_HOMOGLYPHS.get(ch, ch) for ch in text.lower() if not ch.isspace())
 
 
+def _read_blank_frames(
+    page_blocks: List[ParsedBlock],
+    stats: ReconcileStats,
+    table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]],
+) -> List[ParsedBlock]:
+    """
+    Блоки страницы с дочитанными пустыми рамками. Прочитанная рамка
+    заменяется текстовым блоком: содержимого у неё нет, и пустая рамка в
+    индексе — фрагмент без текста, без таблицы и без полей. Всё остальное
+    (в том числе рамка с вырезкой или сырым HTML) проходит как есть.
+    """
+    result: List[ParsedBlock] = []
+    for block in page_blocks:
+        fresh = _read_blank_frame(block, stats, table_reader)
+        if fresh is None:
+            result.append(block)
+            continue
+        result.append(fresh)
+    return result
+
+
+def _read_blank_frame(
+    block: ParsedBlock,
+    stats: ReconcileStats,
+    table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]],
+) -> Optional[ParsedBlock]:
+    """
+    Пустая рамка таблицы -> текстовый блок с дочитанным содержимым или None.
+
+    Отказ (затвор не пропустил, предел рамок, срок, сбой) помечает
+    страницу непрочитанной: содержимое рамки не прочитано ничем, и молчать
+    об этом нельзя — именно так 1180 рамок прода пропали незаметно.
+    """
+    if not settings.BLANK_TABLE_OCR_ENABLED or table_reader is None:
+        return None
+    if block.type != "table" or _carries_own_text(block):
+        return None
+    # Вырезка и сырой HTML — это содержимое: оно уезжает в индекс своей
+    # дорогой, потери текста там нет, а дочитывание дало бы вторую копию.
+    # `_carries_own_text` смотрит только на `table_data` и про них не знает,
+    # поэтому проверяем здесь сами — как и снятие пустой рамки выше.
+    if block.image_ref or block.table_html:
+        return None
+    read = table_reader(block)
+    text = (read or {}).get("text") if isinstance(read, dict) else None
+    text = " ".join((text or "").split())
+    if not text:
+        stats.blank_tables_rejected += 1
+        stats.blank_table_unread_pages.add(block.page)
+        return None
+    stats.blank_tables_read += 1
+    confidence = read.get("confidence")
+    return ParsedBlock(
+        type="text",
+        text=text,
+        page=block.page,
+        bbox=list(block.bbox),
+        page_size=list(block.page_size) if block.page_size else None,
+        confidence=float(confidence) if confidence is not None else 1.0,
+        method=METHOD_BLANK_TABLE_OCR,
+        is_fallback=True,
+    )
+
+
 def _fix_table(
     block: ParsedBlock,
     matched: Sequence[TextLine],
@@ -1193,12 +1403,17 @@ def _fix_table(
         stats.repaired_tables += 1
 
     unused = _repair_table_cells(block, matched, stats)
+    if settings.TABLE_SPLIT_GLUED_NUMBERS:
+        _split_glued_number_cells(block, matched, stats)
     if vocab is None:
         return [], []
     _split_glued_cells(block, vocab, stats, exact, turn)
-    if exact:
+    if exact and not settings.TABLE_VECTOR_LINES_KEPT:
         return [], []
-    kept = _lines_with_new_words(unused, block)
+    # Векторный слой — сам текст файла, обрывков сетки в нём нет: новым
+    # считается и одно слово, и число от `_TABLE_LINE_MIN_DIGITS` цифр
+    # (БИК, счёт и сумма прописью, потерянные моделью таблиц).
+    kept = _lines_with_new_words(unused, block, vector=exact)
     stats.table_lines_kept += len(kept)
     return [], kept
 
@@ -1609,6 +1824,123 @@ def _split_token(
     return pieces[::-1]
 
 
+def split_glued_number(core: str, lines: Sequence["TextLine"]) -> Optional[List[str]]:
+    """
+    Склеенные числа ячейки таблицы по строкам слоя этой таблицы или None.
+
+    Режется только столбик одинаковых по длине номеров (заводские номера
+    партии, инвентарные номера), который модель таблиц склеила в одно число.
+    Доказательство берётся из строк слоя внутри рамки таблицы:
+
+    - число делится на не меньше двух кусков одной длины (от
+      `_GLUED_NUMBER_PIECE_MIN` цифр); два куска — только короткие номера
+      (до `_GLUED_PAIR_MAX_PIECE` цифр), иначе это обычно одно число,
+      перенесённое в узкой ячейке;
+    - каждый кусок стоит отдельным словом на своей строке слоя, строки идут
+      одна под другой и по высоте не пересекаются;
+    - соседние строки — не перенос: продолжение переноса начинается с того же
+      края, а первая строка шире следующей (заполняет ячейку);
+    - само число не стоит ни в одной строке слоя, даже с пробелом внутри;
+    - длина числа не совпадает с длиной реквизита (БИК, ИНН, телефон, ОГРН,
+      ОГРНИП, счёт — `_REQUISITE_DIGITS`) и число не похоже на дату.
+
+    Без перебора разбиений: длина куска перебирается по делителям длины числа.
+    """
+    size = len(core)
+    if (size < _GLUED_NUMBER_MIN_LEN or size > _GLUED_MAX_LEN
+            or not _DIGITS_RE.match(core) or size in _REQUISITE_DIGITS
+            or _looks_like_date(core)):
+        return None
+    owners: Dict[str, List["TextLine"]] = {}
+    for line in lines:
+        text = line.text or ""
+        if core in "".join(text.split()):
+            return None
+        for word in text.split():
+            word = word.strip(_WORD_EDGE)
+            if len(word) >= _GLUED_NUMBER_PIECE_MIN and _DIGITS_RE.match(word):
+                owners.setdefault(word, []).append(line)
+    if not owners:
+        return None
+    for length in sorted({len(number) for number in owners}):
+        if size % length or size // length < 2:
+            continue
+        count = size // length
+        if count == 2 and length > _GLUED_PAIR_MAX_PIECE:
+            continue
+        pieces = [core[i:i + length] for i in range(0, size, length)]
+        chosen: List["TextLine"] = []
+        for piece in pieces:
+            free = [line for line in owners.get(piece, []) if all(line is not c for c in chosen)]
+            if not free:
+                break
+            chosen.append(min(free, key=lambda line: line.bbox[1]))
+        else:
+            if _stacked_rows(chosen):
+                return pieces
+    return None
+
+
+def _stacked_rows(chosen: Sequence["TextLine"]) -> bool:
+    """Строки — отдельные ряды столбика, а не перенос одного значения."""
+    rows = sorted(chosen, key=lambda line: line.bbox[1])
+    for upper, lower in zip(rows, rows[1:]):
+        if lower.bbox[1] < upper.bbox[3] - _ROW_OVERLAP_SLACK:
+            return False                      # по высоте строки пересекаются
+        same_start = abs(upper.bbox[0] - lower.bbox[0]) <= _WRAP_EDGE_SLACK
+        upper_wider = (upper.bbox[2] - upper.bbox[0]) > (lower.bbox[2] - lower.bbox[0]) + _WRAP_EDGE_SLACK
+        if same_start and upper_wider:
+            return False                      # перенос: первая строка заполняет ячейку
+    return True
+
+
+def _looks_like_date(core: str) -> bool:
+    """Восемь цифр датой ДДММГГГГ или ГГГГММДД."""
+    if len(core) != 8:
+        return False
+    day, month, year = int(core[:2]), int(core[2:4]), int(core[4:])
+    if 1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2100:
+        return True
+    year, month, day = int(core[:4]), int(core[4:6]), int(core[6:])
+    return 1900 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31
+
+
+def _split_glued_number_cells(
+    block: ParsedBlock, matched: Sequence["TextLine"], stats: "ReconcileStats",
+) -> None:
+    """Склеенные числа в ячейках, HTML и тексте таблицы (TABLE_SPLIT_GLUED_NUMBERS)."""
+    cache: Dict[str, Optional[List[str]]] = {}
+
+    def fix_text(text: str) -> str:
+        def fix(match: "re.Match[str]") -> str:
+            core = match.group(0)
+            if core not in cache:
+                cache[core] = split_glued_number(core, matched)
+            pieces = cache[core]
+            if not pieces:
+                return core
+            stats.split_tokens += 1
+            return " ".join(pieces)
+        return _GLUED_DIGITS_RE.sub(fix, text)
+
+    table = block.table_data or {}
+    if table:
+        table["headers"] = [fix_text(h) if isinstance(h, str) else h for h in (table.get("headers") or [])]
+        table["rows"] = [[fix_text(c) if isinstance(c, str) else c for c in row]
+                         for row in (table.get("rows") or [])]
+        block.table_data = table
+    if block.table_html:
+        parts = _MARKUP_RE.split(block.table_html)
+        for index in range(0, len(parts), 2):
+            parts[index] = fix_text(parts[index])
+        block.table_html = "".join(parts)
+    if block.text:
+        parts = _MARKUP_RE.split(block.text)
+        for index in range(0, len(parts), 2):
+            parts[index] = fix_text(parts[index])
+        block.text = "".join(parts)
+
+
 def _fix_token(token: str, vocab: Dict[str, str], exact: bool) -> str:
     """
     Токен ячейки: алфавит выправлен, склейка разрезана по словам слоя, а
@@ -1767,7 +2099,9 @@ def _looks_like_word(word: str) -> bool:
     return any(ch in _VOWELS for ch in letters)
 
 
-def _lines_with_new_words(lines: Sequence[TextLine], block: ParsedBlock) -> List[TextLine]:
+def _lines_with_new_words(
+    lines: Sequence[TextLine], block: ParsedBlock, vector: bool = False,
+) -> List[TextLine]:
     """
     Строки слоя из рамки таблицы, чьих слов в ячейках нет.
 
@@ -1781,14 +2115,23 @@ def _lines_with_new_words(lines: Sequence[TextLine], block: ParsedBlock) -> List
     for row in table.get("rows") or []:
         cells.extend(str(c) for c in row)
     known = {_fold_word(w) for w in _TOKEN_RE.findall(" ".join(cells))}
+    if vector:
+        # Число в ячейке и в строке слоя записано по-разному («30 000,00» и
+        # «30000,00»): сравниваются цифры без пробелов внутри.
+        known |= {_fold_word(w) for cell in cells
+                  for w in _TOKEN_RE.findall(re.sub(r"(?<=\d)\s+(?=\d)", "", cell))}
     kept: List[TextLine] = []
+    min_new = 1 if vector else _TABLE_LINE_MIN_NEW_WORDS
     for line in lines:
         words = [w for w in _TOKEN_RE.findall(line.text or "") if len(w) >= 3]
         # Новым считается только настоящее слово: обрывки линий сетки
-        # Tesseract читает как «ООО», «ОИ», «ne».
+        # Tesseract читает как «ООО», «ОИ», «ne». У векторного слоя — ещё и
+        # длинное число.
         new = [_fold_word(w) for w in words
-               if _fold_word(w) not in known and _looks_like_word(w)]
-        if len(new) >= _TABLE_LINE_MIN_NEW_WORDS and len(new) >= len(words) * _TABLE_LINE_MIN_NEW_SHARE:
+               if _fold_word(w) not in known and (
+                   _looks_like_word(w)
+                   or (vector and w.isdigit() and len(w) >= _TABLE_LINE_MIN_DIGITS))]
+        if len(new) >= min_new and len(new) >= len(words) * _TABLE_LINE_MIN_NEW_SHARE:
             kept.append(line)
             known.update(new)
     return kept

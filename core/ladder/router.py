@@ -40,17 +40,19 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import deadline
+from core import deadline, filetypes, telemetry
 from core.config import settings
 from core.ladder import drawing_route
 from core.ladder.base import Strategy, text_chars
-from core.ladder.context import DocumentContext
+from core.ladder.context import SOURCE_RASTER, DocumentContext
 from core.ladder.scoring import Score, score_result
+from core.ladder.text_layer_complete import complete_text_layer
 from core.ladder.strategies.cad_source import CadSourceStrategy
 from core.ladder.strategies.native_text import (
     DocxStrategy,
@@ -67,9 +69,15 @@ from core.ladder.strategies.tabular import SpreadsheetStrategy
 from core.models.parse_result import ParseResult
 from core.providers.storage import StorageProvider
 from core.providers.document_parser import DocumentParserProvider, ParserFailed
+from core.providers.mineru_parser import MINERU_HTTP_MS, MinerUParserProvider
 from core.providers.tesseract_fallback import ocr_memo
 
 logger = logging.getLogger(__name__)
+
+# Пометка в `degraded`: скан остался на плоском OCR, потому что MinerU был
+# недоступен (`PARSE_LAYOUT_UNAVAILABLE_NOTE`). Строка постоянная — по ней
+# ищется список документов на повторный разбор.
+LAYOUT_UNAVAILABLE = "LAYOUT_UNAVAILABLE"
 
 
 # Уровни платформы по возрастанию стоимости. Здесь только типы: создавать
@@ -138,6 +146,26 @@ class Attempt:
         return payload
 
 
+def _record_level_time(level: int, started: float, http_before: float, prefetched=None) -> None:
+    """
+    Время уровней 4 и 5 в тайминги документа. Уровень 5 делится на запрос
+    к MinerU и всё после него (сшивка, OCR-слой): только так видно, куда
+    уходит `parse.document` на скане и что даст каждая правка скорости.
+    Запрос, начатый заранее (`LADDER_PARALLEL_LAYOUT`), идёт вместе с
+    уровнем 4: его время — своё, а из уровня 5 вычитается только ожидание.
+    """
+    elapsed = (time.perf_counter() - started) * 1000
+    if level == 4:
+        telemetry.add("parse.level4_ms", elapsed)
+    elif level == 5 and prefetched is not None:
+        telemetry.add("parse.level5_http_ms", prefetched.http_ms)
+        telemetry.add("parse.level5_post_ms", max(0.0, elapsed - prefetched.waited_ms))
+    elif level == 5:
+        http = max(0.0, telemetry.value(MINERU_HTTP_MS) - http_before)
+        telemetry.add("parse.level5_http_ms", http)
+        telemetry.add("parse.level5_post_ms", max(0.0, elapsed - http))
+
+
 class LadderRouter:
     """Выбор стратегии разбора и подъём по лестнице."""
 
@@ -170,9 +198,16 @@ class LadderRouter:
         # Уровни 4 и 5 читают одни и те же страницы скана: в пределах
         # документа каждая распознаётся один раз (результат тот же).
         with ocr_memo():
-            return self._parse(context)
+            pending: List[Any] = []
+            try:
+                return self._parse(context, pending)
+            finally:
+                # Заранее начатый запрос к MinerU, который уровень 5 не забрал
+                # (срок задачи, отмена, уровень 5 не начат): ответ не нужен.
+                for handle in pending:
+                    handle.abandon()
 
-    def _parse(self, context: DocumentContext) -> ParseResult:
+    def _parse(self, context: DocumentContext, pending: Optional[List[Any]] = None) -> ParseResult:
         applicable = self._applicable(context)
         if not applicable:
             raise ParserFailed(
@@ -180,7 +215,38 @@ class LadderRouter:
                 f"(тип {context.file_type!r}, род {context.kind!r})"
             )
 
+        # Уровень 5 не попал в лестницу из-за лежащего MinerU: скан, который
+        # кончится плоским OCR, должен сказать об этом сам
+        # (`PARSE_LAYOUT_UNAVAILABLE_NOTE`). Решается здесь, а не в конце:
+        # срок недоступности короткий и к концу разбора может истечь.
+        layout_unavailable = settings.PARSE_LAYOUT_UNAVAILABLE_NOTE and any(
+            strategy not in applicable
+            and getattr(strategy, "skipped_as_unavailable", None) is not None
+            and strategy.skipped_as_unavailable(context)
+            for strategy in self.strategies
+        )
         classification = context.classification
+        # Полный текстовый слой: уровень 4 не запускается, его роль (мерка
+        # сохранности и запас для чертёжной ветки) отдаётся уровню 2 — явно,
+        # без пометки `is_fallback` на самом результате. Пропуск решается,
+        # только когда уровень 2 уже дал результат: не справился он — уровень
+        # 4 работает как прежде и остаётся страховкой.
+        substitute_level: Optional[int] = None
+        complete_layer = None
+        if settings.LADDER_SKIP_OCR_ON_TEXT_LAYER and {2, 4} <= {s.level for s in applicable}:
+            complete_layer = complete_text_layer(context)
+            if complete_layer is not None:
+                substitute_level = 2
+        # Скан: запрос к MinerU уходит до уровня 4 и идёт, пока Tesseract
+        # читает те же страницы. Ответ забирает уровень 5, остальное — как
+        # без флага (`LADDER_PARALLEL_LAYOUT`).
+        prefetcher: Optional[Strategy] = None
+        if (settings.LADDER_PARALLEL_LAYOUT and classification.source == SOURCE_RASTER
+                and MinerUParserProvider.is_available()):
+            by_level = {s.level: s for s in applicable}
+            if 4 in by_level and hasattr(by_level.get(5), "prefetch"):
+                prefetcher = by_level[5]
+        prefetched = None
         logger.info(
             "Лестница для %s: источник=%s жанр=%s качество=%s, уровни %s",
             context.uri, classification.source, classification.genre,
@@ -193,6 +259,7 @@ class LadderRouter:
         best_score: Optional[Score] = None
         best_strategy: Optional[Strategy] = None
         candidates: List[tuple[ParseResult, Score, Strategy, float]] = []
+        substitute: Optional[ParseResult] = None
 
         # Объём лучшего фоллбэка — мерка сохранности для структурных
         # уровней: фоллбэк читает страницу целиком и годится как нижняя
@@ -216,14 +283,34 @@ class LadderRouter:
             return (int(retains), unit_coverage, int(structured and retains), evaluated.value)
 
         for strategy in applicable:
+            if strategy.level == 4 and substitute is not None:
+                telemetry.add("parse.level4_ms", 0.0)
+                logger.info(
+                    "Уровень 4 пропущен для %s: текстовый слой полный — страниц %d, символов %d",
+                    context.uri, complete_layer.pages, complete_layer.chars,
+                )
+                continue
             left = deadline.remaining()
             if left is not None and left < settings.LADDER_MIN_REMAINING:
                 logger.warning("Уровень %d пропущен: до срока задачи %.0f с", strategy.level, left)
                 attempts.append(Attempt(strategy.level, strategy.name,
                                         error="нет бюджета времени задачи"))
                 continue
+            if prefetcher is not None and strategy.level == 4 and prefetched is None:
+                try:
+                    prefetched = prefetcher.prefetch(context)
+                except Exception as exc:  # noqa: BLE001 — без запроса заранее уровень 5 спросит сам
+                    logger.warning("Запрос к MinerU заранее не начат: %s", exc)
+                    prefetcher = None
+                else:
+                    if pending is not None:
+                        pending.append(prefetched)
+            handed = prefetched if strategy is prefetcher else None
+            run_started = time.perf_counter()
+            http_before = telemetry.value(MINERU_HTTP_MS)
             try:
-                result = strategy.run(context)
+                result = strategy.run(context) if handed is None else strategy.run(
+                    context, prefetched=handed)
             except SoftTimeLimitExceeded:
                 # Лимит задачи — не «неудача уровня». Если кандидат уже есть,
                 # он сохраняется с пометкой; иначе лимит обрабатывает задача.
@@ -240,6 +327,8 @@ class LadderRouter:
                 )
                 attempts.append(Attempt(strategy.level, strategy.name, error=str(exc)))
                 continue
+            finally:
+                _record_level_time(strategy.level, run_started, http_before, handed)
 
             chars = text_chars(result)
             source_count = context.source_page_count or result.source_page_count
@@ -293,6 +382,11 @@ class LadderRouter:
                         context.uri, strategy.level,
                     )
             else:
+                fallback_chars = max(fallback_chars, chars)
+            if strategy.level == substitute_level:
+                # Слой файла вместо пропущенного распознавания: он и есть
+                # нижняя граница текста страницы.
+                substitute = result
                 fallback_chars = max(fallback_chars, chars)
 
             # Старшинство структурного разбора. Балл здесь не при чём: он
@@ -348,6 +442,11 @@ class LadderRouter:
         # а не нормальный исход. Молчать о ней нельзя: снаружи документ
         # выглядит разобранным, а в индекс уехала каша.
         fallback_won = best.is_fallback and structural_seen
+        if substitute is not None and best is substitute:
+            # Слой файла стоит на месте распознавания: если уровень 5 после
+            # него не справился, это та же деградация, что победа фоллбэка, и
+            # помечается она так же.
+            fallback_won = any(a.error and a.level == 5 for a in attempts)
         if fallback_won:
             # Балл победителя пересчитывается честно: структуру на этом
             # документе кто-то вернул, значит её отсутствие здесь — не
@@ -369,13 +468,30 @@ class LadderRouter:
                 best.degraded.append(note)
             logger.warning("Разбор %s деградировал: %s", context.uri, note)
 
+        # Уровень 5 запускался и упал (MinerU отклонил задачу — на проде это
+        # 409 с нехваткой памяти видеокарты, — не дал блоков, не хватило
+        # срока): скан тоже остался плоским OCR, и тоже молча.
+        layout_failed = (
+            settings.PARSE_LAYOUT_UNAVAILABLE_NOTE
+            and (context.kind == filetypes.KIND_IMAGE or classification.source == SOURCE_RASTER)
+            and any(a.level == 5 and a.error for a in attempts)
+        )
+        if ((layout_unavailable or layout_failed) and best.is_fallback
+                and LAYOUT_UNAVAILABLE not in best.degraded):
+            # Плоский OCR вместо разбора с таблицами — из-за сервиса, а не из-за
+            # документа. Имя пометки не входит в советы RAG: документ виден
+            # неполным, а запрос к базе по `degraded` находит его для
+            # повторного разбора.
+            best.degraded.append(LAYOUT_UNAVAILABLE)
+            logger.warning("Разбор %s остался на OCR: уровень 5 не дал результата", context.uri)
+
         # Старшинство выдано авансом: лист ещё не прочитан. Лучший фоллбэк
         # уезжает вместе с результатом, и после чтения листа моделью объём
         # сверяется заново — уже по тому, что чертёжная ветка принесла.
         reserve: Optional[ParseResult] = None
         if (sheet_read_later and not best.is_fallback
                 and not self._keeps_content(text_chars(best), fallback_chars)):
-            fallbacks = [c for c in candidates if c[0].is_fallback]
+            fallbacks = [c for c in candidates if c[0].is_fallback or c[0] is substitute]
             if fallbacks:
                 reserve = max(fallbacks, key=lambda c: (text_chars(c[0]), c[1].value))[0]
                 best.fallback_reserve = reserve

@@ -420,6 +420,37 @@ def facts_from_drawing_fields(fields, fragment_id: str) -> List[ExtractedFact]:
 
 
 # ===========================================================================
+# Идентификаторы документа (SCAN_CANONICAL_IDS)
+# ===========================================================================
+
+_IDENTITY_LABELS = {
+    "identity.certificate_number": "Номер свидетельства",
+    "identity.serial_number": "Заводской номер",
+    "identity.designation": "Обозначение",
+}
+
+
+def identity_fact(
+    fragment_id: str, index: int, key: str, value: str, read_as: str, evidence: str,
+) -> ExtractedFact:
+    """
+    Номер свидетельства, заводской номер или обозначение в канонической
+    записи (`core/providers/canonical_ids.py`). `value.raw` — каноническая
+    запись; как это место прочитано распознаванием и чем доказана замена —
+    в `provenance` (`read_as`, `evidence`; пустое доказательство — запись
+    оставлена как прочитана).
+    """
+    return ExtractedFact(
+        fact_id=f"{fragment_id}:identity-{index}",
+        fragment_id=fragment_id,
+        key=key,
+        label=_IDENTITY_LABELS.get(key, key),
+        value=FactValue(kind="identifier", raw=value),
+        provenance={"read_as": read_as, "evidence": evidence or None},
+    )
+
+
+# ===========================================================================
 # Точка входа
 # ===========================================================================
 

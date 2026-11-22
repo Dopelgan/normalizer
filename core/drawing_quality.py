@@ -68,16 +68,40 @@ def _transcribed_pages(drawings):
     )
 
 
+def _from_rescan(fragment):
+    """
+    Лист перечитывания плохого скана (DRAWING_RESCAN_POOR_OCR_PAGES). Его
+    страница уже покрыта распознаванием, и лист только добавляет текст
+    модели: его недочитанная часть или неизмеренная полнота — повод
+    проверить сам лист, но не потеря страницы документа.
+
+    Признак — `rescan_reason`. С DRAWING_DIAGNOSTICS_NOT_INDEXED
+    `finalize_fragments` (до `document_quality`) уносит его из payload в
+    `completeness_mechanisms["drawing_diagnostics"]`, а идентификатор
+    фрагмента меняет, поэтому смотрятся оба места. В payload для
+    потребителя признак не добавляется: без флага он ушёл бы в
+    индексируемый текст строкой «Метка: значение».
+    """
+    if "rescan_reason" in (fragment.content.structured_payload or {}):
+        return True
+    # Ключ — contract_finalize.DIAGNOSTICS_KEY; импорт оттуда был бы
+    # циклическим (contract_finalize импортирует этот модуль).
+    diagnostics = (fragment.completeness_mechanisms or {}).get("drawing_diagnostics")
+    return isinstance(diagnostics, dict) and "rescan_reason" in diagnostics
+
+
 def document_quality(fragments):
     """Один результат используется при первой выдаче и сохраняется в БД."""
     drawings = [fragment for fragment in fragments if fragment.type == "drawing"]
     warnings = list(dict.fromkeys(w for fragment in fragments for w in fragment.warnings))
+    # Листы перечитывания документ частичным не делают (см. _from_rescan).
+    judged = [fragment for fragment in drawings if not _from_rescan(fragment)]
     if settings.DRAWING_UNMEASURED_NOT_PARTIAL:
         # Неизмеренная полнота чтения — повод проверить фрагмент, но не
         # потеря страницы: документ partial только при реальной потере.
         covered = _transcribed_pages(drawings)
-        drawing_partial = any(_drawing_lost(fragment, covered) for fragment in drawings)
+        drawing_partial = any(_drawing_lost(fragment, covered) for fragment in judged)
     else:
-        drawing_partial = any(fragment.review_required for fragment in drawings)
+        drawing_partial = any(fragment.review_required for fragment in judged)
     return bool(drawing_partial
                 or any("DRAWING_NOT_RECOGNIZED" in f.warnings for f in fragments)), warnings

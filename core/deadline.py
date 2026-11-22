@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import contextvars
+import threading
 import time
 from contextlib import contextmanager
 from typing import Iterator, Optional
@@ -20,6 +21,19 @@ from typing import Iterator, Optional
 _deadline: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
     "parse_deadline", default=None
 )
+
+# Отмена работы, начатой в потоке (листы чертежа, VLM_SHEET_CONCURRENCY).
+# Обрыв задачи Celery приходит в главный поток; потоки листов о нём не
+# знают и продолжали бы ходить в модель уже после того, как задача
+# закончилась. Событие ставит тот, кто запустил потоки, а вызов модели
+# проверяет его перед каждым запросом (`check_cancelled`).
+_cancel: contextvars.ContextVar[Optional[threading.Event]] = contextvars.ContextVar(
+    "parse_cancel", default=None
+)
+
+
+class Cancelled(Exception):
+    """Работа отменена тем, кто её запустил: дальше не идти."""
 
 
 @contextmanager
@@ -36,6 +50,23 @@ def remaining() -> Optional[float]:
     """Сколько секунд осталось; None — срок не задан."""
     deadline = _deadline.get()
     return None if deadline is None else deadline - time.monotonic()
+
+
+@contextmanager
+def cancel_on(event: threading.Event) -> Iterator[None]:
+    """Внутри блока `check_cancelled` бросает `Cancelled`, когда `event` поставлен."""
+    token = _cancel.set(event)
+    try:
+        yield
+    finally:
+        _cancel.reset(token)
+
+
+def check_cancelled() -> None:
+    """Бросить `Cancelled`, если работа отменена. Вне `cancel_on` ничего не делает."""
+    event = _cancel.get()
+    if event is not None and event.is_set():
+        raise Cancelled()
 
 
 def bounded(budget: float, reserve: float = 0.0) -> float:

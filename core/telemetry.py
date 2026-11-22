@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
@@ -109,12 +110,28 @@ def collected() -> Optional[Dict[str, float]]:
     return _COLLECTOR.get()
 
 
+# Сборщик один на задачу, а дописывают в него и потоки листов чертежа, и
+# потоки плиток модели (контекст копируется, словарь тот же): сложение
+# «прочитать — прибавить — записать» без замка теряло бы слагаемые.
+_ADD_LOCK = threading.Lock()
+
+
 def add(stage: str, duration_ms: float) -> None:
-    """Дописать длительность в сборщик. Повторный этап суммируется."""
+    """Дописать длительность (или счёт) в сборщик. Повторный этап суммируется."""
     bucket = _COLLECTOR.get()
     if bucket is None:
         return
-    bucket[stage] = round(bucket.get(stage, 0.0) + duration_ms, 2)
+    with _ADD_LOCK:
+        bucket[stage] = round(bucket.get(stage, 0.0) + duration_ms, 2)
+
+
+def value(stage: str) -> float:
+    """Накопленное значение этапа в текущем сборщике; 0 вне области сбора."""
+    bucket = _COLLECTOR.get()
+    if bucket is None:
+        return 0.0
+    with _ADD_LOCK:
+        return float(bucket.get(stage, 0.0))
 
 
 # ===========================================================================

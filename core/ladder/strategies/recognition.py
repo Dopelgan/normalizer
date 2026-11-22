@@ -20,12 +20,13 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from core import filetypes
+from core import filetypes, outage
 from core.config import settings
 from core.ladder.base import Strategy
 from core.ladder.context import SOURCE_RASTER, DocumentContext
 from core.models.parse_result import ParsedBlock, ParseResult
-from core.providers.mineru_parser import MinerUParserProvider
+from core.providers import gpu_gate
+from core.providers.mineru_parser import MinerUParserProvider, MinerUPrefetch
 from core.providers.storage import StorageProvider
 from core.providers.tesseract_fallback import TesseractFallbackProvider
 
@@ -103,6 +104,15 @@ class LayoutStrategy(Strategy):
         # который уже сделал уровень 4, только потратив на него вдвое больше
         # времени. Лучше честно пропустить уровень: деградация уже отмечена.
         if not MinerUParserProvider.is_available():
+            # Растровому документу без MinerU остаётся плоский OCR: с
+            # PARSE_REQUEUE_ON_OUTAGE уровень остаётся в лестнице, а `run`
+            # ставит документ в очередь. Решает именно `run`: документ,
+            # которому хватило уровня 4, до уровня 5 не дойдёт и ждать
+            # сервис не будет.
+            if (outage.requeue_allowed()
+                    and (context.kind == filetypes.KIND_IMAGE
+                         or context.classification.source == SOURCE_RASTER)):
+                return True
             logger.warning(
                 "Уровень %d пропущен: MinerU недоступен, разбор остаётся на OCR",
                 self.level,
@@ -110,8 +120,37 @@ class LayoutStrategy(Strategy):
             return False
         return True
 
-    def run(self, context: DocumentContext) -> ParseResult:
-        result = self.provider.parse(context.uri, context.file_type, context.metadata)
+    def skipped_as_unavailable(self, context: DocumentContext) -> bool:
+        """
+        Растровый документ, которому уровень не достаётся только потому, что
+        MinerU помечен недоступным: без уровня 5 скан остаётся плоским OCR
+        (`PARSE_LAYOUT_UNAVAILABLE_NOTE`). Вектор сюда не попадает — он
+        читается по слою, и это не потеря.
+        """
+        if context.kind not in (filetypes.KIND_PDF, filetypes.KIND_IMAGE):
+            return False
+        if MinerUParserProvider.is_available():
+            return False
+        return (context.kind == filetypes.KIND_IMAGE
+                or context.classification.source == SOURCE_RASTER)
+
+    def prefetch(self, context: DocumentContext) -> MinerUPrefetch:
+        """Начать запрос к MinerU заранее — только HTTP, в одном потоке."""
+        return self.provider.prefetch(context.uri, context.file_type, context.metadata)
+
+    def run(
+        self, context: DocumentContext, prefetched: Optional[MinerUPrefetch] = None,
+    ) -> ParseResult:
+        if not MinerUParserProvider.is_available():
+            # Сюда без сервиса доходит только растр под PARSE_REQUEUE_ON_OUTAGE
+            # (`applicable`): документ в очередь (ServiceOutage).
+            outage.mineru_down("сервис помечен недоступным")
+        if prefetched is None:
+            result = self.provider.parse(context.uri, context.file_type, context.metadata)
+        else:
+            result = self.provider.parse(
+                context.uri, context.file_type, context.metadata, prefetched=prefetched
+            )
         if not result.blocks:
             raise ValueError("Разбор с детекцией областей не дал блоков")
         result.parser_name = result.parser_name or self.name
@@ -278,7 +317,8 @@ class VlmEscalationStrategy(Strategy):
             "prompt": settings.VLM_PROMPT,
         }
         try:
-            response = requests.post(
+            response = gpu_gate.call(
+                gpu_gate.VLM, settings.VLM_TIMEOUT + 30, requests.post,
                 f"{settings.VLM_ENDPOINT.rstrip('/')}/parse",
                 json=payload, timeout=settings.VLM_TIMEOUT,
             )

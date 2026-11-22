@@ -162,6 +162,43 @@ class TestCountingRun:
     def test_broken_count_is_not_a_run(self):
         assert counting_run([f"X{n % 20}" for n in range(1, 100)]) is None
 
+    def test_a_run_from_the_start_of_its_series_keeps_its_head(self):
+        """Ряд с единицы голову сохраняет: он мог быть настоящим и сорваться."""
+        real = ["ТАДУ 421451.003-01 Э4", "380 В"]
+        run = [f"XT{n}" for n in range(1, 121)]
+
+        class Counting:
+            def post(self, url, json=None, headers=None, timeout=None):
+                return Response(reply(_json(real + run), finish="length"))
+
+        lines, cut = client(Counting())._transcribe_piece(quartered())
+        assert cut is True
+        assert lines[:2] == real
+        # Сохранены первые тридцать строк ряда, хвост отброшен.
+        assert "XT30" in lines and "XT31" not in lines
+
+    def test_the_whole_invented_count_is_dropped_not_only_its_tail(self):
+        """Из сбитого счёта в текст листа не попадает ни одна строка.
+
+        Проверено на настоящем листе: ряд начинался с «XT21» и шёл до «XT1131»,
+        а XT1…XT20 на листе не было — значит начала у ряда нет и первые его
+        строки такая же выдумка, как последние. Прежде оставались первые
+        тридцать, и «XT34» попадал в текст чертежа, в индекс и в цитаты.
+        """
+        real = ["ТАДУ 421451.003-01 Э4", "380 В", "Кабель ВВГнг(А)-LS 5x6"]
+        invented = [f"XT{n}" for n in range(21, 121)]
+
+        class Counting:
+            def post(self, url, json=None, headers=None, timeout=None):
+                return Response(reply(_json(real + invented), finish="length"))
+
+        lines, cut = client(Counting())._transcribe_piece(quartered())
+        # Ответ помечен оборванным: лист дочитывается частями, и настоящий ряд
+        # клемм, если он там есть, читается заново крупнее.
+        assert cut is True
+        assert lines == real
+        assert not any(line.startswith("XT") for line in lines)
+
 
 class TestMerge:
     def test_overlap_duplicate_dropped_repeat_inside_part_kept(self):

@@ -1,7 +1,9 @@
 # Карта кода Parser/Normalizer
 
 Навигация по коду: какой **файл** и какая **функция** владеют каждым шагом и каждым
-решением. Выведена из кода (базовый коммит `5040065`), не из документации.
+решением. Выведена из кода (базовый коммит `fd0c0e5`), не из документации.
+Номера строк проверены на этом коммите; ветка чертежей за 65 коммитов от `5040065`
+уехала на 60–200 строк, поэтому номер строки сверять, а не верить.
 
 ## Как пользоваться картой
 
@@ -65,7 +67,7 @@
 | 2 | `PdfTextLayerStrategy` (текстовый слой PDF) | `core/ladder/strategies/native_text.py:40` |
 | 2 | `DocxStrategy` | `core/ladder/strategies/native_text.py:81` |
 | 2 | `PlainTextStrategy` | `core/ladder/strategies/native_text.py:162` |
-| 3 | `SpreadsheetStrategy` | `core/ladder/strategies/tabular.py:53` |
+| 3 | `SpreadsheetStrategy` | `core/ladder/strategies/tabular.py:70` |
 | 4 | `PlainOcrStrategy` (Tesseract целиком) | `core/ladder/strategies/recognition.py:35` |
 | 5 | `LayoutStrategy` (MinerU) | `core/ladder/strategies/recognition.py:73` |
 | 6 | `RestoreThenLayoutStrategy` (выправка → MinerU) | `core/ladder/strategies/recognition.py:121` |
@@ -89,38 +91,45 @@
 
 | Стадия | Файл | Функция |
 |---|---|---|
-| **Вся ветка чертежей** | `core/drawing_processor.py` | `DrawingProcessor.process` (130), `enrich_fragments` (358) — вызывается из `ingest/tasks.py:513` |
-| Разметка листа геометрией | `core/drawing_processor.py` | `_sheet_drawings` (434) |
-| Проход «перепиши лист целиком» | `core/drawing_processor.py` | `_transcribe` (557) → `core/providers/qwen_client.py` |
-| Проход по штампу | `core/drawing_processor.py` | `_read_title_block` (592), `_read_title_block_fields` (635); канонические метки — `core/providers/title_block.py` `LABELS` |
-| Проход по боковым графам | `core/drawing_processor.py` | `_read_side_column` (700) |
-| Проход по таблицам листа | `core/drawing_processor.py` | `_read_table` (717) |
-| Поля из аннотаций векторного PDF | `core/drawing_processor.py` | `_fields_from_annotations` (737); категории — `core/providers/vector_drawing.classify` |
-| Клиент Qwen-VL, разрезание листа на плитки | `core/providers/qwen_client.py` | `transcribe` / `transcribe_sheet` (397) |
+| **Вся ветка чертежей** | `core/drawing_processor.py` | `DrawingProcessor.process` (131), `enrich_fragments` (489) — вызывается из `ingest/tasks.py:598` |
+| Разметка листа геометрией | `core/drawing_processor.py` | `_sheet_drawings` (645) |
+| Проходы листа (лист, текст, штамп, таблицы) и их сведение | `core/drawing_processor.py` | `_process`: проходы — замыкания `sheet_pass`, `transcribe_pass`, `region_pass`, исполнитель — `_Passes` (`DRAWING_PASSES_PARALLEL`) |
+| Проход «перепиши лист целиком» | `core/drawing_processor.py` | `_transcribe` (768) → `core/providers/qwen_client.py` |
+| Проход по штампу | `core/drawing_processor.py` | `_read_title_block` (803), `_read_title_block_fields` (846); канонические метки — `core/providers/title_block.py` `LABELS` |
+| Проход по боковым графам | `core/drawing_processor.py` | `_read_side_column` (911) |
+| Проход по таблицам листа | `core/drawing_processor.py` | `_read_table` (928) |
+| Поля из аннотаций векторного PDF | `core/drawing_processor.py` | `_fields_from_annotations` (948); категории — `core/providers/vector_drawing.classify` |
+| Клиент Qwen-VL, разрезание листа на плитки | `core/providers/qwen_client.py` | `transcribe` (621) / `transcribe_sheet` (635); единственная точка вызова модели — `_ask_text` (781) |
 | Геометрия и повороты листа | `core/providers/drawing_vision.py`, `core/providers/raster_drawing.py` | — |
 | Выправка размеров построчно | `core/providers/dimension_fidelity.py` | `repair_lines` |
 | Нормализация строки чертежа (⌀, ±, гомоглифы) | `core/providers/drawing_text.py` | `normalize` |
-| **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (301), строка 329: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (312) |
+| Сведение прочтений поля по странице (`DRAWING_READINGS_RECONCILED`) | `core/providers/reading_reconcile.py` | `apply`, `reconcile_page`, `choose` |
+| **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
 | Качество фрагмента чертежа | `core/drawing_quality.py` | `apply_drawing_quality` (7), `document_quality` (71) |
 | Правка абзацев OCR по строкам листа | `core/drawing_transcript.py` | `_page_transcripts` (88) |
+| **Пересборка текста записи по частям** (`DRAWING_RECORD_COMPOSED`) | `core/drawing_record.py` | `apply` (236), `compose_fragment` (292), разметка частей для чанкера — `_part_index` (363); часть «остальные надписи» — `_other_marks`; вид при размере — `_views_of` |
+| Разметка частей обычного документа | `core/document_parts.py` | — |
+| Учёт разбора в сторону от индекса (`DRAWING_DIAGNOSTICS_NOT_INDEXED`) | `core/contract_finalize.py` | `_diagnostics_aside` |
 | Снятие устаревших источников | `core/drawing_stale_sources.py` | — |
-| **Решение «чертёж против OCR»** | `core/ladder/drawing_route.py` | `settle` (124) — вызывается из `ingest/tasks.py:516`; `deferred` (77), `volume` (94), `lost` (206), `thinner_kept` (211) |
+| **Решение «чертёж против OCR»** | `core/ladder/drawing_route.py` | `settle` (173) — вызывается из `ingest/tasks.py:601`; `deferred` (84), `volume` (143), `lost` (320), `thinner_kept` (325) |
 
 **Сборщика и переупорядочивания строк листа нет.** Текст записи чертежа — строки
 модели в порядке выдачи, правленные построчно (`dimension_fidelity`, `drawing_text`).
 Структурные данные (`structured_drawing_fields`, `structured_payload["tables"]`) в текст
 сознательно **не** попадают: в `payload` остаётся только `transcript_line_count`
-(`drawing_processor.py:314`), чтобы потребитель не индексировал текст дважды.
+(`drawing_processor.py:445`), чтобы потребитель не индексировал текст дважды.
 
 ### 1.6. Нормализация во фрагменты и контракт наружу
 
 | Стадия | Файл | Функция |
 |---|---|---|
 | Блоки → фрагменты контракта | `core/normalizer/normalizer.py` | `TextNormalizer.normalize` (73), `normalize_with_flags` (80) |
+| **Рамка бланка и переносы обычного документа** | `core/document_furniture.py` | `apply`, `is_furniture`, `without_splices`, `without_hyphen_breaks` — вызывается из `core/contract_finalize.finalize_fragments` |
+| Ярлык/заголовок и его текст одним фрагментом | `core/document_parts.py` | `apply`, `is_label_line`, `is_heading_line` |
 | Полнота текста/таблиц/формул | `core/normalizer/completeness.py` | `PageCoverage` (17), `TextLayerRecall` (59), `table_completeness` (103), `formula_completeness` (117) |
 | Чанкование | `core/strategies/factory.py` + `fixed_size.py`, `paragraph.py`, `semantic.py` | — |
 | Извлечение фактов | `core/facts/extractor.py` | `extract_facts` (426); `facts_from_text` (281), `facts_from_table` (328), `facts_from_drawing_fields` (375) |
-| **Стабильные `fragment_id`, финал контракта** | `core/contract_finalize.py` | `finalize_fragments` (123); подпись — `_content_signature` (33), id — `stable_fragment_id` (58), хеш — `normalized_content_hash` (184) |
+| **Стабильные `fragment_id`, финал контракта** | `core/contract_finalize.py` | `finalize_fragments` (126); подпись — `_content_signature` (36), id — `stable_fragment_id` (61), хеш — `normalized_content_hash` (281) |
 | Сборка `DocumentResult` | `ingest/tasks.py` | `build_document_result` (253), `finalize` (288), `page_report` (218), `build_warnings` (245) |
 | Классификация ошибки, ретраи | `ingest/tasks.py` | `classify_error` (158), `build_error_document` (190) |
 | Состояние пакетного запроса (Redis) | `core/result_aggregator.py` | `init_request_state` (70), `put_document_result` (152), `compute_status` (304), `_expire_lost_files` (234) |
@@ -139,12 +148,15 @@
 
 | Флаг | По умолчанию | Читает |
 |---|---|---|
+| `LADDER_SKIP_OCR_ON_TEXT_LAYER` | `false` | `core/ladder/router.py` (условие — `core/ladder/text_layer_complete.py`) |
+| `LADDER_PARALLEL_LAYOUT` | `false` | `core/ladder/router.py` (запрос заранее — `core/providers/mineru_parser.py::MinerUPrefetch`, `core/ladder/strategies/recognition.py::LayoutStrategy.prefetch`) |
 | `LADDER_DRAWING_OVER_OCR` | `false` | `core/ladder/drawing_route.py`, `core/ladder/router.py`, `core/models/parse_result.py`, `ingest/tasks.py` |
 | `DRAWING_VISION_ENABLED` | `true` | `core/drawing_processor.py` |
 | `DRAWING_TEXT_IN_FRAME_ENABLED` | `false` | `core/drawing_processor.py`, `core/providers/vector_drawing.py` |
 | `DRAWING_PAGE_CLASSIFIER_ENABLED` | `false` | `core/drawing_processor.py`, `core/providers/vector_drawing.py` |
 | `DRAWING_TITLE_BLOCK_PASS` | `false` | `core/drawing_processor.py`, `core/providers/qwen_client.py` |
 | `DRAWING_SIDE_COLUMN_READ` | `true` | `core/drawing_processor.py` |
+| `VLM_RESPONSE_CACHE` | `false` | `core/providers/qwen_client.py` (`cache_key`/`cache_get`/`cache_put`, вызов из `_ask_text` 781) |
 | `DRAWING_IMAGE_FULL_READ` | `false` | `core/drawing_processor.py`, `core/drawing_quality.py`, `core/ladder/drawing_route.py` |
 | `DRAWING_PDF_FULL_READ` | `false` | `core/drawing_processor.py`, `core/drawing_quality.py` |
 | `DRAWING_TRANSCRIBE_TILES` | `false` | `core/providers/qwen_client.py`, `core/drawing_processor.py`, `core/drawing_quality.py` |
@@ -154,10 +166,25 @@
 | `DRAWING_DIMENSION_FIDELITY` | `false` | `core/providers/dimension_fidelity.py`, `core/providers/drawing_text.py`, `core/drawing_processor.py`, `core/providers/qwen_client.py`, `core/providers/mineru_parser.py`, `core/providers/vector_drawing.py` |
 | `DRAWING_MATERIAL_NO_TOLERANCE` | `false` | `core/drawing_processor.py` |
 | `DRAWING_SHEET_MISSING_PAGES` | `false` | `core/drawing_processor.py` |
+| `DRAWING_RECORD_COMPOSED` | `false` | `core/drawing_record.py`, `core/contract_finalize.py`, `core/document_parts.py` |
+| `DRAWING_VALUE_VIEW_LINKS` | `false` | `core/providers/drawing_views.py`, `core/drawing_processor.py` |
+| `DRAWING_DIAGNOSTICS_NOT_INDEXED` | `false` | `core/contract_finalize.py` |
+| `DRAWING_RECORD_WITHOUT_SHEET_TEXT` | `false` | `core/drawing_record.py` |
+| `DRAWING_RECORD_USES_VALUE_LINKS` | `false` | `core/drawing_record.py` |
+| `DRAWING_RECORD_STAMP_FROM_FIELDS` | `false` | `core/drawing_record.py` |
+| `DRAWING_RECORD_ALL_FIELDS_SAID` | `false` | `core/drawing_record.py` |
+| `DRAWING_RECORD_ANY_FIELD_FRAGMENT` | `false` | `core/drawing_record.py` |
+| `SCAN_DROP_FRAME_FURNITURE` | `false` | `core/document_furniture.py`, `core/contract_finalize.py` |
+| `SCAN_JOIN_HYPHENATED_WORDS` | `false` | `core/document_furniture.py`, `core/contract_finalize.py` |
+| `DOCUMENT_HEADING_WITH_BODY` | `false` | `core/document_parts.py` |
+| `DRAWING_FIELD_CATEGORY_STRICT` | `false` | `core/providers/vector_drawing.py` |
+| `DRAWING_CATEGORY_PROSE_GUARD` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_SMALL_PRINT_CARE` | `false` | `core/providers/qwen_client.py` |
+| `DRAWING_SHEET_COMPACT_JSON` | `false` | `core/providers/qwen_client.py` (`_sheet_prompt`, `as_annotations`, `compact_annotation`) |
 | `DRAWING_AUTO_ROTATE` | `true` | `core/providers/drawing_vision.py` |
 | `RASTER_FRAME_THIN_LINES` | `false` | `core/providers/raster_drawing.py` |
 | `FRAME_TABLE_GUARD_ENABLED` | `false` | `core/providers/mineru_parser.py` |
+| `STAMP_ROW_HEADER_FIX` | `true` | `core/providers/mineru_parser.py` |
 | `OCR_LAYER_ENABLED` | `true` | `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |
 | `OCR_LAYER_DROP_LOW_CONFIDENCE` | `false` | `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |
 | `OCR_LAYER_DROP_REPEATED` | `false` | `core/providers/mineru_parser.py` |
@@ -170,6 +197,13 @@
 | `DOC_CONVERT_ENABLED` | `true` | `core/providers/office_convert.py` |
 | `INTAKE_FORWARD_TO_PARSER` | `false` | `core/intake/pipeline.py`, `gateway/api.py`, `quality/api.py` |
 | `S3_READONLY` | `true` | `core/providers/storage.py` |
+| `PARSE_REQUEUE_ON_OUTAGE` | `false` | `core/outage.py`; бросают `core/ladder/strategies/recognition.py::LayoutStrategy.applicable`, `core/providers/mineru_parser.py::parse`, `core/drawing_processor.py::enrich_fragments` (итог вызовов из `qwen_client._post`); ловит и ставит в очередь `ingest/tasks.py::process_document` |
+| `GPU_GATE_ENABLED`, `GPU_GATE_YIELD_ON_WAITING` | `false`, `true` | `core/providers/gpu_gate.py`; места берут `core/providers/qwen_client.py::_post`, `core/providers/mineru_parser.py::_parse_with_mineru`, `core/ladder/strategies/recognition.py::VlmEscalationStrategy.run`; часы бюджета листа — `core/drawing_processor.py` |
+| `PARSE_LAYOUT_UNAVAILABLE_NOTE` | `false` | `core/ladder/router.py` (`LAYOUT_UNAVAILABLE`; признак — `core/ladder/strategies/recognition.py::LayoutStrategy.skipped_as_unavailable`) |
+| `DRAWING_LOST_SHEETS_SKIPPED` | `false` | `core/drawing_processor.py` (`_sheet_drawings`) |
+| `SCAN_CANONICAL_IDS` | `false` | `core/contract_finalize.py` → `core/providers/canonical_ids.py`; список серий — `core/gateway/profile.load_section("scan_identity")`; факты — `core/facts/extractor.identity_fact` |
+| `DRAWING_SHEET_GUARDED`, `DRAWING_SHEET_SCHEMA` | `false`, `true` | `core/providers/qwen_client.py` (`read_sheet`, `_ask_sheet_guarded`, `sheet_verdict`, `sheet_answer_accepted`; кэш — `accept` в `_ask_text`); пустой ответ — `core/drawing_processor.py::_guard_empty_sheet`; отчёт по кэшу — `tools/vlm_cache_guard_report.py` |
+| `DRAWING_READINGS_RECONCILED` | `false` | `core/drawing_processor.py::enrich_fragments` → `core/providers/reading_reconcile.apply`; пометка в записи — `core/drawing_record._with_tolerance` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
 
@@ -183,6 +217,9 @@
 | `DRAWING_MIN_COMPLETENESS` = `0.90`, `DRAWING_MIN_FACT_CONFIDENCE` | константы кода | `core/processing_contract.py` → `core/drawing_quality.py` | когда фрагмент чертежа «потерян» |
 | `DRAWING_TIME_BUDGET` | `420` | `core/drawing_processor.py` (`_out_of_time` 587, `_transcribe` 566), `core/providers/qwen_client.py` | бюджет **на лист** (не на документ) |
 | `DRAWING_MAX_SHEETS` | `6` | `core/drawing_processor.py` | сколько листов читается моделью |
+| `VLM_SHEET_CONCURRENCY` | `1` | `core/drawing_processor.py` (`_read_sheets`) | сколько листов документа читается одновременно; порядок и результат не меняются |
+| `DRAWING_PASSES_PARALLEL` | `1` | `core/drawing_processor.py` (`_process`, `_Passes`); пул соединений — `core/providers/qwen_client.py::pool_size` | сколько проходов одного листа идут разом; запись листа не меняется |
+| `GPU_GATE_*_SLOTS_DAY/_NIGHT`, `GPU_GATE_BUSY_HOURS_UTC`, `QWEN_REQUEST_PRIORITY` | `2/10`, `2/6`, `4-13`, не задан | `core/providers/gpu_gate.py`; приоритет — `core/providers/qwen_client.py::_post` | сколько фоновых вызовов vLLM и MinerU разом на все воркеры; поле `priority` в vLLM |
 | `DRAWING_MAX_REGIONS` | `4` | `core/drawing_processor.py`, `core/providers/drawing_vision.py` | сколько областей на лист |
 | `DRAWING_RENDER_DPI` | `200` | `core/drawing_processor.py` | — |
 | `DRAWING_TRANSCRIBE_MAX_SIDE` / `_MAX_TOKENS` | `2800` / `8192` | `core/providers/qwen_client.py` | — |
@@ -190,6 +227,7 @@
 | `QWEN_SHEET_MAX_SIDE`, `QWEN_REGION_MAX_SIDE`, `QWEN_REGION_UPSCALE`, `QWEN_TITLE_BLOCK_MAX_SIDE`, `QWEN_TITLE_BLOCK_UPSCALE` | — | `core/providers/qwen_client.py`, `core/providers/drawing_vision.py`, `core/drawing_processor.py` | размеры картинок проходов |
 | `QWEN_ENDPOINT/_MODEL/_TIMEOUT/_RETRIES/_MAX_TOKENS/_TEMPERATURE` | — | `core/providers/qwen_client.py` | — |
 | `VLM_ENDPOINT`, `VLM_PROMPT` | — | `core/ladder/strategies/recognition.py` | уровень 7 |
+| `VLM_RESPONSE_CACHE_DIR` | пусто → `{ARTIFACTS_MOUNT}/vlm-cache` | `core/providers/qwen_client.py` | где лежит кэш ответов модели |
 | `VLM_TIMEOUT` | `180` | `core/providers/qwen_client.py`, `core/providers/table_vlm.py`, `core/drawing_processor.py`, `core/ladder/strategies/recognition.py` | один вызов модели |
 | `OCR_TIME_BUDGET` | `1200` | `core/providers/tesseract_fallback.py`, `core/providers/mineru_parser.py`, `core/ladder/strategies/recognition.py` | — |
 | `OCR_FULL_MAX_PAGES` | `300` | те же три файла | — |
@@ -204,6 +242,7 @@
 | `PARSE_DEADLINE_RESERVE` | `120` | `ingest/tasks.py` | резерв на финал |
 | `PARSE_STALE_MARGIN_SECONDS` | `300` | `core/result_aggregator.py` | когда файл признан потерянным |
 | `CELERY_TASK_MAX_RETRIES` | `3` | `ingest/tasks.py` | — |
+| `PARSE_OUTAGE_RETRY_SECONDS`, `PARSE_OUTAGE_MAX_WAIT_SECONDS` | `120`/`3600` | `ingest/tasks.py`, `core/outage.py` | пауза перед повтором при отказе сервиса и предел ожидания с первого отказа |
 | `CELERY_ML_QUEUE`, `CELERY_INTERACTIVE_QUEUE`, `CELERY_INTAKE_QUEUE` | — | `core/celery_app.py`, `ingest/api.py`, `ingest/tasks.py` | маршрутизация по очередям |
 | `RESULT_TTL_SECONDS`, `RESULT_DELIVERY_TYPE`, `RESULT_CALLBACK_URL` | — | `core/result_aggregator.py`, `core/result_delivery.py`, `ingest/api.py` | — |
 | `QG_SIMILARITY_THRESHOLD`, `QG_MAX_AGE_DAYS`, `QG_OCR_WARN_CONFIDENCE`, `QG_OCR_BLOCK_CONFIDENCE`, `QG_OCR_PAGES`, `QG_OCR_UNREADABLE_SHARE`, `QG_MAX_SIZE_BYTES` | — | `core/quality/service.py` | гейт качества |
@@ -239,16 +278,23 @@
    сверить `git rev-list --count HEAD..origin/main`: несколько копий отстали
    (например `_worktrees/Super-RAG-fast-route-20261108` — на 164 коммита, и в ней есть
    незакоммиченные правки). Файл, прочитанный в устаревшей копии, может не совпадать с main.
-2. **Известное падение теста, не регрессия:** `tests/unit/test_structural_contract.py:269`
-   `test_rag_profile_matches_agreed_parameters` падает, потому что в репозитории нет
-   `config/rag-consumer-profile.yaml` (есть только `config/profile.example.yaml`). Ожидаемый
-   результат `python -m pytest tests/unit -q` — PASS + этот один FAIL.
+2. **Контракт потребителя RAG:** `config/rag-consumer-profile.yaml` восстановлен из
+   принятого локального commit `6add4d9`; полная ревизия bge-m3 синхронизирована с
+   `core/processing_contract.py`. Прежнее отсутствие профиля и укороченная ревизия
+   были дефектом этой базы. `test_rag_profile_matches_agreed_parameters` проверяет
+   согласованность и длину pin; фактически загруженную модель он не аттестует.
 3. **`DRAWING_SHEETS_SKIPPED:7,8` — список страниц, а не количество.** Собирается в
-   `core/drawing_processor.py:505`. В RAG эта же строка разбирается по префиксу
+   `core/drawing_processor.py:716`. В RAG эта же строка разбирается по префиксу
    (`super_rag/parser/completeness.py`), поэтому формат менять нельзя.
-4. **`DRAWING_TIME_BUDGET` — бюджет на лист** (`core/drawing_processor.py:587`,
-   `:566`), по умолчанию 420 с. Предел задачи — другой: `PARSE_TASK_SOFT_TIME_LIMIT=3600` /
-   `PARSE_TASK_TIME_LIMIT=3900`. Их не складывать и не путать.
+4. **`DRAWING_TIME_BUDGET` — бюджет на лист** (`core/drawing_processor.py:887`,
+   `:865`), по умолчанию 420 с. Предел задачи — другой: `PARSE_TASK_SOFT_TIME_LIMIT=3600` /
+   `PARSE_TASK_TIME_LIMIT=3900`, и они объявлены на самой задаче
+   (`ingest/tasks.py:443-444`), поэтому **именно они и действуют**: `--time-limit=600
+   --soft-time-limit=540` в командной строке воркеров — лишь предел пула для задач,
+   которые своего не объявили (celery 5.4.0, `worker/request.py:363`: `timeout=time_limit
+   or task.time_limit`). Проверено на проде 14.11: 12 разборов завершились успешно
+   дольше 600 с (до 2918 с), `SoftTimeLimitExceeded` за 36 ч — ни одного.
+   Их не складывать и не путать.
 5. **Имя предупреждения решает, попадёт ли документ к человеку.** RAG считает текст
    полным при `partial`, если **все** предупреждения — из списка
    `_ADVISORY_PARSER_WARNINGS` / `_ADVISORY_PARSER_WARNING_PREFIXES`
@@ -275,16 +321,67 @@
 9. **`content.text` фрагмента чертежа — ещё и внутренний носитель.**
    `core/drawing_transcript.py::_page_transcripts` (88) режет его по `"\n"` и считает
    каждый кусок одной строкой модели, чтобы править абзацы OCR на той же странице. Кроме
-   того `core/ladder/drawing_route.volume` (94) считает **символы** `content.text` для
+   того `core/ladder/drawing_route.volume` (143) считает **символы** `content.text` для
    сравнения «чертёж против OCR» — всё добавленное в текст раздувает этот счёт. При этом
-   `core/contract_finalize._content_signature` (41) для чертежа хеширует поля и таблицы,
+   `core/contract_finalize._content_signature` (36) для чертежа хеширует поля и таблицы,
    а не текст, поэтому `fragment_id` от правок текста не меняется.
-10. **Единственное место сборки текста чертежа — `build_fragment`** (строка 329).
+10. **Место сборки текста чертежа — `build_fragment`** (строка 474), а при
+    `DRAWING_RECORD_COMPOSED` текст пересобирается вторым и последним местом —
+    `core/drawing_record.compose_fragment`, из `core/contract_finalize.py`.
     `core/providers/vector_drawing.py` своих `Content` не создаёт и `text` не ставит
-    (проверено: конструкций `Content(` там нет). Если появится второй путь — эту строку
+    (проверено: конструкций `Content(` там нет). Если появится третий путь — эту строку
     и п. 9 править.
 11. **Запись идёт не туда, откуда пришёл файл.** При `S3_READONLY=true` (по умолчанию)
     всё производное пишется в `ARTIFACTS_MOUNT`, а не в исходный бакет
     (`core/providers/storage.py`).
 12. **`MAX_IMAGE_PIXELS`, `CONFIDENCE_THRESHOLD`, `HF_TOKEN` объявлены, но не читаются.**
     Менять их бессмысленно — поведение не изменится.
+13. **Любой наш ключ `structured_payload` по умолчанию становится искомым
+    текстом.** Адаптер RAG (`super_rag/parser/adapter.drawing_search_text`)
+    перебирает ключи payload и выводит строкой «Метка: значение» каждый, которого
+    нет в его собственном списке `_DRAWING_PAYLOAD_TECHNICAL_KEYS` (там 11 имён:
+    `layout`, `model`, `coordinate_reference`, `regions_read`, `regions_skipped`,
+    `detected_count`, `recognition_mode`, `sheet_type`, `tables`, `title_block`,
+    `page_score`). Поэтому `value_links` ушёл в индекс целиком, с рамками надписей
+    и причинами непривязки (42 чанка из 19 699 на проде). Делается это **только**
+    у фрагмента с пустым `content.text` — у фрагмента с текстом индексируется
+    текст, — но таких фрагментов большинство (на проде 4687 из 5110). Добавляя
+    ключ в payload, либо вносить его в список на стороне RAG, либо держать учёт в
+    `completeness_mechanisms` (`DRAWING_DIAGNOSTICS_NOT_INDEXED`): это поле RAG не
+    читает вовсе (`extra="ignore"`), и в текст оно не попадает ниоткуда.
+14. **Хвост «(требует сверки)» ставит RAG, а не Normalizer.**
+    `DRAWING_UNCONFIRMED_MARK` в `super_rag/parser/adapter.py` дописывается к
+    каждой строке поля, у которого `confirmed is not True`, а подтверждает
+    Normalizer почти ничего (порог 0.95). На проде таких хвостов 8633 на 327
+    документов, и они доходят до ответа на экране. Из Normalizer это убирается
+    только тем, что фрагменту даётся собранный `content.text`: тогда адаптер
+    индексирует текст и строк полей не строит вовсе.
+15. **`title_block.fix_designation` — единственное место, где меняется группировка
+    цифр в обозначении** (`_split_triples`, строка 245): слипшийся хвост делится по
+    три цифры, `ТАДУ 687000.001001` → `ТАДУ 687000.001.001`. Это приведение к
+    ГОСТ 2.201, и оно верное, но применяется **только** к графе штампа. Текст
+    листа и распознавание остаются с прочтением модели, поэтому в одном документе
+    оказываются два написания одного обозначения (на проде 207 документов из 327).
+    Проверено: `drawing_text.normalize`, `dimension_fidelity.repair_lines` и
+    `designation_repair` группировку цифр не меняют ни в одну сторону, а формы с
+    лишней точкой («ГОСТ 14.771-76», «4.00007.002») не даёт ни один проход кода —
+    они приходят с чтения.
+16. **Короткий чанк — это почти всегда текстовый документ, а не чертёж.**
+    Замер по выгрузке индекса 50 документов прода: 2901 чанк, медиана 158
+    символов, короче 120 — 1195, то есть 41,2 %. Из этих 1195 **ни один** не
+    приходит от чертёжного фрагмента, а чанки собранной записи чертежа (52 в
+    выборке) имеют медиану 1338 и ни одного короче 120. Короткие — это рамка
+    бланка текстового документа (270), заголовок в отрыве от своего текста
+    (262), обрывки распознавания (60), строки полей адаптера RAG (63) и
+    короткие фразы настоящих документов (516); девять сканированных РЭ/ПС/СТП
+    держат 1003 из 1195. Искать причину в ветке чертежей — терять время.
+17. **Долю коротких чанков снятием мусора почти не сдвинуть, и это
+    арифметика, а не свойство правила.** Снятый короткий чанк уходит и из
+    числителя, и из знаменателя: 240 снятых рамок дают 41,2 % → 36,6 %, а не
+    41,2 % → 29,8 %, как выходит, если вычесть только из числителя (так было
+    посчитано в первом докладе, и это было неверно). Долю двигает упаковка
+    соседних обрывков — она переносит чанк из коротких в длинные, а не
+    удаляет, — и она на стороне RAG (`super_rag/ingest/normalize/service.py`).
+    Со стороны Normalizer честные метрики другие: сколько мусорных чанков
+    снято, сколько подписей граф вырезано из читаемого текста и сколько слов
+    снова находится поиском.

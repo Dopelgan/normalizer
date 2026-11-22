@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
@@ -23,10 +24,10 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from core import filetypes, telemetry
 from core.celery_app import app
-from core import deadline
+from core import deadline, outage
 from core import document_parts
 from core.config import settings
-from core.processing_contract import PROCESSING_PROFILE_VERSION
+from core.processing_contract import processing_profile_version
 from core.drawing_quality import document_quality
 from core.contract_finalize import finalize_fragments, normalized_content_hash
 from core.db.session import SessionLocal
@@ -204,7 +205,7 @@ def build_error_document(
     return DocumentResult(
         s3_fileid=s3_fileid,
         status="error",
-        processing_profile_version=PROCESSING_PROFILE_VERSION,
+        processing_profile_version=processing_profile_version(),
         document_metadata=DocumentMetadata(
             doc_id=doc_id,
             language=settings.DEFAULT_LANGUAGE,
@@ -367,6 +368,9 @@ def build_document_result(
         warnings=list(extra.get("warnings") or []),
         processing_profile_version=extra.get("processing_profile_version"),
         review_required=bool(extra.get("review_required", False)),
+        # Повторная выдача обязана называть полноту так же, как свежий разбор.
+        text_incomplete=extra.get("text_incomplete"),
+        unread_text_pages=list(extra.get("unread_text_pages") or []),
     ).model_dump(mode="json")
 
 
@@ -447,6 +451,7 @@ def process_document(
     operation: str = "create",
     dialog_id: str = "",
     event_id: str = "",
+    outage_since: float = 0.0,
 ) -> Dict[str, Any]:
     """
     Обрабатывает один файл пакета. Возвращает краткий статус для логов.
@@ -454,6 +459,9 @@ def process_document(
     `event_id` — идентификатор lifecycle-события, по которому результат
     сопоставляется с исходным событием; в синхронном разборе его нет, там
     есть `dialog_id`. Один вместо другого не подставляется.
+
+    `outage_since` — когда документ впервые застал отказ MinerU или
+    Qwen-VL (PARSE_REQUEUE_ON_OUTAGE); 0 — не заставал.
     """
     mark_started(request_id, s3_fileid)
     doc_id = generate_doc_id(s3_fileid)
@@ -474,6 +482,8 @@ def process_document(
         settings.PARSE_TASK_SOFT_TIME_LIMIT - settings.PARSE_DEADLINE_RESERVE
     )
     deadline_scope.__enter__()
+    outage_scope = outage.scope(outage_since)
+    outage_scope.__enter__()
 
     try:
         # ------------------------------------------------------ 1. Поиск файла
@@ -489,10 +499,10 @@ def process_document(
             )
             return {"status": "error", "doc_id": doc_id, "reason": "source_not_found"}
 
+        source_name = original_name(s3_fileid, storage, located.uri)
         logger.info(
             "Документ %s: снимок %s, исходное имя «%s», тип .%s",
-            doc_id, s3_fileid,
-            original_name(s3_fileid, storage, located.uri) or "неизвестно",
+            doc_id, s3_fileid, source_name or "неизвестно",
             located.file_type or "?",
         )
 
@@ -502,7 +512,7 @@ def process_document(
             document = doc_repo.get(doc_id, for_update=True)
 
             if (document is not None and document.status == "indexed" and operation != "update"
-                    and (document.extra_data or {}).get("processing_profile_version") == PROCESSING_PROFILE_VERSION
+                    and (document.extra_data or {}).get("processing_profile_version") == processing_profile_version()
                     and (document.extra_data or {}).get("page_coverage_version") == PAGE_COVERAGE_VERSION):
                 logger.info("Документ %s уже проиндексирован, отдаём из БД", doc_id)
                 fragments = [row_to_fragment(r) for r in ChunkRepository(session).get_by_doc_id(doc_id)]
@@ -512,7 +522,9 @@ def process_document(
                 finalize(request_id, s3_fileid, cached, dialog_id, event_id)
                 return {"status": "already_processed", "doc_id": doc_id}
 
-            if document is not None and document.status == "pending":
+            # Повтор после отказа сервиса находит документ в pending, который
+            # оставила ему прошлая задача этого же файла: это не чужой разбор.
+            if document is not None and document.status == "pending" and not outage_since:
                 # Порог — жёсткий лимит разбора с запасом, а не таймаут
                 # синхронного ответа (900 с): иначе живой часовой разбор
                 # считается зависшим и запускается второй раз.
@@ -612,7 +624,9 @@ def process_document(
         # она заменяет фрагменты и вставляет разбор листа целиком, и только
         # теперь состав документа окончателен.
         with telemetry.measure("parse.facts", doc_id=doc_id) as span:
-            fragments, id_map = finalize_fragments(fragments, doc_id, s3_fileid)
+            fragments, id_map = finalize_fragments(
+                fragments, doc_id, s3_fileid, source_name=source_name,
+            )
             span["facts"] = sum(len(f.extracted_facts) for f in fragments)
         flags_by_id = {
             id_map.get(fragment_id, fragment_id): extra
@@ -730,7 +744,7 @@ def process_document(
                 "unread_sheet_pages": unread_sheets,
                 "page_coverage_version": PAGE_COVERAGE_VERSION,
                 "warnings": warnings,
-                "processing_profile_version": PROCESSING_PROFILE_VERSION,
+                "processing_profile_version": processing_profile_version(),
                 "review_required": review_required,
                 # Текст документа неполон — независимо от того, зовут ли
                 # человека. По этому полю считают качество разбора, а не
@@ -791,8 +805,10 @@ def process_document(
             document_metadata=doc_metadata,
             fragments=fragments,
             warnings=warnings,
-            processing_profile_version=PROCESSING_PROFILE_VERSION,
+            processing_profile_version=processing_profile_version(),
             review_required=review_required,
+            text_incomplete=text_incomplete,
+            unread_text_pages=parse_result.unread_text_pages,
         ).model_dump(mode="json")
         finalize(request_id, s3_fileid, result, dialog_id, event_id)
 
@@ -803,6 +819,39 @@ def process_document(
             )
         logger.info("Документ %s обработан: %d фрагментов", doc_id, len(fragments))
         return {"status": "success", "doc_id": doc_id, "fragments": len(fragments)}
+
+    except outage.ServiceOutage as exc:
+        # Сервис разбора лежит (PARSE_REQUEUE_ON_OUTAGE): документ ставится
+        # в очередь заново новой задачей — повторы CELERY_TASK_MAX_RETRIES не
+        # тратятся, результат не пишется, и RAG видит файл «в обработке».
+        # Документ остаётся pending: следующая задача узнаёт его по outage_since.
+        since = outage_since or time.time()
+        logger.warning(
+            "Документ %s: %s — повтор через %d с (отказ длится %.0f с)",
+            doc_id, exc, settings.PARSE_OUTAGE_RETRY_SECONDS, time.time() - since,
+        )
+        try:
+            process_document.apply_async(
+                kwargs={
+                    "request_id": request_id, "s3_fileid": s3_fileid,
+                    "operation": operation, "dialog_id": dialog_id,
+                    "event_id": event_id, "outage_since": since,
+                },
+                countdown=settings.PARSE_OUTAGE_RETRY_SECONDS,
+                queue=(self.request.delivery_info or {}).get("routing_key")
+                or settings.CELERY_ML_QUEUE,
+            )
+        except Exception as requeue_error:  # noqa: BLE001 — брокер лежит: файл не теряется
+            logger.error("Повтор %s не поставлен: %s", s3_fileid, requeue_error)
+            if owns_document:
+                _mark_error(session, doc_id)
+            finalize(request_id, s3_fileid, build_error_document(
+                s3_fileid, doc_id, located.uri if located else "",
+                ParserUnavailable(str(exc)), self.request.retries + 1,
+            ), dialog_id, event_id)
+            return {"status": "error", "doc_id": doc_id, "reason": "outage"}
+        mark_handed_off(request_id, s3_fileid)
+        return {"status": "requeued_on_outage", "doc_id": doc_id}
 
     except SoftTimeLimitExceeded as exc:
         logger.error("Мягкий таймаут на документе %s", doc_id)
@@ -834,6 +883,7 @@ def process_document(
         return {"status": "error", "doc_id": doc_id, "reason": str(exc)}
 
     finally:
+        outage_scope.__exit__(None, None, None)
         deadline_scope.__exit__(None, None, None)
         timings_scope.__exit__(None, None, None)
         session.close()

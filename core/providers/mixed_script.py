@@ -35,9 +35,11 @@ compensation», «For NPP»), а не одной буквой внутри ру�
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import List, Optional, Tuple
 
+from core.processing_contract import structural_v2
 from core.providers.designation_repair import (
     ESKD_CODES, ESKD_KINDS, GRADES, STD_PREFIXES, Change, readings,
 )
@@ -125,5 +127,33 @@ def repair_fragment(fragment) -> List[Change]:
     payload[PAYLOAD_KEY] = [
         {"before": change.before, "after": change.after} for change in changes
     ]
+    if structural_v2():
+        _record_evidence(payload, fragment, text)
     fragment.content.structured_payload = payload
     return changes
+
+
+def _record_evidence(payload, fragment, raw: str) -> None:
+    """Свидетельство правки (профиль v2): места и замены, без копии всего текста.
+
+    Исходный текст восстанавливается по выданному тексту и `edits`; хеш
+    подтверждает восстановление. Повторный вызов по тому же тексту запись не
+    дублирует.
+    """
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    edits = []
+    for match in _WORD.finditer(raw):
+        resolved = resolve_word(match.group(0))
+        if resolved is not None:
+            edits.append({"source_start": match.start(), "source_end": match.end(),
+                          "original": match.group(0), "replacement": resolved})
+    position = fragment.position
+    entry = {
+        "rule": "mixed-script-v1", "raw_sha256": digest, "raw_length": len(raw),
+        "page": position.page if position else None,
+        "bbox": list(position.bbox) if position else None, "edits": edits,
+    }
+    # Список копируется: payload могут делить части одной таблицы.
+    evidence = [item for item in payload.get("text_correction_evidence", [])
+                if not (item.get("rule") == entry["rule"] and item.get("raw_sha256") == digest)]
+    payload["text_correction_evidence"] = evidence + [entry]

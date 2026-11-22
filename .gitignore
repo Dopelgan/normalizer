@@ -62,3 +62,5 @@ wheels/
 
 # Локальные данные
 /data/
+/.local-private/
+/.codex/

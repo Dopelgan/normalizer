@@ -271,6 +271,9 @@ def test_rag_profile_matches_agreed_parameters():
     import yaml
     from core.processing_contract import RAG_EMBEDDING_PROFILE
     profile = yaml.safe_load((Path(__file__).resolve().parents[2] / "config/rag-consumer-profile.yaml").read_text(encoding="utf-8"))
+    assert len(RAG_EMBEDDING_PROFILE["revision"]) == 40
+    assert profile["embedding"]["model"] == RAG_EMBEDDING_PROFILE["model"]
+    assert profile["processing_profile_version"] == PROCESSING_PROFILE_VERSION
     assert profile["embedding"]["revision"] == RAG_EMBEDDING_PROFILE["revision"]
     assert profile["chunking"]["target_tokens"] == 512
     assert profile["chunking"]["max_tokens"] == 768

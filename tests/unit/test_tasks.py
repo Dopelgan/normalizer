@@ -252,6 +252,13 @@ class TestIdempotency:
         session.close()
 
 
+@pytest.fixture
+def structural_v2(monkeypatch):
+    """Профиль structural-rag-v2 под флагом STRUCTURAL_RAG_V2."""
+    from core.config import settings
+    monkeypatch.setattr(settings, "STRUCTURAL_RAG_V2", True)
+
+
 @pytest.mark.usefixtures("pipeline")
 class TestStructuralProfile:
     @pytest.mark.parametrize('page_count,unknown', [(3, [2, 3]), (0, [])])
@@ -303,17 +310,109 @@ class TestStructuralProfile:
         assert first["schema_version"] == "2.0"
         assert first["fragments"][0]["position"]["text_offsets_exact"]
 
-    def test_old_processing_profile_is_reprocessed(self, pipeline, task_db):
+    @pytest.mark.parametrize("old_profile", ["legacy-chunking", "structural-rag-v1"])
+    def test_old_processing_profile_is_reprocessed(self, pipeline, task_db, old_profile, structural_v2):
         init_request_state("old-first", ["file-old"])
         result = process_document("old-first", "file-old")
         session = task_db()
         with session.begin():
             DocumentRepository(session).update_extra(result["doc_id"], {
-                "processing_profile_version": "legacy-chunking",
+                "processing_profile_version": old_profile,
             })
         session.close()
         init_request_state("old-again", ["file-old"])
         assert process_document("old-again", "file-old")["status"] == "success"
+        assert len(pipeline.calls) == 2
+        assert get_request_state("old-again")["documents"][0]["processing_profile_version"] == "structural-rag-v2"
+
+    def test_v2_table_anchors_and_unknown_partial_survive_actual_cache(self, pipeline, structural_v2):
+        from core.processing_contract import processing_profile_version
+
+        # Literal source gold: A2 inherits only its explicit A1:A2 merge.
+        source = {
+            "schema": "source-table-v1", "format": "ods", "coverage": "complete",
+            "header_rows": [1], "data_rows": [2], "title_rows": [],
+            "merges": [{"anchor": "A1", "row_start": 1, "row_end": 2,
+                        "column_start": 1, "column_end": 1}],
+            "rows": [
+                {"row": 1, "cells": [{"coordinate": "A1", "row": 1, "column": 1,
+                                       "display": "Group", "effective_display": "Group",
+                                       "merge_anchor": "A1"},
+                                      {"coordinate": "B1", "row": 1, "column": 2,
+                                       "display": "Serial", "effective_display": "Serial"}]},
+                {"row": 2, "cells": [{"coordinate": "A2", "row": 2, "column": 1,
+                                       "display": "", "effective_display": "Group",
+                                       "covered": True, "merge_anchor": "A1"},
+                                      {"coordinate": "B2", "row": 2, "column": 2,
+                                       "display": "123", "effective_display": "123"}]},
+            ],
+        }
+        pipeline.result.blocks.append(ParsedBlock(
+            type="table", page=1, sheet_name="Source", confidence=1,
+            table_data={"headers": ["Group", "Serial"], "rows": [["", "123"]],
+                        "source_structure": source},
+        ))
+        pipeline.result.page_count = 3
+        pipeline.result.source_page_count = 3
+        init_request_state("v2-source-first", ["file-v2-source"])
+        fresh_result = process_document("v2-source-first", "file-v2-source")
+        first = get_request_state("v2-source-first")["documents"][0]
+        init_request_state("v2-source-cached", ["file-v2-source"])
+        cached_result = process_document("v2-source-cached", "file-v2-source")
+        cached = get_request_state("v2-source-cached")["documents"][0]
+        assert fresh_result["status"] == "success"
+        assert cached_result["status"] == "already_processed"
+        assert len(pipeline.calls) == 1
+        assert first == cached
+        assert first["processing_profile_version"] == processing_profile_version() == "structural-rag-v2"
+        assert first["status"] == "partial"
+        assert first["processed_pages"] == [1]
+        assert first["unknown_pages"] == [2, 3]
+        table = next(fragment for fragment in cached["fragments"] if fragment["type"] == "table")
+        assert table["content"]["table_data"]["source_structure"] == source
+        assert table["content"]["table_data"]["rows"] == [["", "123"]]
+        assert table["provenance"]["source_unit_id"]
+        assert table["provenance"]["processing_profile_version"] == "structural-rag-v2"
+
+    def test_large_physical_table_parts_survive_task_storage_and_cache(self, pipeline, structural_v2):
+        from tests.unit.test_source_table_parts import source_fixture
+        pipeline.result.blocks = source_fixture("ods")
+        pipeline.result.page_count = 3
+        pipeline.result.source_page_count = 3
+        init_request_state("parts-first", ["file-parts"])
+        assert process_document("parts-first", "file-parts")["status"] == "success"
+        fresh = get_request_state("parts-first")["documents"][0]
+        init_request_state("parts-cached", ["file-parts"])
+        assert process_document("parts-cached", "file-parts")["status"] == "already_processed"
+        cached = get_request_state("parts-cached")["documents"][0]
+        assert fresh == cached
+        assert len(pipeline.calls) == 1
+        assert cached["status"] == "partial" and cached["unknown_pages"] == [2, 3]
+        tables = [f["content"]["table_data"] for f in cached["fragments"] if f["type"] == "table"]
+        assert len(tables) > 1
+        assert sum(len(table["rows"]) for table in tables) == 300
+        # Каждая часть — свой table_id: первая с id целой таблицы, далее :part-N.
+        ids = [table["table_id"] for table in tables]
+        assert len(set(ids)) == len(tables)
+        assert all(table_id == f"{ids[0]}:part-{index + 1}" for index, table_id in enumerate(ids) if index)
+        assert [table["source_structure"]["part_index"] for table in tables] == list(range(len(tables)))
+        assert all(table["source_structure"]["part_count"] == len(tables) for table in tables)
+        assert any(table["source_structure"]["merge_anchors"] for table in tables[1:])
+
+    def test_cached_result_is_keyed_on_effective_profile_version(self, pipeline, monkeypatch):
+        from core.config import settings
+        monkeypatch.setattr(settings, "STRUCTURAL_RAG_V2", True)
+        init_request_state("flag-on", ["file-flag"])
+        process_document("flag-on", "file-flag")
+        assert get_request_state("flag-on")["documents"][0]["processing_profile_version"] == "structural-rag-v2"
+        # Флаг выключен: кэш v2 не отдаётся под v1, документ разбирается заново.
+        monkeypatch.setattr(settings, "STRUCTURAL_RAG_V2", False)
+        init_request_state("flag-off", ["file-flag"])
+        assert process_document("flag-off", "file-flag")["status"] == "success"
+        assert len(pipeline.calls) == 2
+        assert get_request_state("flag-off")["documents"][0]["processing_profile_version"] == "structural-rag-v1"
+        init_request_state("flag-off-again", ["file-flag"])
+        assert process_document("flag-off-again", "file-flag")["status"] == "already_processed"
         assert len(pipeline.calls) == 2
 
     def test_partial_drawing_quality_survives_cached_response(self, monkeypatch):

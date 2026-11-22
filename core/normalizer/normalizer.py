@@ -9,6 +9,7 @@
 
 import logging
 import re
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.config import settings
@@ -32,6 +33,8 @@ from core.normalizer.completeness import (
 from core.providers.vector_drawing import structure_ratio
 from core.providers.chunking_strategy import ChunkItem
 from core.source_contract import attach_source, source_unit_ids
+from core.normalizer.table_parts import table_parts
+from core.processing_contract import structural_v2
 
 logger = logging.getLogger(__name__)
 
@@ -295,8 +298,28 @@ class TextNormalizer:
                 or fragment.completeness < self.completeness_threshold or degraded
             )
             fragment.review_required = flag["needs_review"]
-            fragments.append(fragment)
-            flags.append(flag)
+            # Деление большой таблицы на части — только профиль v2; в v1
+            # таблица остаётся одним фрагментом, как раньше.
+            if not (fragment.content.table_data and structural_v2()):
+                fragments.append(fragment)
+                flags.append(flag)
+                continue
+            for number, table in enumerate(table_parts(fragment.content.table_data), 1):
+                part = fragment.model_copy(deep=False)
+                part.content = fragment.content.model_copy(deep=False)
+                part.position = fragment.position.model_copy(deep=True) if fragment.position else None
+                part.content.table_data = table
+                # Свой payload у каждой части: правки одной не должны
+                # переходить на соседние.
+                if fragment.content.structured_payload is not None:
+                    part.content.structured_payload = deepcopy(fragment.content.structured_payload)
+                    # Часть №2 и далее: table_id вложенных таблиц совпадает
+                    # с table_id самой части (`<id>:part-N`).
+                    if number > 1:
+                        for nested in part.content.structured_payload.get("tables", []):
+                            nested["table_id"] = table.table_id
+                fragments.append(part)
+                flags.append(dict(flag))
 
         # Стабильный `fragment_id`, порядок и поля происхождения — одним
         # шагом и тем же кодом, что после обработки чертежей: двух разных

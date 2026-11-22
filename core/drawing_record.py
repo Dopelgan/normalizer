@@ -77,10 +77,13 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from core.config import settings
 from core.models.contract import Fragment
+from core.providers import reading_reconcile
 from core.providers.title_block import (
-    HANDWRITTEN_MARK, LABELS, canonical, label,
+    AS_READ, HANDWRITTEN_MARK, LABELS, canonical, label,
 )
+from core.providers.vector_drawing import VIEW_SCALE_GROUP
 
 # Ключ в payload: сколько подписей граф без значения убрано из текста листа.
 DROPPED_KEY = "record_dropped_furniture"
@@ -107,6 +110,19 @@ CAUTION_PART = ("Часть значений в этой записи прочи
 # разборе нет, и сказать это надо честно, но один раз.
 NO_VIEW_LINK = ("К какому виду или разрезу относится каждый размер, "
                 "запись чертежа не указывает.")
+# То же, когда часть размеров привязана к видам
+# (`DRAWING_RECORD_USES_VALUE_LINKS`): оговорка говорит о непривязанных, а
+# не обо всех размерах листа — иначе она противоречила бы самой записи.
+NO_VIEW_LINK_PART = ("Там, где вид не назван при размере, к какому виду или "
+                     "разрезу размер относится, запись чертежа не указывает.")
+
+# Подпись строки со вторым написанием обозначения (`title_block.AS_READ`).
+# Словами о том, откуда написание взялось, — как и прочие подписи записи:
+# это не другое обозначение, а то же самое, набранное так, как оно стоит на
+# листе. Без этой строки запись листа несла только приведённую к ГОСТ 2.201
+# запись, у которой с напечатанной на чертеже нет ни одного общего токена
+# BM25, и поиск по обозначению с листа до записи не доходил.
+AS_READ_TITLE = f"{LABELS['designation']} (как на листе)"
 
 # Графы основной надписи в том порядке, в котором их спрашивают.
 # Подписи берутся из `title_block.LABELS`: имя графы здесь и в разборе
@@ -180,7 +196,7 @@ _VIEW_PAIR = re.compile(
 # восемнадцать штук. Это та же неоднозначность, из-за которой видом не
 # считается и одиночная буква.
 _VIEW_SCALED = re.compile(
-    r"^[А-ЯЁA-Z]\s*\(\s*\d+(?:[.,]\d+)?\s*:\s*\d+(?:[.,]\d+)?\s*\)$")
+    r"^[А-ЯЁA-Z]\s*" + VIEW_SCALE_GROUP + r"$")
 _VIEW_WORD = re.compile(
     r"^(вид|разрез|сечение|развёртка|развертка)\b", re.IGNORECASE)
 # Строка-название вида не бывает длинной: «Вид на изделие со снятой…» —
@@ -188,6 +204,11 @@ _VIEW_WORD = re.compile(
 _VIEW_MAX_CHARS = 40
 
 _FOLD = re.compile(r"[\s.,:;№\-_]+")
+# Знак, который может быть частью одного значения чертежа, а не границей
+# между значениями. Список тот же, что у адаптера RAG
+# (`_VALUE_CHAR_RE`): по нему решается, сказано значение целиком или
+# только похожим куском (`_whole_value_said`).
+_VALUE_CHAR = re.compile(r"[\w,.+\-*⌀ØøΦφ°×x/±]", re.IGNORECASE)
 
 
 def _fold(text: str) -> str:
@@ -221,6 +242,34 @@ def enabled() -> bool:
     return bool(getattr(settings, "DRAWING_RECORD_COMPOSED", False))
 
 
+def without_text_enabled() -> bool:
+    """Сборка и для фрагмента без текста листа (`DRAWING_RECORD_WITHOUT_SHEET_TEXT`)."""
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_RECORD_WITHOUT_SHEET_TEXT", False))
+
+
+def without_any_type_enabled() -> bool:
+    """Сборка для фрагмента с полями любого типа (`DRAWING_RECORD_ANY_FIELD_FRAGMENT`)."""
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_RECORD_ANY_FIELD_FRAGMENT", False))
+
+
+def all_fields_said_enabled() -> bool:
+    """Запись произносит каждое значение (`DRAWING_RECORD_ALL_FIELDS_SAID`)."""
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_RECORD_ALL_FIELDS_SAID", False))
+
+
+def stamp_from_fields_enabled() -> bool:
+    """Графы штампа берутся и из полей (`DRAWING_RECORD_STAMP_FROM_FIELDS`)."""
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_RECORD_STAMP_FROM_FIELDS", False))
+
+
 def apply(fragments: List[Fragment]) -> List[Fragment]:
     """
     Запись каждого чертёжного фрагмента собирается по частям.
@@ -245,16 +294,60 @@ def apply(fragments: List[Fragment]) -> List[Fragment]:
     Вторая: собирать там почти нечего. На 150 таких фрагментах с прода
     графа «Масса» не нашлась ни у одного, а основная надпись — у семи.
     Весь выигрыш и вся исходная задача — на листах, где текст есть.
+
+    **`DRAWING_RECORD_WITHOUT_SHEET_TEXT` собирает и их, и первый довод
+    выше оказался неверным не в оценке риска, а в сравнении.** Отказ
+    сравнивался с молчанием, а сравнивать надо с тем, что уходит в индекс
+    сегодня: те же неуверенные значения, по одному на строку, и у каждой
+    строки хвост «(требует сверки)» — на проде 8633 хвоста на 327
+    документов, и они доходят до текста ответа на экране («Круг 100 ГОСТ
+    7417-75, сталь 12Х18Н10Т (требует сверки)»). Значит вопрос не в том,
+    называть ли неуверенное значение, а в том, как сказать о неуверенности
+    честно: **одной фразой на запись** (`_caution`), которую человек
+    читает, вместо приписки при каждом значении, которую не читает никто.
+    Уверенность по каждому значению остаётся там, где она и была, — в
+    `structured_drawing_fields` каждого поля.
+
+    Потерь и здесь нет, но беспотерьность держится другим: части 9 у такого
+    фрагмента быть не может — строк листа нет вовсе, — и её роль берёт
+    `_other_marks`: надписи, которых не назвала ни одна часть выше (голое
+    число, буквенное обозначение без значения). Без этой части голое число
+    пропало бы из записи совсем, потому что в перечень родов величин его
+    `_kind_of` сознательно не пускает.
     """
     if not enabled():
         return fragments
     for fragment in fragments:
-        if fragment.type != "drawing":
+        if fragment.type != "drawing" and not _has_fields(fragment):
             continue
-        if not (fragment.content.text or "").strip():
+        if not (fragment.content.text or "").strip() and not without_text_enabled():
             continue
         compose_fragment(fragment)
     return fragments
+
+
+def _has_fields(fragment: Fragment) -> bool:
+    """
+    Фрагмент несёт разобранные величины чертежа, хотя чертежом не назван
+    (`DRAWING_RECORD_ANY_FIELD_FRAGMENT`).
+
+    Зачем. Сборка смотрела на `type == "drawing"`, а адаптер RAG смотрит на
+    **наличие полей**: фрагмент любого типа с `structured_drawing_fields`
+    он выводит строками «Метка: значение» с хвостом «(требует сверки)»
+    (`drawing_search_text` отказывает только тому, у кого нет ни полей, ни
+    фактов). Из-за этого расхождения часть листов оставалась записанной
+    построчно: на десяти переобработанных чертежах 431 хвост держался в том
+    числе на фрагментах, которых сборка не касалась вовсе. Проверено
+    прогоном: фрагмент той же формы с `type="drawing"` собирается и хвостов
+    не даёт, а с `type="image"` или `"text"` — не собирается.
+
+    Потерь нет и здесь: часть «Надписи листа в порядке чтения» повторяет
+    прежний текст фрагмента целиком, поэтому проза текстового фрагмента
+    остаётся в записи дословно, только после названных частей.
+    """
+    if not without_any_type_enabled():
+        return False
+    return bool(fragment.content.structured_drawing_fields)
 
 
 def compose_fragment(fragment: Fragment) -> Optional[str]:
@@ -273,7 +366,8 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
         return content.text
     fields = [
         {"category": f.category, "value": f.value, "tolerance": f.tolerance,
-         "unit": f.unit, "confirmed": f.confirmed}
+         "unit": f.unit, "confirmed": f.confirmed,
+         "agreement": f.agreement, "readings": f.readings}
         for f in (content.structured_drawing_fields or [])
     ]
     lines = [line for line in (content.text or "").split("\n")]
@@ -288,18 +382,35 @@ def compose_fragment(fragment: Fragment) -> Optional[str]:
         parts.extend((kind, item) for item in items)
         return items
 
+    # Привязка величины к виду, если она в данных есть
+    # (`DRAWING_RECORD_USES_VALUE_LINKS`). Пустая карта — значит привязки
+    # нет, и запись говорит об этом прямо, как говорила всегда.
+    links = _views_of(payload, fields)
+
     add("caution", _caution(fields, payload))
     add("stamp", _stamp(payload, fields))
     add("handwritten", _handwritten(payload, fields))
     # Оговорка про непривязанные размеры говорится один раз — в той из двух
-    # частей, которая встретится первой.
-    views = add("views", _views(kept, hedge=True))
-    add("dimensions", _dimensions(fields, hedge=not views))
+    # частей, которая встретится первой. При полной привязке не говорится
+    # вовсе: она была бы неправдой.
+    views = add("views", _views(kept, hedge=not links))
+    add("dimensions", _dimensions(fields, hedge=not views and not links, links=links))
     add("positions", _positions(fields))
     add("callouts", _callouts(fields))
     add("notes", _notes(fields))
     add("tables", _tables(payload))
-    add("sheet_lines", _sheet_lines(kept))
+    lines_said = add("sheet_lines", _sheet_lines(kept))
+    if all_fields_said_enabled():
+        # Последней частью — всё прочитанное, чего не назвала ни одна
+        # часть выше. Это и беспотерьность, и единственный способ погасить
+        # хвост «(требует сверки)»: адаптер RAG дописывает строку с хвостом
+        # на каждое значение, которого не нашёл в тексте.
+        add("unsaid", _unsaid(fields, payload, _JOIN.join(body for _, body in parts)))
+    elif not lines_said and without_text_enabled():
+        # Строк листа нет: беспотерьность держит часть «остальные надписи»,
+        # а не повтор текста. Считается по уже собранному: в неё попадает
+        # только то, чего ни одна часть выше не назвала.
+        add("other_marks", _other_marks(fields, _JOIN.join(body for _, body in parts)))
 
     if not parts:
         return None
@@ -470,6 +581,22 @@ def _graphs(block: Any, corrected: Dict[tuple, str],
     значения по ключу поиска и подписи для записи.
     """
     if not isinstance(block, dict):
+        block = {}
+    if stamp_from_fields_enabled():
+        # Графа, которую принесли поля, а в payload её нет: разбор штампа
+        # кладёт в payload ответ одного прохода, а поля собираются со
+        # всех. На проде из-за этого запись молчала о графах, которые
+        # адаптер RAG тут же дописывал строкой с хвостом «(требует
+        # сверки)»: 109 хвостов из 554 на десяти чертежах стояли на
+        # строках «Основная надпись: …». Имя графы берётся то, которым её
+        # назвало поле; где поле имени не несёт, графа остаётся
+        # непоимённованной и уходит в последнюю часть записи, а не
+        # получает имя по догадке.
+        block = dict(block)
+        for (key, hand), value in corrected.items():
+            if hand is by_hand and key and key not in block:
+                block[key] = value
+    if not block:
         return {}, {}
     out: Dict[str, str] = {}
     names: Dict[str, str] = {}
@@ -534,8 +661,16 @@ def _caution(fields: Sequence[Dict[str, Any]],
 def _stamp(payload: Dict[str, Any],
            fields: Sequence[Dict[str, Any]]) -> List[str]:
     """Основная надпись: графа со своим значением, в порядке ГОСТ 2.104."""
-    block, names = _graphs(payload.get("title_block"), _corrected(fields),
-                           by_hand=False)
+    raw_block = payload.get("title_block")
+    as_read = ""
+    if isinstance(raw_block, dict) and raw_block.get(AS_READ):
+        # Второе написание обозначения — не графа штампа, и в общий перебор
+        # граф ему нельзя: `_graph_key` свернул бы служебный ключ в
+        # «designationasread» и выдал бы его в записи этим словом. Поэтому
+        # оно вынимается до разбора граф и говорится отдельной строкой.
+        raw_block = dict(raw_block)
+        as_read = _clean(raw_block.pop(AS_READ))
+    block, names = _graphs(raw_block, _corrected(fields), by_hand=False)
     if not block:
         return []
     said = [
@@ -558,6 +693,11 @@ def _stamp(payload: Dict[str, Any],
     body = ["Основная надпись листа."]
     if said:
         body.append(" ".join(said))
+    if as_read and as_read != block.get("designation"):
+        # Обозначение, как оно напечатано на листе. Строка стоит в той же
+        # части, что и сама графа: вынеси её отдельной частью — и чанкер
+        # вправе отрезать её от записи, по которой лист и ищут.
+        body.append(f"{AS_READ_TITLE} — {as_read}.")
     if rest:
         body.append(" ".join(rest))
     if signed:
@@ -599,16 +739,32 @@ def _views(lines: Sequence[str], hedge: bool) -> List[str]:
     return [said + ("\n" + NO_VIEW_LINK if hedge else "")]
 
 
-def _dimensions(fields: Sequence[Dict[str, Any]], hedge: bool) -> List[str]:
-    """Размеры по роду величины: число всегда при том, чем оно является."""
+def _dimensions(fields: Sequence[Dict[str, Any]], hedge: bool,
+                links: Optional[Dict[int, str]] = None) -> List[str]:
+    """
+    Размеры по роду величины: число всегда при том, чем оно является.
+
+    Вид при размере называется, когда привязка есть в данных
+    (`links`, см. `_views_of`). Привязана обычно часть величин, поэтому
+    оговорка о непривязанных остаётся — но говорит уже о них, а не обо
+    всех размерах листа.
+    """
+    links = links or {}
     buckets: Dict[str, List[str]] = {kind: [] for kind, _ in _KIND_TITLES}
-    for field in fields:
+    unlinked = 0
+    for index, field in enumerate(fields):
         kind = _kind_of(field)
         if kind is None:
             continue
         value = _with_tolerance(field)
-        if value and value not in buckets[kind]:
-            buckets[kind].append(value)
+        if not value:
+            continue
+        view = links.get(index)
+        said_value = f"{value} (вид {view})" if view else value
+        if links and not view:
+            unlinked += 1
+        if said_value not in buckets[kind]:
+            buckets[kind].append(said_value)
     said = [
         f"{title} — " + "; ".join(buckets[kind]) + "."
         for kind, title in _KIND_TITLES if buckets[kind]
@@ -618,7 +774,50 @@ def _dimensions(fields: Sequence[Dict[str, Any]], hedge: bool) -> List[str]:
     head = "Размеры и обозначения величин на листе, по роду величины."
     if hedge:
         head += " " + NO_VIEW_LINK
+    elif unlinked:
+        head += " " + NO_VIEW_LINK_PART
     return [head + "\n" + "\n".join(said)]
+
+
+def _views_of(payload: Dict[str, Any],
+              fields: Sequence[Dict[str, Any]]) -> Dict[int, str]:
+    """
+    Карта «номер поля -> имя вида» из `value_links`
+    (`DRAWING_RECORD_USES_VALUE_LINKS`).
+
+    Зачем. Привязку величины к виду считает
+    `core/providers/drawing_views.py` и кладёт в
+    `structured_payload["value_links"]`, но до этого флага её не читал
+    никто: запись говорила «к какому виду относится каждый размер, запись
+    чертежа не указывает» даже тогда, когда вид в данных был назван. То
+    есть вся работа связывания в индекс не доезжала вовсе.
+
+    Привязка сверяется по значению, а не только по номеру поля:
+    `drawing_views` хранит в записи и `field_index`, и `value` ровно для
+    этого, а между связыванием и сборкой поля успевают пройти чистку
+    (`core/contract_finalize._drop_nul`), которая способна сдвинуть
+    нумерацию. Разошлось — привязка не используется: чужой вид при размере
+    хуже отсутствия вида.
+    """
+    from core.config import settings
+
+    if not getattr(settings, "DRAWING_RECORD_USES_VALUE_LINKS", False):
+        return {}
+    block = payload.get("value_links")
+    if not isinstance(block, dict):
+        return {}
+    out: Dict[int, str] = {}
+    for record in block.get("fields") or ():
+        if not isinstance(record, dict):
+            continue
+        name = record.get("view_name") or record.get("view")
+        index = record.get("field_index")
+        if not name or not isinstance(index, int) or not 0 <= index < len(fields):
+            continue
+        if str(record.get("value") or "") != str(fields[index].get("value") or ""):
+            continue
+        out[index] = " ".join(str(name).split())
+    return out
 
 
 def _positions(fields: Sequence[Dict[str, Any]]) -> List[str]:
@@ -708,6 +907,121 @@ def _sheet_lines(lines: Sequence[str]) -> List[str]:
     return ["Надписи листа в порядке чтения.\n" + "\n".join(body)]
 
 
+def _unsaid(fields: Sequence[Dict[str, Any]], payload: Dict[str, Any],
+            said: str) -> List[str]:
+    """
+    Всё прочитанное, чего не назвала ни одна часть записи
+    (`DRAWING_RECORD_ALL_FIELDS_SAID`).
+
+    Зачем это нужно, и почему именно так. Адаптер RAG, получив фрагмент с
+    текстом, дописывает к тексту строку «Метка: значение» на **каждое**
+    прочитанное значение, которого в тексте не нашёл, и к каждой такой
+    строке — хвост «(требует сверки)». После сборки записи на проде так
+    осталось 554 хвоста на десяти чертежах, и 423 из них — значения полей,
+    которых запись не назвала: голое число (его не пускает `_kind_of`),
+    графа штампа без имени, позиция, выноска. То есть хвост берётся не
+    оттуда, где мы молчим о неуверенности, а оттуда, где мы **молчим о
+    значении**.
+
+    Отсюда правило: запись обязана произнести каждое значение хотя бы
+    один раз. Тогда адаптеру дописывать нечего, и хвост не появляется —
+    не потому, что мы его запретили (в чужом репозитории мы ничего
+    запретить не можем), а потому, что его нечем породить.
+
+    Сравнение идёт **тем же** правилом, которым ищет адаптер
+    (`_whole_value_said`): значение считается сказанным, только если стоит
+    в тексте целым значением, а не частью другого. Иначе «5» считалось бы
+    сказанным внутри «5±1», адаптер решал бы иначе, и хвост оставался бы.
+
+    Строки таблиц берутся сырыми, склеенными табуляцией: адаптер
+    дописывает строку таблицы именно так, и прозой её не подменить. Это
+    та же соломка, что и часть «Надписи листа в порядке чтения», и стоит
+    она в записи последней, после всего читаемого.
+    """
+    rest: List[str] = []
+
+    def add_value(value: str) -> None:
+        if not value or _whole_value_said(value, said):
+            return
+        if any(_whole_value_said(value, line) for line in rest):
+            return
+        rest.append(value)
+
+    for field in fields:
+        value = _clean(field.get("value"))
+        if field.get("category") in ("title_block", "material"):
+            # Графа записана как «Подпись: значение», а адаптер ищет в
+            # тексте само значение, без подписи. Поэтому и сверяется, и
+            # дописывается значение: иначе остаток повторял бы графу,
+            # которую запись уже назвала словами («разработал Бабанин»).
+            _, sep, text = value.partition(":")
+            if sep and _clean(text):
+                value = _clean(text)
+        add_value(value)
+    for table in (payload.get("tables") or []):
+        if not isinstance(table, dict):
+            continue
+        for row in (table.get("rows") or []):
+            if not _row_said(row):
+                continue
+            add_value("\t".join(_clean(cell) for cell in row).strip())
+    if not rest:
+        return []
+    return ["Остальное, прочитанное на листе; чем именно является каждая "
+            "запись, разбор не называет.\n" + "\n".join(rest)]
+
+
+def _whole_value_said(value: str, haystack: str) -> bool:
+    """
+    Значение стоит в тексте **целым** значением, а не частью другого.
+
+    Правило то же, которым сверяет адаптер RAG
+    (`super_rag/parser/adapter._whole_value_in`): границей считается всё,
+    кроме букв, цифр и знаков, входящих в сами значения чертежа. Поэтому
+    «1» не считается сказанной внутри «100», а «⌀28*» — внутри «⌀28*2».
+    Правило повторено здесь нарочно: если наше «сказано» разойдётся с его
+    «найдено», хвост останется ровно там, где мы решили, что всё хорошо.
+    """
+    if not value:
+        return True
+    for match in re.finditer(re.escape(value), haystack):
+        before = haystack[match.start() - 1] if match.start() else " "
+        after = haystack[match.end()] if match.end() < len(haystack) else " "
+        if not (_VALUE_CHAR.match(before) or _VALUE_CHAR.match(after)):
+            return True
+    return False
+
+
+def _other_marks(fields: Sequence[Dict[str, Any]], said: str) -> List[str]:
+    """
+    Надписи листа, которых не назвала ни одна часть выше.
+
+    Эта часть есть только у фрагмента без текста листа
+    (`DRAWING_RECORD_WITHOUT_SHEET_TEXT`), где части «Надписи листа в
+    порядке чтения» быть не может: строк нет. Без неё из записи пропало бы
+    то, чему разбор не назвал рода величины, — голое число (номер выноски
+    или зоны), буквенное обозначение без значения, графа штампа без
+    канонического имени. Это те самые надписи, которые `_kind_of`
+    сознательно не пускает в перечень родов, и терять их нельзя: на одном
+    только листе крышки голых чисел пять из ста четырёх надписей, и среди
+    них координаты отверстий.
+
+    Заголовок говорит ровно то, что известно: надпись на листе есть, а чем
+    она является, разбор не называет. Порядок — порядок полей, то есть
+    порядок чтения листа моделью или текстовым слоем.
+    """
+    rest: List[str] = []
+    for field in fields:
+        value = _with_tolerance(field)
+        if not value or value in said or value in rest:
+            continue
+        rest.append(value)
+    if not rest:
+        return []
+    return ["Остальные надписи листа; чем именно является каждая из них, "
+            "разбор не называет.\n" + "\n".join(rest)]
+
+
 # --------------------------------------------------------------- частности
 
 def _without_furniture(lines: Sequence[str]) -> tuple:
@@ -787,14 +1101,18 @@ def _with_tolerance(field: Dict[str, Any]) -> str:
     """
     value = _clean(field.get("value"))
     tolerance = _clean(field.get("tolerance"))
+    # Сведённое поле с расходящимися прочтениями (DRAWING_READINGS_RECONCILED)
+    # называет их все: одна строка с пометкой вместо двух молча спорящих.
+    note = (reading_reconcile.conflict_note(field)
+            if value and settings.DRAWING_READINGS_RECONCILED else "")
     if not (value and tolerance):
-        return value
+        return value + note
     # Отклонение уже внутри значения — второй раз не называется. Но голая
     # цифра совпадает с чем угодно: допуск «2» входит в «⌀200», и отклонение
     # пропало бы молча. Поглощённым считается только отклонение со знаком.
     if tolerance in value and not tolerance.isdigit():
-        return value
-    return f"{value} (допуск {tolerance})"
+        return value + note
+    return f"{value} (допуск {tolerance})" + note
 
 
 def _values(fields: Sequence[Dict[str, Any]], category: str) -> List[str]:

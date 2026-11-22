@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from ingest.response_budget import bounded_response
 
 from core import logging_setup, telemetry
 from core.config import settings
@@ -211,11 +212,11 @@ async def parse_sync(request: ParseRequest):
     while True:
         state = await asyncio.to_thread(get_request_state, request.request_id)
         if state and state["status"] not in ACTIVE_STATUSES:
-            return ParseResponse(
+            return bounded_response(ParseResponse(
                 request_id=request.request_id,
                 dialog_id=request.dialog_id,
                 documents=_documents(state),
-            )
+            ))
         if asyncio.get_event_loop().time() >= deadline:
             logger.warning("Синхронный запрос %s не уложился в таймаут", request.request_id)
             partial = SyncPendingResponse(
@@ -231,7 +232,7 @@ async def parse_sync(request: ParseRequest):
                     retryable=True,
                 ),
             )
-            return JSONResponse(status_code=504, content=partial.model_dump(mode="json"))
+            return bounded_response(partial, status_code=504)
         await asyncio.sleep(SYNC_POLL_INTERVAL)
 
 
@@ -281,14 +282,14 @@ async def parse_results(request_id: str):
             detail=f"Запрос {request_id} не найден: он не создавался или истёк срок хранения.",
         )
 
-    return ResultsResponse(
+    return bounded_response(ResultsResponse(
         request_id=state["request_id"],
         event_id=state.get("event_id", ""),
         operation=state.get("operation"),
         status=state["status"],
         documents=_documents(state),
         error=_first_error(state) if state["status"] in ("error", "partial") else None,
-    )
+    ))
 
 
 def _first_error(state: Dict[str, Any]) -> ParserError:

@@ -1,0 +1,17 @@
+# Профиль потребителя Parser → RAG (processing profile structural-rag-v1;
+# при STRUCTURAL_RAG_V2=true Parser выдаёт structural-rag-v2, параметры ниже те же).
+# Описывает параметры RAG; Parser не токенизирует и не усекает фрагменты под них.
+# Восстановлен из принятого локального commit 6add4d9.
+# Это контракт конфигурации, а не свидетельство фактически загруженной модели.
+# Должен совпадать с core/processing_contract.py:RAG_EMBEDDING_PROFILE.
+processing_profile_version: structural-rag-v1
+owner: rag
+embedding:
+  model: BAAI/bge-m3
+  revision: 5617a9f61b028005a4858fdac845db406aefb181
+  dimension: 1024
+chunking:
+  unit: tokens
+  target_tokens: 512
+  max_tokens: 768
+  overlap_ratio: 0.15

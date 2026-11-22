@@ -3,9 +3,10 @@
 import hashlib
 import json
 from collections import Counter
+from copy import deepcopy
 
 from core.models.contract import SourceSpan
-from core.processing_contract import PROCESSING_PROFILE_VERSION
+from core.processing_contract import processing_profile_version, structural_v2
 
 
 def source_unit_ids(blocks, doc_id):
@@ -16,9 +17,14 @@ def source_unit_ids(blocks, doc_id):
         if block.source_unit_id:
             identity = block.source_unit_id
         else:
-            table = None if block.table_data is None else {
-                key: block.table_data.get(key) for key in ("headers", "rows", "total_row")
-            }
+            if block.table_data is None:
+                table = None
+            elif structural_v2():
+                # v2: исходные координаты и сырые значения различают таблицы,
+                # у которых совпадает отображаемый текст.
+                table = block.table_data
+            else:
+                table = {key: block.table_data.get(key) for key in ("headers", "rows", "total_row")}
             fields = None if block.drawing_fields is None else [
                 {key: field.get(key) for key in ("category", "value", "tolerance", "unit", "nature")}
                 for field in block.drawing_fields
@@ -35,8 +41,12 @@ def source_unit_ids(blocks, doc_id):
 
 
 def attach_source(fragment, block, source_unit_id, *, exact_text=False):
+    if block.text_observations and structural_v2():
+        payload = dict(fragment.content.structured_payload or {})
+        payload['text_observations'] = deepcopy(block.text_observations)
+        fragment.content.structured_payload = payload
     fragment.provenance.source_unit_id = source_unit_id
-    fragment.provenance.processing_profile_version = PROCESSING_PROFILE_VERSION
+    fragment.provenance.processing_profile_version = processing_profile_version()
     fragment.section_path = list(block.section_path)
     if not fragment.section_path and fragment.section_title:
         fragment.section_path = [fragment.section_title]

@@ -27,11 +27,13 @@
 """
 
 import base64
+import contextvars
 import json
 import logging
 import os
 import re
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
@@ -42,7 +44,7 @@ import requests
 from core import filetypes
 from celery.exceptions import SoftTimeLimitExceeded
 
-from core import deadline
+from core import deadline, outage, telemetry
 from core.config import settings
 from core.models.parse_result import ParsedBlock, ParseResult
 from core.providers.document_parser import (
@@ -50,7 +52,7 @@ from core.providers.document_parser import (
     ParserFailed,
     ParserUnavailable,
 )
-from core.providers import dimension_fidelity, ocr_cleanup, table_vlm
+from core.providers import blank_table_ocr, dimension_fidelity, gpu_gate, ocr_cleanup
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.tesseract_fallback import TesseractFallbackProvider
 from core.providers.vector_drawing import (
@@ -327,6 +329,62 @@ class _TableHTMLParser(HTMLParser):
             self._cell.append(data)
 
 
+# Подписи граф основной надписи и боковых граф ГОСТ 2.104 в свёрнутом виде
+# (`_fold_stamp_label`): «Изм.», «Лист», «№ докум.», «Подп.», «Дата»,
+# «Разраб.», «Пров.», «Н. контр.», «Утв.», «Инв. № подл.», «Взам. инв. №»,
+# «Подп. и дата».
+_STAMP_LABELS = frozenset({
+    "изм", "лист", "докум", "подп", "дата", "разраб", "пров", "нконтр",
+    "утв", "инвподл", "взаминв", "подпидата",
+})
+_STAMP_NUMBER_SIGN_RE = re.compile(r"(?<![a-zа-я])[n№](?![a-zа-я])")
+_STAMP_NON_WORD_RE = re.compile(r"[\W_]+")
+
+
+def _fold_stamp_label(cell: str) -> str:
+    """«Инв. № подл.» -> «инвподл»: регистр, «ё», знак номера и пунктуация не в счёт."""
+    text = cell.lower().replace("ё", "е")
+    text = _STAMP_NUMBER_SIGN_RE.sub("", text)
+    return _STAMP_NON_WORD_RE.sub("", text)
+
+
+def _is_stamp_only_row(row: List[str]) -> bool:
+    """
+    Строка — одна захваченная графа штампа: ["Изм", "", …].
+
+    Заполнена ровно одна ячейка, это подпись графы штампа, остальные пусты.
+    Шапка листа регистрации изменений «Изм | Лист | № докум. | Подп. | Дата»
+    целиком из подписей, но это настоящие имена столбцов, и она остаётся.
+    Таблица в один столбец («Дата» и даты под ней) тоже не трогается:
+    других ячеек, которые были бы пусты, у строки нет.
+    """
+    filled = [c for c in row if c.strip()]
+    return (len(row) >= 2 and len(filled) == 1
+            and _fold_stamp_label(filled[0]) in _STAMP_LABELS)
+
+
+def _drop_leading_stamp_rows(rows: List[List[str]], flags: List[bool]) -> int:
+    """
+    Сколько первых строк сетки — подписи рамки, а не шапка таблицы.
+
+    На листе в рамке формата MinerU захватывает в таблицу графу «Изм»
+    штампа: первой строкой сетки становится ["Изм", "", …], а настоящие
+    имена столбцов уходят в строки. Такие строки (`_is_stamp_only_row`)
+    снимаются, только если за ними есть другая строка; строка с ячейкой
+    данных или с несколькими подписями не снимается.
+    Исходный HTML остаётся в `table_html`.
+    """
+    skip = 0
+    while skip < len(rows) and _is_stamp_only_row(rows[skip]):
+        skip += 1
+    if skip == len(rows):
+        return 0
+    if skip:
+        del rows[:skip]
+        del flags[:skip]
+    return skip
+
+
 def parse_table_html(html: str) -> Optional[Dict[str, Any]]:
     """HTML таблицы -> {'headers': [...], 'rows': [[...]]}. None, если пусто."""
     if not html or "<t" not in html.lower():
@@ -341,6 +399,9 @@ def parse_table_html(html: str) -> Optional[Dict[str, Any]]:
 
     if not parser.rows:
         return None
+
+    if settings.STAMP_ROW_HEADER_FIX:
+        _drop_leading_stamp_rows(parser.rows, parser.header_flags)
 
     headers: List[str] = []
     rows = parser.rows
@@ -364,6 +425,84 @@ def parse_table_html(html: str) -> Optional[Dict[str, Any]]:
 
 class ParserTimedOut(ParserUnavailable):
     """MinerU доступен, но не уложился в таймаут: деградация документа, не сервиса."""
+
+
+# Сумма времени запросов к MinerU за документ (все уровни, что к нему ходят).
+MINERU_HTTP_MS = "parse.mineru_http_ms"
+
+
+class MinerUPrefetch:
+    """
+    Запрос к MinerU, начатый заранее, пока уровень 4 читает тот же скан
+    (`LADDER_PARALLEL_LAYOUT`). В потоке — только HTTP: ни OCR, ни записи
+    в хранилище, ни сшивки; всё это после ответа делает `parse` в потоке
+    задачи, как и без флага. Файл и его разбор (слой, листы, страницы)
+    прочитаны один раз и уезжают в `parse` вместе с ответом.
+    """
+
+    def __init__(self, uri: str, file_bytes: Optional[bytes], layer, verdicts, pages: int):
+        self.uri = uri
+        self.file_bytes = file_bytes
+        self.layer = layer
+        self.verdicts = verdicts
+        self.pages = pages
+        self.http_ms = 0.0
+        self.waited_ms = 0.0
+        self.abandoned = False
+        self.consumed = False
+        self._session = requests.Session()
+        self._future: Optional[Future] = None
+
+    @property
+    def started(self) -> bool:
+        return self._future is not None
+
+    def start(self, call) -> "MinerUPrefetch":
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mineru-prefetch")
+        # Копия контекста: тайминги документа видны потоку. Срок задачи потоку
+        # не нужен — таймаут запроса посчитан до старта и передан явно.
+        self._future = pool.submit(contextvars.copy_context().run, self._timed, call)
+        # Поток единственный и после этой задачи не нужен: пул закрывается
+        # сразу, без ожидания, и не держит задачу.
+        pool.shutdown(wait=False)
+        return self
+
+    def _timed(self, call):
+        started = time.perf_counter()
+        try:
+            return call(self._session)
+        finally:
+            self.http_ms = (time.perf_counter() - started) * 1000
+
+    def payload(self) -> Dict[str, Any]:
+        """Ответ MinerU; ошибка запроса поднимается здесь, как без флага."""
+        if self._future is None:
+            raise RuntimeError("запрос к MinerU не начат")
+        self.consumed = True
+        started = time.perf_counter()
+        try:
+            return self._future.result()
+        finally:
+            self.waited_ms = (time.perf_counter() - started) * 1000
+            self._session.close()
+
+    def abandon(self) -> None:
+        """
+        Результат не нужен (срок задачи, отмена, уровень 5 не начат): ответ
+        игнорируется. Запрос, уже ушедший в MinerU, этим не обрывается —
+        `Session.close` закрывает только свободные соединения, — и поток
+        живёт до ответа или своего таймаута. Задачу он не держит (пул
+        закрыт без ожидания), а его обрыв MinerU недоступным не объявляет.
+        """
+        if self.abandoned or self.consumed:
+            return
+        self.abandoned = True
+        if self._future is not None:
+            self._future.cancel()
+        try:
+            self._session.close()
+        except Exception:  # noqa: BLE001 — закрытие не роняет задачу
+            pass
 
 
 class MinerUParserProvider(DocumentParserProvider):
@@ -394,23 +533,51 @@ class MinerUParserProvider(DocumentParserProvider):
         self.timeout = settings.MINERU_TIMEOUT
 
     # ------------------------------------------------------------- публичное
+    def prefetch(
+        self,
+        uri: str,
+        file_type: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> MinerUPrefetch:
+        """Начать запрос к MinerU в отдельном потоке; ответ заберёт `parse`."""
+        metadata = metadata or {}
+        file_bytes = self._read_source(uri)
+        layer, drawing_verdicts, pages = self._read_pdf(file_bytes, file_type)
+        handle = MinerUPrefetch(uri, file_bytes, layer, drawing_verdicts, pages)
+        if file_bytes is None:
+            # Ошибку чтения поднимет `parse`, как без флага: запроса нет.
+            return handle
+        request = self._mineru_request(uri, file_type, metadata, file_bytes, pages)
+        return handle.start(lambda session: self._request_mineru(
+            *request, session=session, abandoned=lambda: handle.abandoned))
+
     def parse(
         self,
         uri: str,
         file_type: str,
         metadata: Optional[Dict[str, Any]] = None,
+        prefetched: Optional[MinerUPrefetch] = None,
     ) -> ParseResult:
         metadata = metadata or {}
+        if prefetched is not None and not prefetched.started:
+            prefetched = None
 
         # Текстовый слой читается до похода в MinerU: он нужен и как источник
         # истины по тексту, и как страховка, если MinerU недоступен. Вместе с
         # ним с того же открытого документа снимается вердикт по чертёжным
         # листам — файл за проход открывается один раз.
-        file_bytes = self._read_source(uri)
-        layer, drawing_verdicts, pages = self._read_pdf(file_bytes, file_type)
+        if prefetched is not None:
+            file_bytes = prefetched.file_bytes
+            layer, drawing_verdicts, pages = prefetched.layer, prefetched.verdicts, prefetched.pages
+        else:
+            file_bytes = self._read_source(uri)
+            layer, drawing_verdicts, pages = self._read_pdf(file_bytes, file_type)
 
         try:
-            result = self._parse_with_mineru(uri, file_type, metadata, file_bytes, pages)
+            result = self._parse_with_mineru(
+                uri, file_type, metadata, file_bytes, pages,
+                payload=prefetched.payload() if prefetched is not None else None,
+            )
         except ParserUnavailable as exc:
             # Недоступность сервиса — это деградация системы, а не свойство
             # документа, и путать их нельзя: лежащий mineru-api иначе
@@ -418,6 +585,10 @@ class MinerUParserProvider(DocumentParserProvider):
             # молча и на всём потоке сразу.
             note = (f"mineru_timeout: {exc}" if isinstance(exc, ParserTimedOut)
                     else f"mineru_unavailable: {exc}")
+            if layer is None and not isinstance(exc, ParserTimedOut):
+                # Растр без MinerU — плоский OCR навсегда; с
+                # PARSE_REQUEUE_ON_OUTAGE документ ставится в очередь.
+                outage.mineru_down(str(exc))
             if layer is not None:
                 logger.error(
                     "MinerU недоступен (%s), но у %s есть текстовый слой — читаем его", exc, uri
@@ -466,7 +637,7 @@ class MinerUParserProvider(DocumentParserProvider):
                     keep_structured_tables=settings.OCR_KEEP_STRUCTURED_TABLES,
                     table_line_min_confidence=settings.OCR_TABLE_LINE_MIN_CONFIDENCE,
                     split_columns=settings.OCR_SPLIT_WIDE_GAPS,
-                    table_reader=table_vlm.table_reader(file_bytes, file_type),
+                    table_reader=blank_table_ocr.table_reader(file_bytes, file_type),
                 )
                 if vocab is not None:
                     # Ячейки таблиц и текст MinerU, не перекрытые слоем.
@@ -526,6 +697,14 @@ class MinerUParserProvider(DocumentParserProvider):
                 unread_pages = self._unread_pages(
                     layer_pages_read, pages, layer_truncated, blocks
                 )
+                # Страницы отклонённых пустых рамок — отдельная причина:
+                # проход слоя не обрывался, но содержимое рамки не
+                # прочитано ничем. `_unread_pages` про это не знает и без
+                # объединения такая потеря снова стала бы молчаливой.
+                if stats.blank_table_unread_pages:
+                    unread_pages = sorted(
+                        set(unread_pages) | stats.blank_table_unread_pages
+                    )
                 if unread_pages:
                     result.unread_text_pages = unread_pages
                 return result
@@ -723,15 +902,38 @@ class MinerUParserProvider(DocumentParserProvider):
         metadata: Dict[str, Any],
         file_bytes: Optional[bytes] = None,
         pages: int = 1,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> ParseResult:
-        if file_bytes is None:
-            try:
-                file_bytes = self.storage.read_bytes(uri)
-            except Exception as exc:
-                raise ParserFailed(
-                    f"Не удалось прочитать файл из хранилища: {uri}: {exc}"
-                ) from exc
+        if payload is None:
+            if file_bytes is None:
+                try:
+                    file_bytes = self.storage.read_bytes(uri)
+                except Exception as exc:
+                    raise ParserFailed(
+                        f"Не удалось прочитать файл из хранилища: {uri}: {exc}"
+                    ) from exc
+            payload = self._request_mineru(
+                *self._mineru_request(uri, file_type, metadata, file_bytes, pages)
+            )
 
+        asset_prefix = metadata.get("asset_prefix") or settings.ASSETS_PREFIX
+        blocks, page_count = self._extract(payload, asset_prefix)
+
+        is_image = filetypes.is_image(file_type)
+        return ParseResult(
+            blocks=blocks,
+            is_fallback=False,
+            parser_name="mineru",
+            source_kind="image" if is_image else "vector_pdf",
+            raw_output=payload,
+            failed_pages=[],
+            page_count=page_count or (1 if is_image else len({b.page for b in blocks})),
+        )
+
+    def _mineru_request(
+        self, uri: str, file_type: str, metadata: Dict[str, Any], file_bytes: bytes, pages: int,
+    ) -> Tuple[str, Dict[str, Any], list, int]:
+        """Адрес, поля, файл и таймаут запроса — в потоке задачи (срок задачи здесь)."""
         filename = self._filename(uri, file_type)
         url = f"{self.mineru_endpoint}/file_parse"
         data = {
@@ -748,16 +950,32 @@ class MinerUParserProvider(DocumentParserProvider):
         logger.info(
             "MinerU: %s file=%s size=%d B timeout=%ds", url, filename, len(file_bytes), timeout
         )
+        return url, data, files, timeout
+
+    def _request_mineru(
+        self, url: str, data: Dict[str, Any], files: list, timeout: int, session=None,
+        abandoned=None,
+    ) -> Dict[str, Any]:
+        """Сам запрос и разбор ответа на уровне протокола — без записи и сшивки."""
+        started = time.perf_counter()
         try:
-            response = requests.post(url, files=files, data=data, timeout=timeout)
+            response = gpu_gate.call(gpu_gate.MINERU, timeout + 30, (session or requests).post,
+                                     url, files=files, data=data, timeout=timeout)
         except requests.ReadTimeout as exc:
             # Долгий разбор большого скана — свойство документа, а не отказ
             # сервиса. Если по таймауту помечать MinerU недоступным на минуту, все
             # соседние документы уйдут в плоский OCR без таблиц.
             raise ParserTimedOut(f"MinerU не уложился в {timeout} с: {exc}") from exc
         except requests.RequestException as exc:
-            self.mark_unavailable()
+            # Обрыв брошенного заранее начатого запроса — наше решение, а не
+            # отказ сервиса: соседние документы не должны уйти в плоский OCR.
+            if not (abandoned is not None and abandoned()):
+                self.mark_unavailable()
             raise ParserUnavailable(f"нет связи с MinerU: {exc}") from exc
+        finally:
+            # Время запроса к сервису отдельно от сшивки и OCR-слоя: из него
+            # лестница выводит `parse.level5_http_ms` / `parse.level5_post_ms`.
+            telemetry.add(MINERU_HTTP_MS, (time.perf_counter() - started) * 1000)
 
         if response.status_code >= 500:
             raise ParserUnavailable(f"MinerU вернул {response.status_code}: {response.text[:300]}")
@@ -767,23 +985,9 @@ class MinerUParserProvider(DocumentParserProvider):
             )
 
         try:
-            payload = response.json()
+            return response.json()
         except ValueError as exc:
             raise ParserFailed(f"MinerU вернул не-JSON: {response.text[:300]}") from exc
-
-        asset_prefix = metadata.get("asset_prefix") or settings.ASSETS_PREFIX
-        blocks, page_count = self._extract(payload, asset_prefix)
-
-        is_image = filetypes.is_image(file_type)
-        return ParseResult(
-            blocks=blocks,
-            is_fallback=False,
-            parser_name="mineru",
-            source_kind="image" if is_image else "vector_pdf",
-            raw_output=payload,
-            failed_pages=[],
-            page_count=page_count or (1 if is_image else len({b.page for b in blocks})),
-        )
 
     def _timeout_for(self, pages: int) -> int:
         """

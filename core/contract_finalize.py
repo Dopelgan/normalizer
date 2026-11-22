@@ -19,13 +19,15 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from core.config import settings
 from core.facts.extractor import extract_facts
 from core.models.contract import Fragment
-from core.processing_contract import PROCESSING_PROFILE_VERSION
+from core.processing_contract import processing_profile_version
 from core.drawing_quality import apply_drawing_quality
-from core import drawing_record
-from core.providers import designation_repair, mixed_script
+from core import document_furniture, drawing_record
+from core.providers import canonical_ids, designation_repair, mixed_script
 
 logger = logging.getLogger(__name__)
 
@@ -128,12 +130,19 @@ def finalize_fragments(
     doc_id: str,
     s3_fileid: str = "",
     extract: bool = True,
+    source_name: str = "",
 ) -> Tuple[List[Fragment], Dict[str, str]]:
     """
     Проставляет стабильные идентификаторы, дополняет provenance и извлекает
     факты. Возвращает фрагменты и карту «прежний id -> новый id»: по ней
     пересобираются служебные пометки, собранные нормализатором.
     """
+    # Рамка бланка — до идентификаторов и до фактов: в индекс и в факты
+    # должен уйти тот текст, который увидит заказчик, а снятый фрагмент не
+    # должен получить ни идентификатора, ни порядкового номера
+    # (`SCAN_DROP_FRAME_FURNITURE`, `SCAN_JOIN_HYPHENATED_WORDS`).
+    fragments = document_furniture.apply(fragments)
+
     id_map: Dict[str, str] = {}
     seen: Dict[str, int] = {}
 
@@ -141,10 +150,19 @@ def finalize_fragments(
         _drop_nul(fragment)
         # До fragment_id и до извлечения фактов: факт и идентификатор должны
         # считаться по тому тексту, который уйдёт в индекс.
+        # Починки текста тоже меняют его длину (сведение разорванного слова
+        # укорачивает), а смещения измерены по тексту исходного блока. Там, где
+        # длина изменилась, точные смещения больше не обещаются — то же, что
+        # делает снятие рамки у себя (`document_furniture.apply`). Замена той же
+        # длины диапазон не ломает, и обещание остаётся.
+        before_repairs = fragment.content.text or ""
         if settings.SCAN_NO_MIXED_SCRIPT_WORDS and fragment.type == "text":
             mixed_script.repair_fragment(fragment)
         if settings.SCAN_DESIGNATION_REPAIR and fragment.type == "text":
             designation_repair.repair_fragment(fragment)
+        if (fragment.position is not None
+                and len(fragment.content.text or "") != len(before_repairs)):
+            fragment.position.text_offsets_exact = False
         if fragment.type == "drawing":
             apply_drawing_quality(fragment)
         if fragment.provenance.source_unit_id is None:
@@ -172,7 +190,7 @@ def finalize_fragments(
             fragment.provenance.source_page = fragment.position.page
         if s3_fileid:
             fragment.provenance.source_file_id = s3_fileid
-        fragment.provenance.processing_profile_version = PROCESSING_PROFILE_VERSION
+        fragment.provenance.processing_profile_version = processing_profile_version()
         for index, table in enumerate((fragment.content.structured_payload or {}).get("tables", [])):
             table.setdefault("table_id", f"{fragment.provenance.source_unit_id}:table-{index + 1}")
             table.setdefault("row_start", 0)
@@ -205,9 +223,91 @@ def finalize_fragments(
     # заказчик. `extract=True` ставит только финализация после ветки
     # чертежей, то есть ровно то место, где собирать и надо.
     if extract:
+        if settings.SCAN_CANONICAL_IDS:
+            # Одна запись номера свидетельства, заводского номера и
+            # обозначения. После идентификаторов: `fragment_id` считается по
+            # прочтению, и включение флага его не меняет. До сборки записи
+            # чертежа: запись собирается уже из канонической графы.
+            try:
+                canonical_ids.apply(
+                    fragments, source_name=source_name,
+                    series=canonical_ids.profile_series(), file_id=s3_fileid,
+                )
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 — запись номера не важнее документа
+                logger.warning("Канонические номера %s не записаны: %s", doc_id, exc)
         drawing_record.apply(fragments)
+        if settings.DRAWING_DIAGNOSTICS_NOT_INDEXED:
+            for fragment in fragments:
+                _diagnostics_aside(fragment)
 
     return fragments, id_map
+
+
+# Ключи `structured_payload`, которые читает потребитель. Всё остальное у
+# чертежа — наш учёт разбора, и в индексируемый текст он не идёт.
+#
+# Кто читает что: `title_block`, `title_block_handwritten`, `tables` —
+# адаптер RAG и сборка записи (`core/drawing_record.py`); `record_parts`,
+# `record_context` — чанкер RAG (`super_rag/ingest/normalize/service.py`),
+# без них он режет запись посреди перечня; `sheet_reparse_candidate`,
+# `sheet_reparse_reason` — очередь перечитывания RAG
+# (`super_rag/parser/completeness.py`, вид `rag_sheet_reparse_candidate`);
+# `transcript_line_count`, `transcript_complete` — качество фрагмента
+# (`core/drawing_quality.py`); `recognition_mode`, `sheet_type`,
+# `coordinate_reference` — чем прочитан лист.
+_PAYLOAD_FOR_CONSUMER: frozenset = frozenset({
+    "title_block", "title_block_handwritten", "tables",
+    "record_parts", "record_context",
+    "sheet_reparse_candidate", "sheet_reparse_reason",
+    "transcript_line_count", "transcript_complete",
+    "recognition_mode", "sheet_type", "coordinate_reference",
+})
+# Куда переносится учёт. Поле `completeness_mechanisms` уже есть в
+# контракте, в текст не попадает нигде и ни одним потребителем не читается:
+# у RAG `extra="ignore"`, поэтому запись из него собрать нельзя даже
+# случайно.
+DIAGNOSTICS_KEY = "drawing_diagnostics"
+
+
+def _diagnostics_aside(fragment: Fragment) -> None:
+    """
+    Служебные данные разбора чертежа — из `structured_payload` в
+    `completeness_mechanisms`.
+
+    Зачем перенос, а не удаление. Рамки надписей, причины непривязки и
+    счётчики нужны нам: по ним видно, почему величина осталась без вида и
+    какой лист имеет смысл перечитать. Удалив их, мы бы считали обрывы
+    грепом по логам воркера. Но искомым текстом они быть не должны:
+    адаптер RAG выводит строкой «Метка: значение» любой ключ payload,
+    которого нет в его собственном списке служебных, и `value_links`
+    туда не внесён — ни один новый наш ключ туда не внесён и не может
+    быть внесён заранее. Поэтому решает не список чужого репозитория, а
+    место хранения: `completeness_mechanisms` не индексируется.
+
+    Делается последним шагом, после сборки записи: все, кто читает эти
+    ключи внутри конвейера (`core/drawing_processor.process`,
+    `core/drawing_quality.py`, `core/drawing_record.py`), к этому моменту
+    уже прочитали. Идемпотентно: второй проход переносить нечего.
+    """
+    if fragment.type != "drawing":
+        return
+    payload = fragment.content.structured_payload
+    if not payload:
+        return
+    aside = {key: value for key, value in payload.items()
+             if key not in _PAYLOAD_FOR_CONSUMER}
+    if not aside:
+        return
+    fragment.content.structured_payload = {
+        key: value for key, value in payload.items() if key in _PAYLOAD_FOR_CONSUMER
+    } or None
+    mechanisms = dict(fragment.completeness_mechanisms or {})
+    kept = dict(mechanisms.get(DIAGNOSTICS_KEY) or {})
+    kept.update(aside)
+    mechanisms[DIAGNOSTICS_KEY] = kept
+    fragment.completeness_mechanisms = mechanisms
 
 
 def normalized_content_hash(fragments: List[Fragment]) -> Optional[str]:

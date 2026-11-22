@@ -102,6 +102,22 @@ class TestSheetReadingFields:
         field = processor.process(SHEET_URI, {})["parsed_fields"][0]
         assert field["value"] == "⌀44H7"
 
+    def test_annotation_as_bare_string_does_not_lose_the_sheet(self, processor):
+        """
+        Надпись пришла строкой, а не объектом. Раньше на этом весь лист
+        уходил в AttributeError, который в `enrich_fragments` глотался
+        молча: от листа не оставалось ничего.
+        """
+        processor.qwen.reading = reading(
+            "Ra 6,3",
+            annotation("size", "⌀44H7", [0.2, 0.3, 0.3, 0.35]),
+        )
+        fields = processor.process(SHEET_URI, {})["parsed_fields"]
+
+        assert [f["value"] for f in fields] == ["Ra 6,3", "⌀44H7"]
+        # Координат у голой строки нет: берётся лист целиком, не угадываем.
+        assert fields[0]["bbox"] == [0.0, 0.0, 1.0, 1.0]
+
     def test_agreement_with_rules_raises_confidence(self, processor):
         processor.qwen.reading = reading(
             annotation("size", "⌀44"),               # правила согласны
