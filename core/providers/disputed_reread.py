@@ -29,7 +29,7 @@
 надписей. Неудачный вызов не меняет ничего.
 
 С D3 (DRAWING_READINGS_RECONCILED) дочитывание идёт после сведения по
-документу: в проходе листа сохраняются только вырезки (`cut_all`), спорные
+документу: в проходе листа сохраняются только рамки полей (`boxes`), спорные
 поля выбирает согласие D3, а прочтение вырезки становится ещё одним
 прочтением поля (`reading_reconcile.witness`). Своё сведение (группы двух
 записей рядом) для полей D3 не повторяется.
@@ -317,24 +317,24 @@ def _key(box: Sequence[float]) -> Tuple[float, ...]:
     return tuple(round(float(v), 6) for v in box)
 
 
-def cut_all(image, fields: Sequence[Dict[str, Any]]) -> Dict[Tuple[float, ...], Any]:
+def boxes(fields: Sequence[Dict[str, Any]]) -> set:
     """
-    Вырезки всех полей, которые может понадобиться дочитать, по рамке поля.
-    Нужны, когда дочитывание идёт после сведения D3: к тому времени картинки
-    листа уже нет, а какие поля спорные, решит только D3.
+    Рамки полей листа, которые может понадобиться дочитать. Нужны, когда
+    дочитывание идёт после сведения D3: какие поля спорные, решит только
+    D3, а вырезаются потом только выбранные — из заново открытого листа.
     """
-    pieces: Dict[Tuple[float, ...], Any] = {}
+    found: set = set()
     for f in fields:
         box = _place(f.get("bbox")) if eligible(f) else None
-        if box is not None and _key(box) not in pieces:
-            pieces[_key(box)] = crop(image, box)
-    return pieces
+        if box is not None:
+            found.add(_key(box))
+    return found
 
 
 def apply(
     client: Any, image, fields: List[Dict[str, Any]], until: Optional[float] = None,
     rule: Callable[[str, str], Optional[str]] = decide,
-    pieces: Optional[Dict[Tuple[float, ...], Any]] = None,
+    allowed: Optional[set] = None,
     reconcile: Optional[Callable[[Dict[str, Any], str], Tuple[Dict[str, Any], str]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
@@ -344,19 +344,30 @@ def apply(
     после которого вызов не начинается (бюджет листа). `rule` — правило
     значения.
 
-    После сведения D3 картинки листа нет: вырезки берутся из `pieces`
-    (`cut_all`), а поле, сведённое D3 (есть `readings`), решает `reconcile`:
+    После сведения D3 картинки листа в памяти нет: `image` — функция без
+    аргументов, которая открывает лист заново (зовётся, только если есть что
+    дочитывать; None — лист не открылся), `allowed` — рамки, сохранённые в
+    проходе листа (`boxes`). Поле, сведённое D3 (есть `readings`), решает `reconcile`:
     прочтение вырезки — ещё одно свидетельство в его прочтениях. Он
     возвращает поле и исход: «agreed», «corrected» или «kept».
     """
     chosen = targets(fields)
-    if pieces is not None:
-        chosen = [item for item in chosen if _key(item[1]) in pieces]
+    if allowed is not None:
+        chosen = [item for item in chosen if _key(item[1]) in allowed]
     stats: Dict[str, Any] = {"crops": len(chosen), "calls": 0, "failed_calls": 0,
                              "agreed": 0, "corrected": 0, "dropped": 0, "unread": 0,
                              "skipped_time": 0, "changes": []}
     if not chosen:
         return fields, stats
+    if callable(image):
+        if until is not None and gpu_gate.budget_now() + settings.VLM_TIMEOUT > until:
+            stats["skipped_time"] = len(chosen)
+            return fields, stats
+        image = image()
+        if image is None:
+            stats["failed_calls"] = 1
+            stats["unread"] = len(chosen)
+            return fields, stats
     answers: Dict[int, str] = {}
     for start in range(0, len(chosen), CELLS):
         batch = chosen[start:start + CELLS]
@@ -364,8 +375,7 @@ def apply(
             stats["skipped_time"] += len(batch)
             continue
         try:
-            picture = grid([pieces[_key(box)] if pieces is not None else crop(image, box)
-                            for _, box in batch])
+            picture = grid([crop(image, box) for _, box in batch])
         except Exception as exc:  # noqa: BLE001 — битая вырезка не роняет лист
             logger.error("Вырезки спорных надписей не собраны: %s", exc)
             stats["failed_calls"] += 1

@@ -478,9 +478,16 @@ class DrawingProcessor:
         if settings.DRAWING_DISPUTED_REREAD and fields and crops is not None:
             # Сведение D3 (DRAWING_READINGS_RECONCILED) идёт по всему документу
             # после листов и само решает, какие поля спорные: дочитывание —
-            # после него (`_reread_reconciled`), а здесь только вырезки, пока
-            # картинка листа есть.
-            crops[(image_ref, sheet)] = disputed_reread.cut_all(layout.image, fields)
+            # после него (`_reread_reconciled`). Здесь — только рамки полей,
+            # как открыть лист заново и сколько осталось от бюджета листа:
+            # рендер в памяти до конца документа не держится.
+            budget = settings.DRAWING_TIME_BUDGET
+            crops[(image_ref, sheet)] = {
+                "image_ref": image_ref, "page": page,
+                "angle": layout.angle, "turn": layout.turn,
+                "boxes": disputed_reread.boxes(fields),
+                "left": budget_started + budget - gpu_gate.budget_now() if budget else None,
+            }
         elif settings.DRAWING_DISPUTED_REREAD and fields:
             # Третье свидетельство по спорным числам (D4): вырезки в родном
             # разрешении. Здесь — после сведения прочтений листа и до того,
@@ -762,12 +769,21 @@ class DrawingProcessor:
         чертёж. Без второго обработчик молчал на сканах и фотографиях
         чертежей: фрагмента `image` в таком документе нет.
         """
-        result: List[Fragment] = []
-        # Вырезки полей листов для дочитывания после сведения D3 (оба флага):
-        # по (image_ref, страница) — так их находит фрагмент листа.
+        # Рамки полей листов для дочитывания после сведения D3 (оба флага):
+        # по (image_ref, страница) — так их находит фрагмент листа. Живут
+        # только на время документа.
         self._reread_crops = (
             {} if settings.DRAWING_DISPUTED_REREAD and settings.DRAWING_READINGS_RECONCILED else None
         )
+        try:
+            return self._enrich_fragments(fragments, metadata)
+        finally:
+            self._reread_crops = None
+
+    def _enrich_fragments(
+        self, fragments: List[Fragment], metadata: Dict[str, Any]
+    ) -> List[Fragment]:
+        result: List[Fragment] = []
         # Прочтения по страницам, накопленные вызовами `process()`: вырезка
         # вида и сама страница читаются разными вызовами, а надпись у них
         # одна. Вырезки идут до прохода по странице, поэтому страница видит
@@ -858,7 +874,6 @@ class DrawingProcessor:
             if self._reread_crops is not None:
                 # D3 свёл прочтения, D4 дочитывает то, что осталось спорным.
                 self._reread_reconciled(result)
-        self._reread_crops = None
         if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
             result.extend(self._rescan_poor_pages(result, metadata))
         # Модель не ответила документу ни разу и отказывала как сервис:
@@ -1505,8 +1520,8 @@ class DrawingProcessor:
         drawings.sort(key=lambda f: not reading_reconcile._is_whole_sheet(f))
         for fragment in drawings:
             page = fragment.position.page if fragment.position else 1
-            pieces = self._reread_crops.get((fragment.content.image_ref, page))
-            if not pieces:
+            sheet = self._reread_crops.get((fragment.content.image_ref, page))
+            if not sheet or not sheet["boxes"]:
                 continue
             left = deadline.remaining()
             if left is not None and left < settings.VLM_TIMEOUT:
@@ -1514,21 +1529,32 @@ class DrawingProcessor:
                 return
             fields = [f.model_dump() for f in fragment.content.structured_drawing_fields]
             keys = [(page, _readings_key(f)) for f in fields]
-            pieces = dict(pieces)
+            allowed = set(sheet["boxes"])
             for n, key in enumerate(keys):
                 if key[1] and key in done:
                     fields[n] = {**done[key], "bbox": fields[n]["bbox"], "category": fields[n]["category"]}
-                    pieces.pop(disputed_reread._key(fields[n]["bbox"]), None)
-            try:
-                fields, stats = disputed_reread.apply(
-                    self.qwen, None, fields, pieces=pieces,
-                    reconcile=lambda item, text: reading_reconcile.witness(item, text, disputed_reread.decide),
-                )
-            except (SoftTimeLimitExceeded, deadline.Cancelled):
-                raise
-            except Exception as exc:  # noqa: BLE001 — дочитывание не роняет документ
-                logger.error("Дочитывание спорных надписей не удалось: %s", exc)
-                continue
+                    allowed.discard(disputed_reread._key(fields[n]["bbox"]))
+
+            def render(sheet=sheet):
+                # Тот же выправленный лист, что видел проход листа.
+                image = self._open(sheet["image_ref"], sheet["page"])
+                return None if image is None else drawing_vision.reproduce(image, sheet["angle"], sheet["turn"])
+
+            # Остаток бюджета листа (DRAWING_TIME_BUDGET): на свои часы, без
+            # ожидания мест на видеокарте; проверяется перед открытием листа
+            # и перед каждой картинкой вырезок.
+            with gpu_gate.budget_clock():
+                until = None if sheet["left"] is None else gpu_gate.budget_now() + sheet["left"]
+                try:
+                    fields, stats = disputed_reread.apply(
+                        self.qwen, render, fields, until=until, allowed=allowed,
+                        reconcile=lambda item, text: reading_reconcile.witness(item, text, disputed_reread.decide),
+                    )
+                except (SoftTimeLimitExceeded, deadline.Cancelled):
+                    raise
+                except Exception as exc:  # noqa: BLE001 — дочитывание не роняет документ
+                    logger.error("Дочитывание спорных надписей не удалось: %s", exc)
+                    continue
             # Поля D3 дочитывание не снимает (группы — только у несведённых
             # полей), поэтому номера до и после совпадают.
             if len(fields) == len(keys):

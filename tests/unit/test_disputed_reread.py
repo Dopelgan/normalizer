@@ -246,7 +246,7 @@ class SheetAndCropQwen:
         return self.reader.read_values(image, count)
 
 
-def _both_flags_document(temp_storage, monkeypatch, d4=True):
+def _both_flags_document(temp_storage, monkeypatch, d4=True, prepare=None):
     from core.drawing_processor import DrawingProcessor
     from core.models.contract import Content, Fragment, Position, Provenance
 
@@ -272,7 +272,11 @@ def _both_flags_document(temp_storage, monkeypatch, d4=True):
                         provenance=Provenance(method="mineru_image", strategy_level=2, source="vector_pdf"))
 
     fragments = [picture("view.png", [0.0, 0.0, 0.5, 1.0], 1), picture("sheet.png", [0.0, 0.0, 1.0, 1.0], 2)]
-    out = DrawingProcessor(temp_storage, qwen=qwen).enrich_fragments(fragments, {})
+    processor = DrawingProcessor(temp_storage, qwen=qwen)
+    qwen.processor = processor
+    if prepare is not None:
+        prepare(processor)
+    out = processor.enrich_fragments(fragments, {})
     sheet_fragment = next(f for f in out if f.content.image_ref == "assets/doc/sheet.png")
     qwen.view = next(f for f in out if f.content.image_ref == "assets/doc/view.png")
     return sheet_fragment, qwen
@@ -315,3 +319,79 @@ def test_d3_alone_unchanged_by_d4_code(temp_storage, monkeypatch):
     (f280,) = [f for f in sheet_fragment.content.structured_drawing_fields if "280" in f.value]
     assert f280.value == "⌀280+0,3" and f280.agreement == "conflict"
     assert "disputed_reread" not in sheet_fragment.content.structured_payload
+
+
+def test_both_flags_keep_only_boxes_and_recut_chosen_targets(temp_storage, monkeypatch):
+    # До конца документа держатся рамки и ссылка на лист, не картинки; лист
+    # открывается заново, и вырезается только выбранное D3 спорное поле.
+    seen, cuts = [], []
+    real_crop = dr.crop
+    monkeypatch.setattr(dr, "crop", lambda image, box, *a: cuts.append(box) or real_crop(image, box, *a))
+
+    def prepare(processor):
+        real = processor._reread_reconciled
+
+        def spy(fragments):
+            seen.extend(processor._reread_crops.values())
+            return real(fragments)
+        processor._reread_reconciled = spy
+
+    sheet_fragment, qwen = _both_flags_document(temp_storage, monkeypatch, prepare=prepare)
+    assert seen and all(not isinstance(v, Image.Image) for entry in seen for v in entry.values())
+    assert all(isinstance(entry["boxes"], set) for entry in seen)
+    assert cuts == [[0.30, 0.34, 0.32, 0.40]]
+    assert qwen.processor._reread_crops is None
+
+
+def test_both_flags_crops_reset_when_reread_fails(temp_storage, monkeypatch):
+    held = []
+
+    def prepare(processor):
+        def boom(fragments):
+            assert processor._reread_crops
+            raise RuntimeError("сбой")
+        processor._reread_reconciled = boom
+        held.append(processor)
+
+    with pytest.raises(RuntimeError):
+        _both_flags_document(temp_storage, monkeypatch, prepare=prepare)
+    assert held[0]._reread_crops is None
+
+
+def test_both_flags_reread_skipped_when_sheet_budget_spent(temp_storage, monkeypatch):
+    # Бюджет листа почти исчерпан: на вызов модели после D3 его не хватает.
+    monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 1)
+    monkeypatch.setattr(settings, "VLM_TIMEOUT", 30)
+    sheet_fragment, qwen = _both_flags_document(temp_storage, monkeypatch)
+    assert qwen.reader.calls == []
+    stats = sheet_fragment.content.structured_payload["disputed_reread"]
+    assert stats["skipped_time"] == 1 and stats["calls"] == 0
+
+
+def test_budget_checked_between_batches(sheet, monkeypatch):
+    # 14 полей — две картинки; после первой бюджет кончился, вторая не идёт.
+    clock = iter([0.0, 0.0, 100.0, 100.0])
+    monkeypatch.setattr(dr.gpu_gate, "budget_now", lambda: next(clock))
+    monkeypatch.setattr(settings, "VLM_TIMEOUT", 10)
+    fields = [field("size", f"{n}-0,{n}", [0.05 * (n % 10), 0.04 * n, 0.05 * (n % 10) + 0.04, 0.04 * n + 0.02])
+              for n in range(1, 15)]
+    reader = FakeReader([f"{n}+0,{n}" for n in range(1, 15)])
+    opened = []
+    result, stats = dr.apply(reader, lambda: opened.append(1) or sheet, fields, until=50.0)
+    assert opened == [1]
+    assert [count for _, count in reader.calls] == [12]
+    assert stats["skipped_time"] == 2 and stats["corrected"] == 12
+
+
+def test_reproduce_gives_the_same_straightened_sheet():
+    from io import BytesIO
+
+    from PIL import ImageChops
+
+    from core.providers import drawing_vision
+    from tests.fixtures import synthetic_sheet
+
+    tilted = Image.open(BytesIO(synthetic_sheet.png_bytes())).convert("RGB").rotate(1.5, fillcolor="white")
+    layout = drawing_vision.analyse(tilted)
+    again = drawing_vision.reproduce(tilted, layout.angle, layout.turn)
+    assert layout.angle and ImageChops.difference(again, layout.image).getbbox() is None

@@ -239,6 +239,20 @@ def _find_regions(image) -> Optional[Tuple[Optional[List[float]], List[Region], 
     return frame, regions, signals
 
 
+def reproduce(image, angle: float, turn: int):
+    """
+    Та же выправленная картинка, что дал `analyse` с этими наклоном и
+    поворотом: те же вызовы поворота. Нужна дочитыванию после сведения D3,
+    чтобы не держать рендер листа в памяти до конца документа.
+    """
+    if angle:
+        from PIL import Image
+        image = image.rotate(angle, resample=Image.BICUBIC, expand=False, fillcolor="white")
+    if turn:
+        image = image.rotate(turn, expand=True, fillcolor="white")
+    return image
+
+
 def plain(image) -> SheetLayout:
     """Разметка выключена: лист идёт в модель как есть."""
     return SheetLayout(image=image, signals={"vision": "выключено"})
