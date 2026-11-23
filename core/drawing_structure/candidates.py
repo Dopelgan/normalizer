@@ -386,11 +386,18 @@ def _candidate(item, ref: Tuple[int, int], fragment: Fragment, carrier: bool, pa
     for alternative in getattr(item, "alternatives", None) or []:
         readings.append({"value": str(alternative), "source": source, "pass": pass_, "confidence": None})
     exact = vector or bool(getattr(item, "bbox_exact", None))
+    agreement = item.agreement
+    if agreement is None and getattr(item, "needs_review", None):
+        # Размещение полей (N0) нашло расхождение прочтений — на проверку.
+        agreement = "conflict"
+    confidence = float(item.confidence or 0.0)
+    if getattr(item, "low_quality", None):
+        confidence = min(confidence, 0.5)
     return Candidate(
         value=value, category=item.category, bbox=bbox, source=source, pass_=pass_,
-        confidence=float(item.confidence or 0.0), field_ref=ref, label=label,
+        confidence=confidence, field_ref=ref, label=label,
         handwritten=handwritten, tolerance=item.tolerance, nature=item.nature,
-        agreement=item.agreement, confirmed=bool(item.confirmed), link=link,
+        agreement=agreement, confirmed=bool(item.confirmed), link=link,
         readings=readings, exact=exact,
     )
 

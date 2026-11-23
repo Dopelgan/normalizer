@@ -152,3 +152,25 @@ def test_one_pass_never_merges_two_numbers_in_one_table_row():
         _field("size", "247", [0.59, 0.57, 0.62, 0.59]),
     ], fid="w")
     assert len(merge.merge(candidates.collect([whole]).candidates)) == 2
+
+
+def test_fragment_already_placed_on_page_is_taken_as_is():
+    # Размещение полей (DRAWING_FIELD_PLACEMENT_V2) уже перевело рамки вырезки в доли страницы.
+    crop = _drawing([_field("size", "R2", [0.55, 0.25, 0.57, 0.27], bbox_exact=True,
+                            alternatives=["R3"], needs_review=True)],
+                    bbox=(0.5, 0.2, 0.7, 0.4), payload={"coordinate_reference": "page"}, fid="crop")
+    whole = _drawing([_field("size", "⌀5", [0.1, 0.1, 0.12, 0.12])], fid="whole")
+    pool = candidates.collect([whole, crop])
+    placed = next(c for c in pool.candidates if c.value == "R2")
+    assert placed.bbox == [0.55, 0.25, 0.57, 0.27] and placed.exact
+    element = next(e for e in merge.merge(pool.candidates) if e.value == "R2")
+    assert [a["value"] for a in element.alternatives] == ["R3"] and element.needs_check()
+
+
+def test_crop_mapping_uses_field_placement_turn():
+    # Вырезка, повёрнутая на 90°: точка (0, 0) выправленной картинки — правый верхний угол вырезки.
+    crop = _drawing([_field("size", "R2", [0.0, 0.0, 0.1, 0.1])], bbox=(0.5, 0.2, 0.7, 0.4),
+                    payload={"layout": {"angle": 0.0, "turn": 90}}, fid="crop")
+    whole = _drawing([_field("size", "⌀5", [0.1, 0.1, 0.12, 0.12])], fid="whole")
+    placed = next(c for c in candidates.collect([whole, crop]).candidates if c.value == "R2")
+    assert placed.bbox[2] == 0.7 and placed.bbox[1] == 0.2
