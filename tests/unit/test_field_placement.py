@@ -109,6 +109,15 @@ def test_item_reference_read_as_size_becomes_callout():
     assert (field.category, field.value) == ("callout", "п.4")
 
 
+def test_item_reference_loses_dimension_link():
+    link = DimensionLink(target_label="габаритная ширина", target_bbox=[0.3, 0.3, 0.4, 0.4],
+                         leader=[], method="vlm", confidence=0.5)
+    sheet = _drawing([_field("size", "п4", [0.5, 0.5, 0.52, 0.52], link=link)], [0, 0, 1, 1])
+    fp.apply([sheet])
+    field = sheet.content.structured_drawing_fields[0]
+    assert field.category == "callout" and field.link is None
+
+
 def test_sheet_and_crop_reading_of_one_inscription_merge_into_the_precise_one():
     sheet = _drawing([_field("size", "п4", [0.55, 0.26, 0.57, 0.30], confidence=0.7)], [0, 0, 1, 1])
     crop = _drawing([_field("callout", "п.4", [0.04, 0.40, 0.06, 0.45], confidence=0.75)],

@@ -201,6 +201,9 @@ def reclassify(field: DrawingField) -> None:
             field.value = f"п.{match.group(1)}"
             field.tolerance = None
             field.unit = ""
+            # Связь «п4 -> габаритная ширина» (крышка 687000.001.001) —
+            # связь ссылки на пункт требований, а не величины: её нет.
+            field.link = None
 
 
 def mark_quality(field: DrawingField) -> None:
