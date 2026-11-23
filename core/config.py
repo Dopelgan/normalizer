@@ -407,6 +407,12 @@ class Settings(BaseSettings):
     # DRAWING_DIMENSION_LINKS_MAX — сколько величин листа спрашивать у модели.
     DRAWING_DIMENSION_LINKS: bool = False
     DRAWING_DIMENSION_LINKS_MAX: int = 60
+    # Размещение полей чертежа на странице (core/providers/field_placement.py):
+    # рамки полей вырезок видов переводятся из долей вырезки в доли страницы
+    # (с обратным наклоном и поворотом), повторы одной надписи из разных
+    # проходов сводятся в одно поле с вариантами, ссылки «п.4» из размеров
+    # становятся выносками, мусорные прочтения помечаются. По умолчанию выключено.
+    DRAWING_FIELD_PLACEMENT_V2: bool = False
     # Служебные данные разбора не уходят в индексируемый текст: перед выдачей
     # они переносятся из `content.structured_payload` в
     # `completeness_mechanisms["drawing_diagnostics"]`. В `structured_payload`

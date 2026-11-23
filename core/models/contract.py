@@ -297,11 +297,22 @@ class DrawingField(BaseModel):
     # Связь величины с измеряемым элементом (DRAWING_DIMENSION_LINKS). Без
     # флага и без найденной связи ключа нет в ответе вовсе.
     link: Optional[DimensionLink] = None
+    # Размещение на странице (DRAWING_FIELD_PLACEMENT_V2). `bbox_exact` —
+    # рамка стоит на самой надписи (иначе это область, где её прочли);
+    # `alternatives` — другие прочтения той же надписи; `needs_review` —
+    # прочтения расходятся или запись похожа на ошибку распознавания;
+    # `low_quality` — прочтение сомнительное, просмотру его прятать.
+    # Без флага ключей нет в ответе вовсе.
+    bbox_exact: Optional[bool] = None
+    alternatives: Optional[List[str]] = None
+    needs_review: Optional[bool] = None
+    low_quality: Optional[bool] = None
 
     @model_serializer(mode="wrap")
     def _without_unset_readings(self, handler):
         data = handler(self)
-        for key in ("readings", "agreement", "link"):
+        for key in ("readings", "agreement", "link", "bbox_exact", "alternatives",
+                    "needs_review", "low_quality"):
             if isinstance(data, dict) and data.get(key) is None:
                 data.pop(key, None)
         return data

@@ -70,8 +70,8 @@ from core import deadline, outage
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
-    dimension_fidelity, disputed_reread, drawing_text, drawing_vision, gpu_gate, raster_drawing,
-    reading_reconcile, title_block, vector_drawing,
+    dimension_fidelity, disputed_reread, drawing_text, drawing_vision, field_placement, gpu_gate,
+    raster_drawing, reading_reconcile, title_block, vector_drawing,
 )
 from core.providers.qwen_client import (
     CATEGORIES, GUARD_MIN_TEXT_LINES, REJECT_EMPTY, QwenVisionClient,
@@ -274,6 +274,10 @@ class DrawingProcessor:
         fields: List[Dict[str, Any]] = []
         payload: Dict[str, Any] = {"layout": layout.as_dict(), "tables": []}
         payload["coordinate_reference"] = "deskewed_page"
+        if settings.DRAWING_FIELD_PLACEMENT_V2:
+            # Размер картинки до выправления: по нему обратный наклон
+            # переводит рамки полей в доли исходной картинки (field_placement).
+            payload["layout"]["source_size"] = [int(image.size[0]), int(image.size[1])]
         missing_regions: List[Dict[str, Any]] = []
 
         # Перечитывание плохого скана (DRAWING_RESCAN_POOR_OCR_PAGES) просит
@@ -973,6 +977,10 @@ class DrawingProcessor:
             # После правки абзацев: исправленный абзац к этому моменту —
             # текст модели, и убирается как повтор, а не как расхождение.
             result = suppress_stale_sources(result)
+        if settings.DRAWING_FIELD_PLACEMENT_V2:
+            # Последним: сведение D3 и дочитывание D4 работают в координатах
+            # вырезок и выправленного листа, а наружу поля уходят в долях страницы.
+            result = field_placement.apply(result)
         return result
 
     # ------------------------------------------- перечитывание плохого скана
