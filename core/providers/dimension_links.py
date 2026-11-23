@@ -873,6 +873,8 @@ def apply(
             try:
                 data = ask(marked_image(image, asked), vlm_prompt(asked), len(asked))
             except Exception as exc:  # noqa: BLE001 — сбой вызова не роняет лист
+                if _stops_the_task(exc):
+                    raise
                 logger.warning("Связь размеров моделью не получена: %s", exc)
             found, dropped = validate_vlm(data, asked, tuple(image.size), forbidden)
             for reason, count in dropped.items():
@@ -894,6 +896,17 @@ def apply(
 # ===========================================================================
 # Мелочи
 # ===========================================================================
+
+def _stops_the_task(exc: BaseException) -> bool:
+    """Обрыв задачи или отмена листа — не сбой связи: их не глотаем."""
+    try:
+        from celery.exceptions import SoftTimeLimitExceeded
+    except ImportError:  # pragma: no cover
+        SoftTimeLimitExceeded = ()  # type: ignore[assignment]
+    from core import deadline
+
+    return isinstance(exc, (deadline.Cancelled,) + ((SoftTimeLimitExceeded,) if SoftTimeLimitExceeded else ()))
+
 
 def _link(label: str, target: Sequence[float], leader: Sequence[Sequence[float]],
           method: str, confidence: float) -> Dict[str, Any]:

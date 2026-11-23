@@ -318,6 +318,23 @@ class TestApply:
                          ask=lambda *a: calls.append(a), has_time=lambda: False)
         assert calls == [] and stats["dropped"] == {"no_time": 2}
 
+    def test_cancelled_sheet_is_not_swallowed(self):
+        from core import deadline
+
+        def ask(*args):
+            raise deadline.Cancelled()
+
+        with pytest.raises(deadline.Cancelled):
+            dl.apply(fields()[:2], image=Image.new("RGB", SHEET, "white"), ask=ask)
+
+    def test_model_error_gives_no_links(self):
+        def ask(*args):
+            raise RuntimeError("сеть")
+
+        items = fields()[:2]
+        stats = dl.apply(items, image=Image.new("RGB", SHEET, "white"), ask=ask)
+        assert stats["linked"] == 0 and all("link" not in item for item in items)
+
     def test_title_block_values_are_not_linked(self):
         item = {"category": "size", "value": "1:2", "bbox": [0.8, 0.9, 0.85, 0.95]}
         assert not dl.linkable(item, forbidden=[[0.6, 0.8, 1.0, 1.0]])
