@@ -105,6 +105,7 @@
 | Нормализация строки чертежа (⌀, ±, гомоглифы) | `core/providers/drawing_text.py` | `normalize` |
 | Сведение прочтений поля по странице (`DRAWING_READINGS_RECONCILED`) | `core/providers/reading_reconcile.py` | `apply`, `reconcile_page`, `choose`; свидетельство вырезки D4 — `witness` |
 | Связь размера с измеряемым элементом (`DRAWING_DIMENSION_LINKS`) | `core/providers/dimension_links.py` | `apply`; геометрия PDF — `geometry_from_page`, `vector_link`; модель — `vlm_prompt`, `marked_image`, `validate_vlm`; место вызова — `DrawingProcessor._dimension_links` сразу после `_value_links` |
+| Размещение полей на странице, повторы, классы (`DRAWING_FIELD_PLACEMENT_V2`) | `core/providers/field_placement.py` | `apply` (перевод вырезка→страница `place_fragment`/`box_to_page`, `reclassify`, `mark_quality`, `dedupe_page`); вызов — последним в `DrawingProcessor._enrich_fragments`; размер картинки — `layout.source_size` в `_process` |
 | Дочитывание спорных чисел вырезками (`DRAWING_DISPUTED_REREAD`) | `core/providers/disputed_reread.py` | `apply`, `targets`; без D3 — `DrawingProcessor._reread_disputed` в проходе листа, с D3 — `_reread_reconciled` после `reading_reconcile.apply` |
 | **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
 | Качество фрагмента чертежа | `core/drawing_quality.py` | `apply_drawing_quality` (7), `document_quality` (71) |
@@ -174,6 +175,7 @@
 | `DRAWING_RECORD_COMPOSED` | `false` | `core/drawing_record.py`, `core/contract_finalize.py`, `core/document_parts.py` |
 | `DRAWING_VALUE_VIEW_LINKS` | `false` | `core/providers/drawing_views.py`, `core/drawing_processor.py` |
 | `DRAWING_DIMENSION_LINKS`, `DRAWING_DIMENSION_LINKS_MAX` | `false`, `60` | `core/providers/dimension_links.py` (`apply`, `vector_link`, `validate_vlm`), `core/drawing_processor.py` (`_dimension_links`, `_vector_geometry`), вызов модели — `core/providers/qwen_client.py::read_dimension_links` |
+| `DRAWING_FIELD_PLACEMENT_V2` | `false` | `core/drawing_processor.py` (`_process`, `_enrich_fragments`), `core/providers/field_placement.py` |
 | `DRAWING_DIAGNOSTICS_NOT_INDEXED` | `false` | `core/contract_finalize.py` |
 | `DRAWING_RECORD_WITHOUT_SHEET_TEXT` | `false` | `core/drawing_record.py` |
 | `DRAWING_RECORD_USES_VALUE_LINKS` | `false` | `core/drawing_record.py` |
