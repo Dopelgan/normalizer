@@ -104,6 +104,7 @@
 | Выправка размеров построчно | `core/providers/dimension_fidelity.py` | `repair_lines` |
 | Нормализация строки чертежа (⌀, ±, гомоглифы) | `core/providers/drawing_text.py` | `normalize` |
 | Сведение прочтений поля по странице (`DRAWING_READINGS_RECONCILED`) | `core/providers/reading_reconcile.py` | `apply`, `reconcile_page`, `choose`; свидетельство вырезки D4 — `witness` |
+| Связь размера с измеряемым элементом (`DRAWING_DIMENSION_LINKS`) | `core/providers/dimension_links.py` | `apply`; геометрия PDF — `geometry_from_page`, `vector_link`; модель — `vlm_prompt`, `marked_image`, `validate_vlm`; место вызова — `DrawingProcessor._dimension_links` сразу после `_value_links` |
 | Дочитывание спорных чисел вырезками (`DRAWING_DISPUTED_REREAD`) | `core/providers/disputed_reread.py` | `apply`, `targets`; без D3 — `DrawingProcessor._reread_disputed` в проходе листа, с D3 — `_reread_reconciled` после `reading_reconcile.apply` |
 | **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
 | Качество фрагмента чертежа | `core/drawing_quality.py` | `apply_drawing_quality` (7), `document_quality` (71) |
@@ -172,6 +173,7 @@
 | `DRAWING_SHEET_NAME_CARRY` | `false` | `core/drawing_sheet_name.py`, `core/contract_finalize.py` |
 | `DRAWING_RECORD_COMPOSED` | `false` | `core/drawing_record.py`, `core/contract_finalize.py`, `core/document_parts.py` |
 | `DRAWING_VALUE_VIEW_LINKS` | `false` | `core/providers/drawing_views.py`, `core/drawing_processor.py` |
+| `DRAWING_DIMENSION_LINKS`, `DRAWING_DIMENSION_LINKS_MAX` | `false`, `60` | `core/providers/dimension_links.py` (`apply`, `vector_link`, `validate_vlm`), `core/drawing_processor.py` (`_dimension_links`, `_vector_geometry`), вызов модели — `core/providers/qwen_client.py::read_dimension_links` |
 | `DRAWING_DIAGNOSTICS_NOT_INDEXED` | `false` | `core/contract_finalize.py` |
 | `DRAWING_RECORD_WITHOUT_SHEET_TEXT` | `false` | `core/drawing_record.py` |
 | `DRAWING_RECORD_USES_VALUE_LINKS` | `false` | `core/drawing_record.py` |
@@ -265,7 +267,7 @@
 |---|---|---|---|
 | `Fragment` | `core/models/contract.py:305` | единица контракта наружу | `fragment_id`, `type`, `content`, `position`, `confidence`, `completeness`, `provenance`, `warnings`, `review_required` |
 | `Content` | `core/models/contract.py:230` | тело фрагмента | `text` (у чертежа — строки листа); `table_data`; `structured_drawing_fields`; `structured_payload` |
-| `DrawingField` | `core/models/contract.py:208` | графа штампа / подписанная величина | `category`, `value`, `tolerance`, `unit`, `nature`, `confirmed` |
+| `DrawingField` | `core/models/contract.py:223` | графа штампа / подписанная величина | `category`, `value`, `tolerance`, `unit`, `nature`, `confirmed`; `link` (`DimensionLink`, под `DRAWING_DIMENSION_LINKS`) |
 | `Position` / `SourceSpan` | `core/models/contract.py:111` / `:95` | где во входном файле | `page`, `sheet`, `bbox`, `source_spans` |
 | `Provenance` | `core/models/contract.py:148` | как получено | `method`, `strategy_level` (1..7), `source` |
 | `TableData` | `core/models/contract.py:182` | таблица | `headers`, `rows`, `total_row` |

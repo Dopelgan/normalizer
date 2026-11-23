@@ -514,6 +514,12 @@ class DrawingProcessor:
         value_links = self._value_links(layout, fields)
         if value_links is not None:
             payload["value_links"] = value_links
+        if _dimension_links() and fields and not text_only:
+            # Связь размера с тем, что он измеряет: ключ `link` у поля. Место
+            # то же, что у привязки к виду, — поля уже сведены.
+            payload["dimension_links"] = self._dimension_links(
+                image_ref, page, layout, fields, value_links, budget_started,
+            )
         mode = MODE_VISION_VLM if (self.vision_enabled and layout.regions) else MODE_SHEET_ONLY
         if not fields and not payload["tables"] and not payload.get("transcript_lines"):
             self._log_sheet(image_ref, sheet, MODE_NONE, 0, len(lines or []),
@@ -655,6 +661,78 @@ class DrawingProcessor:
 
         return drawing_views.attach(layout, fields)
 
+    # ------------------------------------------ связь размера с элементом
+    def _dimension_links(self, image_ref, page, layout, fields, value_links, budget_started) -> Dict[str, Any]:
+        """
+        Ставит `link` полям листа и возвращает учёт для
+        `structured_payload["dimension_links"]` (`DRAWING_DIMENSION_LINKS`).
+
+        Геометрия берётся только у страницы векторного PDF: файл читается
+        ещё раз (рендер его не хранит), и только под флагом. Вызов модели —
+        если на него хватает бюджета листа.
+        """
+        from core.providers import dimension_links
+
+        started = time.monotonic()
+        geometry = self._vector_geometry(image_ref, page, layout)
+        views = [view.get("bbox") for view in (value_links or {}).get("views", [])
+                 if isinstance(view, dict) and view.get("bbox")]
+        budget = settings.DRAWING_TIME_BUDGET
+
+        def has_time() -> bool:
+            return not budget or gpu_gate.budget_now() + settings.VLM_TIMEOUT <= budget_started + budget
+
+        try:
+            stats = dimension_links.apply(
+                fields, image=layout.image,
+                forbidden=dimension_links.forbidden_regions(layout),
+                geometry=geometry,
+                ask=self.qwen.read_dimension_links if self.qwen.available else None,
+                views=views, has_time=has_time,
+            )
+        except (SoftTimeLimitExceeded, deadline.Cancelled):
+            raise
+        except Exception as exc:  # noqa: BLE001 — связь не роняет лист
+            logger.error("Связь размеров с элементами не построилась: %s", exc)
+            for item in fields:
+                item.pop("link", None)
+            return {"error": type(exc).__name__}
+        stats["seconds"] = round(time.monotonic() - started, 2)
+        logger.info(
+            "Связь размеров листа %s: величин %d, по геометрии %d, моделью %d, отказов %d за %.1f с",
+            image_ref, stats["dimensions"], stats["linked_vector"], stats["linked_vlm"],
+            sum(stats["dropped"].values()), stats["seconds"],
+        )
+        return stats
+
+    def _vector_geometry(self, image_ref, page, layout):
+        """Отрезки и стрелки страницы PDF в координатах выправленного листа или None."""
+        data = self._read(image_ref)
+        if data[:5] != b"%PDF-":
+            return None
+        try:
+            import fitz
+        except ImportError:  # pragma: no cover
+            return None
+        from core.providers import dimension_links
+
+        with _PDF_RENDER_LOCK:
+            try:
+                document = fitz.open(stream=data, filetype="pdf")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("PDF чертежа не открылся для геометрии: %s", exc)
+                return None
+            try:
+                if not 1 <= page <= document.page_count:
+                    return None
+                pdf_page = document[page - 1]
+                frame = dimension_links.PageFrame.from_page(
+                    pdf_page, layout.image.size, layout.angle, layout.turn,
+                )
+                return dimension_links.geometry_from_page(pdf_page, frame)
+            finally:
+                document.close()
+
     # ------------------------------------------------------------------- лог
     # Доказательство работы модели на чертеже читается прямо из лога: по
     # строке на каждый вызов Qwen-VL и строка-итог на лист. Содержимого
@@ -726,6 +804,15 @@ class DrawingProcessor:
             "detected_count": drawing_result.get("detected_count", 0),
             "recognition_mode": mode,
         })
+        mechanisms = dict(drawing_result.get("completeness_mechanisms") or {})
+        links_stats = payload.pop("dimension_links", None)
+        if links_stats is not None:
+            # Учёт связи размеров — служебный: в payload его адаптер RAG
+            # вывел бы строкой в индекс (`contract_finalize._diagnostics_aside`),
+            # поэтому он сразу лежит там, где тот флаг держит служебное.
+            diagnostics = dict(mechanisms.get("drawing_diagnostics") or {})
+            diagnostics["dimension_links"] = links_stats
+            mechanisms["drawing_diagnostics"] = diagnostics
         fragment = Fragment(
             fragment_id=source.fragment_id,
             type="drawing",
@@ -742,7 +829,7 @@ class DrawingProcessor:
             confidence=round(float(drawing_result.get("avg_confidence", 0.0)), 3),
             completeness=drawing_result.get("completeness"),
             structure_score=drawing_result.get("structure_score"),
-            completeness_mechanisms=drawing_result.get("completeness_mechanisms") or {},
+            completeness_mechanisms=mechanisms,
             missing_regions=[
                 {**region, "page": source.position.page if source.position else 0,
                  "sheet": source.position.sheet if source.position else None}
@@ -1532,7 +1619,8 @@ class DrawingProcessor:
             allowed = set(sheet["boxes"])
             for n, key in enumerate(keys):
                 if key[1] and key in done:
-                    fields[n] = {**done[key], "bbox": fields[n]["bbox"], "category": fields[n]["category"]}
+                    fields[n] = {**done[key], "bbox": fields[n]["bbox"], "category": fields[n]["category"],
+                                 "link": fields[n].get("link")}
                     allowed.discard(disputed_reread._key(fields[n]["bbox"]))
 
             def render(sheet=sheet):
@@ -1680,6 +1768,11 @@ def _value_view_links() -> bool:
     настроек: pydantic отказывается заводить неизвестное поле даже на запись.
     """
     return bool(getattr(settings, "DRAWING_VALUE_VIEW_LINKS", False))
+
+
+def _dimension_links() -> bool:
+    """Связывать ли размеры с измеряемыми элементами (`DRAWING_DIMENSION_LINKS`)."""
+    return bool(getattr(settings, "DRAWING_DIMENSION_LINKS", False))
 
 
 def _page_area_share(fragment: Fragment) -> Optional[float]:

@@ -950,6 +950,13 @@ class QwenVisionClient:
             return None
         return disputed_reread.parse_values(data, count)
 
+    def read_dimension_links(self, image, prompt: str, count: int) -> Optional[Dict[str, Any]]:
+        """
+        Лист с отмеченными величинами (DRAWING_DIMENSION_LINKS) -> ответ
+        модели как есть; проверяет его `dimension_links.validate_vlm`.
+        """
+        return self._ask(image, prompt, settings.QWEN_SHEET_MAX_SIDE, max_tokens=128 + 96 * count)
+
     def transcribe(self, image) -> Optional[List[str]]:
         """Весь текст листа строками: штамп, графы, примечания, таблицы."""
         data = self._ask(

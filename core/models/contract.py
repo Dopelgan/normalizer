@@ -205,6 +205,21 @@ class FormulaData(BaseModel):
     operations: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class DimensionLink(BaseModel):
+    """
+    К чему относится величина листа (`DRAWING_DIMENSION_LINKS`): что она
+    измеряет, рамка измеряемого элемента и линия от надписи к нему (концы
+    размерной линии или выноски). Координаты — доли выправленного листа,
+    как у `DrawingField.bbox`.
+    """
+
+    target_label: str
+    target_bbox: List[float]
+    leader: List[List[float]] = Field(default_factory=list)
+    method: Literal["vector", "vlm"]
+    confidence: float = Field(0.0, ge=0, le=1)
+
+
 class DrawingField(BaseModel):
     """Структурированное поле чертежа."""
 
@@ -231,11 +246,14 @@ class DrawingField(BaseModel):
     # Без флага ключей нет в ответе вовсе (см. `_without_unset_readings`).
     readings: Optional[List[Dict[str, str]]] = None
     agreement: Optional[Literal["vector", "agreed", "single", "conflict"]] = None
+    # Связь величины с измеряемым элементом (DRAWING_DIMENSION_LINKS). Без
+    # флага и без найденной связи ключа нет в ответе вовсе.
+    link: Optional[DimensionLink] = None
 
     @model_serializer(mode="wrap")
     def _without_unset_readings(self, handler):
         data = handler(self)
-        for key in ("readings", "agreement"):
+        for key in ("readings", "agreement", "link"):
             if isinstance(data, dict) and data.get(key) is None:
                 data.pop(key, None)
         return data

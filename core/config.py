@@ -398,6 +398,15 @@ class Settings(BaseSettings):
     # относится к детали, к которой он не относится
     # (core/providers/drawing_views.py). По умолчанию выключено.
     DRAWING_VALUE_VIEW_LINKS: bool = False
+    # Связь размера с тем, что он измеряет: у поля чертежа ключ `link` —
+    # фраза («диаметр отверстия», «габаритная длина»), рамка элемента и
+    # концы размерной линии или выноски. Сначала геометрия векторного PDF
+    # (стрелки и выносные линии), для сканов и несвязанных величин — один
+    # вызов модели на лист с проверкой ответа; сомнительная связь не
+    # ставится (core/providers/dimension_links.py). По умолчанию выключено.
+    # DRAWING_DIMENSION_LINKS_MAX — сколько величин листа спрашивать у модели.
+    DRAWING_DIMENSION_LINKS: bool = False
+    DRAWING_DIMENSION_LINKS_MAX: int = 60
     # Служебные данные разбора не уходят в индексируемый текст: перед выдачей
     # они переносятся из `content.structured_payload` в
     # `completeness_mechanisms["drawing_diagnostics"]`. В `structured_payload`
