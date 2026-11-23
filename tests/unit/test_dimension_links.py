@@ -265,6 +265,10 @@ class TestVlmValidation:
         prompt = dl.vlm_prompt(ASKED)
         assert "1: «⌀20»" in prompt and "400, 300" not in prompt and "[400" not in prompt
 
+    def test_flat_leader_is_read_as_points(self):
+        found, dropped = dl.validate_vlm(answer(good(leader=[400, 330, 355, 385])), ASKED, SIZE)
+        assert dropped == {} and found[1]["leader"] == [[0.4, 0.33], [0.355, 0.385]]
+
     def test_no_leader_is_kept_with_lower_confidence(self):
         found, _ = dl.validate_vlm(answer(good(leader=None)), ASKED, SIZE)
         assert found[1]["leader"] == [] and found[1]["confidence"] == dl.VLM_CONFIDENCE_BARE
@@ -278,6 +282,8 @@ class TestVlmValidation:
         (good(leader=[[100, 100], [355, 385]]), "leader_mismatch"),     # начало не у надписи
         (good(leader=[[400, 330], [700, 700]]), "leader_mismatch"),     # конец не у элемента
         (good(leader=[[400, 330]]), "bad_leader"),
+        (good(target_bbox=[395, 295, 455, 335], leader=[[420, 310], [430, 320]]), "leader_in_label"),
+        (good(target_bbox=[395, 295, 455, 335], leader=None), "target_is_label"),
         (good(target="hole"), "bad_label"),
         (good(target=""), "bad_label"),
         (good(id=7), "unknown_id"),
@@ -314,8 +320,8 @@ class TestApply:
         def ask(image, prompt, count):
             calls.append((image.size, prompt, count))
             # Номер 1 — первая несвязанная геометрией величина: «15».
-            return answer({"id": 1, "target": "толщина стенки", "target_bbox": [600, 800, 660, 860],
-                           "leader": [[600, 810], [620, 830]]})
+            return answer({"id": 1, "target": "толщина стенки", "target_bbox": [690, 840, 750, 900],
+                           "leader": [[640, 830], [700, 860]]})
 
         image = Image.new("RGB", SHEET, "white")
         stats = dl.apply(items, image=image, geometry=geometry_of(sheet_pdf()), ask=ask)

@@ -75,6 +75,8 @@ _CURVE_STEPS = 6
 _VLM_TARGET_GAP = 0.2    # рамка элемента не дальше 20 % листа от надписи
 _VLM_LEADER_START = 0.04  # линия начинается у надписи
 _VLM_LEADER_END = 0.03   # и кончается у элемента
+_VLM_LEADER_REACH = 0.015  # и уходит от надписи хотя бы на 1,5 % листа
+_VLM_BARE_OVERLAP = 0.5  # без линии рамка цели не накрывает надпись и наполовину
 _VLM_TARGET_AREA = 0.25  # элемент не больше четверти листа
 _VLM_OVERALL_AREA = 0.6  # габарит — деталь целиком, но не весь лист
 _VLM_TARGET_MIN = 0.002
@@ -790,6 +792,17 @@ def validate_vlm(
             if start_gap > _VLM_LEADER_START * longest or end_gap > _VLM_LEADER_END * longest:
                 drop("leader_mismatch")
                 continue
+            # Линия, не выходящая из надписи, ни на что не указывает: на листе
+            # крышки так модель «связала» ⌀8,5 с рамкой вокруг самой надписи.
+            reach = max(_gap_to_box((x * width, y * height), own_px) for x, y in leader)
+            if reach < _VLM_LEADER_REACH * longest:
+                drop("leader_in_label")
+                continue
+        elif (not label.lower().startswith("габарит")
+              and _overlap(target_px, own_px) >= _VLM_BARE_OVERLAP * _area(own_px)):
+            # Габарит — деталь целиком, и надпись вправе лежать в её рамке.
+            drop("target_is_label")
+            continue
         out[number] = _link(
             label, list(target), leader, METHOD_VLM,
             VLM_CONFIDENCE_LEADER if leader else VLM_CONFIDENCE_BARE,
@@ -971,6 +984,11 @@ def _model_box(raw: Any, span_ok: bool = False) -> Optional[List[float]]:
 
 
 def _model_points(raw: Any) -> List[List[float]]:
+    if (isinstance(raw, (list, tuple)) and 4 <= len(raw) <= 16 and len(raw) % 2 == 0
+            and all(isinstance(c, (int, float)) for c in raw)):
+        # Точки плоским списком [x1, y1, x2, y2, ...] — так модель отвечает
+        # на вырезках; порядок тот же, что у пар.
+        raw = [raw[k:k + 2] for k in range(0, len(raw), 2)]
     if not isinstance(raw, (list, tuple)) or not 2 <= len(raw) <= 8:
         return []
     points: List[List[float]] = []
