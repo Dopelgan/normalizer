@@ -22,6 +22,7 @@ from core import filetypes
 from core.ladder.base import Strategy
 from core.ladder.context import DocumentContext
 from core.models.parse_result import ParsedBlock, ParseResult
+from core import recognition_lines
 from core.providers.text_layer import group_lines, lines_to_text, merge_line_bboxes, page_turn
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,10 @@ class PdfTextLayerStrategy(Strategy):
                     type="text", text=text, page=page,
                     bbox=merge_line_bboxes(group),
                     confidence=1.0, method=self.method,
+                    **recognition_lines.fields(
+                        group, recognition_lines.SOURCE_TEXT_LAYER, exact=True,
+                        page_size=layer.page_sizes.get(page), page_rotation=turn,
+                    ),
                 ))
 
         if not blocks:

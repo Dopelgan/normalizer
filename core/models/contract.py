@@ -19,7 +19,9 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel, ConfigDict, Field, field_serializer, field_validator, model_serializer, model_validator,
+)
 
 FragmentType = Literal["text", "table", "formula", "drawing", "image", "structured"]
 DocumentStatus = Literal["pending", "indexed", "error"]
@@ -108,6 +110,38 @@ class SourceSpan(BaseModel):
         return self
 
 
+class RecognitionLine(BaseModel):
+    """
+    Одна распознанная строка фрагмента (флаг `RECOGNITION_LINES`).
+
+    `bbox` — в тех же долях страницы, что `position.bbox`. `confidence`
+    нет у векторного текстового слоя (текст взят из файла). `rotation` —
+    наклон строки в градусах против часовой, только если он больше 5°.
+    `page` — только у строки соединённого фрагмента, лежащей не на
+    `position.page`.
+    """
+
+    text: str
+    bbox: List[float]
+    source: str          # text_layer | ocr_layer | mineru | tesseract
+    confidence: Optional[float] = Field(None, ge=0, le=1)
+    rotation: Optional[float] = None
+    page: Optional[int] = Field(None, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _drop_absent(self, handler):
+        # Необязательные ключи не пишутся вовсе: строк на странице сотни,
+        # и `null` в каждой удваивал бы выдачу.
+        data = handler(self)
+        return {k: v for k, v in data.items() if v is not None or k in ("text", "bbox", "source")}
+
+
+# Поля положения, которых нет у старых потребителей: при значении None они
+# не попадают в JSON, и выдача с выключенным `RECOGNITION_LINES` совпадает
+# с прежней байт в байт.
+_POSITION_OPTIONAL = ("lines", "page_size", "page_rotation")
+
+
 class Position(BaseModel):
     """Положение фрагмента в исходном документе."""
 
@@ -121,6 +155,20 @@ class Position(BaseModel):
     offset_reference: Literal["extracted_block_unicode_codepoints_v1"] = "extracted_block_unicode_codepoints_v1"
     text_offsets_exact: bool = False
     bbox_exact: bool = False
+    # Строки фрагмента с рамками, размер страницы [ширина, высота] в
+    # единицах источника (pt у PDF и MinerU, px у растра Tesseract) и
+    # поворот текста страницы (0/90/180/270). Только при RECOGNITION_LINES.
+    lines: Optional[List[RecognitionLine]] = None
+    page_size: Optional[List[float]] = None
+    page_rotation: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _drop_absent(self, handler):
+        data = handler(self)
+        for key in _POSITION_OPTIONAL:
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
     @model_validator(mode="after")
     def _check_range(self):

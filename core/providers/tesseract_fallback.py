@@ -45,7 +45,7 @@ import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
 
-from core import filetypes
+from core import filetypes, recognition_lines
 from celery.exceptions import SoftTimeLimitExceeded
 
 from core import deadline
@@ -56,7 +56,7 @@ from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.ocr_prepare import PreparedPage, prepare_page
 from core.workspace import temp_dir
 from core.providers.text_layer import (
-    TextLayer, TextLine, column_lines, group_columns, group_lines, merge_line_bboxes,
+    TextLayer, TextLine, column_lines, group_columns, group_lines, merge_line_bboxes, page_turn,
 )
 
 logger = logging.getLogger(__name__)
@@ -463,6 +463,8 @@ class TesseractFallbackProvider:
                 groups = group_columns(column_lines(as_text_lines))
             else:
                 groups = group_lines(as_text_lines)
+            # Поворот текста страницы нужен только строкам распознавания.
+            turn = page_turn(as_text_lines) if recognition_lines.enabled() else None
             for group in groups:
                 text = "\n".join(l.text.strip() for l in group).strip()
                 if vocab is not None and text:
@@ -476,6 +478,10 @@ class TesseractFallbackProvider:
                     bbox=merge_line_bboxes(group),
                     confidence=_weighted_lines(group),
                     is_fallback=True,
+                    **recognition_lines.fields(
+                        group, recognition_lines.SOURCE_TESSERACT,
+                        page_size=getattr(image, "size", None), page_rotation=turn,
+                    ),
                 ))
             if blocks:
                 return blocks

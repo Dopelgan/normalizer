@@ -30,6 +30,10 @@ class ParsedBlock(BaseModel):
     confidence: float = 1.0
     is_fallback: bool = False                     # получен через Tesseract
     page_size: Optional[List[float]] = None       # [width, height] исходной страницы
+    # Строки блока с рамками и поворот текста страницы — только при
+    # RECOGNITION_LINES (core/recognition_lines.py), иначе None.
+    lines: Optional[List[Dict[str, Any]]] = None
+    page_rotation: Optional[int] = None
     # Чем реально получен текст блока: text_layer | text_layer_recovered |
     # mineru_ocr | tesseract. Нужен, чтобы provenance не выдумывался по типу
     # фрагмента, а отражал фактический путь.

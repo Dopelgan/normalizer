@@ -284,6 +284,8 @@ class TextNormalizer:
             ))
             if strategy is not None and fragment.position:
                 fragment.position.bbox_exact = False
+                # Кусок нарезки — не весь блок: строки блока ему не принадлежат.
+                fragment.position.lines = None
             # Старый needs_review остаётся служебным; согласованный публичный
             # review_required передаётся отдельно и сохраняется в JSON.
             # Деградация разбора — повод на проверку независимо от полноты.
