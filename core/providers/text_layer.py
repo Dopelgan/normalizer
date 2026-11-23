@@ -28,6 +28,7 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from core import recognition_lines
 from core.config import settings
 from core.models.parse_result import ParsedBlock
 from core.providers import latex_text, table_from_lines
@@ -682,6 +683,11 @@ OCR_LAYER = LayerSource(
 )
 
 
+def _line_source(source: LayerSource) -> str:
+    """Подпись источника строк в `position.lines`: файл или распознавание."""
+    return recognition_lines.SOURCE_TEXT_LAYER if source.exact else recognition_lines.SOURCE_OCR_LAYER
+
+
 @dataclass
 class ReconcileStats:
     """Что дала сшивка — уезжает в логи и в сырой результат парсера."""
@@ -944,6 +950,10 @@ def reconcile_with_text_layer(
                 bbox=merge_line_bboxes(group),
                 confidence=source.confidence_of(group),
                 method=source.recovered_method,
+                **recognition_lines.fields(
+                    group, _line_source(source), exact=source.exact,
+                    page_size=layer.page_sizes.get(page), page_rotation=turn,
+                ),
             ))
 
         page_blocks.sort(key=lambda block: _block_reading_key(block, turn))
@@ -1127,6 +1137,8 @@ def _rebuild_text_block(
     block.bbox = merge_line_bboxes(matched)
     block.method = source.method
     block.confidence = source.confidence_of(matched)
+    recognition_lines.apply(block, matched, _line_source(source), exact=source.exact,
+                            page_rotation=turn)
     stats.rebuilt_blocks += 1
 
 
@@ -1159,6 +1171,8 @@ def _fix_formula(
         block.bbox = merge_line_bboxes(matched)
         block.method = source.method
         block.confidence = source.confidence_of(matched)
+        recognition_lines.apply(block, matched, _line_source(source), exact=source.exact,
+                                page_rotation=turn)
         stats.repaired_formulas += 1
         return
 

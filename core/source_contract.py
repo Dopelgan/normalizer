@@ -4,7 +4,8 @@ import hashlib
 import json
 from collections import Counter
 
-from core.models.contract import SourceSpan
+from core import recognition_lines
+from core.models.contract import RecognitionLine, SourceSpan
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 
 
@@ -44,6 +45,7 @@ def attach_source(fragment, block, source_unit_id, *, exact_text=False):
     if position:
         position.page_start = position.page_end = block.page
         position.bbox_exact = block.bbox_exact
+        _attach_lines(position, block)
         if exact_text and block.text is not None:
             position.source_spans = [SourceSpan(
                 source_unit_id=source_unit_id, page=block.page, sheet=position.sheet,
@@ -57,3 +59,19 @@ def attach_source(fragment, block, source_unit_id, *, exact_text=False):
         table.setdefault("row_start", 0)
         table.setdefault("row_end", len(table.get("rows") or []))
     fragment.warnings = list(dict.fromkeys(fragment.warnings + block.warnings))
+
+
+def _attach_lines(position, block):
+    """
+    Строки блока, размер страницы и поворот текста — в положение фрагмента
+    (`RECOGNITION_LINES`). При выключенном флаге положение не меняется,
+    даже если парсер знает размер страницы: прежняя выдача его не несла.
+    """
+    if not recognition_lines.enabled():
+        return
+    if block.lines is not None:
+        position.lines = [RecognitionLine(**line) for line in block.lines]
+    if block.page_size and len(block.page_size) == 2 and all(block.page_size):
+        position.page_size = [round(float(v), 2) for v in block.page_size]
+    if block.page_rotation is not None:
+        position.page_rotation = int(block.page_rotation) % 360

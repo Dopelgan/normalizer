@@ -274,6 +274,7 @@ def _join_into(first: Fragment, second: Fragment,
             and first.position.bbox == second.position.bbox
         )
         first.position.bbox = _bbox_union(first.position.bbox, second.position.bbox)
+        _merge_lines(first.position, second.position)
         starts = [p for p in (first.position.page_start, second.position.page_start)
                   if p is not None]
         ends = [p for p in (first.position.page_end, second.position.page_end)
@@ -312,6 +313,23 @@ def _join_into(first: Fragment, second: Fragment,
     first.extracted_facts = [*first.extracted_facts, *second.extracted_facts]
     first.graph_nodes = [*first.graph_nodes, *second.graph_nodes]
     first.relations = [*first.relations, *second.relations]
+
+
+def _merge_lines(first, second) -> None:
+    """
+    Строки распознавания второго участника переходят к первому
+    (`RECOGNITION_LINES`): рамка соединённого фрагмента — объединение, и
+    без строк второго просмотрщик показал бы его пустым местом. Строка с
+    другой страницы помечается `page`.
+    """
+    if second.lines is None:
+        return
+    moved = []
+    for line in second.lines:
+        if line.page is None and second.page != first.page:
+            line = line.model_copy(update={"page": second.page})
+        moved.append(line)
+    first.lines = [*(first.lines or []), *moved]
 
 
 def _bbox_union(first: List[float], second: List[float]) -> List[float]:

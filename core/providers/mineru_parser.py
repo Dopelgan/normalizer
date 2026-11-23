@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from core import filetypes
+from core import filetypes, recognition_lines
 from celery.exceptions import SoftTimeLimitExceeded
 
 from core import deadline, outage, telemetry
@@ -881,6 +881,10 @@ class MinerUParserProvider(DocumentParserProvider):
                     type="text", text=text, page=page,
                     bbox=merge_line_bboxes(group), order=len(blocks),
                     confidence=1.0, method="text_layer",
+                    **recognition_lines.fields(
+                        group, recognition_lines.SOURCE_TEXT_LAYER, exact=True,
+                        page_size=layer.page_sizes.get(page), page_rotation=turn,
+                    ),
                 ))
         return ParseResult(
             blocks=blocks,
@@ -1141,6 +1145,7 @@ class MinerUParserProvider(DocumentParserProvider):
                 confidence=confidence, page_size=[width, height] if width else None,
                 section_title=text[:200] if raw.get("type") == "title" else None,
                 method=METHOD_PARSER_OCR,
+                **self._line_fields(raw, width, height),
             )
 
         if raw_type in _FORMULA:
@@ -1176,6 +1181,13 @@ class MinerUParserProvider(DocumentParserProvider):
             )
 
         return None
+
+    @staticmethod
+    def _line_fields(raw: Dict[str, Any], width: float, height: float) -> Dict[str, Any]:
+        """Строки блока MinerU с рамками (`RECOGNITION_LINES`); пусто без флага."""
+        if not recognition_lines.enabled():
+            return {}
+        return {"lines": recognition_lines.mineru_lines(raw, width, height)}
 
     @staticmethod
     def _text_from_block(raw: Dict[str, Any]) -> str:
