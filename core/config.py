@@ -128,10 +128,10 @@ class Settings(BaseSettings):
     # распознавания и модели (не текстовый слой, не Word); исходные
     # написания — в structured_payload["ocr_corrections"]. Файл словаря —
     # OCR_CORRECTION_DICTIONARY_PATH (JSON, вне репозитория: слова
-    # заказчика в Git не попадают); пусто или нет файла — ничего не
-    # правится. Число с буквой вместо цифры («1Омм», «О,4») — отдельно,
-    # OCR_CORRECTION_NUMERIC_GLYPHS, только при запятой или единице
-    # измерения. По умолчанию всё выключено.
+    # заказчика в Git не попадают); пусто или нет файла — словарных правок
+    # нет. Число с буквой вместо цифры («1Омм», «О,4») — отдельный флаг
+    # OCR_CORRECTION_NUMERIC_GLYPHS (работает и без словаря), только при
+    # запятой или единице измерения. По умолчанию всё выключено.
     OCR_CORRECTION_DICTIONARY: bool = False
     OCR_CORRECTION_DICTIONARY_PATH: str = ""
     OCR_CORRECTION_NUMERIC_GLYPHS: bool = False

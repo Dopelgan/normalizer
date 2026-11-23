@@ -161,13 +161,14 @@ def finalize_fragments(
         # делает снятие рамки у себя (`document_furniture.apply`). Замена той же
         # длины диапазон не ломает, и обещание остаётся.
         before_repairs = fragment.content.text or ""
-        if settings.OCR_CORRECTION_DICTIONARY:
+        if settings.OCR_CORRECTION_DICTIONARY or settings.OCR_CORRECTION_NUMERIC_GLYPHS:
             # Первой из починок: слово, выправленное по словарю корпуса,
             # дальше уже видят правка алфавита и обозначений. Только текст
             # распознавания (`ocr_correction.applies_to`).
             ocr_correction.correct_fragment(
                 fragment,
-                ocr_correction.load_dictionary(settings.OCR_CORRECTION_DICTIONARY_PATH),
+                ocr_correction.load_dictionary(settings.OCR_CORRECTION_DICTIONARY_PATH)
+                if settings.OCR_CORRECTION_DICTIONARY else ocr_correction.Dictionary(),
                 numeric=settings.OCR_CORRECTION_NUMERIC_GLYPHS,
             )
         if settings.SCAN_NO_MIXED_SCRIPT_WORDS and fragment.type == "text":

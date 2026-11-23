@@ -100,11 +100,20 @@ _UNIT_ALT = "|".join(sorted(_UNITS, key=len, reverse=True))
 # обрывок обозначения, чем «90 А».
 _GLUED_UNIT_ALT = "|".join(sorted((u for u in _UNITS if len(u) > 1), key=len, reverse=True))
 _NUMBER = re.compile(
-    r"(?<![\w.,/-])(?P<num>[0-9OОoоlIЗ]+(?:[.,][0-9OОoоlIЗ]+)?)"
+    r"(?<![\w.,/])(?<!\w-)(?P<num>[0-9OОoоlIЗ]+(?:[.,][0-9OОoоlIЗ]+)?)"
     r"(?P<unit>" + _GLUED_UNIT_ALT + r")?(?![\w])"
 )
 _CODE_GOES_ON = re.compile(r"[.,/-][0-9OОoоlIЗ]")
-_UNIT_AFTER = re.compile(r"[ \t]?(?:(?:" + _UNIT_ALT + r")(?![\w])|°|%)")
+# Единица следом. Однобуквенная («м», «В», «А») — только если за ней не
+# идёт слово: «1О В нём» — это предлог, а не вольты.
+_UNIT_AFTER = re.compile(
+    r"[ \t]?(?:(?:" + _GLUED_UNIT_ALT + r")(?![\w])"
+    r"|(?:м|В|А)(?![\w])(?![ \t]+[^\W\d_])|°|%)"
+)
+# Слово внутри обозначения: вплотную к «.», «/» или «-» с цифрой
+# («АБВТ.301261», «А.3ал.01»). Его правит `designation_repair`, не словарь.
+_IN_CODE_AFTER = re.compile(r"[./-][0-9]")
+_IN_CODE_BEFORE = re.compile(r"[0-9][./-]$")
 
 
 class Correction(NamedTuple):
@@ -126,25 +135,41 @@ class Dictionary:
         return not self.pairs and not self.words
 
 
-@functools.lru_cache(maxsize=4)
 def load_dictionary(path: str) -> Dictionary:
     """
     Словарь из файла JSON `{"pairs": {ошибка: слово}, "words": [...]}`.
-    Нет пути, нет файла, файл битый — пустой словарь и ничего не правится:
-    выправка не обязательна, разбор не должен из-за неё падать.
+    Нет пути, нет файла, файл битый или не той формы — пустой словарь и
+    ничего не правится: выправка не обязательна, разбор не должен из-за неё
+    падать. Файл перечитывается, когда меняется время его правки: новый
+    словарь подхватывается без перезапуска воркеров.
     """
     if not path:
         return Dictionary()
-    if not os.path.isfile(path):
+    try:
+        stamp: Optional[int] = os.stat(path).st_mtime_ns
+    except OSError:
+        stamp = None
+    return _load_dictionary(path, stamp)
+
+
+@functools.lru_cache(maxsize=4)
+def _load_dictionary(path: str, stamp: Optional[int]) -> Dictionary:
+    if stamp is None:
         logger.warning("Словарь выправки распознавания не найден: %s", path)
         return Dictionary()
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:
             data = json.load(handle)
     except (OSError, ValueError) as exc:
         logger.warning("Словарь выправки распознавания не прочитан: %s", exc)
         return Dictionary()
-    return build_dictionary(data.get("pairs") or {}, data.get("words") or ())
+    pairs = data.get("pairs") if isinstance(data, dict) else None
+    words = data.get("words") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or not isinstance(pairs or {}, dict) \
+            or not isinstance(words or [], list):
+        logger.warning("Словарь выправки распознавания не той формы: %s", path)
+        return Dictionary()
+    return build_dictionary(pairs or {}, words or [])
 
 
 def build_dictionary(pairs: Mapping[str, Any], words: Any) -> Dictionary:
@@ -162,6 +187,9 @@ def build_dictionary(pairs: Mapping[str, Any], words: Any) -> Dictionary:
             clean[low] = target.lower()
     clean = {k: v for k, v in clean.items() if not any(part in clean for part in v.split(" "))}
     vocabulary = frozenset(w.strip().lower() for w in words if isinstance(w, str) and w.strip())
+    # Слово списка не бывает ключом пары: иначе выправка по двойникам дала
+    # бы ключ, а следующий проход — другое слово.
+    vocabulary = vocabulary - frozenset(clean)
     return Dictionary(pairs=clean, words=vocabulary)
 
 
@@ -256,6 +284,10 @@ def _number_fix(text: str, match: "re.Match[str]") -> Optional[str]:
     # правит `designation_repair`, не здесь.
     if len(re.split(r"[.,]", num)[0]) > 4 or _CODE_GOES_ON.match(text, match.end()):
         return None
+    # Слитная единица с буквы-двойника съела бы цифру: «1ООм» — это 100 м,
+    # а не «10Ом».
+    if unit and unit[0] in _DIGIT_GLYPH and num[-1] in _DIGIT_GLYPH:
+        return None
     # «l»/«I» — единица только рядом с настоящей цифрой: «II» — римское число.
     for index, ch in enumerate(num):
         if ch in "lI" and not any(n.isdigit() for n in num[max(0, index - 1):index + 2]):
@@ -308,6 +340,9 @@ def correct_text(
         start, end = match.start(), match.end()
         token = match.group(0)
         if not free(start, end) or _hyphen_neighbour(text, start, end):
+            continue
+        if (_IN_CODE_AFTER.match(text, end)
+                or _IN_CODE_BEFORE.search(text[max(0, start - 2):start])):
             continue
         target = dictionary.pairs.get(token.lower())
         rule = "pair"
@@ -380,8 +415,13 @@ def correct_fragment(
             [fix(value, [r, c]) for c, value in enumerate(row)]
             for r, row in enumerate(table.rows or [])
         ]
+        if isinstance(table.total_row, dict):
+            table.total_row = {
+                key: fix(value, ["total", key]) for key, value in table.total_row.items()
+            }
     if records:
         payload = content.structured_payload or {}
-        payload.setdefault(PAYLOAD_KEY, []).extend(records)
+        previous = payload.get(PAYLOAD_KEY)
+        payload[PAYLOAD_KEY] = (previous if isinstance(previous, list) else []) + records
         content.structured_payload = payload
     return records

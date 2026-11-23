@@ -7,6 +7,7 @@
 """
 
 import json
+import os
 
 import pytest
 
@@ -54,6 +55,26 @@ class TestDictionary:
         broken = tmp_path / "broken.json"
         broken.write_text("{не json", encoding="utf-8")
         assert ocr_correction.load_dictionary(str(broken)).empty
+
+    @pytest.mark.parametrize("body", [
+        "[]", "5", '{"pairs": ["x"]}', '{"words": 5}', '{"pairs": {"a": "b"}, "words": "ab"}',
+    ])
+    def test_wrong_shape_is_empty(self, tmp_path, body):
+        path = tmp_path / "shape.json"
+        path.write_text(body, encoding="utf-8")
+        assert ocr_correction.load_dictionary(str(path)).empty
+
+    def test_bom_accepted_and_changed_file_reloaded(self, tmp_path):
+        path = tmp_path / "dict.json"
+        path.write_bytes("\ufeff{\"pairs\": {\"дорота\": \"дорога\"}}".encode("utf-8"))
+        assert ocr_correction.load_dictionary(str(path)).pairs == {"дорота": "дорога"}
+        path.write_text('{"pairs": {"3ал": "зал"}}', encoding="utf-8")
+        os.utime(path, ns=(1, 10 ** 18))
+        assert ocr_correction.load_dictionary(str(path)).pairs == {"3ал": "зал"}
+
+    def test_word_that_is_a_pair_key_dropped_from_words(self):
+        dictionary = build_dictionary({"стал": "стол"}, ["стал", "стол"])
+        assert dictionary.words == frozenset({"стол"})
 
     def test_file_loaded(self, tmp_path):
         path = tmp_path / "dict.json"
@@ -161,12 +182,30 @@ class TestNumberGlyphs:
         "АБВГ 42145100З.04",           # номер обозначения: длинная целая часть
         "деталь О5.01.35.01",          # код продолжается через точку
         "класс 1,II",                  # римское число
+        "длина 1ООм",                  # 100 м, а не «10Ом»
+        "раздел 1О В нём",             # «В» — предлог, а не вольты
     ])
     def test_not_a_value_untouched(self, text):
         assert correct_text(text, DICTIONARY, numeric=True)[0] == text
 
+    def test_minus_sign_before_value(self):
+        assert correct_text("допуск -О,2 мм", DICTIONARY, numeric=True)[0] == "допуск -0,2 мм"
+
+    def test_numeric_works_without_dictionary(self):
+        empty = build_dictionary({}, [])
+        assert correct_text("длина 1Омм", empty, numeric=True)[0] == "длина 10мм"
+
     def test_off_without_flag(self):
         assert correct_text("длина 1Омм", DICTIONARY)[0] == "длина 1Омм"
+
+
+class TestDesignationContext:
+    @pytest.mark.parametrize("text", ["А.3ал.01", "дорота.301261.001", "12-дорота", "дорота/5"])
+    def test_word_glued_to_code_untouched(self, text):
+        assert correct_text(text, DICTIONARY)[0] == text
+
+    def test_word_before_sentence_dot_corrected(self):
+        assert correct_text("Вот дорота. Дальше", DICTIONARY)[0] == "Вот дорога. Дальше"
 
 
 class TestFragment:
@@ -191,6 +230,15 @@ class TestFragment:
             {"rule": "pair", "from": "дорота", "to": "дорога", "offset": 5},
         ]
 
+    def test_total_row_and_odd_payload(self):
+        table = TableData(headers=["a"], rows=[["b"]], total_row={"итог": "3ал", "n": 2})
+        fragment = _fragment(None, method="mineru_table", type_="table", table=table)
+        fragment.content.structured_payload = {"ocr_corrections": None}
+        ocr_correction.correct_fragment(fragment, DICTIONARY)
+        assert fragment.content.table_data.total_row == {"итог": "Зал", "n": 2}
+        records = fragment.content.structured_payload["ocr_corrections"]
+        assert records[0]["cell"] == ["total", "итог"]
+
     def test_table_cells_corrected(self):
         table = TableData(headers=["3ал", "Дата"], rows=[["mолоко", 5], ["", None]])
         fragment = _fragment(None, method="mineru_table", type_="table", table=table)
@@ -206,10 +254,13 @@ class TestFinalize:
         path = tmp_path / "ocr_corrections.json"
         path.write_text(json.dumps({"pairs": {"дорота": "дорога"}, "words": ["дорога"]},
                                    ensure_ascii=False), encoding="utf-8")
-        ocr_correction.load_dictionary.cache_clear()
         monkeypatch.setattr(settings, "OCR_CORRECTION_DICTIONARY_PATH", str(path))
-        yield path
-        ocr_correction.load_dictionary.cache_clear()
+        return path
+
+    def test_numeric_flag_alone(self, dictionary_file, monkeypatch):
+        monkeypatch.setattr(settings, "OCR_CORRECTION_NUMERIC_GLYPHS", True)
+        fragments, _ = finalize_fragments([_fragment("дорота 1Омм")], doc_id="d1", extract=False)
+        assert fragments[0].content.text == "дорота 10мм"
 
     def test_flag_off_by_default(self, dictionary_file):
         assert settings.OCR_CORRECTION_DICTIONARY is False
