@@ -45,7 +45,10 @@ def build_sheet(drawings: Sequence[Fragment], others: Sequence[Fragment] = ()
     title_block, leftovers = title.build(in_title, pool)
     elements = merge.merge(rest + leftovers)
     snap.snap(elements, pool.lines)
-    typed = [(element, typing_.classify(element.value, element.category, pool.sheet_type)) for element in elements]
+    stamp = _stamp_box(pool, title_block)
+    typed = [(element, typing_.classify(element.value, element.category, pool.sheet_type,
+                                        in_title=_inside(element.bbox, stamp)))
+             for element in elements]
 
     sections = links.build(pool, typed, title_block)
     links.identify(sections, title_block)
@@ -61,3 +64,26 @@ def build_sheet(drawings: Sequence[Fragment], others: Sequence[Fragment] = ()
     merged = sum(e.merged for e in elements) + sum(
         max(0, len(t.get("field_refs") or []) - 1) for t in (title_block.get("fields") or {}).values())
     return validate.finish(pool.page, pool.sheet_type, frame, title_block, sections, merged, warnings)
+
+
+# Рамка штампа больше этой доли листа — не штамп, а ошибка места: не учитывается.
+_STAMP_MAX_AREA = 0.25
+
+
+def _stamp_box(pool, title_block) -> Optional[List[float]]:
+    """Рамка штампа: из прохода по штампу, иначе собранная по клеткам."""
+    box = pool.title_bbox or (title_block or {}).get("bbox")
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None
+    x1, y1, x2, y2 = (float(v) for v in box)
+    if (x2 - x1) * (y2 - y1) > _STAMP_MAX_AREA:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _inside(bbox: Sequence[float], box: Optional[List[float]]) -> bool:
+    """Центр надписи в рамке штампа (надпись с местом)."""
+    if box is None or not candidates_.is_place(bbox):
+        return False
+    cx, cy = candidates_.centre(bbox)
+    return box[0] <= cx <= box[2] and box[1] <= cy <= box[3]

@@ -143,3 +143,83 @@ def test_size_cap_drops_texts_and_marks_truncated():
     assert sheet is not None and sheet.stats.truncated
     assert sheet_size_bytes(sheet) <= SIZE_CAP_BYTES
     assert validate.W_TRUNCATED in warnings
+
+
+def _notes_sheet(extra=(), payload_extra=None, text=None):
+    fields = [
+        _field("note", "9. Сварные швы по ГОСТ 1-76.", [0.10, 0.70, 0.45, 0.72]),
+        _field("note", "10. Оценка качества сварных соединений:", [0.10, 0.72, 0.30, 0.74]),
+        _field("note", "- визуальный контроль по РБ-1-14 1) - 100%.", [0.14, 0.74, 0.45, 0.76]),
+        _field("note", "Нормы оценки по ГОСТ 2-2009 1); уровень качества - D.", [0.10, 0.76, 0.45, 0.78]),
+        _field("note", "11. Цвета побежалости не допускаются.", [0.10, 0.78, 0.30, 0.80]),
+        _field("note", "1) - нормативный документ по договору поставки.", [0.14, 0.82, 0.42, 0.84]),
+        _field("note", "МЕТРОЛОГИЧЕСКАЯ ЭКСПЕРТИЗА ПРОВЕДЕНА Петров", [0.05, 0.80, 0.20, 0.82]),
+        *extra,
+    ]
+    payload = {"sheet_type": "detail", "title_block_bbox": [0.55, 0.85, 0.98, 0.98],
+               **(payload_extra or {})}
+    return build_sheet([_drawing(fields, payload=payload, text=text)])
+
+
+def test_note_continuation_lines_join_previous_note():
+    sheet, _ = _notes_sheet()
+    note10 = next(n for n in sheet.notes if n.number == 10 and n.kind == "item")
+    assert "визуальный контроль" in note10.text and "Нормы оценки" in note10.text
+    assert note10.bbox[3] == 0.78 and len(note10.field_refs) == 3
+    texts = [t.text for t in sheet.texts]
+    assert not any("визуальный" in t or "Нормы оценки" in t for t in texts)
+    # Штамп прописными левее пункта продолжением не становится.
+    assert any(t.startswith("МЕТРОЛОГИЧЕСКАЯ") for t in texts)
+    assert not any("МЕТРОЛОГ" in n.text for n in sheet.notes)
+
+
+def test_footnote_is_separate_and_linked_from_marker():
+    sheet, warnings = _notes_sheet()
+    footnote = next(n for n in sheet.notes if n.kind == "footnote")
+    assert footnote.number == 1 and footnote.text.startswith("нормативный")
+    note10 = next(n for n in sheet.notes if n.number == 10)
+    assert footnote.id in note10.refs.notes
+    # Сноска 1 не закрывает пропуск пунктов 1–8 и не подменяет пункт 1.
+    assert validate.W_NOTE_GAP in warnings
+
+
+def test_numbered_line_between_breaks_continuation():
+    fields = [
+        _field("note", "8. Остальные характеристики по ТЗ.", [0.57, 0.48, 0.81, 0.49]),
+        _field("note", "4 Для блока использовать модули.", [0.57, 0.49, 0.81, 0.50]),
+        _field("note", "- трубы крепить скобами.", [0.57, 0.50, 0.81, 0.51]),
+    ]
+    sheet, _ = build_sheet([_drawing(fields, payload={"sheet_type": "detail"})])
+    note8 = next(n for n in sheet.notes if n.number == 8)
+    assert note8.text == "Остальные характеристики по ТЗ."
+    assert {t.text for t in sheet.texts} == {"4 Для блока использовать модули.", "- трубы крепить скобами."}
+
+
+def test_date_reading_goes_to_title_not_notes():
+    text = "Технические требования\n1. Размеры для справок.\n14. 10.16 (рукописно)"
+    extra = [_field("callout", "14.10.16", [0.60, 0.90, 0.66, 0.92])]
+    sheet, _ = _notes_sheet(extra=extra, text=text)
+    assert not any(n.number == 14 for n in sheet.notes)
+    assert sheet.title_block.fields["signed_date"].value == "14.10.16"
+    assert not any(d.value_raw == "14.10.16" for d in sheet.dimensions)
+
+
+def test_role_name_and_date_split_from_aggregated_cell():
+    payload = {"title_block": {"developed": "Иванов 01.02.20 (рукописно)", "checked": "Петров"}}
+    sheet, _ = _notes_sheet(payload_extra=payload)
+    roles = {r.role: r for r in sheet.title_block.roles}
+    assert roles["developed"].name == "Иванов" and roles["developed"].date == "01.02.20"
+    assert roles["developed"].handwritten and roles["developed"].personal
+    assert roles["checked"].name == "Петров"
+
+
+def test_number_in_title_block_is_not_a_position():
+    fields = [
+        _field("position", "1", [0.30, 0.30, 0.32, 0.32]),
+        _field("position", "1", [0.96, 0.90, 0.97, 0.92]),
+        _field("title_block", "Масштаб: 1:1", [0.55, 0.85, 0.98, 0.98]),
+    ]
+    payload = {"sheet_type": "assembly", "title_block_bbox": [0.55, 0.85, 0.98, 0.98]}
+    sheet, _ = build_sheet([_drawing(fields, payload=payload)])
+    assert [p.bbox for p in sheet.positions] == [[0.3, 0.3, 0.32, 0.32]]
+    assert any(t.text == "1" for t in sheet.texts)

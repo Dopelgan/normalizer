@@ -65,7 +65,9 @@ def check(sections: Dict[str, List[Item]], title_block: Dict[str, Any],
         if outside:
             warnings.append(W_OUTSIDE)
 
-    numbers = sorted({item.data["number"] for item in sections["notes"] if item.data.get("number")})
+    # Сноски «1)» нумеруются отдельно и пропуском в пунктах не считаются.
+    numbers = sorted({item.data["number"] for item in sections["notes"]
+                      if item.data.get("number") and item.data.get("kind") != "footnote"})
     if numbers and numbers != list(range(1, numbers[-1] + 1)):
         warnings.append(W_NOTE_GAP)
 

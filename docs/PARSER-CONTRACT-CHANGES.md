@@ -1167,7 +1167,11 @@ deskewed_page`), та же система, что у `bbox` поля, поэто
 «N отв.»), `formula {expr, variables}`, `view_id`, `feature_id`, `leader`,
 `link {method, confidence}`, `note_refs`), `positions` (`number`, `leader`,
 `target_bbox`, `view_id`, `table_row {table_id, row}`), `notes` (`number`,
-`text`, `defines_marker`, `refs {notes, dimensions, features, symbols}`),
+`text`, `defines_marker`, `kind` — `item` (пункт) или `footnote` (сноска
+«1) - …»: свой номер, с пунктами не сравнивается; пункт со знаком «1)» в
+тексте ссылается на неё через `refs.notes`), `refs {notes, dimensions,
+features, symbols}`; строки пункта без номера — «- …», строчная буква,
+продолжение фразы — входят в текст пункта над ними),
 `tables` (`kind`, `headers`, `rows[].cells[] {text, bbox}`), `symbols`
 (`kind`, `value`, `scope`, `feature_id`, `standard`), `texts` (надписи, не
 подошедшие ни к одному виду) и `stats` (`elements`, `merged_duplicates`,

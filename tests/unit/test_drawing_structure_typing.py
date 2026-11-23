@@ -122,3 +122,75 @@ def test_variable_sizes_of_a_parametric_sheet():
     assert typing_.parse_dimension("L±10")["tolerance"]["upper"] == 10
     assert typing_.parse_dimension("R1")["kind"] == "radius"
     assert typing_.parse_dimension("M8")["kind"] == "thread"
+
+
+@pytest.mark.parametrize("value", ["A", "Б", "B", "Д"])
+def test_view_letter_is_never_a_dimension(value):
+    assert typing_.classify(value, "size").kind == typing_.TEXT
+
+
+@pytest.mark.parametrize("value", ["380 В", "4,№91", "10ABC70XY001 (ЗН)"])
+def test_callout_number_with_word_is_text(value):
+    assert typing_.classify(value, "callout").kind == typing_.TEXT
+
+
+@pytest.mark.parametrize("value", ["15±0,1", "⌀8,5", "45°", "20*"])
+def test_callout_with_dimension_notation_stays_dimension(value):
+    assert typing_.classify(value, "callout", "detail").kind == typing_.DIMENSION
+
+
+def test_scheme_numbers_and_designators_are_positions():
+    assert typing_.classify("14", "callout", "scheme").kind == typing_.POSITION
+    typed = typing_.classify("M1, M2", "thread", "scheme")
+    assert typed.kind == typing_.POSITION and typed.number == "M1, M2"
+    assert typing_.classify("M20", "thread", "detail").kind == typing_.DIMENSION
+
+
+@pytest.mark.parametrize("value", ["14. 10.16 (рукописно)", "02.2022", "19.10.26; 29.09.25 (рукописно)"])
+def test_signing_date_is_title_not_note_or_size(value):
+    assert typing_.is_date(value)
+    assert typing_.classify(value, "note").kind == typing_.TITLE
+    assert typing_.classify(value, "size").kind == typing_.TITLE
+
+
+@pytest.mark.parametrize("value", ["1.5", "12.50", "15-0,1"])
+def test_decimals_are_not_dates(value):
+    assert not typing_.is_date(value)
+
+
+def test_number_inside_title_block_is_not_position_or_size():
+    assert typing_.classify("1", "position", "assembly", in_title=True).kind == typing_.TITLE
+    assert typing_.classify("1", "callout", "detail", in_title=True).kind == typing_.TITLE
+    assert typing_.classify("1", "position", "assembly").kind == typing_.POSITION
+
+
+def test_footnote_is_separate_note_kind():
+    typed = typing_.classify("1) - нормативный документ по договору поставки.", "note")
+    assert typed.kind == typing_.NOTE and typed.footnote and typed.note_number == 1
+    assert typed.note_text.startswith("нормативный")
+    assert not typing_.classify("1. Размеры для справок.", "note").footnote
+    assert typing_.footnote_marks("контроль по ГОСТ 1-2018 1) - 100%.") == [1]
+    assert typing_.footnote_marks("1) - документ") == []
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("- визуальный контроль 100%.", True),
+    ("валов h14, отверстий H14.", True),
+    ("Нормы оценки по ГОСТ 1-2009; уровень качества - D.", True),
+    ("4 Для фиксации труб использовать скобы.", False),
+    ("Технические требования", False),
+    ("СБ210/СП-02-100П-В-4 IP67 ГОСТ 1-2009", False),
+    ("МЕТРОЛОГИЧЕСКАЯ ЭКСПЕРТИЗА ПРОВЕДЕНА Петров И. И.", False),
+])
+def test_note_continuation_candidates(value, expected):
+    assert typing_.continues_note(value) is expected
+
+
+def test_transcript_notes_skip_date_and_footnote_and_table_rows():
+    lines = ["Технические требования", "6. Маркировать на бирке обозначение чертежа.",
+             "10.02.2022 (рукописно)", "см.таблицу\t1:1", "-01\t247\t321",
+             "7. Покрытие по ГОСТ 9.032.", "- грунт в один слой;", "1) - документ по договору."]
+    notes = typing_.transcript_notes(lines)
+    assert [n for n, _ in notes] == [6, 7]
+    assert notes[0][1] == "Маркировать на бирке обозначение чертежа."
+    assert notes[1][1].endswith("- грунт в один слой;")

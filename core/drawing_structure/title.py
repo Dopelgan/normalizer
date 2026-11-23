@@ -18,6 +18,7 @@ import difflib
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from core.drawing_structure import typing as typing_
 from core.drawing_structure.candidates import (
     PASS_SHEET,
     PASS_TITLE_BLOCK,
@@ -33,6 +34,8 @@ SCHEMA_KEY = {"organization": "organisation", "inventory": "inventory_no"}
 ROLES = ("developed", "checked", "tech_control", "norm_control", "approved")
 _DATE = re.compile(r"\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}|\d{1,2}[.\-/]\d{4}")
 _NOTICE = re.compile(r"(?:[А-ЯЁA-Z]{2,4}[. ])?\d+(?:/\d+)?-\d{2}")
+# Пометка прочтения у имени или даты: «Глинко (рукописно)».
+_REMARK = re.compile(r"\(\s*(?:рукописно|рук\.?|подпись)\s*\)", re.IGNORECASE)
 _SIMILAR = 0.75
 
 
@@ -71,10 +74,17 @@ def _role_line(text: str) -> Optional[Tuple[str, str, str]]:
     key = title_block._signer(words[0])
     if key is None:
         return None
-    rest = words[1:]
-    date = next((w for w in rest if _DATE.fullmatch(w)), "")
-    names = [w for w in rest if w != date and title_block._fold(w) not in title_block._NOT_A_NAME]
-    return key, " ".join(names), date
+    name, date, _ = name_and_date(" ".join(words[1:]))
+    return key, name, date
+
+
+def name_and_date(text: str) -> Tuple[str, str, bool]:
+    """«Белянинова 14.10.16 (рукописно)» -> ('Белянинова', '14.10.16', True)."""
+    handwritten = bool(_REMARK.search(text or ""))
+    words = _REMARK.sub(" ", text or "").split()
+    date = next((w for w in words if _DATE.fullmatch(w)), "")
+    names = [w for w in words if w != date and title_block._fold(w) not in title_block._NOT_A_NAME]
+    return " ".join(names), date, handwritten
 
 
 def in_title(candidate: Candidate, pool: PagePool) -> bool:
@@ -85,7 +95,8 @@ def in_title(candidate: Candidate, pool: PagePool) -> bool:
         return True
     if candidate.label:
         return True
-    return False
+    # Дата подписи вне клетки штампа («14. 10.16») — графа штампа, не пункт и не размер.
+    return typing_.is_date(candidate.value)
 
 
 def build(candidates: Sequence[Candidate], pool: PagePool) -> Tuple[Dict[str, Any], List[Candidate]]:
@@ -146,6 +157,11 @@ def build(candidates: Sequence[Candidate], pool: PagePool) -> Tuple[Dict[str, An
             key = _key_by_value(cell, fields)
         if key is None and cell.category == "material":
             key = "material"
+        if key is None and typing_.is_date(cell.value) and (
+                cell.category != "title_block" or "signed_date" not in fields):
+            # Дата без подписи графы — дата подписания; клетка штампа с другой
+            # датой при уже прочитанной графе (строка изменений) остаётся надписью.
+            key = "signed_date"
         if key is None:
             leftovers.append(cell)
             continue
@@ -158,12 +174,16 @@ def build(candidates: Sequence[Candidate], pool: PagePool) -> Tuple[Dict[str, An
             continue
         entry = roles.setdefault(key, {"role": key, "name": "", "date": "", "handwritten": False,
                                        "personal": True, "_refs": [], "bbox": None})
+        # В графе бывает имя с датой и пометкой: «Белянинова 14.10.16 (рукописно)».
+        name, date, remark = name_and_date(typed["value"])
         if not entry["name"]:
-            entry["name"] = typed["value"]
-        elif not similar(entry["name"], typed["value"]):
-            entry.setdefault("alternatives", []).append(typed["value"])
+            entry["name"] = name
+        elif name and not similar(entry["name"], name):
+            entry.setdefault("alternatives", []).append(name)
+        if date and not entry["date"]:
+            entry["date"] = date
         entry["_refs"].extend(typed["field_refs"])
-        entry["handwritten"] = entry["handwritten"] or typed["handwritten"]
+        entry["handwritten"] = entry["handwritten"] or typed["handwritten"] or remark
     signed = fields.pop("signed_date", None)
     if signed is not None:
         for part in re.split(r"\s*;\s*", signed["value"]):

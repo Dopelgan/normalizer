@@ -392,6 +392,9 @@ class NoteRefs(_SheetModel):
 class Note(Element):
     number: Optional[int] = Field(None, ge=0)
     text: str
+    # `footnote` — сноска «1) - …» под требованиями: номер свой, с пунктами не
+    # сравнивается; пункты со знаком «1)» ссылаются на неё через `refs.notes`.
+    kind: Literal["item", "footnote"] = "item"
     # Пункт, определяющий знак у размеров («*» — справочный и т. п.).
     defines_marker: Optional[Literal["*", "**"]] = None
     refs: NoteRefs = Field(default_factory=NoteRefs)

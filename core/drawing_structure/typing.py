@@ -57,6 +57,26 @@ _MARKER_ANYWHERE = re.compile(r"(?<![\d\w])(\*{1,3})\s*(?:[-–—]\s*)?разм
 # Слово в пункте требований: «1. 15» — не пункт, «1. Размеры …» — пункт.
 _WORD = re.compile(r"[А-Яа-яЁё]{3}")
 _SURFACE_WORDS = re.compile(r"(сторон|поверхн|плоскост|кромк|торец|торц)", re.IGNORECASE)
+# Сноска требований: «1) - нормативный документ …», «2) по согласованию …».
+_FOOTNOTE = re.compile(r"^\s*(\d{1,2})\)\s*(?:[-–—]\s*(?P<dash>.+)|(?P<lower>[а-яё].*))$", re.S)
+# Заголовок раздела требований и слово строчными — признак фразы.
+_NOTES_HEADER = re.compile(r"^\s*(?:технические\s+требования|примечани)", re.IGNORECASE)
+_PROSE = re.compile(r"[а-яё]{3,}")
+# Знак сноски внутри текста: «… РБ-089-14 1) - 100%» (не в начале записи).
+_FOOTNOTE_MARK = re.compile(r"(?<=\s)(\d)\)(?=[\s;,.]|$)")
+# Дата («14.10.16», «14. 10.16», «10.2016») с пометкой прочтения «(рукописно)».
+_DATE_ONLY = re.compile(
+    r"^\s*(?:\d{1,2}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*(?:\d{4}|\d{2})|\d{1,2}\s*[.\-/]\s*\d{4})\s*$")
+_REMARK = re.compile(r"\([^)]{0,20}\)")
+# Буква обозначения вида («А», «Б»; латинские двойники кириллицы) — не размер.
+# X, Y, Z, L, H, N, S, D остаются переменными исполнения («X» — размер).
+_VIEW_LETTER = re.compile(r"^\s*(?:[АБВГДЕЖИКЛМПРСТФШЩЭЮЯ]|[ABCEKMPT])\s*$")
+# Позиционные обозначения схемы: «M1, M2», «HL3, HL5».
+_DESIGNATORS = re.compile(r"^\s*[A-ZА-Я]{1,3}\d{1,3}(?:\s*,\s*[A-ZА-Я]{1,3}\d{1,3})+\s*$")
+# Хвост величины на выноске после номинала: допуск, поле допуска, звёздочка.
+_CALLOUT_TAIL = re.compile(
+    r"^\s*°?\s*(?:(?:±|[+\-−])\s*\d+(?:[.,]\d+)?\s*°?\s*){0,2}"
+    r"(?:[A-Za-z]{1,2}\d{1,2}(?:/[A-Za-z]{1,2}\d{1,2})?)?\s*$")
 
 # Величина: знак вида, номинал или выражение, допуск.
 _LEAD = re.compile(r"^\s*(?P<lead>⌀|Ø|ø|R|M|М|SR|Tr)?\s*", re.IGNORECASE)
@@ -93,6 +113,11 @@ class Typed:
     note_text: str = ""
     marker: Optional[str] = None
     label: str = ""
+    # Пункт требований — сноска «1)»; строка требований без номера (`note_line`)
+    # и может ли она быть продолжением пункта над ней (`continuation`).
+    footnote: bool = False
+    note_line: bool = False
+    continuation: bool = False
 
 
 def _float(text: str) -> Optional[float]:
@@ -238,15 +263,68 @@ def _is_dimension_text(text: str) -> bool:
     return bool(_PLAIN.match(rest) or _THREAD.match(body) or _CHAMFER.match(body))
 
 
-def classify(value: str, category: str, sheet_type: str = "unknown") -> Typed:
+def is_date(text: str) -> bool:
+    """Запись — только даты: «14.10.16», «14. 10.16 (рукописно)», «19.10.26; 29.09.25»."""
+    parts = [p for p in re.split(r"[;,]", _REMARK.sub(" ", text or "")) if p.strip()]
+    return bool(parts) and all(_DATE_ONLY.match(p) for p in parts)
+
+
+def continues_note(text: str) -> bool:
+    """
+    Строка может продолжать пункт требований: начинается с тире, строчной
+    буквы или без номера, и это фраза («Нормы оценки по …»), а не номер
+    («4 Для блока …»), заголовок, обозначение («СБ210/СП-02 …») или штамп
+    прописными («МЕТРОЛОГИЧЕСКАЯ ЭКСПЕРТИЗА …»).
+    """
+    text = (text or "").strip()
+    if not text or text[0].isdigit() or _NOTES_HEADER.match(text):
+        return False
+    if text[0] in "-–—" or text[0].islower():
+        return True
+    letters = [c for c in text if c.isalpha()]
+    upper = sum(1 for c in letters if c.isupper())
+    return bool(_PROSE.search(text)) and upper <= 0.5 * len(letters)
+
+
+def footnote_marks(text: str) -> List[int]:
+    """Номера сносок, на которые ссылается текст: «… РБ-089-14 1) - 100%» -> [1]."""
+    return list(dict.fromkeys(int(m) for m in _FOOTNOTE_MARK.findall(text or "")))
+
+
+def _callout_dimension(text: str) -> bool:
+    """Выноска — размер, только если после номинала идёт запись допуска, а не слово («380 В»)."""
+    body = strip_note_refs(text)
+    if count_of(body):
+        body = _strip_count(body)
+    body = body.replace("*", " ").strip()
+    if _FORMULA.search(body) or _BARE_VARIABLE.match(body) or _CHAMFER.match(body) or _THREAD.match(body):
+        return True
+    lead = _LEAD.match(body)
+    rest = body[lead.end():] if lead else body
+    plain = _PLAIN.match(rest)
+    return bool(plain) and bool(_CALLOUT_TAIL.match(rest[plain.end():]))
+
+
+def classify(value: str, category: str, sheet_type: str = "unknown", in_title: bool = False) -> Typed:
     """
     Тип надписи по её записи и категории прохода. `sheet_type` — вид листа:
-    число на выноске — номер позиции только на сборочном.
+    число на выноске — номер позиции только на сборочном листе и схеме.
+    `in_title` — надпись лежит в рамке штампа: число там — графа, не размер
+    и не позиция.
     """
     text = " ".join(str(value or "").split())
     if category in ("title_block", "material"):
         return Typed(kind=TITLE)
+    if is_date(text):
+        # Дата подписи — графа штампа, а не пункт «14.» и не размер.
+        return Typed(kind=TITLE)
+    if in_title and (_POSITION.match(text) or _VIEW_LETTER.match(text)):
+        return Typed(kind=TITLE)
     if category == "note":
+        footnote = _FOOTNOTE.match(text)
+        if footnote:
+            body = (footnote.group("dash") or footnote.group("lower") or "").strip()
+            return Typed(kind=NOTE, note_number=int(footnote.group(1)), note_text=body, footnote=True)
         numbered = _NOTE_NUMBER.match(text)
         marker = _MARKER_ANYWHERE.search(text) or (
             _MARKER_DEFINITION.match(numbered.group(2)) if numbered else None)
@@ -259,6 +337,11 @@ def classify(value: str, category: str, sheet_type: str = "unknown") -> Typed:
         return Typed(kind=VIEW_TITLE, view=title)
     if _NOTE_REF_ONLY.match(text):
         return Typed(kind=NOTE_REF, note_refs=note_refs(text))
+    if _VIEW_LETTER.match(text):
+        # Буква вида у стрелки или над видом размером не бывает.
+        return Typed(kind=TEXT)
+    if sheet_type == "scheme" and _DESIGNATORS.match(text):
+        return Typed(kind=POSITION, number=text)
     if category == "roughness" or (_ROUGHNESS.search(text) and len(text) <= 24):
         symbol = {"kind": "roughness", "value": text,
                   "scope": "general" if _GENERAL_ROUGHNESS.search(text) else None}
@@ -274,9 +357,12 @@ def classify(value: str, category: str, sheet_type: str = "unknown") -> Typed:
                   if position else text.rstrip("*").strip())
         return Typed(kind=POSITION, number=number)
     if category in ("size", "radius", "thread", "tolerance", "position", "callout") and _is_dimension_text(text):
-        if category == "callout" and _POSITION.match(text) and sheet_type == "assembly":
+        if category == "callout" and _POSITION.match(text) and sheet_type in ("assembly", "scheme"):
             # Число без знака на выноске — номер позиции, а не размер.
             return Typed(kind=POSITION, number=_POSITION.match(text).group(1))
+        if category == "callout" and not _callout_dimension(text):
+            # «380 В», «4,№91», «10UKIA70AX001 …»: число со словом — надпись.
+            return Typed(kind=TEXT, note_refs=note_refs(text) if len(text) <= 40 else [])
         refs = note_refs(text)
         dimension = parse_dimension(strip_note_refs(text) if refs else text, category)
         return Typed(kind=DIMENSION, dimension=dimension, note_refs=refs, count=dimension.get("count"))
@@ -292,6 +378,9 @@ def classify(value: str, category: str, sheet_type: str = "unknown") -> Typed:
         refs = note_refs(text)
         if _SURFACE_WORDS.search(text) and len(text) <= 40 and refs:
             return Typed(kind=SURFACE, label=strip_note_refs(text), note_refs=refs)
+        # Строка требований без номера: продолжение пункта над ней, если он рядом.
+        return Typed(kind=TEXT, note_refs=note_refs(text) if len(text) <= 40 else [],
+                     note_text=text, note_line=True, continuation=continues_note(text))
     return Typed(kind=TEXT, note_refs=note_refs(text) if len(text) <= 40 else [])
 
 
@@ -307,6 +396,11 @@ def transcript_notes(lines: List[str]) -> List[Tuple[int, str]]:
         if re.match(r"^технические\s+требования", text, re.IGNORECASE):
             started = True
             continue
+        if is_date(text) or _FOOTNOTE.match(text):
+            # Дата подписи («14. 10.16») — не пункт 14; сноска «1) - …» — не пункт 1.
+            # Строки за ними — уже не продолжение пункта.
+            started = False
+            continue
         numbered = _NOTE_NUMBER.match(text)
         if numbered and len(numbered.group(2)) >= 8 and _WORD.search(numbered.group(2)):
             number = int(numbered.group(1))
@@ -316,7 +410,7 @@ def transcript_notes(lines: List[str]) -> List[Tuple[int, str]]:
             notes.append((number, numbered.group(2).strip()))
             started = True
             continue
-        if started and notes and text and not _NOTE_NUMBER.match(text) and re.match(r"^[а-яё(]", text):
+        if started and notes and text and not _NOTE_NUMBER.match(text) and re.match(r"^(?:[а-яё(]|[-–—]\s+\w)", text):
             number, body = notes[-1]
             notes[-1] = (number, f"{body} {text}")
     return notes

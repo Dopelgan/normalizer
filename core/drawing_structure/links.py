@@ -31,11 +31,14 @@ from core.drawing_structure import typing as typing_
 from core.drawing_structure.candidates import PASS_LINKS, PagePool, area, centre, is_place
 from core.drawing_structure.merge import Element
 from core.models.drawing_sheet import element_anchor
+from core.providers import reading_reconcile
 
 # Привязка соседей: «4 отв.» к размеру, «п.8» к элементу.
 NEAR = 0.06
 # Заголовок вида не дальше этого от рамки вырезки.
 TITLE_REACH = 0.05
+# Строка продолжения пункта требований — не ниже пункта больше чем на столько.
+CONTINUATION_GAP = 0.03
 # Угол общей шероховатости: правый верхний угол листа.
 _GENERAL_CORNER = (0.6, 0.2)
 _SPEC_HEADER = re.compile(r"поз|обозначен|наименован|кол", re.IGNORECASE)
@@ -181,6 +184,8 @@ def build(pool: PagePool, typed: Sequence[Tuple[Element, typing_.Typed]],
     sections["views"] = build_views(pool, typed)
     counts: List[Tuple[Element, typing_.Typed]] = []
     refs: List[Tuple[Element, typing_.Typed]] = []
+    continuations: List[Item] = []
+    barriers: List[List[float]] = []
     surfaces: List[Tuple[Element, typing_.Typed]] = []
     for element, kind in typed:
         if kind.kind == typing_.DIMENSION:
@@ -195,7 +200,8 @@ def build(pool: PagePool, typed: Sequence[Tuple[Element, typing_.Typed]],
         elif kind.kind == typing_.NOTE:
             data = base(element)
             data.update({"number": kind.note_number, "text": kind.note_text,
-                         "defines_marker": kind.marker if kind.marker in ("*", "**") else None})
+                         "defines_marker": kind.marker if kind.marker in ("*", "**") else None,
+                         "kind": "footnote" if kind.footnote else "item"})
             sections["notes"].append(Item("notes", "note", data, element, element.value,
                                           note_numbers=list(kind.note_refs)))
         elif kind.kind == typing_.SYMBOL:
@@ -215,9 +221,15 @@ def build(pool: PagePool, typed: Sequence[Tuple[Element, typing_.Typed]],
         else:
             data = base(element)
             data["text"] = element.value
-            sections["texts"].append(Item("texts", "text", data, element, element.value,
-                                          note_numbers=list(kind.note_refs)))
+            item = Item("texts", "text", data, element, element.value, note_numbers=list(kind.note_refs))
+            if kind.continuation:
+                continuations.append(item)
+            else:
+                sections["texts"].append(item)
+                if kind.note_line and is_place(element.bbox):
+                    barriers.append(list(element.bbox))
 
+    _join_continuations(continuations, sections, barriers)
     _transcript_notes(pool, sections["notes"])
     _counts(counts, sections)
     for element, kind in surfaces:
@@ -357,9 +369,67 @@ def _note_refs(refs: Sequence[Tuple[Element, typing_.Typed]], sections: Dict[str
         target.data["field_refs"].extend({"fragment": f, "field": i} for f, i in element.field_refs)
 
 
+def _join_continuations(lines: Sequence[Item], sections: Dict[str, List[Item]],
+                        barriers: Sequence[Sequence[float]] = ()) -> None:
+    """
+    Строка требований без номера («- визуальный контроль …», «Нормы оценки …»)
+    — продолжение пункта прямо над ней в той же колонке: текст дописывается
+    в пункт, рамка расширяется. Не нашлось пункта рядом — остаётся надписью.
+    """
+    for line in sorted(lines, key=lambda i: (i.data["bbox"][1], i.data["bbox"][0])):
+        host = _note_above(line.data["bbox"], sections["notes"]) if is_place(line.data["bbox"]) else None
+        if host is not None and _between(host.data["bbox"], line.data["bbox"], barriers):
+            host = None
+        if host is None:
+            sections["texts"].append(line)
+            continue
+        data = host.data
+        if reading_reconcile.notation(line.data["text"]) not in reading_reconcile.notation(data["text"]):
+            data["text"] = f"{data['text']} {line.data['text']}".strip()
+        box = data["bbox"]
+        data["bbox"] = [min(box[0], line.data["bbox"][0]), min(box[1], line.data["bbox"][1]),
+                        max(box[2], line.data["bbox"][2]), max(box[3], line.data["bbox"][3])]
+        data["field_refs"].extend(line.data["field_refs"])
+        data["confidence"] = round(min(data["confidence"], line.data["confidence"]), 3)
+        host.note_numbers.extend(n for n in line.note_numbers if n not in host.note_numbers)
+
+
+def _between(top: Sequence[float], bottom: Sequence[float], barriers: Sequence[Sequence[float]]) -> bool:
+    """Между пунктом и строкой есть строка требований, которая продолжением не стала («4 Для …»)."""
+    for box in barriers:
+        _, cy = centre(box)
+        overlap_x = min(box[2], bottom[2]) - max(box[0], bottom[0])
+        if top[3] - 0.002 <= cy <= bottom[1] + 0.002 and overlap_x > 0 and list(box) != list(bottom):
+            return True
+    return False
+
+
+def _note_above(box: Sequence[float], notes: Sequence[Item]) -> Optional[Item]:
+    """Пункт с номером, нижний край которого прямо над строкой и в той же колонке."""
+    best: Optional[Tuple[float, Item]] = None
+    for note in notes:
+        if note.data.get("number") is None or note.data.get("kind") == "footnote":
+            continue
+        other = note.data["bbox"]
+        if not is_place(other):
+            continue
+        gap = box[1] - other[3]
+        width = min(box[2] - box[0], other[2] - other[0])
+        overlap_x = min(box[2], other[2]) - max(box[0], other[0])
+        if width <= 0 or overlap_x < 0.5 * width or not -0.02 <= gap <= CONTINUATION_GAP:
+            continue
+        if box[0] < other[0] - 0.01:
+            continue    # строка левее пункта — не его продолжение (штамп, подпись рядом)
+        if other[1] >= box[1]:
+            continue
+        if best is None or abs(gap) < best[0]:
+            best = (abs(gap), note)
+    return best[1] if best else None
+
+
 def _transcript_notes(pool: PagePool, notes: List[Item]) -> None:
     """Пункты требований из строк листа, которых нет среди полей."""
-    have = {item.data.get("number") for item in notes}
+    have = {item.data.get("number") for item in notes if item.data.get("kind") != "footnote"}
     for number, text in typing_.transcript_notes(pool.transcript):
         if number in have:
             continue
@@ -370,6 +440,7 @@ def _transcript_notes(pool: PagePool, notes: List[Item]) -> None:
             "provenance": {"source": "vlm", "passes": ["transcribe"]}, "confidence": 0.6,
             "review": {"state": "auto"}, "alternatives": [], "field_refs": [],
             "number": number, "text": text, "defines_marker": marker if marker in ("*", "**") else None,
+            "kind": "item",
         }
         notes.append(Item("notes", "note", data, value=f"{number}. {text}",
                           note_numbers=typing_.note_refs(text)))
@@ -448,10 +519,13 @@ def resolve(sections: Dict[str, List[Item]]) -> List[str]:
     """Ссылки между элементами по `id`; возвращает предупреждения о несвязанном."""
     warnings: List[str] = []
     notes_by_number: Dict[int, Item] = {}
+    footnotes: Dict[int, Item] = {}
     for item in sections["notes"]:
         number = item.data.get("number")
-        if number is not None and number not in notes_by_number:
-            notes_by_number[number] = item
+        # Сноска «1)» со своим номером: пункт 1 ею не подменяется.
+        bucket = footnotes if item.data.get("kind") == "footnote" else notes_by_number
+        if number is not None and number not in bucket:
+            bucket[number] = item
         item.data["refs"] = {"notes": [], "dimensions": [], "features": [], "symbols": []}
     markers = {item.data.get("defines_marker"): item for item in sections["notes"] if item.data.get("defines_marker")}
 
@@ -460,6 +534,12 @@ def resolve(sections: Dict[str, List[Item]]) -> List[str]:
             target = notes_by_number.get(number)
             if target is not None and target is not item:
                 item.data["refs"]["notes"].append(target.data["id"])
+        if item.data.get("kind") != "footnote":
+            # Знак «1)» в тексте пункта — ссылка на сноску 1.
+            for number in typing_.footnote_marks(item.data.get("text") or ""):
+                target = footnotes.get(number)
+                if target is not None and target.data["id"] not in item.data["refs"]["notes"]:
+                    item.data["refs"]["notes"].append(target.data["id"])
     missing = 0
     for name in ("dimensions", "features", "symbols", "positions", "texts"):
         for item in sections[name]:
