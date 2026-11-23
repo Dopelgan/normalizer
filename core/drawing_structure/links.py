@@ -279,7 +279,11 @@ def _counts(counts: Sequence[Tuple[Element, typing_.Typed]], sections: Dict[str,
         count = kind.count or ""
         target.data["count"] = int(count) if count.isdigit() and int(count) >= 1 else None
         target.data["_count_raw"] = count
-        target.data["value_raw"] = f"{target.data['value_raw']} {element.value}".strip()
+        target.data["_count_text"] = element.value
+        if not target.data["count"]:
+            # «N отв.»: число задано не цифрой — в схеме v1 `count` целое,
+            # и запись сохраняется при значении размера, чтобы не пропасть.
+            target.data["value_raw"] = f"{target.data['value_raw']} {element.value}".strip()
         target.data["field_refs"].extend({"fragment": f, "field": i} for f, i in element.field_refs)
         target.note_numbers.extend(n for n in kind.note_refs if n not in target.note_numbers)
 
@@ -309,7 +313,6 @@ def _derived_features(sections: Dict[str, List[Item]]) -> None:
             same.data["_derived"].append(item)
             item.data["_feature"] = same
             continue
-        count_raw = data.get("_count_raw")
         feature = {
             "bbox": list(bbox), "bbox_exact": False,
             "provenance": {"source": data["provenance"]["source"], "passes": list(data["provenance"]["passes"])},
@@ -317,8 +320,9 @@ def _derived_features(sections: Dict[str, List[Item]]) -> None:
             "field_refs": [], "kind": kind, "label": label or None,
             "count": data.get("count"), "_derived": [item], "_from_link": bool(target),
         }
-        if count_raw and not data.get("count"):
-            feature["label"] = (label + " " if label else "") + f"{count_raw} шт."
+        if data.get("_count_text"):
+            # Запись числа элементов как на листе: «8 отв.», «N отв.».
+            feature["label"] = data["_count_text"]
         feat = Item("features", "feature", feature, value=f"{kind}:{data['value_raw']}")
         sections["features"].append(feat)
         item.data["_feature"] = feat

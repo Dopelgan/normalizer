@@ -159,15 +159,23 @@ def _matches(candidate: Candidate, element: Element) -> bool:
     same_kind = (reading_reconcile.kind(candidate.value) == reading_reconcile.kind(element.value)
                  and reading_reconcile.groups(candidate.value) == reading_reconcile.groups(element.value))
     if (numeric and same_kind and candidate.placed and element.placed
+            and (candidate.source != element.source or candidate.pass_ not in element.passes)
             and overlap(candidate.bbox, element.bbox) >= SAME_SPOT
-            and reading_reconcile.digits(candidate.value)):
+            and _one_digit_apart(candidate.value, element.value)):
         # Одно место, тот же вид и число чисел — одна надпись, прочитанная
-        # с ошибкой в цифре («⌀8,8» против «⌀8,5» текстового слоя).
+        # разными проходами с ошибкой в одной цифре («⌀8,8» против «⌀8,5»
+        # текстового слоя). Один проход в одном месте две надписи не сводит.
         return True
     if not same_text(candidate.value, element.value, numeric) and not any(
             same_text(candidate.value, member.value, numeric) for member in element.members):
         return False
     return True
+
+
+def _one_digit_apart(a: str, b: str) -> bool:
+    """Числовые скелеты одной длины, расходятся не больше чем в одной цифре."""
+    da, db = reading_reconcile.digits(a), reading_reconcile.digits(b)
+    return bool(da) and len(da) == len(db) and sum(x != y for x, y in zip(da, db)) <= 1
 
 
 def merge(candidates: Sequence[Candidate]) -> List[Element]:

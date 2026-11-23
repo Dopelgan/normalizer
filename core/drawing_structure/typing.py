@@ -59,9 +59,14 @@ _WORD = re.compile(r"[А-Яа-яЁё]{3}")
 _SURFACE_WORDS = re.compile(r"(сторон|поверхн|плоскост|кромк|торец|торц)", re.IGNORECASE)
 
 # Величина: знак вида, номинал или выражение, допуск.
-_LEAD = re.compile(r"^\s*(?P<lead>⌀|Ø|ø|R|M|М|Sф|S⌀|SR|Tr|G|K|□)?\s*", re.IGNORECASE)
-_FORMULA = re.compile(r"\(([^()]*[A-Za-zА-Яа-я][^()]*)\)")
+_LEAD = re.compile(r"^\s*(?P<lead>⌀|Ø|ø|R|M|М|SR|Tr)?\s*", re.IGNORECASE)
+# Параметрический размер: короткое выражение в скобках с переменной и
+# действием — «(X+38)», «(Y-2*H)». «(с кабелем)» выражением не является.
+_FORMULA = re.compile(r"\(\s*([A-Za-zА-ЯЁ0-9.,\s]{0,8}[+\-−*/×][A-Za-zА-ЯЁ0-9.,+\-−*/×\s]{1,16})\)")
 _VARIABLE = re.compile(r"(?<![A-Za-zА-Яа-яЁё])([A-ZА-ЯЁ]|[a-z])(?![A-Za-zА-Яа-яЁё])")
+_BARE_VARIABLE = re.compile(
+    r"^\s*(?![RrMm]\d)(?P<expr>[A-Za-z]\d?(?:\s*[+\-−]\s*\d+(?:[.,]\d+)?)?)\s*(?:±\s*\d+(?:[.,]\d+)?)?\s*$")
+_VARIABLE_TOKEN = re.compile(r"[A-Za-z]\d?")
 _PLUS_MINUS = re.compile(r"±\s*(" + _NUMBER + r")")
 _SIGNED = re.compile(r"([+\-−])\s*(" + _NUMBER + r")")
 _FIT = re.compile(r"(?<![A-Za-zА-Яа-яЁё\d])(?P<fit>[A-Za-z]{1,2}\d{1,2}(?:/[A-Za-z]{1,2}\d{1,2})?)(?![\d])")
@@ -168,6 +173,13 @@ def parse_dimension(value: str, category: str = "size") -> Dict[str, Any]:
                            "tolerance": None, "reference": reference}
     if count:
         out["count"] = count
+    bare = _BARE_VARIABLE.match(body_clean)
+    if bare:
+        # «X», «L1», «Z+10», «L±10»: размер задан переменной исполнения.
+        expr = bare.group("expr").replace(" ", "")
+        out["formula"] = {"expr": expr, "variables": sorted(set(_VARIABLE_TOKEN.findall(expr)))}
+        out["tolerance"] = tolerance(body_clean[bare.end("expr"):])
+        return out
     formula = _FORMULA.search(body_clean)
     if formula:
         expr = formula.group(1).replace(" ", "")
@@ -219,13 +231,18 @@ def _is_dimension_text(text: str) -> bool:
         return False
     if _FORMULA.search(body) and _NUM.search(body):
         return True
+    if _BARE_VARIABLE.match(body.replace("*", "")):
+        return True
     lead = _LEAD.match(body)
     rest = body[lead.end():] if lead else body
     return bool(_PLAIN.match(rest) or _THREAD.match(body) or _CHAMFER.match(body))
 
 
-def classify(value: str, category: str) -> Typed:
-    """Тип надписи по её записи и категории прохода."""
+def classify(value: str, category: str, sheet_type: str = "unknown") -> Typed:
+    """
+    Тип надписи по её записи и категории прохода. `sheet_type` — вид листа:
+    число на выноске — номер позиции только на сборочном.
+    """
     text = " ".join(str(value or "").split())
     if category in ("title_block", "material"):
         return Typed(kind=TITLE)
@@ -243,19 +260,21 @@ def classify(value: str, category: str) -> Typed:
     if _NOTE_REF_ONLY.match(text):
         return Typed(kind=NOTE_REF, note_refs=note_refs(text))
     if category == "roughness" or (_ROUGHNESS.search(text) and len(text) <= 24):
-        rough = _ROUGHNESS.search(text)
-        symbol = {"kind": "roughness", "value": f"{rough.group(1)} {rough.group(2)}" if rough else text,
+        symbol = {"kind": "roughness", "value": text,
                   "scope": "general" if _GENERAL_ROUGHNESS.search(text) else None}
         return Typed(kind=SYMBOL, symbol=symbol, note_refs=note_refs(text))
     count = count_of(text)
     if count and not _is_dimension_text(_strip_count(text)):
         return Typed(kind=COUNT, count=count, note_refs=note_refs(text))
-    position = _POSITION.match(text)
-    if category == "position" and position:
-        number = position.group(1) + (f".{position.group(2)}" if position.group(2) else "")
+    if category == "position":
+        # Позиция — номер выноски сборочного листа, а на схеме — позиционное
+        # обозначение («HL1, HL2», «K20»): размером она не становится никогда.
+        position = _POSITION.match(text)
+        number = (position.group(1) + (f".{position.group(2)}" if position.group(2) else "")
+                  if position else text.rstrip("*").strip())
         return Typed(kind=POSITION, number=number)
     if category in ("size", "radius", "thread", "tolerance", "position", "callout") and _is_dimension_text(text):
-        if category == "callout" and _POSITION.match(text):
+        if category == "callout" and _POSITION.match(text) and sheet_type == "assembly":
             # Число без знака на выноске — номер позиции, а не размер.
             return Typed(kind=POSITION, number=_POSITION.match(text).group(1))
         refs = note_refs(text)

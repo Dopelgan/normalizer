@@ -102,12 +102,19 @@ def build(candidates: Sequence[Candidate], pool: PagePool) -> Tuple[Dict[str, An
     value_cells: List[Candidate] = []
 
     # Сводная запись: «Метка: значение» (поля) и payload прохода по штампу.
+    # Рамка, общая для нескольких подписанных граф, — весь штамп, а не клетка.
+    shared: Dict[Tuple[float, ...], int] = {}
+    for candidate in candidates:
+        if candidate.label:
+            box = tuple(round(float(v), 3) for v in candidate.bbox)
+            shared[box] = shared.get(box, 0) + 1
     for candidate in candidates:
         if candidate.label:
             key = title_block.canonical(candidate.label)
             if key is None:
                 key = "other:" + candidate.label
-            _put(fields, key, candidate, aggregated=True)
+            own_cell = shared.get(tuple(round(float(v), 3) for v in candidate.bbox), 0) < 2
+            _put(fields, key, candidate, own_cell and is_place(candidate.bbox))
         elif not is_place(candidate.bbox):
             # Значение без метки с рамкой всего штампа: место неизвестно.
             value_cells.append(candidate)
@@ -173,22 +180,32 @@ def build(candidates: Sequence[Candidate], pool: PagePool) -> Tuple[Dict[str, An
             typed["field_refs"].append(cell.field_ref)
 
     changes = _changes(fields.pop("changes", None), pool.title_rows)
+    placed = [c for c in candidates if is_place(c.bbox) and not c.label]
+    title_box = pool.title_bbox or _union([c.bbox for c in placed]) or [0.0, 0.0, 1.0, 1.0]
     for typed in fields.values():
         # Расходящиеся прочтения графы («Глинка»/«Глинко») — на проверку.
         typed["review"] = {"state": "needs_check" if typed["alternatives"] else "auto"}
         if not typed["bbox"]:
-            # Клетки графы на листе не нашлось: место — весь штамп.
-            typed["bbox"] = list(pool.title_bbox or [0.0, 0.0, 1.0, 1.0])
+            # Клетки графы не нашлось по подписи: клетка с тем же значением
+            # (одна «1» на «Лист» и «Листов» одноклеточного листа), иначе — весь штамп.
+            twin = next((c for c in placed if similar(c.value, typed["value"])), None)
+            typed["bbox"] = list(twin.bbox) if twin is not None else list(title_box)
             typed["bbox_exact"] = False
         typed["field_refs"] = [{"fragment": f, "field": i} for f, i in dict.fromkeys(typed["field_refs"])]
     out_fields = {SCHEMA_KEY.get(key, key): value for key, value in fields.items()}
     block = {
-        "bbox": pool.title_bbox,
+        "bbox": pool.title_bbox or (title_box if placed else None),
         "fields": out_fields,
         "roles": [_role_out(entry) for entry in roles.values()],
         "changes": changes,
     }
     return block, leftovers
+
+
+def _union(boxes: Sequence[Sequence[float]]) -> Optional[List[float]]:
+    if not boxes:
+        return None
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
 
 
 def _typed(value: str, bbox, pass_: str, ref: Optional[Tuple[int, int]], confidence: float,
@@ -201,16 +218,19 @@ def _typed(value: str, bbox, pass_: str, ref: Optional[Tuple[int, int]], confide
     }
 
 
-def _put(fields: Dict[str, Dict[str, Any]], key: str, candidate: Candidate, aggregated: bool) -> None:
+def _put(fields: Dict[str, Dict[str, Any]], key: str, candidate: Candidate, own_cell: bool) -> None:
     current = fields.get(key)
     if current is None:
         # Рамка сводной записи — весь штамп (или боковая колонка), не клетка:
-        # место графе даёт клетка листа (`_cell_into`), а текстовый слой — сразу.
-        own = candidate.bbox if candidate.exact and is_place(candidate.bbox) else None
+        # место графе даёт клетка листа (`_cell_into`); своя рамка — только у
+        # подписанной клетки листа и у текстового слоя.
+        own = candidate.bbox if (candidate.exact or own_cell) and is_place(candidate.bbox) else None
         fields[key] = _typed(candidate.value, own, candidate.pass_, candidate.field_ref,
                              candidate.confidence, candidate.handwritten, candidate.source)
         fields[key]["bbox_exact"] = own is not None
         return
+    if own_cell and is_place(candidate.bbox) and not current["bbox"]:
+        current["bbox"] = list(candidate.bbox)
     _add_reading(current, candidate)
 
 

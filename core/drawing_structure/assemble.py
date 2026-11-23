@@ -45,7 +45,7 @@ def build_sheet(drawings: Sequence[Fragment], others: Sequence[Fragment] = ()
     title_block, leftovers = title.build(in_title, pool)
     elements = merge.merge(rest + leftovers)
     snap.snap(elements, pool.lines)
-    typed = [(element, typing_.classify(element.value, element.category)) for element in elements]
+    typed = [(element, typing_.classify(element.value, element.category, pool.sheet_type)) for element in elements]
 
     sections = links.build(pool, typed, title_block)
     links.identify(sections, title_block)

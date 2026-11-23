@@ -73,7 +73,19 @@ def test_size_with_item_reference_keeps_both():
 
 
 def test_balloon_on_callout_is_position():
-    assert typing_.classify("3", "callout").kind == typing_.POSITION
+    assert typing_.classify("3", "callout", "assembly").kind == typing_.POSITION
+    # На детали число на выноске — размер.
+    assert typing_.classify("3", "callout", "detail").kind == typing_.DIMENSION
+
+
+def test_scheme_designators_are_positions_not_sizes():
+    for value in ("K20, K21", "HL1, HL2", "M1, M2", "QF3..QF11"):
+        typed = typing_.classify(value, "position", "scheme")
+        assert typed.kind == typing_.POSITION and typed.number == value
+
+
+def test_words_in_brackets_are_not_a_formula():
+    assert typing_.classify("Датчик ДП-003Т (с кабелем)", "size").kind == typing_.TEXT
     assert typing_.classify("12", "position").number == "12"
 
 
@@ -101,3 +113,12 @@ def test_transcript_notes_join_continuation():
     notes = typing_.transcript_notes(lines)
     assert [n for n, _ in notes] == [1, 2]
     assert "валов h14" in notes[1][1]
+
+
+def test_variable_sizes_of_a_parametric_sheet():
+    for value, expr in (("X", "X"), ("L1", "L1"), ("Z+10", "Z+10"), ("L*", "L")):
+        typed = typing_.classify(value, "size")
+        assert typed.kind == typing_.DIMENSION and typed.dimension["formula"]["expr"] == expr
+    assert typing_.parse_dimension("L±10")["tolerance"]["upper"] == 10
+    assert typing_.parse_dimension("R1")["kind"] == "radius"
+    assert typing_.parse_dimension("M8")["kind"] == "thread"

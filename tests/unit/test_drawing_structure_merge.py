@@ -144,3 +144,11 @@ def test_nothing_dropped_every_field_is_referenced():
     expected = {(0, i) for i in range(len(whole.content.structured_drawing_fields))}
     expected |= {(1, i) for i in range(len(crop.content.structured_drawing_fields))}
     assert expected <= refs, sorted(expected - refs)
+
+
+def test_one_pass_never_merges_two_numbers_in_one_table_row():
+    whole = _drawing([
+        _field("size", "-01", [0.58, 0.57, 0.61, 0.59]),
+        _field("size", "247", [0.59, 0.57, 0.62, 0.59]),
+    ], fid="w")
+    assert len(merge.merge(candidates.collect([whole]).candidates)) == 2

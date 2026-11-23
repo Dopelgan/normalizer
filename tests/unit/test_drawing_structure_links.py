@@ -88,7 +88,7 @@ def test_surface_callout_links_note_and_roughness():
     assert surface.id in note8.refs.features
     rough = {s.value: s for s in sheet.symbols}
     assert rough["Ra 1,6"].scope == "surface" and rough["Ra 1,6"].feature_id == surface.id
-    assert rough["Ra 6,3"].scope == "general"
+    assert rough["Ra 6,3 (√)"].scope == "general"
 
 
 def test_views_from_title_and_crop_frame():
