@@ -1077,3 +1077,12 @@ deskewed_page`); при `turn != 0` они не совпадают с исход
 - RAG сегодня неизвестные ключи поля не читает; показать расхождение на экране сверки и в ответе — карточка D8.
 
 Ограждённый проход листа (`DRAWING_SHEET_GUARDED`) контракта не меняет: пометка отбракованного и не дочитанного листа — `sheet_guard` в `structured_payload` (вместе с прежними `sheet_reparse_candidate`/`sheet_reparse_reason`), новых имён предупреждений нет.
+
+## Выправка ошибок распознавания по словарю корпуса (23.11.2026)
+
+Флаги `OCR_CORRECTION_DICTIONARY` и `OCR_CORRECTION_NUMERIC_GLYPHS` (по умолчанию выключены), файл словаря — `OCR_CORRECTION_DICTIONARY_PATH`. Изменение аддитивное.
+
+- Меняется `content.text` (и ячейки `content.table_data`) только у фрагментов `text`/`table`, прочитанных распознаванием или моделью (`provenance.method`: `ocr_layer`, `mineru_ocr`, `tesseract`, `mineru_table`, `vlm_escalation`, `vision_plus_vlm`, `vlm_full_page`). Текстовый слой, Word и чертёжные фрагменты не меняются.
+- Исходное написание не теряется: `structured_payload["ocr_corrections"]` — список `{"rule", "from", "to", "offset"}`; `rule` — `pair` | `mixed_script` | `hyphen_join` | `number_glyph`; `offset` — позиция в тексте до выправки; у ячейки таблицы вместо смещения в тексте — `cell`: `[строка, столбец]` или `["header", столбец]`. Ключ — служебный, как `mixed_script_words` и `designation_repairs`; потребитель, не знающий его, пропускает.
+- `fragment_id` считается по выправленному тексту (выправка — до идентификаторов и фактов): у переобработанного с флагом документа идентификаторы фрагментов с заменами меняются. Если выправка изменила длину текста, `position.text_offsets_exact` становится `false` — как у прочих починок текста.
+

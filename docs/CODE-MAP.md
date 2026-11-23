@@ -81,6 +81,7 @@
 | OCR Tesseract (полный проход) | `core/providers/tesseract_fallback.py` | многопоточность страниц — строки 262–285 (см. ловушку про OMP) |
 | Подготовка растра к OCR | `core/providers/ocr_prepare.py` | выправка наклона, снятие линий таблиц, удаление шума |
 | Чистка слов распознавания | `core/providers/ocr_cleanup.py` | — |
+| Выправка по словарю корпуса (фрагменты распознавания) | `core/providers/ocr_correction.py` | `correct_fragment` — из `core/contract_finalize.finalize_fragments`; словарь собирает `tools/build_ocr_corrections.py` |
 | MinerU | `core/providers/mineru_parser.py` | сшивка слоя распознавания, защита от «таблица-рамка», таймаут на страницу |
 | Таблицы из линий / повторный проход VLM | `core/providers/table_from_lines.py`, `core/providers/table_vlm.py` | — |
 | Конвертация office → PDF | `core/providers/office_convert.py` | — |
@@ -194,6 +195,7 @@
 | `OCR_ORDINAL_SUFFIX_FIX` | `false` | `core/providers/ocr_cleanup.py` |
 | `OCR_RUS_SECOND_MODEL` | `""` | `core/providers/ocr_model.py` (`languages`), `core/providers/tesseract_fallback.py` |
 | `OCR_WORD_FIX_ENABLED` | `false` | `core/providers/ocr_cleanup.py`, `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |
+| `OCR_CORRECTION_DICTIONARY` (+ `_PATH`, `OCR_CORRECTION_NUMERIC_GLYPHS`) | `false` | `core/providers/ocr_correction.py`, `core/contract_finalize.py` |
 | `OCR_KEEP_STRUCTURED_TABLES` | `false` | `core/providers/mineru_parser.py` |
 | `OCR_SPLIT_WIDE_GAPS` | `false` | `core/providers/mineru_parser.py`, `core/providers/tesseract_fallback.py` |
 | `OCR_PREPROCESS_ENABLED` | `true` | `core/providers/tesseract_fallback.py` |
