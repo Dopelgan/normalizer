@@ -245,6 +245,26 @@ class TestVlmValidation:
         found, _ = dl.validate_vlm(answer(row), ASKED, SIZE)
         assert found[1]["target_bbox"] == [0.3, 0.38, 0.36, 0.44]
 
+    def test_span_target_gets_thickness(self):
+        """Длина отрезком «от выносной до выносной» — рамка нулевой толщины."""
+        row = good(target="габаритная длина", target_bbox=[150, 400, 660, 400], leader=None)
+        found, dropped = dl.validate_vlm(answer(row), ASKED, SIZE)
+        assert dropped == {}
+        x0, y0, x1, y1 = found[1]["target_bbox"]
+        assert (x0, x1) == (0.15, 0.66) and y1 - y0 == pytest.approx(dl._VLM_TARGET_MIN, abs=1e-4)
+
+    def test_overall_size_may_cover_the_part(self):
+        row = good(target="габаритная высота", target_bbox=[180, 160, 860, 870], leader=None)
+        found, _ = dl.validate_vlm(answer(row), ASKED, SIZE)
+        assert 1 in found
+        found, dropped = dl.validate_vlm(answer(good(target_bbox=[180, 160, 860, 870], leader=None)), ASKED, SIZE)
+        assert found == {} and dropped == {"bad_bbox": 1}
+
+    def test_prompt_does_not_carry_label_coordinates(self):
+        """Иначе модель возвращает рамку надписи как рамку цели (лист крышки, 12 из 12)."""
+        prompt = dl.vlm_prompt(ASKED)
+        assert "1: «⌀20»" in prompt and "400, 300" not in prompt and "[400" not in prompt
+
     def test_no_leader_is_kept_with_lower_confidence(self):
         found, _ = dl.validate_vlm(answer(good(leader=None)), ASKED, SIZE)
         assert found[1]["leader"] == [] and found[1]["confidence"] == dl.VLM_CONFIDENCE_BARE

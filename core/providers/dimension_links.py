@@ -76,6 +76,7 @@ _VLM_TARGET_GAP = 0.2    # рамка элемента не дальше 20 % л
 _VLM_LEADER_START = 0.04  # линия начинается у надписи
 _VLM_LEADER_END = 0.03   # и кончается у элемента
 _VLM_TARGET_AREA = 0.25  # элемент не больше четверти листа
+_VLM_OVERALL_AREA = 0.6  # габарит — деталь целиком, но не весь лист
 _VLM_TARGET_MIN = 0.002
 _VLM_SELF_SHARE = 0.8    # рамка «элемента» почти целиком на самой надписи
 _LABEL_MAX = 60
@@ -655,7 +656,9 @@ _PROMPT = """На чертеже красными рамками с номера
 
 - target — коротко по-русски, что измеряется: «диаметр отверстия», «габаритная длина»,
   «толщина стенки», «радиус скругления», «шероховатость поверхности», «деталь позиции».
-- target_bbox — рамка измеряемого элемента на листе.
+- target_bbox — рамка измеряемого элемента на листе: отверстия, кромки, участка контура или
+  детали. Это НЕ рамка самой надписи и не красная рамка: такой ответ не принимается.
+  Для длины, ширины или высоты — рамка измеряемого участка детали от выносной линии до выносной.
 - leader — концы размерной линии или выноски: первая точка у надписи, последняя — у элемента
   (остриё стрелки). Для размера со стрелками на обоих концах — два острия.
 - Координаты — целые тысячные доли стороны листа от 0 до 1000: x слева, y сверху; рамка — лево, верх, право, низ.
@@ -663,12 +666,15 @@ _PROMPT = """На чертеже красными рамками с номера
 
 
 def vlm_prompt(asked: Sequence[Tuple[int, Dict[str, Any]]]) -> str:
-    """Текст запроса: номер, надпись и рамка каждой величины в тысячных."""
-    rows = []
-    for number, item in asked:
-        box = _field_box(item) or [0.0, 0.0, 0.0, 0.0]
-        coords = ", ".join(str(int(round(c * 1000))) for c in box)
-        rows.append(f"{number}: «{_value(item)}» [{coords}]")
+    """
+    Текст запроса: номер и надпись каждой величины.
+
+    Координат надписи в запросе нет намеренно: на листе крышки модель,
+    получив рамки надписей числами, вернула их же как рамки целей у всех
+    12 величин (проверка отбросила все). Где надпись — показывает красная
+    рамка с номером на картинке.
+    """
+    rows = [f"{number}: «{_value(item)}»" for number, item in asked]
     return _PROMPT.format(items="\n".join(rows))
 
 
@@ -741,12 +747,14 @@ def validate_vlm(
         if not label or len(label) > _LABEL_MAX or not _CYRILLIC.search(label):
             drop("bad_label")
             continue
-        target = _model_box(row.get("target_bbox"))
+        target = _model_box(row.get("target_bbox"), span_ok=True)
         if target is None:
             drop("bad_bbox")
             continue
         area = (target[2] - target[0]) * (target[3] - target[1])
-        if area > _VLM_TARGET_AREA or min(target[2] - target[0], target[3] - target[1]) < _VLM_TARGET_MIN:
+        # Габарит измеряет деталь целиком — его цель вправе быть крупнее.
+        largest = _VLM_OVERALL_AREA if label.lower().startswith("габарит") else _VLM_TARGET_AREA
+        if area > largest or max(target[2] - target[0], target[3] - target[1]) < _VLM_TARGET_MIN:
             drop("bad_bbox")
             continue
         own = _field_box(item)
@@ -934,8 +942,12 @@ def _field_box(item: Dict[str, Any]) -> Optional[List[float]]:
     return box
 
 
-def _model_box(raw: Any) -> Optional[List[float]]:
-    """Рамка от модели: тысячные (или доли), строго внутри листа."""
+def _model_box(raw: Any, span_ok: bool = False) -> Optional[List[float]]:
+    """
+    Рамка от модели: тысячные (или доли), строго внутри листа. `span_ok` —
+    рамка нулевой толщины (длина отрезком «от выносной до выносной»)
+    принимается и получает толщину `_VLM_TARGET_MIN`.
+    """
     if not isinstance(raw, (list, tuple)) or len(raw) != 4:
         return None
     try:
@@ -947,6 +959,12 @@ def _model_box(raw: Any) -> Optional[List[float]]:
     if min(box) < -0.005 or max(box) > 1.005:
         return None
     box = [max(0.0, min(1.0, c)) for c in box]
+    if span_ok and box[2] >= box[0] and box[3] >= box[1] and (box[2] > box[0]) != (box[3] > box[1]):
+        half = _VLM_TARGET_MIN / 2
+        if box[2] == box[0]:
+            box[0], box[2] = max(0.0, box[0] - half), min(1.0, box[2] + half)
+        else:
+            box[1], box[3] = max(0.0, box[1] - half), min(1.0, box[3] + half)
     if box[2] <= box[0] or box[3] <= box[1]:
         return None
     return box
