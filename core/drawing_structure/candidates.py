@@ -310,8 +310,9 @@ def collect(drawings: Sequence[Fragment], others: Sequence[Fragment] = ()) -> Pa
             })
         pool.total_fields += len(own)
 
-    for fragment in list(drawings) + list(others):
-        pool.lines.extend(_lines_of(fragment))
+    if _lines_comparable(carrier):
+        for fragment in list(drawings) + list(others):
+            pool.lines.extend(_lines_of(fragment, pool.page))
     for fragment in drawings:
         if is_vector(fragment):
             for item in fragment.content.structured_drawing_fields or []:
@@ -402,15 +403,37 @@ def _candidate(item, ref: Tuple[int, int], fragment: Fragment, carrier: bool, pa
     )
 
 
-def _lines_of(fragment: Fragment) -> List[Dict[str, Any]]:
-    """Строки распознавания фрагмента (`position.lines`, флаг RECOGNITION_LINES)."""
+def _lines_comparable(carrier: Optional[Fragment]) -> bool:
+    """
+    Строки распознавания лежат в долях страницы. Рамки листа — тоже, если
+    поля размещены (N0) или лист не повёрнут; у повёрнутого на 90/180/270
+    и не размещённого листа рамки в долях повёрнутой картинки, и строка
+    дала бы чужую рамку — такие строки не берутся.
+    """
+    if carrier is None or _on_page(carrier):
+        return True
+    payload = carrier.content.structured_payload or {}
+    layout = payload.get("layout") if isinstance(payload.get("layout"), dict) else {}
+    return int(layout.get("turn") or 0) % 360 == 0
+
+
+def _lines_of(fragment: Fragment, page: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Строки распознавания фрагмента (`position.lines`, флаг RECOGNITION_LINES)
+    на странице `page`: у соединённого фрагмента строка другой страницы
+    несёт свой `page` и сюда не идёт.
+    """
     lines = getattr(fragment.position, "lines", None) if fragment.position else None
+    home = page_of(fragment)
     out: List[Dict[str, Any]] = []
     for line in lines or []:
         text = getattr(line, "text", None) if not isinstance(line, dict) else line.get("text")
         bbox = getattr(line, "bbox", None) if not isinstance(line, dict) else line.get("bbox")
         source = getattr(line, "source", None) if not isinstance(line, dict) else line.get("source")
+        own = getattr(line, "page", None) if not isinstance(line, dict) else line.get("page")
         if not text or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        if page is not None and (own if own is not None else home) != page:
             continue
         kind = SOURCE_TEXT_LAYER if source == "text_layer" else SOURCE_OCR
         out.append({"text": str(text), "bbox": clamp_box(bbox), "source": kind})

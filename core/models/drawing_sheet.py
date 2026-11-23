@@ -28,7 +28,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
@@ -48,6 +48,8 @@ SheetType = Literal["detail", "assembly", "scheme", "unknown"]
 ToleranceSource = Literal["explicit", "general_tolerance_table", "fit_notation", "unknown"]
 
 _ID = re.compile(r"^[a-z_]+-\d+$")
+# Число повторов: целое или как написано на листе («N отв.» -> "N").
+_COUNT_MAX_CHARS = 16
 _SPACES = re.compile(r"\s+")
 
 
@@ -61,6 +63,24 @@ def _normalize_bbox(value: List[float]) -> List[float]:
         raise ValueError(f"bbox должен содержать 4 координаты, получено {len(value)}")
     x1, y1, x2, y2 = (float(c) for c in value)
     return [_clamp(min(x1, x2)), _clamp(min(y1, y2)), _clamp(max(x1, x2)), _clamp(max(y1, y2))]
+
+
+def _count(value: Any) -> Any:
+    """Целое >= 1 или непустая короткая запись («N»); цифры строкой -> целое."""
+    if value is None or isinstance(value, bool):
+        return None if value is None else _bad_count(value)
+    if isinstance(value, int):
+        return value if value >= 1 else _bad_count(value)
+    text = " ".join(str(value).split())
+    if text.isdigit():
+        return _count(int(text))
+    if not text or len(text) > _COUNT_MAX_CHARS:
+        return _bad_count(value)
+    return text
+
+
+def _bad_count(value: Any):
+    raise ValueError(f"count — целое >= 1 или короткая запись, получено {value!r}")
 
 
 def _normalize_points(value: List[List[float]]) -> List[List[float]]:
@@ -195,13 +215,25 @@ class TypedValue(Element):
 
 
 class TitleRole(_SheetModel):
-    """Роль в штампе. Имя — персональные данные: в связи графа не идёт."""
+    """
+    Роль в штампе. Имя — персональные данные: в связи графа не идёт.
+    `alternatives` — другие прочтения имени, `bbox` — клетка имени,
+    `field_refs` — поля, из которых роль собрана.
+    """
 
     role: str
     name: str
     date: Optional[str] = None
     handwritten: bool = False
     personal: Literal[True] = True
+    bbox: Optional[List[float]] = None
+    alternatives: List[str] = Field(default_factory=list)
+    field_refs: List["FieldRef"] = Field(default_factory=list)
+
+    @field_validator("bbox")
+    @classmethod
+    def _bbox(cls, value: Optional[List[float]]) -> Optional[List[float]]:
+        return None if value is None else _normalize_bbox(value)
 
 
 class TitleChange(_SheetModel):
@@ -242,6 +274,13 @@ class View(Element):
     scale: Optional[str] = None
     # Число одинаковых мест вида («4 места»).
     count: Optional[int] = Field(None, ge=1)
+    # Рамка заголовка вида («Б (4:1)»), когда `bbox` — область вида.
+    title_bbox: Optional[List[float]] = None
+
+    @field_validator("title_bbox")
+    @classmethod
+    def _title_bbox(cls, value: Optional[List[float]]) -> Optional[List[float]]:
+        return None if value is None else _normalize_bbox(value)
 
 
 class Feature(Element):
@@ -251,10 +290,16 @@ class Feature(Element):
         "hole", "thread", "fillet", "chamfer", "bend", "edge", "surface", "contour", "weld",
     ]
     label: Optional[str] = None
-    count: Optional[int] = Field(None, ge=1)
+    # Сколько таких элементов: целое или запись листа («N» у «N отв.»).
+    count: Optional[Union[int, str]] = None
     view_id: Optional[str] = None
     # id элементов, из которых элемент выведен.
     derived_from: List[str] = Field(default_factory=list)
+
+    @field_validator("count", mode="before")
+    @classmethod
+    def _count_value(cls, value: Any) -> Any:
+        return _count(value)
 
 
 class Tolerance(_SheetModel):
@@ -287,8 +332,9 @@ class Dimension(Element):
     # Справочный размер («*» по примечанию) и размер, обеспечиваемый инструментом.
     reference: bool = False
     tool_provided: bool = False
-    # «N отв.», «4 места»: сколько раз размер повторяется.
-    count: Optional[int] = Field(None, ge=1)
+    # «N отв.», «4 места»: сколько раз размер повторяется — целое или
+    # запись листа, когда число задано буквой («N»).
+    count: Optional[Union[int, str]] = None
     formula: Optional[Formula] = None
     view_id: Optional[str] = None
     feature_id: Optional[str] = None
@@ -302,6 +348,11 @@ class Dimension(Element):
     @classmethod
     def _leader(cls, value: List[List[float]]) -> List[List[float]]:
         return _normalize_points(value)
+
+    @field_validator("count", mode="before")
+    @classmethod
+    def _count_value(cls, value: Any) -> Any:
+        return _count(value)
 
 
 class TableRowRef(_SheetModel):

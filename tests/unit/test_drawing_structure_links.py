@@ -54,7 +54,7 @@ def _detail():
 def test_hole_count_and_note_reference_attach_to_diameter():
     sheet, _ = build_sheet(list(_detail()))
     dim = next(d for d in sheet.dimensions if d.kind == "diameter")
-    assert "N отв." in dim.value_raw and dim.count is None
+    assert dim.value_raw == "⌀8,5" and dim.count == "N"
     note5 = next(n for n in sheet.notes if n.number == 5)
     assert note5.id in dim.note_refs
     assert dim.id in note5.refs.dimensions

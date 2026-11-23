@@ -102,6 +102,7 @@ def build_views(pool: PagePool, typed: Sequence[Tuple[Element, typing_.Typed]]) 
                 "review": {"state": "auto"}, "alternatives": [], "field_refs": [],
                 "label": view.get("name") or None, "kind": view.get("kind") or "view",
                 "scale": view.get("scale") or None, "_title_box": title_box,
+                "title_bbox": title_box if title_box != bbox else None,
             }
             views.append(Item("views", "view", data, value=str(view.get("name") or "")))
     else:
@@ -123,7 +124,9 @@ def build_views(pool: PagePool, typed: Sequence[Tuple[Element, typing_.Typed]]) 
             data = base(element)
             data.update({"bbox": bbox, "label": name or None, "title_raw": element.value,
                          "kind": view_kind, "scale": scale or None,
-                         "_title_box": list(element.bbox), "_has_area": frame_index is not None})
+                         "_title_box": list(element.bbox), "_has_area": frame_index is not None,
+                         # Рамка вида стала областью вырезки — место заголовка отдельно.
+                         "title_bbox": list(element.bbox) if frame_index is not None else None})
             views.append(Item("views", "view", data, element=element, value=element.value))
         rest = [frame for i, frame in enumerate(frames) if i not in used]
         if rest:
@@ -242,7 +245,7 @@ def _dimension(element: Element, kind: typing_.Typed) -> Item:
         "tolerance": parsed.get("tolerance"),
         "reference": bool(parsed.get("reference")) or element.nature == "reference",
         "tool_provided": element.nature == "tool_provided",
-        "count": int(count) if count and str(count).isdigit() and int(count) >= 1 else None,
+        "count": _count_value(count),
         "formula": parsed.get("formula"),
     })
     if element.link:
@@ -255,6 +258,14 @@ def _dimension(element: Element, kind: typing_.Typed) -> Item:
     item = Item("dimensions", "dimension", data, element, element.value, note_numbers=list(kind.note_refs))
     item.data["_count_raw"] = count
     return item
+
+
+def _count_value(count: Any) -> Any:
+    """Число повторов для схемы: целое >= 1, иначе запись листа («N»), иначе None."""
+    text = " ".join(str(count or "").split())
+    if text.isdigit():
+        return int(text) if int(text) >= 1 else None
+    return text if text and len(text) <= 16 else None
 
 
 def _counts(counts: Sequence[Tuple[Element, typing_.Typed]], sections: Dict[str, List[Item]]) -> None:
@@ -277,13 +288,10 @@ def _counts(counts: Sequence[Tuple[Element, typing_.Typed]], sections: Dict[str,
                                           note_numbers=list(kind.note_refs)))
             continue
         count = kind.count or ""
-        target.data["count"] = int(count) if count.isdigit() and int(count) >= 1 else None
+        # «N отв.»: число задано буквой — `count` хранит запись листа ("N").
+        target.data["count"] = _count_value(count)
         target.data["_count_raw"] = count
         target.data["_count_text"] = element.value
-        if not target.data["count"]:
-            # «N отв.»: число задано не цифрой — в схеме v1 `count` целое,
-            # и запись сохраняется при значении размера, чтобы не пропасть.
-            target.data["value_raw"] = f"{target.data['value_raw']} {element.value}".strip()
         target.data["field_refs"].extend({"fragment": f, "field": i} for f, i in element.field_refs)
         target.note_numbers.extend(n for n in kind.note_refs if n not in target.note_numbers)
 
