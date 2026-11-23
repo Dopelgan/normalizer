@@ -338,6 +338,33 @@ class TestApply:
         assert stats["dropped"] == {"no_answer": 1} and stats["vlm_unlinked"] == 2
         assert all("link" not in item for item in items)
 
+    def test_empty_answer_is_asked_again_by_halves(self):
+        """Крышка 687000.001.001: «{}» на 11 величин; половины листа модель связывает."""
+        items = [{"category": "size", "value": str(10 + n), "bbox": [0.1 + 0.08 * n, 0.3, 0.14 + 0.08 * n, 0.33]}
+                 for n in range(5)]
+        calls = []
+
+        def ask(image, prompt, count):
+            calls.append(count)
+            if count == 5:
+                return {}
+            x = 120 if count == 3 else 360  # первая величина своей половины
+            return answer({"id": 1, "target": "длина ребра", "target_bbox": [x - 20, 380, x + 40, 440],
+                           "leader": [[x, 330], [x, 385]]})
+
+        stats = dl.apply(items, image=Image.new("RGB", SIZE, "white"), ask=ask)
+        assert calls == [5, 3, 2]
+        assert stats["vlm_split"] == 2 and stats["asked_vlm"] == 5
+        assert stats["linked_vlm"] == 2 and stats["vlm_unlinked"] == 3
+        assert [n for n, item in enumerate(items) if "link" in item] == [0, 3]
+        assert "no_answer" not in stats["dropped"]
+
+    def test_failed_call_is_not_split(self):
+        calls = []
+        stats = dl.apply(fields()[:2], image=Image.new("RGB", SHEET, "white"),
+                         ask=lambda image, prompt, count: calls.append(count))
+        assert calls == [2] and "vlm_split" not in stats and stats["dropped"] == {"no_answer": 1}
+
     def test_no_time_no_call(self):
         calls = []
         stats = dl.apply(fields()[:2], image=Image.new("RGB", SHEET, "white"),

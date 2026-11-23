@@ -255,3 +255,40 @@ class TestItemReferences:
         text = ocr("см. n.3")
         reading_reconcile.apply([text])
         assert text.content.text == "см. n.3"
+
+
+class TestDimensionLink:
+    """Связь размера (DRAWING_DIMENSION_LINKS) не теряется, когда поле вырезки сводится с полем листа."""
+
+    @staticmethod
+    def linked(value, bbox):
+        from core.models.contract import DimensionLink
+
+        item = field(value, bbox)
+        item.link = DimensionLink(target_label="длина", target_bbox=[0.5, 0.2, 0.7, 0.3],
+                                  leader=[[0.6, 0.34], [0.6, 0.3]], method="vlm", confidence=0.6)
+        return item
+
+    def test_crop_link_moves_to_the_sheet_field(self):
+        sheet = drawing([field("⌀280±0,3", [0.30, 0.34, 0.32, 0.40])])
+        crop = drawing([self.linked("⌀280±0,3", [0.60, 0.34, 0.64, 0.40]), field("⌀18", [0.1, 0.8, 0.14, 0.84])],
+                       bbox=CROP, name="crop")
+        reading_reconcile.apply([sheet, crop])
+        assert [f.value for f in crop.content.structured_drawing_fields] == ["⌀18"]
+        link = sheet.content.structured_drawing_fields[0].link
+        assert link is not None and link.target_label == "длина"
+        assert link.target_bbox == [0.25, 0.2, 0.35, 0.3]       # из долей вырезки в доли листа
+        assert link.leader == [[0.3, 0.34], [0.3, 0.3]]
+
+    def test_own_sheet_link_wins(self):
+        sheet = drawing([self.linked("⌀280±0,3", [0.30, 0.34, 0.32, 0.40])])
+        crop = drawing([self.linked("⌀280±0,3", [0.60, 0.34, 0.64, 0.40])], bbox=CROP, name="crop")
+        reading_reconcile.apply([sheet, crop])
+        assert sheet.content.structured_drawing_fields[0].link.target_bbox == [0.5, 0.2, 0.7, 0.3]
+
+    def test_turned_crop_keeps_link_to_itself(self):
+        sheet = drawing([field("⌀280±0,3", [0.30, 0.34, 0.32, 0.40])])
+        crop = drawing([self.linked("⌀280±0,3", [0.60, 0.34, 0.64, 0.40])], bbox=CROP, name="crop")
+        crop.content.structured_payload = {"layout": {"turn": 90}}
+        reading_reconcile.apply([sheet, crop])
+        assert sheet.content.structured_drawing_fields[0].link is None

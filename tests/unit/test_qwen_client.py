@@ -163,6 +163,24 @@ class TestSheetReading:
         reading = client(FakeSession(FakeResponse(answer(fenced)))).read_sheet(picture())
         assert reading.annotations[0]["value"] == "20"
 
+    def test_bbox_in_thousandths_becomes_fractions(self):
+        """
+        Запрос просит доли, а модель отвечает тысячными: на ГЧ 302182.001 все
+        57 надписей пришли так, и поля легли рамкой всего листа.
+        """
+        payload = {"annotations": [
+            {"category": "title_block", "value": "ТАДУ 302182.001 ГЧ", "bbox": [539, 798, 853, 828]},
+            {"category": "size", "value": "⌀44H7", "bbox": [0.1, 0.2, 0.2, 0.3]},
+            {"category": "size", "value": "20", "bbox": [1200, 300, 1300, 340]},
+        ]}
+        reading = client(FakeSession(FakeResponse(answer(payload)))).read_sheet(picture())
+
+        assert [a["bbox"] for a in reading.annotations] == [
+            [0.539, 0.798, 0.853, 0.828],
+            [0.1, 0.2, 0.2, 0.3],        # доли — как были
+            [1200, 300, 1300, 340],      # больше 1000 — пиксели, не переводим
+        ]
+
     def test_answer_without_annotations_is_empty_not_broken(self):
         reading = client(FakeSession(FakeResponse(answer({"sheet_type": "scheme"})))).read_sheet(picture())
         assert reading.sheet_type == "scheme"
@@ -480,4 +498,28 @@ class TestResponseCache:
         for path in cache.rglob("*.json"):
             path.write_text("не json", encoding="utf-8")
         client(session).read_sheet(sheet)
+        assert len(session.requests) == 2
+
+
+class TestDimensionLinksAnswer:
+    """Ответ без списка `links` не замерзает в кэше ответов модели."""
+
+    @pytest.mark.parametrize("content,ok", [
+        ("{}", False), ('{"links": "нет"}', False), ("не JSON", False),
+        ('{"links": []}', True), ('{"links": [{"id": 1}]}', True),
+    ])
+    def test_only_answers_with_links_are_cached(self, content, ok):
+        assert qwen_client.links_answer_accepted(content) is ok
+
+    def test_empty_object_is_not_cached_and_is_asked_again(self, mocker, tmp_path):
+        mocker.patch.object(qwen_client.settings, "VLM_RESPONSE_CACHE", True)
+        mocker.patch.object(qwen_client.settings, "VLM_RESPONSE_CACHE_DIR", str(tmp_path))
+        session = FakeSession(FakeResponse(answer({})), FakeResponse(answer({"links": []})),
+                              FakeResponse(answer({"links": [{"id": 9}]})))
+        model = client(session)
+
+        assert model.read_dimension_links(picture(), "связи", 2) == {}
+        assert model.read_dimension_links(picture(), "связи", 2) == {"links": []}
+        # Принятый ответ взят из кэша: третьего вызова нет.
+        assert model.read_dimension_links(picture(), "связи", 2) == {"links": []}
         assert len(session.requests) == 2

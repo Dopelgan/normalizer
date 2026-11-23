@@ -888,23 +888,31 @@ def apply(
         asked_rows = rest[:limit] if limit > 0 else []
         stats["not_asked"] = len(rest) - len(asked_rows)
         if asked_rows and has_time():
-            asked = [(number + 1, fields[n]) for number, n in enumerate(asked_rows)]
-            stats["asked_vlm"] = len(asked)
-            data = None
-            try:
-                data = ask(marked_image(image, asked), vlm_prompt(asked), len(asked))
-            except Exception as exc:  # noqa: BLE001 — сбой вызова не роняет лист
-                if _stops_the_task(exc):
-                    raise
-                logger.warning("Связь размеров моделью не получена: %s", exc)
-            found, dropped = validate_vlm(data, asked, tuple(image.size), forbidden)
+            stats["asked_vlm"] = len(asked_rows)
+            found, dropped, answered = _ask_rows(ask, image, fields, asked_rows, forbidden)
+            if answered and dropped.get("no_answer") and len(asked_rows) > 1:
+                # Модель ответила, но без списка связей («{}» на крышке
+                # 687000.001.001 при 11 отмеченных величинах). Тот же запрос
+                # при нулевой температуре даст тот же отказ, поэтому
+                # спрашиваются половины: другая картинка, меньше номеров.
+                # Сбой вызова (нет ответа вовсе) так не повторяется.
+                half = (len(asked_rows) + 1) // 2
+                found, dropped = {}, {}
+                stats["vlm_split"] = 2
+                for part in (asked_rows[:half], asked_rows[half:]):
+                    if not has_time():
+                        dropped["no_time"] = dropped.get("no_time", 0) + len(part)
+                        continue
+                    part_found, part_dropped, _ = _ask_rows(ask, image, fields, part, forbidden)
+                    found.update(part_found)
+                    for reason, count in part_dropped.items():
+                        dropped[reason] = dropped.get(reason, 0) + count
             for reason, count in dropped.items():
                 drop(reason, count)
-            for number, n in enumerate(asked_rows, start=1):
-                if number in found:
-                    fields[n]["link"] = found[number]
-                    stats["linked_vlm"] += 1
-            stats["vlm_unlinked"] = len(asked) - len(found)
+            for n, link in found.items():
+                fields[n]["link"] = link
+                stats["linked_vlm"] += 1
+            stats["vlm_unlinked"] = len(asked_rows) - len(found)
         elif asked_rows:
             stats["not_asked"] = len(rest)
             drop("no_time", len(asked_rows))
@@ -912,6 +920,27 @@ def apply(
         stats["not_asked"] = len(rest)
     stats["linked"] = stats["linked_vector"] + stats["linked_vlm"]
     return stats
+
+
+def _ask_rows(
+    ask: Callable[[Any, str, int], Any], image, fields: List[Dict[str, Any]],
+    rows: Sequence[int], forbidden: Sequence[Sequence[float]],
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, int], bool]:
+    """
+    Один вызов модели по полям `rows` (номера на листе — с 1 по порядку).
+    Возвращает {индекс поля: связь} прошедших проверку, счёт отказов и
+    ответила ли модель вообще (разобранный JSON, а не сбой вызова).
+    """
+    asked = [(number + 1, fields[n]) for number, n in enumerate(rows)]
+    data = None
+    try:
+        data = ask(marked_image(image, asked), vlm_prompt(asked), len(asked))
+    except Exception as exc:  # noqa: BLE001 — сбой вызова не роняет лист
+        if _stops_the_task(exc):
+            raise
+        logger.warning("Связь размеров моделью не получена: %s", exc)
+    found, dropped = validate_vlm(data, asked, tuple(image.size), forbidden)
+    return {rows[number - 1]: link for number, link in found.items()}, dropped, data is not None
 
 
 # ===========================================================================

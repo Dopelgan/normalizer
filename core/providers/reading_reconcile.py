@@ -314,6 +314,7 @@ def reconcile_page(drawings: List[Fragment], layer_lines: Sequence[str]) -> None
             taken.add(twin)
             twins[id(crop_fields[twin][1])] = field
             readings.append({"source": CROP, "value": crop_fields[twin][1].value})
+            _carry_link(field, primary, *crop_fields[twin][:2])
         if not numeric:
             if twin is not None:
                 _set(field, field.value, readings, AGREED)
@@ -352,6 +353,34 @@ def reconcile_page(drawings: List[Fragment], layer_lines: Sequence[str]) -> None
                 _set(field, field.value, [{"source": CROP, "value": field.value}], SINGLE)
             kept.append(field)
         crop.content.structured_drawing_fields = kept
+
+
+def _turn(fragment: Fragment) -> int:
+    layout = (fragment.content.structured_payload or {}).get("layout")
+    return int((layout or {}).get("turn") or 0) if isinstance(layout, dict) else 0
+
+
+def _carry_link(field: DrawingField, primary: Fragment, crop: Fragment, crop_field: DrawingField) -> None:
+    """
+    Связь размера (`link`, DRAWING_DIMENSION_LINKS) поля вырезки, которое
+    уходит в поле листа, переходит к полю листа, если своей у него нет.
+    Без этого связь терялась вместе с полем вырезки: на крышке 687000.001.001
+    модель не ответила на лист целиком, а три связи вырезок пропали при
+    сведении. Рамки — из долей вырезки в доли листа тем же переносом, что и
+    у сравнения мест (`_to_page`); при повороте вырезки или листа на 90°
+    такой перенос неверен, и связь не переносится.
+    """
+    link = crop_field.link
+    frame = list(crop.position.bbox or []) if crop.position else []
+    if field.link is not None or link is None or len(frame) != 4 or _turn(crop) or _turn(primary):
+        return
+    fx1, fy1, fx2, fy2 = (float(v) for v in frame)
+    w, h = fx2 - fx1, fy2 - fy1
+    moved = link.model_copy(deep=True)
+    moved.target_bbox = [round(v, 4) for v in _to_page(link.target_bbox, frame)]
+    moved.leader = [[round(fx1 + float(p[0]) * w, 4), round(fy1 + float(p[1]) * h, 4)]
+                    for p in link.leader if len(p) == 2]
+    field.link = moved
 
 
 def _numbers(value: Any) -> List[str]:

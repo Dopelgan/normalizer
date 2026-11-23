@@ -954,8 +954,22 @@ class QwenVisionClient:
         """
         Лист с отмеченными величинами (DRAWING_DIMENSION_LINKS) -> ответ
         модели как есть; проверяет его `dimension_links.validate_vlm`.
+
+        Ответ без списка `links` (на крышке 687000.001.001 модель вернула
+        «{}») в кэш не пишется, а из кэша не берётся: иначе отказ модели
+        замерзал бы, и переобработка листа повторяла бы его без вызова.
         """
-        return self._ask(image, prompt, settings.QWEN_SHEET_MAX_SIDE, max_tokens=128 + 96 * count)
+        if not self.available:
+            logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
+            return None
+        answer = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE,
+                                max_tokens=128 + 96 * count, accept=links_answer_accepted)
+        if answer is None:
+            return None
+        data = extract_json(answer[0])
+        if data is None:
+            logger.error("Модель вернула не-JSON (%d символов): %.200s", len(answer[0]), answer[0])
+        return data
 
     def transcribe(self, image) -> Optional[List[str]]:
         """Весь текст листа строками: штамп, графы, примечания, таблицы."""
@@ -1686,6 +1700,33 @@ def compact_annotation(item: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def links_answer_accepted(content: str, finish: Optional[str] = None) -> bool:
+    """Ответ о связях размеров годен в кэш: объект со списком `links` (пустой — тоже ответ)."""
+    data = extract_json(content)
+    return isinstance(data, dict) and isinstance(data.get("links"), list)
+
+
+def _box_from_thousandths(annotation: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Рамка надписи-объекта в тысячных долях (0–1000) -> в доли листа.
+
+    Запрос просит доли от 0 до 1, но Qwen-VL по своей привычке нередко
+    отвечает тысячными: на ГЧ 302182.001 все 57 надписей листа пришли так
+    ([539, 798, 853, 828] — обозначение в штампе), разбор принял их за
+    пиксели, и поля легли рамкой всего листа. Пикселей больше 1000 (лист
+    уходит модели до 2000 по стороне) по-прежнему не переводим — такой
+    bbox дальше отбрасывается, как раньше.
+    """
+    box = annotation.get("bbox")
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return annotation
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in box):
+        return annotation
+    if max(box) <= 1.5 or min(box) < 0 or max(box) > 1000:
+        return annotation
+    return {**annotation, "bbox": [round(float(v) / 1000.0, 4) for v in box]}
+
+
 def as_annotations(
     items: Sequence[Any], compact: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -1700,7 +1741,8 @@ def as_annotations(
     отдаёт то, что возвращает `json.JSONDecoder.raw_decode`, то есть объект,
     массив, строку, число, `true`/`false`/`null` — других не бывает.
 
-    * объект — надпись, как и прежде;
+    * объект — надпись, как и прежде; рамку в тысячных долях переводит
+      `_box_from_thousandths`;
     * строка — надпись без места: модель бросила обёртку объекта и
       перечисляет значения подряд. Текст на листе есть, и терять его
       незачем; места нет, поэтому разбор поставит ему рамку всего листа, а
@@ -1737,7 +1779,7 @@ def as_annotations(
 
     def take(item: Any, depth: int = 0) -> None:
         if isinstance(item, dict):
-            annotations.append(item)
+            annotations.append(_box_from_thousandths(item))
             return
         if compact:
             unpacked = compact_annotation(item)
