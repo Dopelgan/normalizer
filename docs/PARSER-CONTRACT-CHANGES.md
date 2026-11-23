@@ -1140,6 +1140,62 @@ deskewed_page`), та же система, что у `bbox` поля, поэто
 не добавляет. Потребитель, не знающий ключа `link`, его не видит.
 
 
+## Структура листа чертежа `drawing-sheet-v1` (23.11.2026)
+
+Схема `2.0` не меняется, изменение аддитивное. Модель —
+`core/models/drawing_sheet.py`. У `content` появляется необязательный ключ
+`drawing_sheet` — структура одной страницы, только у фрагмента «лист
+целиком». Пока сборщик за флагом `DRAWING_STRUCTURE` (по умолчанию
+выключен) не включён, ключа нет в ответе вовсе (не `null`); прежние ответы,
+`structured_drawing_fields`, `structured_payload`, `content.text` и
+`fragment_id` не меняются — структура в подпись фрагмента не входит.
+
+Состав объекта: `schema` (`"drawing-sheet-v1"`), `page`, `sheet_type`
+(`detail` | `assembly` | `scheme` | `unknown`), `frame`
+(`coordinate_reference: deskewed_page`, `angle`, `turn`, `format`,
+`format_confidence`, `inner_frame`, `page_px`), `title_block` (`bbox`,
+`fields` — графы по ключам `designation`, `name`, `material`, `mass`,
+`scale`, `sheet`, `sheets`, `format`, `organisation`, `inventory_no` и
+другим, `bbox` графы — рамка клетки; `roles` с `personal: true`; `changes`),
+`views`, `features`, `dimensions` (`value_raw`, `kind`, `nominal`, `unit`,
+`tolerance {upper, lower, fit, source}`, `reference`, `tool_provided`,
+`count`, `formula {expr, variables}`, `view_id`, `feature_id`, `leader`,
+`link {method, confidence}`, `note_refs`), `positions` (`number`, `leader`,
+`target_bbox`, `view_id`, `table_row {table_id, row}`), `notes` (`number`,
+`text`, `defines_marker`, `refs {notes, dimensions, features, symbols}`),
+`tables` (`kind`, `headers`, `rows[].cells[] {text, bbox}`), `symbols`
+(`kind`, `value`, `scope`, `feature_id`, `standard`), `texts` (надписи, не
+подошедшие ни к одному виду) и `stats` (`elements`, `merged_duplicates`,
+`alternatives`, `needs_check`, `unlinked_dimensions`, `truncated`).
+
+У каждого элемента (и у графы штампа) общие ключи: `id` (`<вид>-<n>` в
+порядке чтения; ссылки между элементами — по `id`), `anchor`, `bbox`,
+`bbox_exact`, `provenance {source: vector|text_layer|ocr|vlm, passes}`,
+`confidence`, `review {state: auto|needs_check|confirmed|corrected|rejected}`,
+`alternatives [{value, source, pass, confidence}]` и `field_refs
+[{fragment, field}]` — мост к плоским полям: порядковый номер фрагмента
+страницы среди фрагментов с `structured_drawing_fields` (с нуля, в порядке
+ответа) и индекс поля в нём.
+
+- Координаты — доли выправленного листа `[x1, y1, x2, y2]`, как у `bbox`
+  поля; линии — `[[x, y], ...]`.
+- `anchor` — sha1 строки `<вид>|<значение>|<cx>,<cy>`: значение после NFKC,
+  без пробелов, без регистра, запятая заменена точкой; центр рамки на сетке
+  1/64 листа (`element_anchor`). Тем же правилом RAG сопоставляет решения
+  специалиста после перечитывания листа.
+- Ключ со значением `null` внутри структуры не выводится: отсутствующий ключ
+  читать как `null`.
+- Версия — `schema` внутри объекта. Новые ключи версию не меняют, разбор их
+  пропускает; ломающее изменение — `v2`, один выпуск рядом с `v1`.
+- Размер — не больше 48 КБ компактного JSON в UTF-8 (`cap_sheet_size`):
+  сначала снимаются линии `leader` у размеров и позиций, затем надписи
+  `texts` с конца; при снятии ставится `stats.truncated`. Не уложившуюся
+  структуру Normalizer не отдаёт.
+
+Откат — флаг выключен. Потребитель, не знающий ключа, его не видит
+(`ParserContractModel` RAG — `extra="ignore"`).
+
+
 ## Строки распознавания с координатами в положении фрагмента (23.11.2026)
 
 Флаг `RECOGNITION_LINES`, по умолчанию **выключен**. При выключенном флаге

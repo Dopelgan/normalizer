@@ -23,6 +23,8 @@ from pydantic import (
     BaseModel, ConfigDict, Field, field_serializer, field_validator, model_serializer, model_validator,
 )
 
+from core.models.drawing_sheet import DrawingSheet
+
 FragmentType = Literal["text", "table", "formula", "drawing", "image", "structured"]
 DocumentStatus = Literal["pending", "indexed", "error"]
 RequestStatus = Literal["queued", "processing", "completed", "partial", "error"]
@@ -331,6 +333,17 @@ class Content(BaseModel):
     parsed_expression: Optional[FormulaData] = None
     structured_drawing_fields: Optional[List[DrawingField]] = None
     structured_payload: Optional[Dict[str, Any]] = None
+    # Структура листа `drawing-sheet-v1` (DRAWING_STRUCTURE): одна на страницу,
+    # у фрагмента «лист целиком». Не задана — ключа нет в ответе вовсе, поэтому
+    # прежние ответы и подпись фрагмента не меняются.
+    drawing_sheet: Optional[DrawingSheet] = None
+
+    @model_serializer(mode="wrap")
+    def _without_unset_sheet(self, handler):
+        data = handler(self)
+        if isinstance(data, dict) and data.get("drawing_sheet") is None:
+            data.pop("drawing_sheet", None)
+        return data
 
 
 # ===========================================================================
