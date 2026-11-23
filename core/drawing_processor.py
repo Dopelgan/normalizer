@@ -981,6 +981,11 @@ class DrawingProcessor:
             # Последним: сведение D3 и дочитывание D4 работают в координатах
             # вырезок и выправленного листа, а наружу поля уходят в долях страницы.
             result = field_placement.apply(result)
+        if settings.DRAWING_STRUCTURE:
+            # После размещения: структура листа собирается из окончательных
+            # полей страницы, без вызовов модели (core/drawing_structure/).
+            from core import drawing_structure
+            result = drawing_structure.apply(result)
         return result
 
     # ------------------------------------------- перечитывание плохого скана

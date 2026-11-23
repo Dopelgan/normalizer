@@ -1156,10 +1156,15 @@ deskewed_page`), та же система, что у `bbox` поля, поэто
 `format_confidence`, `inner_frame`, `page_px`), `title_block` (`bbox`,
 `fields` — графы по ключам `designation`, `name`, `material`, `mass`,
 `scale`, `sheet`, `sheets`, `format`, `organisation`, `inventory_no` и
-другим, `bbox` графы — рамка клетки; `roles` с `personal: true`; `changes`),
-`views`, `features`, `dimensions` (`value_raw`, `kind`, `nominal`, `unit`,
+другим, `bbox` графы — рамка клетки; `roles` (`role`, `name`, `date`,
+`handwritten`, `personal: true`, `bbox` клетки имени, `alternatives` —
+другие прочтения имени, `field_refs`); `changes`),
+`views` (`label`, `title_raw`, `kind`, `scale`, `count`, `title_bbox` — рамка
+заголовка, когда `bbox` — область вида), `features` (`count` — как у
+размера), `dimensions` (`value_raw`, `kind`, `nominal`, `unit`,
 `tolerance {upper, lower, fit, source}`, `reference`, `tool_provided`,
-`count`, `formula {expr, variables}`, `view_id`, `feature_id`, `leader`,
+`count` — целое или запись листа, если число задано буквой («N» у
+«N отв.»), `formula {expr, variables}`, `view_id`, `feature_id`, `leader`,
 `link {method, confidence}`, `note_refs`), `positions` (`number`, `leader`,
 `target_bbox`, `view_id`, `table_row {table_id, row}`), `notes` (`number`,
 `text`, `defines_marker`, `refs {notes, dimensions, features, symbols}`),
@@ -1191,6 +1196,15 @@ deskewed_page`), та же система, что у `bbox` поля, поэто
   сначала снимаются линии `leader` у размеров и позиций, затем надписи
   `texts` с конца; при снятии ставится `stats.truncated`. Не уложившуюся
   структуру Normalizer не отдаёт.
+
+Флаг `DRAWING_STRUCTURE` (по умолчанию выключен): структура собирается
+после всех проходов чертежей, вызовов модели нет. Рамки уточняются по
+строкам текстового слоя и распознавания той же страницы
+(`position.lines`, `RECOGNITION_LINES`; у повёрнутого неразмещённого листа —
+только по текстовому слою), значение от строки не меняется. Учёт сборки
+(`built`, `warnings` `DRAWING_STRUCTURE_*`, `stats`) — в
+`completeness_mechanisms.drawing_diagnostics.structure` фрагмента-носителя;
+в `warnings` фрагмента и в `review_required` структура не попадает.
 
 Откат — флаг выключен. Потребитель, не знающий ключа, его не видит
 (`ParserContractModel` RAG — `extra="ignore"`).
