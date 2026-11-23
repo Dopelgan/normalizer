@@ -36,7 +36,8 @@ _DIGITS = 4
 
 
 def enabled() -> bool:
-    return bool(getattr(settings, "RECOGNITION_LINES", False))
+    # Прямое чтение атрибута: по нему тест кэша лестницы находит флаг и требует его в ключе.
+    return bool(settings.RECOGNITION_LINES)
 
 
 def _bbox(raw: Sequence[float]) -> Optional[List[float]]:

@@ -140,6 +140,14 @@ class TestKey:
         monkeypatch.setattr(result_cache, "_code_digest", "другой код")
         assert result_cache.cache_key(SHA, "pdf", {}) != before
 
+    def test_recognition_lines_flag_changes_key(self, monkeypatch):
+        # Строки распознавания лежат в блоках ParseResult: результат, кэшированный
+        # без флага, не должен отдаваться при включённом RECOGNITION_LINES.
+        monkeypatch.setattr(settings, "RECOGNITION_LINES", False)
+        before = result_cache.cache_key(SHA, "pdf", {})
+        monkeypatch.setattr(settings, "RECOGNITION_LINES", True)
+        assert result_cache.cache_key(SHA, "pdf", {}) != before
+
     def test_every_setting_the_ladder_reads_is_classified(self):
         # Новая настройка в коде лестницы должна попасть либо в ключ, либо
         # в явный список «результат не меняет» — иначе кэш отдаст результат,
