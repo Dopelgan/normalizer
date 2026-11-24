@@ -266,13 +266,16 @@ def finalize_fragments(
 # (`super_rag/parser/completeness.py`, вид `rag_sheet_reparse_candidate`);
 # `transcript_line_count`, `transcript_complete` — качество фрагмента
 # (`core/drawing_quality.py`); `recognition_mode`, `sheet_type`,
-# `coordinate_reference` — чем прочитан лист.
+# `coordinate_reference` — чем прочитан лист; `what_drawn` — «Что изображено»
+# для описания листа RAG (`super_rag/drawings/description`); ключ в нижнем
+# регистре адаптер RAG считает служебным и в искомый текст не выводит.
 _PAYLOAD_FOR_CONSUMER: frozenset = frozenset({
     "title_block", "title_block_handwritten", "tables",
     "record_parts", "record_context",
     "sheet_reparse_candidate", "sheet_reparse_reason",
     "transcript_line_count", "transcript_complete",
     "recognition_mode", "sheet_type", "coordinate_reference",
+    "what_drawn",
 })
 # Куда переносится учёт. Поле `completeness_mechanisms` уже есть в
 # контракте, в текст не попадает нигде и ни одним потребителем не читается:

@@ -103,6 +103,15 @@ class TestDiagnosticsAside:
                     "sheet_reparse_reason", "transcript_line_count", "recognition_mode"):
             assert key in payload, key
 
+    def test_what_drawn_reaches_consumer(self, aside):
+        # «Что изображено» читает описание листа RAG; в учёт разбора его уносить нельзя.
+        fragment = drawing_fragment()
+        what = {"version": 1, "object": "Плоская пластина", "views": [], "dimensions": [],
+                "parts_fit": None}
+        fragment.content.structured_payload["what_drawn"] = what
+        fragments, _ = finalize_fragments([fragment], doc_id="d1")
+        assert fragments[0].content.structured_payload.get("what_drawn") == what
+
     def test_diagnostics_kept_aside(self, aside):
         fragments, _ = finalize_fragments([drawing_fragment()], doc_id="d1")
         kept = (fragments[0].completeness_mechanisms or {}).get(DIAGNOSTICS_KEY) or {}
