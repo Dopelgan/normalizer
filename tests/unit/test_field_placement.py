@@ -167,6 +167,30 @@ def test_title_block_cell_and_aggregated_record_merge_keeping_label_and_variants
     assert len(sheet.content.structured_drawing_fields) == 7
 
 
+@pytest.mark.parametrize("flag, kept", [(True, 3), (False, 2)])
+def test_margin_graph_is_not_a_part_of_the_stamp_row_next_to_it(monkeypatch, flag, kept):
+    """
+    Лист фланца ТАДУ 302389.001.01.02.001: клетка «Подп. и дата» поля
+    подшивки стоит вплотную к строке штампа «Разраб. Бабанин 10.02.2022».
+    С DRAWING_MARGIN_COLUMNS графа не сводится в строку как её часть, а та
+    же запись графы без подписи по-прежнему сводится.
+    """
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "DRAWING_MARGIN_COLUMNS", flag)
+    sheet = _drawing([
+        _field("title_block", "Разраб. Бабанин 10.02.2022", [0.118, 0.859, 0.408, 0.88]),
+        _field("title_block", "Подп. и дата: 10.02.2022 (рукописно)", [0.06, 0.77, 0.1146, 0.883]),
+        _field("title_block", "Инв. № подл.: 1012-05 (рукописно)", [0.06, 0.883, 0.1146, 0.964]),
+        _field("title_block", "1012-05", [0.07, 0.89, 0.11, 0.95], confidence=0.6),
+    ], [0, 0, 1, 1])
+    fp.apply([sheet])
+    values = [f.value for f in sheet.content.structured_drawing_fields]
+    assert len(values) == kept
+    assert "1012-05" not in values
+    assert ("Подп. и дата: 10.02.2022 (рукописно)" in values) is flag
+
+
 def test_garbled_readings_are_marked_low_quality():
     sheet = _drawing([
         _field("callout", "4, Nот", [0.1, 0.1, 0.12, 0.12], confidence=0.75),

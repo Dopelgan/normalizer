@@ -230,6 +230,25 @@ def _split_label(value: str) -> Tuple[str, str]:
     return "", text.strip()
 
 
+# Подписи граф поля подшивки (ГОСТ 2.104), как их возвращает `_split_label`.
+_MARGIN_GRAPHS = frozenset(
+    label.casefold() for label in ("Инв. № подл.", "Подп. и дата", "Взам. инв. №", "Инв. № дубл.",
+                                   "Перв. примен.", "Справ. №")
+)
+
+
+def _margin_graph(label: str) -> bool:
+    """
+    Подпись — графа поля подшивки (DRAWING_MARGIN_COLUMNS). Клетка графы
+    стоит вплотную к строкам штампа, и «Подп. и дата: 10.02.2022» на листе
+    фланца ТАДУ 302389.001.01.02.001 сводилась в соседнюю строку
+    «Разраб. Бабанин 10.02.2022» как её часть — графа пропадала.
+    """
+    from core.config import settings
+
+    return bool(settings.DRAWING_MARGIN_COLUMNS) and label in _MARGIN_GRAPHS
+
+
 def _folded(value: str) -> str:
     return _NOT_WORD.sub("", notation(value))
 
@@ -269,6 +288,8 @@ def _relation(a: DrawingField, b: DrawingField) -> Optional[str]:
         return "same"
     if a.category in NUMERIC or b.category in NUMERIC:
         return None     # у величин повтором считается только та же запись
+    if _margin_graph(label_a) != _margin_graph(label_b):
+        return None     # графа подшивки — не часть строки штампа рядом с ней
     short, long_ = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
     if len(short) >= 2 and short in long_:
         return "part"
