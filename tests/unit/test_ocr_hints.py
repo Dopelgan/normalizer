@@ -185,3 +185,10 @@ def test_endpoint_failure_gives_no_hints(requests_mock, monkeypatch):
     monkeypatch.setattr(settings, "DRAWING_OCR_HINTS_ENDPOINT", "http://ocr-hints:8090/")
     requests_mock.post("http://ocr-hints:8090/", status_code=500)
     assert ocr_hints.from_endpoint(Image.new("RGB", (800, 600), "white"), 200) is None
+
+
+def test_value_already_read_without_label_is_not_filled_again():
+    fields = [field("2068-06", [0.03, 0.89, 0.056, 0.97], category="title_block")]
+    stats = ocr_hints.new_stats()
+    ocr_hints.fill_empty(fields, [line("2068-06", [0.03, 0.9, 0.05, 0.96], region="margin")], stats)
+    assert len(fields) == 1 and stats["filled"] == 0
