@@ -488,6 +488,38 @@ _WELD_AS_THREAD = re.compile(r"^\d+[MМNН№]\*?\d{0,2}$")
 _SCHEME_DESIGNATOR = re.compile(r"^[MМ]\d{1,3}(?:\(\d+\)|-\d{1,3})?$")
 
 
+# Метка шва ГОСТ 2.312: «№1», «2№3», «4N°1» (знак номера — и «N°», «Nº»).
+_WELD_MARK = re.compile(r"^\d*\s?(?:№|N[°ºo]?)\s?\d{1,2}$")
+# Номер позиции на полке выноски сборочного чертежа (ГОСТ 2.109): голое
+# число без единиц и знаков.
+_POSITION_NUMBER = re.compile(r"^\d{1,3}$")
+
+
+def _position_rule(items: List[_Item], stats: Dict[str, int]) -> None:
+    """
+    Позиции и метки швов на сборочном чертеже (DRAWING_SENSE_POSITIONS).
+    Демо-проверка 24.11, пробка ЭК150: номера позиций 2–7 и 11 пришли
+    выносками, а метки швов «№1»…«2№3» — позициями. На листе сборки голое
+    число на выноске — номер позиции, а «№» с цифрой — метка шва (выноска).
+    Только `sheet_type` = `assembly`: на листе детали голое число на выноске
+    — ссылка на пункт или размер.
+    """
+    for item in items:
+        field = item.field
+        if item.gone or field.category not in ("position", "callout"):
+            continue
+        payload = item.fragment.content.structured_payload or {}
+        if payload.get("sheet_type") != "assembly":
+            continue
+        value = " ".join(str(field.value or "").split())
+        if field.category == "position" and _WELD_MARK.match(value):
+            field.category = "callout"
+            stats["weld_marks"] += 1
+        elif field.category == "callout" and _POSITION_NUMBER.match(value) and int(value) > 0:
+            field.category = "position"
+            stats["positions"] += 1
+
+
 def _thread_rule(items: List[_Item], stats: Dict[str, int]) -> None:
     """
     Резьба, которой на листе нет: метка шва «2№3» на сборке пробки ЭК150 и
@@ -592,7 +624,7 @@ def apply_page(drawings: List[Fragment], texts: Sequence[str] = ()) -> Dict[str,
     """
     stats = {"thickness": 0, "thickness_merged": 0, "roughness_dropped": 0,
              "roughness_to_size": 0, "roughness_review": 0, "links_dropped": 0,
-             "thread_weld": 0, "thread_designator": 0, "twins_merged": 0}
+             "thread_weld": 0, "thread_designator": 0, "twins_merged": 0, "weld_marks": 0, "positions": 0}
     t = thickness(_material_texts(drawings))
     if t is None and texts:
         t = thickness([(text, False) for text in texts])
@@ -603,6 +635,10 @@ def apply_page(drawings: List[Fragment], texts: Sequence[str] = ()) -> Dict[str,
     ]
     _roughness_rule(items, t, stats)
     _thread_rule(items, stats)
+    from core.config import settings
+
+    if settings.DRAWING_SENSE_POSITIONS:
+        _position_rule(items, stats)
     if t is not None:
         _thickness_rule(items, t, stats)
         _deduplicate_thickness(items, t, stats)

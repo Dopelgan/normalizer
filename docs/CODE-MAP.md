@@ -222,6 +222,7 @@
 | `VLM_SAME_REQUEST_ONCE` | `false` | `core/providers/qwen_client.py` (`_ask_text`: `_join_flight`/`_land_flight` — одинаковые запросы в полёте; `rejected_get`/`rejected_put` и `sheet_answer_repeats` — отложенные отказы листа `<ключ>.rejected` рядом с кэшем); токены вызова — `_post` (`parse.vlm_prompt_tokens`, `parse.vlm_completion_tokens`, `parse.vlm_reused`) |
 | `DRAWING_READINGS_RECONCILED` | `false` | `core/drawing_processor.py::enrich_fragments` → `core/providers/reading_reconcile.apply`; пометка в записи — `core/drawing_record._with_tolerance` |
 | `DRAWING_SENSE_RULES` | `false` | `core/drawing_processor.py::_enrich_fragments` и `_dimension_links` → `core/providers/sense_rules.py` (`apply`, `check_links`) |
+| `DRAWING_SENSE_POSITIONS` | `false` | `core/providers/sense_rules.py::_position_rule` (из `apply_page`) |
 | `DRAWING_CORNER_ROUGHNESS` | `false` | `core/drawing_processor.py::_process` → `_corner_roughness`; `core/providers/qwen_client.py::read_corner_roughness` |
 | `DRAWING_MARGIN_COLUMNS` | `false` | `core/drawing_processor.py::_process` → `_margin_columns` → `core/providers/margin_columns.py`; `qwen_client.read_margin_columns` |
 | `DRAWING_INNER_FRAME_EXTENT` | `false` | `core/providers/drawing_vision.py::_inner_frame` → `_frame_rows` |

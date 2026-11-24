@@ -389,3 +389,32 @@ def test_roughness_elsewhere_and_two_sizes_stay():
     ])
     sense_rules.apply([sheet])
     assert len(sheet.content.structured_drawing_fields) == 4
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_assembly_positions_and_weld_marks(monkeypatch, flag):
+    """Пробка ЭК150 (демо 24.11): позиции пришли выносками, метки швов — позициями."""
+    monkeypatch.setattr(settings, "DRAWING_SENSE_POSITIONS", flag)
+    sheet = drawing([
+        field("2", [0.3, 0.2, 0.31, 0.22], category="callout"),
+        field("11", [0.4, 0.5, 0.41, 0.52], category="callout"),
+        field("п.6", [0.5, 0.2, 0.52, 0.22], category="callout"),
+        field("№1", [0.6, 0.3, 0.62, 0.32], category="position"),
+        field("2N°3", [0.7, 0.3, 0.72, 0.32], category="position"),
+        field("8", [0.8, 0.3, 0.81, 0.32], category="position"),
+    ])
+    sheet.content.structured_payload = {"sheet_type": "assembly"}
+    sense_rules.apply([sheet])
+    got = [f.category for f in sheet.content.structured_drawing_fields]
+    if flag:
+        assert got == ["position", "position", "callout", "callout", "callout", "position"]
+    else:
+        assert got == ["callout", "callout", "callout", "position", "position", "position"]
+
+
+def test_detail_sheet_callouts_stay(monkeypatch):
+    monkeypatch.setattr(settings, "DRAWING_SENSE_POSITIONS", True)
+    sheet = drawing([field("4", [0.3, 0.2, 0.31, 0.22], category="callout")])
+    sheet.content.structured_payload = {"sheet_type": "detail"}
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].category == "callout"
