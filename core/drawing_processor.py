@@ -202,6 +202,8 @@ class DrawingProcessor:
     # Вырезки для дочитывания после сведения D3 (`enrich_fragments`); вне
     # документа — None, и лист дочитывается сам.
     _reread_crops: Optional[Dict[Any, Any]] = None
+    # Листы для «Что изображено» (DRAWING_WHAT_DRAWN); живут только на время документа.
+    _what_drawn_sheets: Optional[Dict[Any, Dict[str, Any]]] = None
 
     def __init__(
         self,
@@ -543,6 +545,18 @@ class DrawingProcessor:
             payload["dimension_links"] = self._dimension_links(
                 image_ref, page, layout, fields, value_links, budget_started,
             )
+        if (settings.DRAWING_WHAT_DRAWN and self._what_drawn_sheets is not None and whole_sheet
+                and not text_only and fields
+                and reading is not None and reading.sheet_type in ("detail", "assembly")):
+            # «Что изображено» — после сведения, дочитывания и правил здравого
+            # смысла документа (`_what_drawn_pass`), чтобы величины были
+            # окончательными. Здесь — как открыть лист заново и сколько
+            # осталось от бюджета листа: рендер до конца документа не держится.
+            budget = settings.DRAWING_TIME_BUDGET
+            self._what_drawn_sheets[(image_ref, sheet)] = {
+                "image_ref": image_ref, "page": page, "angle": layout.angle, "turn": layout.turn,
+                "left": budget_started + budget - gpu_gate.budget_now() if budget else None,
+            }
         mode = MODE_VISION_VLM if (self.vision_enabled and layout.regions) else MODE_SHEET_ONLY
         if not fields and not payload["tables"] and not payload.get("transcript_lines"):
             self._log_sheet(image_ref, sheet, MODE_NONE, 0, len(lines or []),
@@ -896,11 +910,15 @@ class DrawingProcessor:
         # живёт дольше документа, и ссылка прошлого документа не должна
         # делать листом вырезку следующего.
         self._whole_images = set()
+        # Листы для «Что изображено» (DRAWING_WHAT_DRAWN): по (image_ref, страница
+        # документа), как их находит фрагмент листа.
+        self._what_drawn_sheets = {}
         try:
             return self._enrich_fragments(fragments, metadata)
         finally:
             self._reread_crops = None
             self._whole_images = set()
+            self._what_drawn_sheets = None
 
     def _enrich_fragments(
         self, fragments: List[Fragment], metadata: Dict[str, Any]
@@ -953,7 +971,8 @@ class DrawingProcessor:
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_SKIPPED_NO_TIME"]))
                 result.append(fragment)
                 continue
-            if (settings.DRAWING_CORNER_ROUGHNESS or settings.DRAWING_MARGIN_COLUMNS) and _covers_page(fragment):
+            if ((settings.DRAWING_CORNER_ROUGHNESS or settings.DRAWING_MARGIN_COLUMNS
+                    or settings.DRAWING_WHAT_DRAWN) and _covers_page(fragment)):
                 # Картинка MinerU на всю страницу — лист целиком, хотя и
                 # читается как вырезка: у неё есть угол рамки со знаком
                 # общей шероховатости (`_corner_roughness`).
@@ -1009,6 +1028,11 @@ class DrawingProcessor:
             changed = sense_rules.apply(result)
             if any(changed.values()):
                 logger.info("Правила здравого смысла: %s", changed)
+        if settings.DRAWING_WHAT_DRAWN and self._what_drawn_sheets:
+            # После правил: величины листа окончательные, связи `link` проверены.
+            # До размещения полей: рамки ещё в долях выправленного листа —
+            # того, что уходит в модель.
+            self._what_drawn_pass(result)
         if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
             result.extend(self._rescan_poor_pages(result, metadata))
         # Модель не ответила документу ни разу и отказывала как сервис:
@@ -1798,6 +1822,56 @@ class DrawingProcessor:
                 payload = dict(fragment.content.structured_payload or {})
                 payload["disputed_reread"] = stats
                 fragment.content.structured_payload = payload
+
+    def _what_drawn_pass(self, fragments: List[Fragment]) -> None:
+        """
+        «Что изображено» (DRAWING_WHAT_DRAWN): один вызов на лист целиком
+        детали или сборки. Вызов не начинается, если остатка бюджета листа
+        или срока задачи на него не хватает; таймаут чтения не повторяется
+        (`QwenClient.read_what_drawn`). Итог — `structured_payload.what_drawn`;
+        отказ модели, пустой или непроверенный ответ ключа не дают.
+        """
+        from core.providers import what_drawn
+
+        done = set()
+        for fragment in fragments:
+            if fragment.type != "drawing" or not fragment.content.structured_drawing_fields:
+                continue
+            page = fragment.position.page if fragment.position else 1
+            key = (fragment.content.image_ref, page)
+            sheet = self._what_drawn_sheets.get(key)
+            if sheet is None or key in done:
+                continue
+            done.add(key)
+            prompt, dims = what_drawn.build_prompt(
+                [f.model_dump() for f in fragment.content.structured_drawing_fields])
+            if not dims:
+                continue
+            left = deadline.remaining()
+            if ((sheet["left"] is not None and sheet["left"] < settings.VLM_TIMEOUT)
+                    or (left is not None and left < settings.VLM_TIMEOUT)):
+                logger.info("«Что изображено» пропущено для %s: не хватает времени", key[0])
+                continue
+            started = time.monotonic()
+            try:
+                image = self._open(sheet["image_ref"], sheet["page"])
+                if image is None:
+                    continue
+                image = drawing_vision.reproduce(image, sheet["angle"], sheet["turn"])
+                result = what_drawn.parse(self.qwen.read_what_drawn(image, prompt), dims)
+            except (SoftTimeLimitExceeded, deadline.Cancelled):
+                raise
+            except Exception as exc:  # noqa: BLE001 — описание листа не роняет документ
+                logger.error("«Что изображено» не прочитано: %s", exc)
+                continue
+            if result is None:
+                continue
+            payload = dict(fragment.content.structured_payload or {})
+            payload["what_drawn"] = result
+            fragment.content.structured_payload = payload
+            logger.info("«Что изображено» листа %s: видов %d, величин со смыслом %d из %d за %.1f с",
+                        key[0], len(result["views"]), len(result["dimensions"]), len(dims),
+                        time.monotonic() - started)
 
     # ------------------------------------------------------------ хранилище
     def _open(self, image_ref: str, page: int = 1):

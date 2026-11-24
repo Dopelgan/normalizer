@@ -1010,6 +1010,15 @@ class QwenVisionClient:
         return self._ask_short(image, _careful(_MARGIN_COLUMNS_PROMPT),
                                settings.QWEN_TITLE_BLOCK_MAX_SIDE, max_tokens=320)
 
+    def read_what_drawn(self, image, prompt: str) -> Optional[Dict[str, Any]]:
+        """
+        Лист целиком и пронумерованные величины (DRAWING_WHAT_DRAWN) ->
+        ответ модели как есть; проверяет его `what_drawn.parse`. Один вызов,
+        таймаут чтения не повторяется, как у прочих добавочных вызовов листа.
+        """
+        return self._ask_short(image, prompt, settings.QWEN_SHEET_MAX_SIDE,
+                               max_tokens=settings.DRAWING_WHAT_DRAWN_MAX_TOKENS)
+
     def _ask_short(self, image, prompt: str, max_side: int, max_tokens: int) -> Optional[Dict[str, Any]]:
         """
         Короткий добавочный вызов листа (угол, графы поля подшивки). Бюджет

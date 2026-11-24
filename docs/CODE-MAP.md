@@ -109,6 +109,7 @@
 | Правила здравого смысла полей (`DRAWING_SENSE_RULES`) | `core/providers/sense_rules.py` | `apply`, `apply_page`, `thickness`, `misread_thickness`, `link_fits`, `check_links`; место вызова — `DrawingProcessor._enrich_fragments` после D3/D4, связи — `_dimension_links` |
 | Знак общей шероховатости в углу листа (`DRAWING_CORNER_ROUGHNESS`) | `core/drawing_processor.py::_corner_roughness` | угол и разбор ответа — `sense_rules.corner_box`, `corner_roughness`, `roughness_known`; вызов модели — `qwen_client.read_corner_roughness` |
 | Графы поля подшивки и графа 26 (`DRAWING_MARGIN_COLUMNS`) | `core/providers/margin_columns.py` | `geometry`, `compose`, `parse`, `merge`, `check_designation`; вызов — `DrawingProcessor._margin_columns`, модель — `qwen_client.read_margin_columns` |
+| «Что изображено» на листе (`DRAWING_WHAT_DRAWN`) | `core/providers/what_drawn.py` | `build_prompt`, `parse`, `contradicts`, `parts_fit`; лист запоминается в `DrawingProcessor._process`, вызов — `_what_drawn_pass` после `sense_rules.apply`, модель — `qwen_client.read_what_drawn` |
 | Уборка мусора листа (`DRAWING_BLOCK_CLEANUP`) | `core/providers/block_cleanup.py` | `drop_gibberish_tables` (в `text_layer.reconcile_with_text_layer`), `unplace_oversized` (конец `field_placement.apply`), `drop_caption_fields` (`DrawingProcessor._process` после `_deduplicate`) |
 | Дочитывание спорных чисел вырезками (`DRAWING_DISPUTED_REREAD`) | `core/providers/disputed_reread.py` | `apply`, `targets`; без D3 — `DrawingProcessor._reread_disputed` в проходе листа, с D3 — `_reread_reconciled` после `reading_reconcile.apply` |
 | **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
@@ -222,6 +223,7 @@
 | `DRAWING_SENSE_RULES` | `false` | `core/drawing_processor.py::_enrich_fragments` и `_dimension_links` → `core/providers/sense_rules.py` (`apply`, `check_links`) |
 | `DRAWING_CORNER_ROUGHNESS` | `false` | `core/drawing_processor.py::_process` → `_corner_roughness`; `core/providers/qwen_client.py::read_corner_roughness` |
 | `DRAWING_MARGIN_COLUMNS` | `false` | `core/drawing_processor.py::_process` → `_margin_columns` → `core/providers/margin_columns.py`; `qwen_client.read_margin_columns` |
+| `DRAWING_WHAT_DRAWN` | `false` | `core/drawing_processor.py::_process` (запись листа) → `_enrich_fragments` → `_what_drawn_pass` → `core/providers/what_drawn.py`; `qwen_client.read_what_drawn` |
 | `DRAWING_BLOCK_CLEANUP` | `false` | `core/providers/mineru_parser.py` → `text_layer.reconcile_with_text_layer(drop_gibberish_tables)`; `field_placement.apply`; `DrawingProcessor._process` → `core/providers/block_cleanup.py` |
 
 ### 2.2. Пороги и лимиты — файл-читатель

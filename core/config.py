@@ -1100,6 +1100,14 @@ class Settings(BaseSettings):
     # него хватает бюджета листа (core/providers/margin_columns.py). Поле
     # графы получает рамку своей клетки. По умолчанию выключено.
     DRAWING_MARGIN_COLUMNS: bool = False
+    # «Что изображено» (core/providers/what_drawn.py): один вызов модели на
+    # лист детали или сборки целиком после связи размеров и правил здравого
+    # смысла — что изображено, что показывает каждый вид и что измеряет
+    # каждая уже прочитанная величина. Смысл, не сходящийся со знаком
+    # величины, и два смысла у одной величины отбрасываются. Итог —
+    # `structured_payload.what_drawn`. По умолчанию выключено.
+    DRAWING_WHAT_DRAWN: bool = False
+    DRAWING_WHAT_DRAWN_MAX_TOKENS: int = 8000
     # Уборка мусора чертежа (core/providers/block_cleanup.py): таблица MinerU
     # на половину листа и больше с ячейками из бессмыслицы снимается и при
     # OCR_KEEP_STRUCTURED_TABLES; поле чертежа с рамкой больше 0,2 страницы
