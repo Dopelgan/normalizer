@@ -324,6 +324,14 @@ _SYSTEM = (
     "Ответ — только JSON, без пояснений и без markdown."
 )
 
+# Правило повторов прохода «лист целиком» и его замена (DRAWING_KEEP_REPEATS).
+_NO_REPEATS_RULE = "Не повторяй одну надпись дважды и не выдумывай надписей, которых нет."
+_KEEP_REPEATS_RULE = (
+    "Надпись, которая стоит на листе в нескольких местах, пиши столько раз, сколько она "
+    "стоит, каждую со своим местом; одну надпись в одном месте дважды не пиши. "
+    "Не выдумывай надписей, которых нет."
+)
+
 _SHEET_PROMPT = """Прочитай чертёж и верни JSON:
 
 {{"sheet_type": "detail|assembly|scheme|unknown",
@@ -804,6 +812,9 @@ class QwenVisionClient:
             prompt = _SHEET_PROMPT_COMPACT.format(codes=_COMPACT_LEGEND, hint=hint_rule)
         else:
             prompt = _SHEET_PROMPT.format(categories=", ".join(CATEGORIES), hint=hint_rule)
+        if settings.DRAWING_KEEP_REPEATS:
+            # Карточка D: «15±0,1» стоит на листе четырежды — четыре поля.
+            prompt = prompt.replace(_NO_REPEATS_RULE, _KEEP_REPEATS_RULE)
         if settings.DRAWING_DIMENSION_FIDELITY:
             prompt += _SIGN_RULE + _CAREFUL_LETTERS_RULE
         if settings.DRAWING_SMALL_PRINT_CARE:
