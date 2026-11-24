@@ -76,7 +76,8 @@ def test_corner_read_adds_general_roughness_once(temp_storage, monkeypatch):
     sheet, qwen = run(temp_storage, monkeypatch, {"value": "Ra 6,3", "check_mark": True}, [SIZE])
     assert len(qwen.corner_calls) == 1
     (rough,) = roughness(sheet)
-    assert rough.value == "Шероховатость (общая): Ra 6,3 (√)"
+    # Голое значение, как у прочих полей шероховатости: подпись — категория.
+    assert rough.value == "Ra 6,3 (√)" and rough.category == "roughness"
     x1, y1, x2, y2 = rough.bbox
     assert x1 >= 0.69 and y2 <= 0.13          # правый верхний угол листа
 

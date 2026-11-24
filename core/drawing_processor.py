@@ -1642,7 +1642,10 @@ class DrawingProcessor:
             payload["corner_roughness"] = "none" if value is None else "known"
             return []
         payload["corner_roughness"] = "added"
-        return [_field("roughness", value, box, 0.7, label=sense_rules.CORNER_LABEL)]
+        # Значение голое, как у прочих полей шероховатости: подпись поля —
+        # его категория, а сверка и описание листа сравнивают значение.
+        logger.info("%s в углу листа: %s", sense_rules.CORNER_LABEL, value)
+        return [_field("roughness", value, box, 0.7)]
 
     def _reread_disputed(
         self, image, fields: List[Dict[str, Any]], payload: Dict[str, Any], started: float,

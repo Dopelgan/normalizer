@@ -459,9 +459,7 @@ def roughness_known(value: str, fields: Iterable[Dict[str, Any]]) -> bool:
     for item in fields:
         if item.get("category") != "roughness":
             continue
-        own = str(item.get("value") or "")
-        own = own.split(":", 1)[1] if own.startswith(CORNER_LABEL) else own
-        own = own.replace("(√)", "").replace("√", "")
+        own = str(item.get("value") or "").replace("(√)", "").replace("√", "")
         if reading_reconcile.notation(own) == wanted:
             return True
     return False
