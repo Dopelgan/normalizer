@@ -192,3 +192,47 @@ def test_value_already_read_without_label_is_not_filled_again():
     stats = ocr_hints.new_stats()
     ocr_hints.fill_empty(fields, [line("2068-06", [0.03, 0.9, 0.05, 0.96], region="margin")], stats)
     assert len(fields) == 1 and stats["filled"] == 0
+
+
+# ---------------------------------------------------------------------------
+# DRAWING_OCR_PROMPT: строки OCR — подсказкой в запрос вырезки
+# ---------------------------------------------------------------------------
+
+def test_prompt_block_takes_lines_inside_the_crop_in_reading_order():
+    lines = [line("Фланец", [0.50, 0.86, 0.63, 0.89], "stamp"),
+             line("ТАДУ 302389.001.01.02.001", [0.48, 0.79, 0.89, 0.82], "stamp"),
+             line("⌀315", [0.41, 0.34, 0.45, 0.39]),
+             line("Фланец", [0.50, 0.86, 0.63, 0.89], "field")]
+    block = ocr_hints.prompt_block(lines, [[0.1, 0.78, 0.96, 0.97]])
+    assert block.index("ТАДУ 302389") < block.index("Фланец")
+    assert "⌀315" not in block and block.count("Фланец") == 1
+    assert ocr_hints.prompt_block(lines, [[0.0, 0.0, 0.05, 0.05]]) == ""
+    assert ocr_hints.prompt_block(None, [[0, 0, 1, 1]]) == ""
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_stamp_request_carries_ocr_lines_only_with_flag(temp_storage, monkeypatch, flag):
+    from core.config import settings
+    from core.drawing_processor import DrawingProcessor
+    from core.providers import title_block
+    from tests.fixtures import synthetic_sheet as sheet
+    from tests.unit.test_title_block_fields import SHEET_URI, FakeQwen
+
+    temp_storage.write_file(SHEET_URI, sheet.png_bytes())
+    storage = temp_storage
+
+    monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
+    monkeypatch.setattr(settings, "DRAWING_OCR_PROMPT", flag)
+    monkeypatch.setattr(settings, "DRAWING_OCR_HINTS_DIR", "/hints")
+    inside = [0.85, 0.92, 0.95, 0.95]   # внутри вырезки штампа синтетического листа
+    monkeypatch.setattr(ocr_hints, "from_dir", lambda d, m, p: [line("Фланец", inside, "stamp")])
+    hints = []
+
+    class Recording(FakeQwen):
+        def read_title_block_fields(self, image, hint=""):
+            hints.append(hint)
+            return super().read_title_block_fields(image)
+
+    qwen = Recording(block=title_block.parse({"fields": {"Наименование": "Фланец"}}))
+    DrawingProcessor(storage, qwen=qwen).process(SHEET_URI, {})
+    assert hints and (("Фланец" in hints[0]) is flag) and (hints[0] == "") is (not flag)

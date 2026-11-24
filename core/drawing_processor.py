@@ -277,6 +277,15 @@ class DrawingProcessor:
         fields: List[Dict[str, Any]] = []
         payload: Dict[str, Any] = {"layout": layout.as_dict(), "tables": []}
         payload["coordinate_reference"] = "deskewed_page"
+        if settings.DRAWING_OCR_PROMPT and log_page is None and not text_only and not layout.turn:
+            # Строки OCR листа (DRAWING_OCR_PROMPT) — подсказкой в запросы
+            # штампа, боковой колонки и граф подшивки. Только лист целиком
+            # без поворота: рамки строк — в долях страницы.
+            from core.providers import ocr_hints
+
+            dpi = settings.DRAWING_RENDER_DPI
+            layout.ocr_lines = ocr_hints.sheet_lines(metadata, page, layout.image, float(dpi))
+            payload["ocr_prompt"] = {"lines": len(layout.ocr_lines or [])}
         if settings.DRAWING_FIELD_PLACEMENT_V2:
             # Размер картинки до выправления: по нему обратный наклон
             # переводит рамки полей в доли исходной картинки (field_placement).
@@ -1614,7 +1623,7 @@ class DrawingProcessor:
             upscale=settings.QWEN_TITLE_BLOCK_UPSCALE,
             max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE,
         )
-        parsed = self.qwen.read_title_block_fields(piece)
+        parsed = self.qwen.read_title_block_fields(piece, **_ocr_hint(layout, [bbox]))
         side = self._read_side_column(layout, payload)
         if parsed is None and side is None:
             logger.warning("Штамп не прочитан")
@@ -1678,7 +1687,7 @@ class DrawingProcessor:
             layout.image, bbox, upscale=settings.QWEN_TITLE_BLOCK_UPSCALE,
             padding=0.0, max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE,
         ))
-        parsed = self.qwen.read_side_column(piece)
+        parsed = self.qwen.read_side_column(piece, **_ocr_hint(layout, [bbox]))
         payload["side_column"] = {"bbox": bbox, "read": parsed is not None}
         return parsed
 
@@ -1842,8 +1851,9 @@ class DrawingProcessor:
             box = drawing_vision.crop(layout.image, geometry["top_box"],
                                       upscale=settings.QWEN_TITLE_BLOCK_UPSCALE, padding=0.0,
                                       max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE)
-            parsed = margin_columns.parse(
-                self.qwen.read_margin_columns(margin_columns.compose(strip, box)))
+            parsed = margin_columns.parse(self.qwen.read_margin_columns(
+                margin_columns.compose(strip, box),
+                **_ocr_hint(layout, [geometry["strip"], geometry["top_box"]])))
         except (SoftTimeLimitExceeded, deadline.Cancelled):
             raise
         except Exception as exc:  # noqa: BLE001 — графы подшивки не роняют лист
@@ -2364,6 +2374,21 @@ def _deduplicate(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 _MARGIN_KEYS = ("inventory", "inventory_dup", "replaced_inventory", "first_use", "reference",
                 "signed_date")
 _MARGIN_LABELS = frozenset(title_block.label(key) for key in _MARGIN_KEYS)
+
+
+def _ocr_hint(layout: Any, boxes: List[List[float]]) -> Dict[str, str]:
+    """
+    Подсказка OCR для запроса вырезки (DRAWING_OCR_PROMPT): `{"hint": …}`
+    или пустой словарь — тогда вызов модели в точности прежний (и ключ
+    кэша ответов тот же).
+    """
+    lines = getattr(layout, "ocr_lines", None)
+    if not settings.DRAWING_OCR_PROMPT or not lines:
+        return {}
+    from core.providers import ocr_hints
+
+    hint = ocr_hints.prompt_block(lines, boxes)
+    return {"hint": hint} if hint else {}
 
 
 def _is_graph_caption(text: str) -> bool:

@@ -338,5 +338,56 @@ def fill_empty(fields: List[Dict[str, Any]], lines: Sequence[Dict[str, Any]], st
         stats["filled"] += 1
 
 
+# ===========================================================================
+# Подсказка в запрос модели (DRAWING_OCR_PROMPT)
+# ===========================================================================
+
+PROMPT_MAX_LINES = 60
+_PROMPT_HEAD = (
+    "\n\nСтроки машинного распознавания (OCR) этой вырезки — подсказка, а не ответ: OCR путает "
+    "похожие буквы и цифры (S/5, №/М, Б/6, З/3) и рукописное. Значение бери с картинки; строкой OCR "
+    "пользуйся, только если картинка подтверждает её:\n"
+)
+
+
+def prompt_block(lines: Optional[Sequence[Dict[str, Any]]], boxes: Sequence[Sequence[float]]) -> str:
+    """
+    Строки OCR, центр которых лежит в одной из рамок `boxes` (доли листа),
+    — блоком для запроса модели: сверху вниз, слева направо, без повторов.
+    Нет строк — пустая строка: запрос остаётся прежним.
+    """
+    if not lines or not boxes:
+        return ""
+    picked: List[Tuple[float, float, str]] = []
+    seen: set = set()
+    for line in lines:
+        box = line.get("box") or []
+        text = " ".join(str(line.get("text") or "").split())
+        if len(box) != 4 or not text or float(line.get("score") or 0) < 0.5:
+            continue
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        if not any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes):
+            continue
+        key = norm(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append((round(cy, 2), cx, text))
+    if not picked:
+        return ""
+    picked.sort()
+    return _PROMPT_HEAD + "\n".join(f"- {text}" for _, _, text in picked[:PROMPT_MAX_LINES])
+
+
+def sheet_lines(metadata: Dict[str, Any], page: int, image, dpi: float) -> Optional[List[Dict[str, Any]]]:
+    """Строки OCR листа: каталог подготовленных строк, иначе сервис; нет — None."""
+    lines = None
+    if settings.DRAWING_OCR_HINTS_DIR:
+        lines = from_dir(settings.DRAWING_OCR_HINTS_DIR, metadata, page)
+    if lines is None and settings.DRAWING_OCR_HINTS_ENDPOINT:
+        lines = from_endpoint(image, dpi)
+    return lines
+
+
 def new_stats() -> Dict[str, int]:
     return {"lines": 0, "confirmed": 0, "one_char": 0, "not_thread": 0, "reread": 0, "added": 0, "filled": 0}

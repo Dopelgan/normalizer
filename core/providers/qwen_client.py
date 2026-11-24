@@ -935,7 +935,7 @@ class QwenVisionClient:
         )
         return {"fields": named, "rows": _string_rows(data.get("rows"))}
 
-    def read_title_block_fields(self, image) -> Optional[Dict[str, Any]]:
+    def read_title_block_fields(self, image, hint: str = "") -> Optional[Dict[str, Any]]:
         """
         Вырезка штампа в высоком разрешении -> графы с подписями,
         рукописные отдельно, та же таблица построчно
@@ -948,15 +948,15 @@ class QwenVisionClient:
         вырезке и путаются фамилии и код документа. Тот же потолок обязан
         стоять и в `drawing_vision.crop`, иначе вырезку ужмут до отправки.
         """
-        data = self._ask(image, _careful(_TITLE_BLOCK_FIELDS_PROMPT),
+        data = self._ask(image, _careful(_TITLE_BLOCK_FIELDS_PROMPT) + hint,
                          settings.QWEN_TITLE_BLOCK_MAX_SIDE)
         if data is None:
             return None
         return title_block.parse(data)
 
-    def read_side_column(self, image) -> Optional[Dict[str, Any]]:
+    def read_side_column(self, image, hint: str = "") -> Optional[Dict[str, Any]]:
         """Колонка дополнительных граф у левого поля -> графы и рукописные."""
-        data = self._ask(image, _careful(_SIDE_COLUMN_PROMPT),
+        data = self._ask(image, _careful(_SIDE_COLUMN_PROMPT) + hint,
                          settings.QWEN_TITLE_BLOCK_MAX_SIDE)
         if data is None:
             return None
@@ -1030,13 +1030,13 @@ class QwenVisionClient:
         """
         return self._ask_short(image, _CORNER_ROUGHNESS_PROMPT, settings.DRAWING_REREAD_MAX_SIDE, max_tokens=64)
 
-    def read_margin_columns(self, image) -> Optional[Dict[str, Any]]:
+    def read_margin_columns(self, image, hint: str = "") -> Optional[Dict[str, Any]]:
         """
         Полоса граф поля подшивки и графа 26 одной картинкой
         (DRAWING_MARGIN_COLUMNS) -> ответ модели как есть; разбирает его
         `margin_columns.parse`.
         """
-        return self._ask_short(image, _careful(_MARGIN_COLUMNS_PROMPT),
+        return self._ask_short(image, _careful(_MARGIN_COLUMNS_PROMPT) + hint,
                                settings.QWEN_TITLE_BLOCK_MAX_SIDE, max_tokens=320)
 
     def read_what_drawn(self, image, prompt: str) -> Optional[Dict[str, Any]]:

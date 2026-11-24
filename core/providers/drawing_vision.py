@@ -113,6 +113,9 @@ class SheetLayout:
     frame: Optional[List[float]] = None
     regions: List[Region] = field(default_factory=list)
     signals: Dict[str, Any] = field(default_factory=dict)
+    # Строки OCR листа в долях страницы (DRAWING_OCR_PROMPT); в разметку
+    # (`as_dict`) не попадают.
+    ocr_lines: Optional[List[Dict[str, Any]]] = None
 
     @property
     def title_block(self) -> Optional[Region]:
