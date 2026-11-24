@@ -189,7 +189,7 @@ def test_missing_frame_uses_sheet_corner(temp_storage, monkeypatch):
     qwen = SheetTypeQwen({"value": "Ra 3,2"})
     out, _ = _process(temp_storage, monkeypatch, [_image_fragment(temp_storage, "assets/doc/a.png")], qwen)
     (rough,) = roughness(out[0])
-    assert rough.bbox == sense_rules.corner_box(None)
+    assert rough.bbox == sense_rules.corner_sign_box(sense_rules.corner_box(None))
 
 
 def test_vlm_exception_keeps_sheet(temp_storage, monkeypatch):
