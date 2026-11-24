@@ -321,3 +321,71 @@ def test_real_threads_stay(value, sheet_type):
     sheet.content.structured_payload = {"sheet_type": sheet_type}
     sense_rules.apply([sheet])
     assert sheet.content.structured_drawing_fields[0].category == "thread"
+
+
+# ---------------------------------------------------------------------------
+# N-S1: толщина из текста страницы, справочная толщина, двойники одного места
+# ---------------------------------------------------------------------------
+
+def test_thickness_from_transcript_only():
+    """«Лист 0,5 ГОСТ 19904-90» только в тексте листа: «50,5*» -> «S0,5*»."""
+    sheet = drawing([field("50,5*", MARK)])
+    sheet.content.structured_payload = {"transcript_lines": ["Лист 0,5 ГОСТ 19904-90", "Масса 0,02"]}
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].value == "S0,5*"
+
+
+def test_thickness_from_page_ocr_text():
+    sheet = drawing([field("50,5*", MARK)])
+    text = Fragment(fragment_id="t", type="text", content=Content(text="Бирка. Лист 0,5 ГОСТ 19904-90"),
+                    position=Position(page=1, bbox=[0, 0, 1, 1]), confidence=0.9, completeness=1.0,
+                    provenance=Provenance(method="ocr_layer", strategy_level=5, source="scanned_pdf"))
+    sense_rules.apply([sheet, text])
+    assert sheet.content.structured_drawing_fields[0].value == "S0,5*"
+
+
+def test_sheet_number_in_transcript_is_not_thickness():
+    """«Лист 1» вне графы материала — номер листа: толщины нет, размер не трогается."""
+    sheet = drawing([field("51*", MARK)])
+    sheet.content.structured_payload = {"transcript_lines": ["Лист 1", "Листов 1", "Лист 1 Листов 2"]}
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].value == "51*"
+
+
+def test_no_thickness_anywhere_leaves_size():
+    sheet = drawing([field("50,5*", MARK)])
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].value == "50,5*"
+
+
+def test_reference_star_and_s_reading_make_thickness_without_material():
+    sheet = drawing([
+        field("50,5*", MARK, readings=[{"source": "sheet", "value": "50,5*"}, {"source": "crop", "value": "S0,5*"}]),
+        field("* Размеры для справок.", [0.1, 0.8, 0.4, 0.82], category="note"),
+    ])
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].value == "S0,5*"
+
+
+def test_reference_rule_needs_the_note():
+    sheet = drawing([field("50,5*", MARK, readings=[{"source": "sheet", "value": "50,5*"},
+                                                    {"source": "crop", "value": "S0,5*"}])])
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].value == "50,5*"
+
+
+def test_roughness_twin_over_thickness_collapses():
+    """«Ra 0,5*» на месте «S0,5*» — то же прочтение: остаётся толщина."""
+    sheet = sheet_with(field("S0,5*", MARK), field("Ra 0,5", MARK, category="roughness"))
+    stats = sense_rules.apply([sheet])
+    values = [f.value for f in sheet.content.structured_drawing_fields if f.category != "material"]
+    assert values == ["S0,5*"] and stats["twins_merged"] == 1
+
+
+def test_roughness_elsewhere_and_two_sizes_stay():
+    sheet = drawing([
+        field("3,2", MARK), field("Ra 3,2", [0.1, 0.1, 0.13, 0.12], category="roughness"),
+        field("32", [0.5, 0.5, 0.53, 0.52]), field("52", [0.5, 0.5, 0.53, 0.52]),
+    ])
+    sense_rules.apply([sheet])
+    assert len(sheet.content.structured_drawing_fields) == 4

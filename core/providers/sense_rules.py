@@ -448,6 +448,20 @@ def check_links(fields: Iterable[Any]) -> int:
     return removed
 
 
+def _page_texts(fragment: Fragment) -> List[str]:
+    """Текст страницы для толщины: весь текст листа и текст прочих фрагментов."""
+    content = fragment.content
+    if fragment.type == "drawing":
+        lines = (content.structured_payload or {}).get("transcript_lines") or []
+        return [str(line) for line in lines if line]
+    return [content.text] if content.text else []
+
+
+def _notes(drawings: Sequence[Fragment]) -> List[str]:
+    return [field.value or "" for fragment in drawings
+            for field in fragment.content.structured_drawing_fields or [] if field.category == "note"]
+
+
 def _material_texts(drawings: Sequence[Fragment]) -> List[str]:
     """Записи графы материала страницы: поле «material» или графа штампа с «Материал»."""
     texts = []
@@ -498,12 +512,90 @@ def _thread_rule(items: List[_Item], stats: Dict[str, int]) -> None:
             stats["thread_designator"] += 1
 
 
-def apply_page(drawings: List[Fragment]) -> Dict[str, int]:
-    """Правила для чертёжных фрагментов одной страницы; правит их на месте."""
+# Шероховатость или толщина, прочитанная поверх размера того же места:
+# приставка «S», «Ra», «Rz» или «5» на месте «S» снимается, цифры сравниваются.
+_TWIN_PREFIX = re.compile(r"^(?:√)?(?:R[az]|[SС]|5)", re.IGNORECASE)
+# Примечание «* Размеры для справок»: звёздочка у размера — справочная.
+_REFERENCE_NOTE = re.compile(r"размер\w*\s+для\s+справ", re.IGNORECASE)
+
+
+def _twin_key(value: Any) -> str:
+    return reading_reconcile.digits(_TWIN_PREFIX.sub("", _compact(value).rstrip("*")))
+
+
+def _twin_rank(field: DrawingField) -> int:
+    """Кто остаётся из двойников одного места: толщина, размер, шероховатость."""
+    if is_thickness(field.value):
+        return 0
+    return 1 if field.category in _SIZE_LIKE else 2
+
+
+def _twin_rule(items: List[_Item], stats: Dict[str, int]) -> None:
+    """
+    Двойники одного места (рамки с IoU от `OVERLAP_IOU`): «S0,5*», «50,5*» и
+    «Ra 0,5*» — одно прочтение толщины тремя способами. Сводятся в одно
+    поле, только если цифры без приставки совпадают и хотя бы одно из них
+    — толщина или шероховатость: два размера на одном месте этим правилом
+    не трогаются. Остаётся толщина, затем размер; прочтения сводятся.
+    """
+    twins = [item for item in items if not item.gone
+             and item.field.category in _SIZE_LIKE + ("roughness",)]
+    twins.sort(key=lambda i: (_twin_rank(i.field), not i.whole, -i.field.confidence))
+    for n, keep in enumerate(twins):
+        if keep.gone:
+            continue
+        key = _twin_key(keep.field.value)
+        if not key:
+            continue
+        for other in twins[n + 1:]:
+            if other.gone or _twin_key(other.field.value) != key:
+                continue
+            if _twin_rank(keep.field) == _twin_rank(other.field) == 1:
+                continue
+            if not _comparable(keep, other, strict=True) or not _removable(other):
+                continue
+            _merge_readings(keep, other)
+            _drop(other)
+            stats["twins_merged"] += 1
+
+
+def _reference_thickness_rule(items: List[_Item], notes: str, stats: Dict[str, int]) -> None:
+    """
+    Толщина без графы материала: размер «5<x>*», среди прочтений которого
+    есть «S<x>», на листе с примечанием «* Размеры для справок» становится
+    «S<x>*». Звёздочка справочная, и прочтение «S» того же места — два
+    свидетельства вместо графы материала.
+    """
+    if not _REFERENCE_NOTE.search(notes):
+        return
+    for item in items:
+        field = item.field
+        if item.gone or field.category not in _SIZE_LIKE or is_thickness(field.value):
+            continue
+        compact = _compact(field.value)
+        if not compact.endswith("*") or not compact.startswith("5"):
+            continue
+        alternative = _s_alternative(field, compact[1:-1])
+        if alternative is None:
+            continue
+        _rewrite(item, "S" + compact[1:-1] + "*", category="size")
+        stats["thickness"] += 1
+
+
+def apply_page(drawings: List[Fragment], texts: Sequence[str] = ()) -> Dict[str, int]:
+    """
+    Правила для чертёжных фрагментов одной страницы; правит их на месте.
+
+    `texts` — прочий текст той же страницы (весь текст листа, строки OCR):
+    толщина из него берётся только по строгому образцу «Лист 0,5 ГОСТ …»
+    и только если графы материала нет.
+    """
     stats = {"thickness": 0, "thickness_merged": 0, "roughness_dropped": 0,
              "roughness_to_size": 0, "roughness_review": 0, "links_dropped": 0,
-             "thread_weld": 0, "thread_designator": 0}
+             "thread_weld": 0, "thread_designator": 0, "twins_merged": 0}
     t = thickness(_material_texts(drawings))
+    if t is None and texts:
+        t = thickness([(text, False) for text in texts])
     items = [
         _Item(fragment, field, reading_reconcile._is_whole_sheet(fragment))
         for fragment in drawings
@@ -514,6 +606,9 @@ def apply_page(drawings: List[Fragment]) -> Dict[str, int]:
     if t is not None:
         _thickness_rule(items, t, stats)
         _deduplicate_thickness(items, t, stats)
+    else:
+        _reference_thickness_rule(items, "\n".join(_notes(drawings)) + "\n" + "\n".join(texts), stats)
+    _twin_rule(items, stats)
     for fragment in drawings:
         stats["links_dropped"] += check_links(fragment.content.structured_drawing_fields or [])
     return stats
@@ -522,12 +617,15 @@ def apply_page(drawings: List[Fragment]) -> Dict[str, int]:
 def apply(fragments: List[Fragment]) -> Dict[str, int]:
     """Правила по страницам документа; фрагменты правятся на месте."""
     pages: Dict[Optional[int], List[Fragment]] = {}
+    texts: Dict[Optional[int], List[str]] = {}
     for fragment in fragments:
+        page = reading_reconcile._page(fragment)
         if fragment.type == "drawing" and fragment.content.structured_drawing_fields:
-            pages.setdefault(reading_reconcile._page(fragment), []).append(fragment)
+            pages.setdefault(page, []).append(fragment)
+        texts.setdefault(page, []).extend(_page_texts(fragment))
     total: Dict[str, int] = {}
-    for drawings in pages.values():
-        for key, value in apply_page(drawings).items():
+    for page, drawings in pages.items():
+        for key, value in apply_page(drawings, texts.get(page, [])).items():
             total[key] = total.get(key, 0) + value
     return total
 
