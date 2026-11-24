@@ -214,3 +214,105 @@ class TestUpright:
 
         monkeypatch.setattr(ocr_prepare, "osd_rotation", lambda gray: (90, 0.5))
         assert table_vlm._upright(Image.new("RGB", (400, 300))).size == (400, 300)
+
+
+# ---------------------------------------------------------------------------
+# Спецификация ЕСКД скана (TABLE_VLM_ESKD_SPEC)
+# ---------------------------------------------------------------------------
+
+# Строки MinerU со скана ТАДУ 687000.001 (изм. 2), лист 2: номер позиции
+# склеен с обозначением, надпись поля подшивки стала первой ячейкой строки.
+SPEC_MINERU = {
+    "headers": ["", "шowdoф", "DHOE", "290", "Обозначение", "Наименование", "", "Приме-чание"],
+    "rows": [
+        ["A4", "", "1", "& 1 TARY 305364.00200", "Компенсатор перепадов давления", "$*1", "Заим.", ""],
+        ["p upo", "", "A4", "", "8", "ТАДУ 765200.082.00", "Ввод кабельный типа", "2"],
+        ["A3", "", "17", "17 TAAY 687000001001", "Крышка", "1", "", ""],
+        ["A4", "", "18", "18 TAY 687000001002", "Уплотнение 7", "1", "", ""],
+    ],
+}
+SPEC_QWEN = {
+    "headers": ["Формат", "Зона", "Поз.", "Обозначение", "Наименование", "Кол.", "Примечание"],
+    "rows": [
+        ["A4", "", "1", "ТАДУ 305364.002.00", "Компенсатор перепадов давления", "1*1", "Заим."],
+        ["A4", "", "8", "ТАДУ 765200.082.00", "Ввод кабельный типа \"a\"", "*2", "Заим."],
+        ["A3", "", "17", "ТАДУ 687000.001.001", "Крышка", "1", ""],
+        ["A4", "", "18", "ТАДУ 687000.001.002", "Уплотнение", "1", ""],
+    ],
+    "total_row": None,
+}
+
+
+def spec_block():
+    from core.models.parse_result import ParsedBlock
+
+    return ParsedBlock(type="table", page=1, order=0, bbox=[0.05, 0.05, 0.95, 0.9], confidence=0.9,
+                       method="mineru_table", table_data={k: [list(r) for r in v] if k == "rows" else list(v)
+                                                          for k, v in SPEC_MINERU.items()})
+
+
+def spec_layer():
+    from tests.unit.test_mangled_tables import line
+
+    return TextLayer(pages={1: [line("Крышка", 0.5, 0.6), line("Уплотнение", 0.5, 0.65)]}, page_count=1)
+
+
+class TestEskdSpec:
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_scan_spec_is_read_by_vision(self, monkeypatch, flag):
+        monkeypatch.setattr(settings, "TABLE_VLM_ESKD_SPEC", flag)
+        called = []
+
+        def reader(block):
+            called.append(block.page)
+            return SPEC_QWEN
+
+        blocks, stats = reconcile_with_text_layer([spec_block()], spec_layer(), source=OCR_LAYER,
+                                                  table_reader=reader)
+        table = next(b for b in blocks if b.type == "table")
+        rows = table.table_data["rows"]
+        if flag:
+            assert called == [1] and stats.vlm_tables == 1
+            assert ["A3", "", "17", "ТАДУ 687000.001.001", "Крышка", "1", ""] in rows
+        else:
+            assert called == [] and stats.vlm_tables == 0
+            assert not any(r[3:5] == ["ТАДУ 687000.001.001", "Крышка"] for r in rows)
+
+    def test_short_answer_keeps_mineru_table(self, monkeypatch):
+        monkeypatch.setattr(settings, "TABLE_VLM_ESKD_SPEC", True)
+        short = dict(SPEC_QWEN, rows=SPEC_QWEN["rows"][:1])
+        blocks, stats = reconcile_with_text_layer([spec_block()], spec_layer(), source=OCR_LAYER,
+                                                  table_reader=lambda b: short)
+        assert stats.vlm_tables == 0
+
+    @pytest.mark.parametrize("data, expected", [
+        (SPEC_MINERU, True),
+        ({"headers": ["Поз.", "Обозначение", "Наименование", "Кол."], "rows": []}, True),
+        ({"headers": ["Формула", "Физические величины"], "rows": [["x", "y"]]}, False),
+        ({"headers": ["Обозначение", "Наименование"], "rows": []}, False),
+        (None, False),
+    ])
+    def test_spec_detection(self, data, expected):
+        assert table_vlm.eskd_spec(data) is expected
+
+    def test_spec_crop_goes_with_its_own_ceiling(self, monkeypatch):
+        monkeypatch.setattr(settings, "TABLE_VLM_RETRY_ENABLED", True)
+        monkeypatch.setattr(settings, "TABLE_VLM_ESKD_SPEC", True)
+        seen = {}
+
+        class Client:
+            available = True
+
+            def read_table(self, image, max_side=None):
+                seen["max_side"] = max_side
+                return {"headers": [], "rows": [["1"]]}
+
+        def render(data, ftype, page, dpi=None):
+            seen["dpi"] = dpi
+            return Image.new("RGB", (400, 600), "white")
+
+        monkeypatch.setattr(table_vlm, "_render_page", render)
+        monkeypatch.setattr(table_vlm, "_upright", lambda image: image)
+        read = table_vlm.table_reader(b"%PDF", "pdf", client=Client())
+        read(spec_block())
+        assert seen == {"dpi": settings.TABLE_VLM_SPEC_DPI, "max_side": settings.TABLE_VLM_SPEC_MAX_SIDE}

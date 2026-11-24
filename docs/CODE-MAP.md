@@ -209,6 +209,7 @@
 | `OCR_PREPROCESS_ENABLED` | `true` | `core/providers/tesseract_fallback.py` |
 | `OCR_REMOVE_TABLE_LINES` | `true` | `core/providers/ocr_prepare.py` |
 | `TABLE_VLM_RETRY_ENABLED` | `false` | `core/providers/table_vlm.py` |
+| `TABLE_VLM_ESKD_SPEC` | `false` | `core/providers/text_layer.py::_fix_table` → `core/providers/table_vlm.py` (`eskd_spec`, `table_reader`) |
 | `DOC_CONVERT_ENABLED` | `true` | `core/providers/office_convert.py` |
 | `INTAKE_FORWARD_TO_PARSER` | `false` | `core/intake/pipeline.py`, `gateway/api.py`, `quality/api.py` |
 | `S3_READONLY` | `true` | `core/providers/storage.py` |

@@ -1344,6 +1344,23 @@ def _fix_table(
     `turn` — поворот текста страницы (`page_turn`): колонки и строки
     таблицы ищутся по прямо стоящему листу.
     """
+    if (settings.TABLE_VLM_ESKD_SPEC and not exact and table_reader is not None
+            and table_vlm_spec(block.table_data)):
+        # Спецификация ЕСКД скана (ТАДУ 687000.001, изм. 2): модель таблиц
+        # MinerU сдвигает графы — номер позиции уходит в «Обозначение», а
+        # вертикальная надпись поля подшивки становится первой ячейкой
+        # строки, и строка съезжает на две графы. Слоем OCR это не выправить:
+        # он не знает граф. Модель зрения читает таблицу по вырезке в своём
+        # разрешении; не прочитала — обычная выправка по слою ниже.
+        read = table_reader(block)
+        if read and len(read["rows"]) * 2 >= _filled_rows(block.table_data):
+            block.table_data = read
+            block.table_html = None
+            block.method = METHOD_VLM_TABLE
+            stats.vlm_tables += 1
+            kept = _lines_with_new_words(matched, block)
+            stats.table_lines_kept += len(kept)
+            return [], kept
     if latex_text.mangled_cells(block.table_data):
         stats.mangled_tables += 1
         if not table_from_lines.repair_cells(block, _upright_lines(matched, turn)):
@@ -2061,6 +2078,18 @@ def _looks_like_word(word: str) -> bool:
     if len(letters) < len(word) * 0.8 or len(set(letters)) < 2:
         return False
     return any(ch in _VOWELS for ch in letters)
+
+
+def table_vlm_spec(table_data: Optional[Dict[str, Any]]) -> bool:
+    from core.providers.table_vlm import eskd_spec
+
+    return eskd_spec(table_data)
+
+
+def _filled_rows(table_data: Optional[Dict[str, Any]]) -> int:
+    """Строк таблицы MinerU, где есть хоть одна непустая ячейка."""
+    rows = (table_data or {}).get("rows") or []
+    return sum(1 for row in rows if any(str(cell).strip() for cell in row))
 
 
 def _lines_with_new_words(

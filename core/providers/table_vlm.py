@@ -61,13 +61,19 @@ def table_reader(file_bytes: Optional[bytes], file_type: str, client=None) -> Op
             return None
         budget["left"] -= 1
         try:
-            if block.page not in pages:
-                pages[block.page] = _render_page(file_bytes, file_type, block.page)
-            page = pages[block.page]
+            spec = settings.TABLE_VLM_ESKD_SPEC and eskd_spec(block.table_data)
+            key = (block.page, spec)
+            if key not in pages:
+                pages[key] = _render_page(file_bytes, file_type, block.page,
+                                          dpi=settings.TABLE_VLM_SPEC_DPI if spec else None)
+            page = pages[key]
             if page is None:
                 return None
             piece = _upright(_crop(page, block.bbox))
-            table = client.read_table(piece)
+            if spec:
+                table = client.read_table(piece, max_side=settings.TABLE_VLM_SPEC_MAX_SIDE)
+            else:
+                table = client.read_table(piece)
         except SoftTimeLimitExceeded:
             raise
         except Exception as exc:  # noqa: BLE001 — сбой перечитывания не роняет разбор
@@ -82,6 +88,25 @@ def table_reader(file_bytes: Optional[bytes], file_type: str, client=None) -> Op
         return data
 
     return read
+
+
+# Графы спецификации ЕСКД (ГОСТ 2.106, форма 1) в шапке таблицы MinerU.
+_SPEC_GRAPHS = ("обозначение", "наименование")
+_SPEC_ANY = ("поз", "кол", "примеч", "приме-", "формат", "зона")
+
+
+def eskd_spec(table_data: Optional[Dict[str, Any]]) -> bool:
+    """
+    Таблица — спецификация ЕСКД: в шапке или первых строках есть графы
+    «Обозначение» и «Наименование» и хотя бы одна из «Поз.», «Кол.»,
+    «Примечание», «Формат», «Зона». Шапка скана приходит с мусором
+    («шowdoф» вместо «Формат»), поэтому достаточно двух слов и одного.
+    """
+    if not table_data:
+        return False
+    rows = [table_data.get("headers") or []] + list(table_data.get("rows") or [])[:2]
+    text = " ".join(str(cell) for row in rows for cell in row).casefold()
+    return all(word in text for word in _SPEC_GRAPHS) and any(word in text for word in _SPEC_ANY)
 
 
 def _table_data(table: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

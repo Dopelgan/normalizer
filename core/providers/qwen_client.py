@@ -937,7 +937,8 @@ class QwenVisionClient:
             return None
         return title_block.parse(data)
 
-    def read_table(self, image, expect_rows: int = 0) -> Optional[Dict[str, Any]]:
+    def read_table(self, image, expect_rows: int = 0,
+                   max_side: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Вырезанная таблица -> заголовок, шапка и строки.
 
@@ -947,9 +948,9 @@ class QwenVisionClient:
         берётся ответ, где строк больше. Без ограды вызов прежний.
         """
         if settings.DRAWING_SHEET_GUARDED and expect_rows >= _TABLE_EXPECT_MIN_ROWS:
-            data = self._read_table_guarded(image, expect_rows)
+            data = self._read_table_guarded(image, expect_rows, max_side)
         else:
-            data = self._ask(image, _TABLE_PROMPT, settings.QWEN_REGION_MAX_SIDE)
+            data = self._ask(image, _TABLE_PROMPT, max_side or settings.QWEN_REGION_MAX_SIDE)
         if data is None:
             return None
         headers = data.get("headers")
@@ -959,7 +960,8 @@ class QwenVisionClient:
             "rows": _string_rows(data.get("rows")),
         }
 
-    def _read_table_guarded(self, image, expect_rows: int) -> Optional[Dict[str, Any]]:
+    def _read_table_guarded(self, image, expect_rows: int,
+                            max_side: Optional[int] = None) -> Optional[Dict[str, Any]]:
         def enough(content: str, finish: Optional[str]) -> bool:
             data = extract_json(content)
             rows = _string_rows(data.get("rows")) if isinstance(data, dict) else []
@@ -969,7 +971,8 @@ class QwenVisionClient:
         for _ in range(2):
             if not self.available:
                 return None
-            answer = self._ask_text(image, _TABLE_PROMPT, settings.QWEN_REGION_MAX_SIDE, accept=enough)
+            answer = self._ask_text(image, _TABLE_PROMPT, max_side or settings.QWEN_REGION_MAX_SIDE,
+                                    accept=enough)
             if answer is None:
                 continue
             data = extract_json(answer[0])
