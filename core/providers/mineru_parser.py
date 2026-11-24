@@ -605,6 +605,7 @@ class MinerUParserProvider(DocumentParserProvider):
             blocks, stats = reconcile_with_text_layer(
                 result.blocks, layer,
                 frame_table_guard=settings.FRAME_TABLE_GUARD_ENABLED,
+                drop_gibberish_tables=settings.DRAWING_BLOCK_CLEANUP,
             )
             blocks = self._apply_vector_drawings(blocks, layer, drawing_verdicts)
             dimension_fixes = self._fix_dimensions(blocks, drawing_verdicts)
@@ -635,6 +636,7 @@ class MinerUParserProvider(DocumentParserProvider):
                     result.blocks, ocr_layer, source=OCR_LAYER,
                     frame_table_guard=settings.FRAME_TABLE_GUARD_ENABLED,
                     keep_structured_tables=settings.OCR_KEEP_STRUCTURED_TABLES,
+                    drop_gibberish_tables=settings.DRAWING_BLOCK_CLEANUP,
                     table_line_min_confidence=settings.OCR_TABLE_LINE_MIN_CONFIDENCE,
                     split_columns=settings.OCR_SPLIT_WIDE_GAPS,
                     table_reader=blank_table_ocr.table_reader(file_bytes, file_type),

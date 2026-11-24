@@ -407,4 +407,14 @@ def apply(fragments: List[Fragment]) -> List[Fragment]:
             pages.setdefault(int(fragment.position.page), []).append(fragment)
     for drawings in pages.values():
         dedupe_page(drawings)
+    from core.config import settings
+
+    if settings.DRAWING_BLOCK_CLEANUP:
+        # После сведения повторов: рамка сведённого поля — объединение
+        # рамок, и полстраницы она может стать только здесь.
+        from core.providers import block_cleanup
+
+        for drawings in pages.values():
+            for fragment in drawings:
+                block_cleanup.unplace_oversized(fragment.content.structured_drawing_fields or [])
     return fragments

@@ -482,6 +482,35 @@ _CORNER_ROUGHNESS_PROMPT = """На картинке — правый верхн�
 - Знака нет, это не шероховатость или ты не уверен — верни {"value": "", "unsure": true}.
 """
 
+# Графы поля подшивки и графа 26 (`DRAWING_MARGIN_COLUMNS`): повёрнутый текст
+# проход листа не читает, а «Инв. № подл.» приходил одним хвостом «05».
+# Ключи графы — внутренние имена: у двух граф «Подп. и дата» подпись одна.
+_MARGIN_COLUMNS_PROMPT = """На картинке две части чертежа по ЕСКД (ГОСТ 2.104).
+Сверху — полоса граф у левого поля, уже повёрнутая под чтение. Слева направо:
+inventory «Инв. № подл.», signed_date «Подп. и дата», replaced_inventory
+«Взам. инв. №», inventory_dup «Инв. № дубл.», signed_date_dup «Подп. и дата»,
+затем пустое место, затем reference «Справ. №» и first_use «Перв. примен.».
+Снизу — графа с обозначением документа из левого верхнего угла рамки.
+Верни JSON:
+
+{"columns": {"inventory": {"value": "", "handwritten": false},
+             "signed_date": {"value": "", "handwritten": false},
+             "replaced_inventory": {"value": "", "handwritten": false},
+             "inventory_dup": {"value": "", "handwritten": false},
+             "signed_date_dup": {"value": "", "handwritten": false},
+             "reference": {"value": "", "handwritten": false},
+             "first_use": {"value": "", "handwritten": false}},
+ "top_designation": ""}
+
+Правила:
+- value — только то, что вписано в графу, целиком: «1012-05», а не «05»;
+  название графы значением не является.
+- Пустая графа — пустая строка. Ничего не додумывай.
+- handwritten — true, если значение вписано от руки.
+- top_designation — обозначение из нижней части картинки со всеми точками;
+  нет его или не читается — пустая строка.
+"""
+
 # Знак отклонения и справочная звёздочка (`DRAWING_DIMENSION_FIDELITY`).
 # В транскрипции листа «30±10*» приходило как «30+10*», а на вырезке вида
 # знак был верный: модель подменяет «±» на «+» сама, и правится это запросом.
@@ -971,6 +1000,33 @@ class QwenVisionClient:
         ответ модели как есть; разбирает его `sense_rules.corner_roughness`.
         """
         return self._ask(image, _CORNER_ROUGHNESS_PROMPT, settings.DRAWING_REREAD_MAX_SIDE, max_tokens=64)
+
+    def read_margin_columns(self, image) -> Optional[Dict[str, Any]]:
+        """
+        Полоса граф поля подшивки и графа 26 одной картинкой
+        (DRAWING_MARGIN_COLUMNS) -> ответ модели как есть; разбирает его
+        `margin_columns.parse`.
+        """
+        return self._ask_short(image, _careful(_MARGIN_COLUMNS_PROMPT),
+                               settings.QWEN_TITLE_BLOCK_MAX_SIDE, max_tokens=320)
+
+    def _ask_short(self, image, prompt: str, max_side: int, max_tokens: int) -> Optional[Dict[str, Any]]:
+        """
+        Короткий добавочный вызов листа (угол, графы поля подшивки). Бюджет
+        листа резервирует под него один `VLM_TIMEOUT`, поэтому таймаут чтения
+        не повторяется: второй такой же срок в резерв уже не входит. Место на
+        видеокарте берётся, как у всех вызовов, в `_post_attempts`.
+        """
+        if not self.available:
+            logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
+            return None
+        answer = self._ask_text(image, prompt, max_side, max_tokens, read_timeout_retries=0)
+        if answer is None:
+            return None
+        data = extract_json(answer[0])
+        if data is None:
+            logger.error("Модель вернула не-JSON (%d символов): %.200s", len(answer[0]), answer[0])
+        return data
 
     def read_dimension_links(self, image, prompt: str, count: int) -> Optional[Dict[str, Any]]:
         """

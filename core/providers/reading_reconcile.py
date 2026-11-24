@@ -47,6 +47,7 @@ NUMERIC = ("size", "tolerance", "thread", "radius", "roughness")
 # Источники прочтения.
 SHEET = "sheet"            # проход «лист целиком» или поле фрагмента листа
 CROP = "crop"              # вырезка вида MinerU той же страницы
+MARGIN = "margin_column"   # графа поля подшивки (margin_columns.SOURCE)
 TRANSCRIPT = "transcript"  # проход «весь текст листа»
 OCR = "ocr"                # слой распознавания страницы
 VECTOR = "vector"          # текстовый слой векторного PDF
@@ -306,6 +307,11 @@ def reconcile_page(drawings: List[Fragment], layer_lines: Sequence[str]) -> None
     for field in primary.content.structured_drawing_fields or []:
         numeric = field.category in NUMERIC
         readings = [{"source": SHEET, "value": field.value}]
+        if any(r.get("source") == MARGIN for r in field.readings or []):
+            # Графа поля подшивки уже заменила прочтение листа
+            # (DRAWING_MARGIN_COLUMNS): прежнее значение — первое прочтение,
+            # и сведение его не теряет.
+            readings = list(field.readings)
         # Вырезка: ближайшее поле той же надписи. Величина — по цифрам, виду
         # и числу чисел (запись могла прочитаться по-разному); прочая надпись
         # — той же категории и той же записи.

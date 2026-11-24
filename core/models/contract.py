@@ -307,12 +307,16 @@ class DrawingField(BaseModel):
     alternatives: Optional[List[str]] = None
     needs_review: Optional[bool] = None
     low_quality: Optional[bool] = None
+    # Рамка поля — не место надписи (DRAWING_BLOCK_CLEANUP): прочитано в
+    # области на пол-листа, рамка снята ([0, 0, 1, 1]), рисовать её нельзя.
+    # Без флага ключа нет в ответе вовсе.
+    placeable: Optional[bool] = None
 
     @model_serializer(mode="wrap")
     def _without_unset_readings(self, handler):
         data = handler(self)
         for key in ("readings", "agreement", "link", "bbox_exact", "alternatives",
-                    "needs_review", "low_quality"):
+                    "needs_review", "low_quality", "placeable"):
             if isinstance(data, dict) and data.get(key) is None:
                 data.pop(key, None)
         return data

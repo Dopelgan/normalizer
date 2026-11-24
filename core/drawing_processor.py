@@ -70,7 +70,7 @@ from core import deadline, outage
 from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
-    dimension_fidelity, disputed_reread, drawing_text, drawing_vision, field_placement, gpu_gate,
+    block_cleanup, dimension_fidelity, disputed_reread, drawing_text, drawing_vision, field_placement, gpu_gate,
     raster_drawing, reading_reconcile, sense_rules, title_block, vector_drawing,
 )
 from core.providers.qwen_client import (
@@ -466,6 +466,9 @@ class DrawingProcessor:
             payload["regions_skipped"] = skipped
 
         fields = _deduplicate(fields)
+        if settings.DRAWING_BLOCK_CLEANUP:
+            # Подписи граф штампа («Лит.», «Масса») без значения — не поля.
+            fields = block_cleanup.drop_caption_fields(fields)
         if settings.DRAWING_DIMENSION_FIDELITY:
             # Один размер, прочитанный и на листе целиком, и на вырезке вида:
             # остаётся прочтение со знаком «±» и со справочной звёздочкой.
@@ -485,6 +488,11 @@ class DrawingProcessor:
             # Только лист целиком (у вырезки вида угла листа нет) и не схема
             # и не сборка: общий знак ставится на чертеже детали.
             fields.extend(self._corner_roughness(layout, fields, payload, budget_started))
+        if settings.DRAWING_MARGIN_COLUMNS and whole_sheet and not text_only:
+            # Графы поля подшивки и графа 26: повёрнутые надписи, которых проход
+            # листа не читает. Только лист целиком: у вырезки вида поля
+            # подшивки нет. Поля правятся на месте (`margin_columns.merge`).
+            self._margin_columns(layout, fields, payload, budget_started)
         crops = self._reread_crops
         if settings.DRAWING_DISPUTED_REREAD and fields and crops is not None:
             # Сведение D3 (DRAWING_READINGS_RECONCILED) идёт по всему документу
@@ -936,7 +944,7 @@ class DrawingProcessor:
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_SKIPPED_NO_TIME"]))
                 result.append(fragment)
                 continue
-            if settings.DRAWING_CORNER_ROUGHNESS and _covers_page(fragment):
+            if (settings.DRAWING_CORNER_ROUGHNESS or settings.DRAWING_MARGIN_COLUMNS) and _covers_page(fragment):
                 # Картинка MinerU на всю страницу — лист целиком, хотя и
                 # читается как вырезка: у неё есть угол рамки со знаком
                 # общей шероховатости (`_corner_roughness`).
@@ -1646,6 +1654,57 @@ class DrawingProcessor:
         # его категория, а сверка и описание листа сравнивают значение.
         logger.info("%s в углу листа: %s", sense_rules.CORNER_LABEL, value)
         return [_field("roughness", value, box, 0.7)]
+
+    def _margin_columns(
+        self, layout, fields: List[Dict[str, Any]], payload: Dict[str, Any], started: float,
+    ) -> None:
+        """
+        Графы поля подшивки и графа 26 (DRAWING_MARGIN_COLUMNS): две вырезки
+        по геометрии ГОСТ от внутренней рамки, одна картинка, один вызов.
+        Вызов не начинается, если бюджета листа или срока задачи на него не
+        хватает. Итог — `structured_payload.margin_columns`.
+        """
+        from core.providers import margin_columns
+
+        geometry = margin_columns.geometry(layout)
+        if geometry is None:
+            payload["margin_columns"] = {"status": "no_frame"}
+            return
+        budget = settings.DRAWING_TIME_BUDGET
+        left = deadline.remaining()
+        if ((budget and gpu_gate.budget_now() + settings.VLM_TIMEOUT > started + budget)
+                or (left is not None and left < settings.VLM_TIMEOUT)):
+            payload["margin_columns"] = {"status": "no_time"}
+            return
+        try:
+            strip = drawing_vision.crop(layout.image, geometry["strip"],
+                                        upscale=settings.QWEN_TITLE_BLOCK_UPSCALE, padding=0.0,
+                                        max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE)
+            box = drawing_vision.crop(layout.image, geometry["top_box"],
+                                      upscale=settings.QWEN_TITLE_BLOCK_UPSCALE, padding=0.0,
+                                      max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE)
+            parsed = margin_columns.parse(
+                self.qwen.read_margin_columns(margin_columns.compose(strip, box)))
+        except (SoftTimeLimitExceeded, deadline.Cancelled):
+            raise
+        except Exception as exc:  # noqa: BLE001 — графы подшивки не роняют лист
+            logger.error("Графы поля подшивки не прочитаны: %s", exc)
+            payload["margin_columns"] = {"status": "error"}
+            return
+        reads = []
+        for key, (value, by_hand) in parsed["columns"].items():
+            text = drawing_text.normalize(value)
+            reads.append(_field(
+                category="title_block", text=title_block.mark(text, by_hand),
+                bbox=geometry["cells"][key],
+                confidence=_HANDWRITTEN if by_hand else _FROM_REGION,
+                label=margin_columns.label(key),
+            ))
+        stats: Dict[str, Any] = margin_columns.merge(fields, reads)
+        stats["designation"] = margin_columns.check_designation(fields, parsed["designation"])
+        stats["status"] = "read"
+        payload["margin_columns"] = stats
+        logger.info("Графы поля подшивки: %s", stats)
 
     def _reread_disputed(
         self, image, fields: List[Dict[str, Any]], payload: Dict[str, Any], started: float,

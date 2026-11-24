@@ -718,6 +718,7 @@ class ReconcileStats:
     table_lines_kept: int = 0
     #: «Таблиц» во весь лист с прозой внутри — рамок ЕСКД, разобранных в текст.
     frame_tables: int = 0
+    gibberish_tables: int = 0
     #: Строк слоя из рамки таблицы, отброшенных по уверенности.
     low_confidence_table_lines: int = 0
     #: Неразобранных таблиц, перечитанных моделью зрения (`table_reader`).
@@ -732,7 +733,12 @@ class ReconcileStats:
     layer_chars_by_page: Dict[int, int] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
+        extra: Dict[str, Any] = {}
+        if self.gibberish_tables:
+            # Только при снятии (DRAWING_BLOCK_CLEANUP): без флага учёт прежний.
+            extra["gibberish_tables"] = self.gibberish_tables
         return {
+            **extra,
             "rebuilt_blocks": self.rebuilt_blocks,
             "recovered_blocks": self.recovered_blocks,
             "recovered_chars": self.recovered_chars,
@@ -765,6 +771,7 @@ def reconcile_with_text_layer(
     table_line_min_confidence: float = 0.0,
     split_columns: bool = False,
     table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]] = None,
+    drop_gibberish_tables: bool = False,
 ) -> Tuple[List[ParsedBlock], ReconcileStats]:
     """
     Текст блоков берётся из слоя, а не из OCR; всё, что не попало ни в одну
@@ -798,6 +805,14 @@ def reconcile_with_text_layer(
     ведёт себя в точности как прежде.
     """
     stats = ReconcileStats(layer_chars_by_page=layer.char_counts_by_page())
+    if drop_gibberish_tables:
+        # Таблица во весь лист из бессмыслицы (DRAWING_BLOCK_CLEANUP) — до
+        # защиты рамок: `keep_structured_tables` принял бы её за спецификацию.
+        from core.providers import block_cleanup
+
+        kept = block_cleanup.drop_gibberish_tables(blocks)
+        stats.gibberish_tables += len(blocks) - len(kept)
+        blocks = kept
     if frame_table_guard:
         blocks = _drop_frame_tables(
             blocks, layer, stats, keep_structured=keep_structured_tables and not source.exact
