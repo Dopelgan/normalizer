@@ -161,6 +161,40 @@ def cache_key_v1(model: str, max_tokens: int, prompt: str, encoded: str) -> str:
     return digest.hexdigest()
 
 
+def _thinking_off() -> Dict[str, Any]:
+    """
+    Рассуждение модели выключено (DRAWING_VLM_STABLE): шаблон Qwen иначе
+    открывает блок <think>, и JSON-формат держит ответ внутри него.
+    """
+    if not settings.DRAWING_VLM_STABLE:
+        return {}
+    return {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def _non_empty(content: str, finish: Optional[str]) -> bool:
+    """Ответ — непустой JSON-объект (пустой «{}» — сбой, а не ответ)."""
+    data = extract_json(content)
+    return not (isinstance(data, dict) and not data)
+
+
+def _log_rejected(key: str, answer: Tuple[str, Optional[str]]) -> None:
+    """
+    Непринятый ответ модели — в лог и, с DRAWING_VLM_REJECTED_LOG, строкой
+    JSON в файл: сырые отказы иначе нигде не хранятся (карточка E).
+    """
+    content, finish = answer
+    logger.warning("Ответ модели отбракован (%s, finish=%s): %.300s", key[:12], finish, content)
+    path = settings.DRAWING_VLM_REJECTED_LOG
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"key": key, "finish": finish, "head": content[:300],
+                                     "length": len(content)}, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("Лог отбракованных ответов не записан: %s", exc)
+
+
 def cache_get(key: str) -> Optional[Tuple[str, Optional[str]]]:
     """Сохранённый ответ или None. Битый файл — это промах, не ошибка."""
     if not settings.VLM_RESPONSE_CACHE:
@@ -1248,7 +1282,13 @@ class QwenVisionClient:
         if not self.available:
             logger.error("QWEN_ENDPOINT не задан — разбор чертежа невозможен")
             return None
-        answer = self._ask_text(image, prompt, max_side, max_tokens)
+        accept = _non_empty if settings.DRAWING_VLM_STABLE else None
+        answer = self._ask_text(image, prompt, max_side, max_tokens, accept=accept)
+        if answer is not None and accept is not None and not accept(*answer):
+            # Пустой объект «{}» — один токен, и на нём модель иногда
+            # останавливается (карточка E): спросить ещё раз, один раз.
+            logger.warning("Модель ответила пустым объектом: вопрос задаётся ещё раз")
+            answer = self._ask_text(image, prompt, max_side, max_tokens, accept=accept)
         if answer is None:
             return None
         content = answer[0]
@@ -1296,6 +1336,7 @@ class QwenVisionClient:
             "temperature": settings.QWEN_TEMPERATURE,
             "max_tokens": limit,
             "response_format": response_format or {"type": "json_object"},
+            **_thinking_off(),
             "messages": [
                 {"role": "system", "content": _SYSTEM},
                 {"role": "user", "content": [
@@ -1376,8 +1417,10 @@ class QwenVisionClient:
         answer = (content, _finish_of(payload))
         if accept is None or accept(*answer):
             cache_put(key, answer)
-        elif keep_rejected is not None and keep_rejected(*answer):
+            return answer
+        if keep_rejected is not None and keep_rejected(*answer):
             rejected_put(key, answer)
+        _log_rejected(key, answer)
         return answer
 
     def _post(self, body: Dict[str, Any], **limits: Any) -> Optional[Dict[str, Any]]:
