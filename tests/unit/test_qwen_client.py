@@ -523,3 +523,34 @@ class TestDimensionLinksAnswer:
         # Принятый ответ взят из кэша: третьего вызова нет.
         assert model.read_dimension_links(picture(), "связи", 2) == {"links": []}
         assert len(session.requests) == 2
+
+
+class TestStableCalls:
+    """Карточка E (DRAWING_VLM_STABLE): рассуждение выключено, «{}» переспрашивается."""
+
+    def test_thinking_off_only_with_flag(self, mocker):
+        session = FakeSession(FakeResponse(answer({"fields": {"Масса": "1"}})),
+                              FakeResponse(answer({"fields": {"Масса": "1"}})))
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", False)
+        client(session).read_title_block_fields(picture())
+        assert "chat_template_kwargs" not in session.requests[0]["json"]
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", True)
+        client(session).read_title_block_fields(picture((310, 200)))
+        assert session.requests[1]["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_empty_object_is_asked_once_more_and_logged(self, mocker, tmp_path):
+        log = tmp_path / "rejected.jsonl"
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", True)
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_REJECTED_LOG", str(log))
+        session = FakeSession(FakeResponse(answer("{}")), FakeResponse(answer({"fields": {"Масса": "3,74"}})))
+        parsed = client(session).read_title_block_fields(picture())
+        assert len(session.requests) == 2
+        assert parsed["fields"]["mass"] == "3,74"
+        rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        assert rows and rows[0]["head"] == "{}"
+
+    def test_empty_object_without_flag_is_taken_as_is(self, mocker):
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", False)
+        session = FakeSession(FakeResponse(answer("{}")))
+        client(session).read_title_block_fields(picture())
+        assert len(session.requests) == 1
