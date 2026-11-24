@@ -1705,7 +1705,7 @@ class DrawingProcessor:
         # Значение голое, как у прочих полей шероховатости: подпись поля —
         # его категория, а сверка и описание листа сравнивают значение.
         logger.info("%s в углу листа: %s", sense_rules.CORNER_LABEL, value)
-        return [_field("roughness", value, box, 0.7)]
+        return [_field("roughness", value, sense_rules.corner_sign_box(box), 0.7)]
 
     def _margin_columns(
         self, layout, fields: List[Dict[str, Any]], payload: Dict[str, Any], started: float,

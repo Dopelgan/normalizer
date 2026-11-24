@@ -80,6 +80,8 @@ def test_corner_read_adds_general_roughness_once(temp_storage, monkeypatch):
     assert rough.value == "Ra 6,3 (√)" and rough.category == "roughness"
     x1, y1, x2, y2 = rough.bbox
     assert x1 >= 0.69 and y2 <= 0.13          # правый верхний угол листа
+    # Рамка — место знака у правого края, а не весь угол: центр правее 0,85.
+    assert (x1 + x2) / 2 > 0.85 and x2 - x1 < 0.15
 
 
 def test_corner_read_empty_answer_adds_nothing(temp_storage, monkeypatch):
@@ -180,7 +182,7 @@ def test_turned_sheet_uses_frame_of_turned_image(temp_storage, monkeypatch):
     out, _ = _process(temp_storage, monkeypatch, [_image_fragment(temp_storage, "assets/doc/a.png")],
                       qwen, layout=turned)
     (rough,) = roughness(out[0])
-    assert rough.bbox == sense_rules.corner_box(frame)
+    assert rough.bbox == sense_rules.corner_sign_box(sense_rules.corner_box(frame))
 
 
 def test_missing_frame_uses_sheet_corner(temp_storage, monkeypatch):

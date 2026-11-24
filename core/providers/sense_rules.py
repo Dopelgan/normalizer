@@ -551,6 +551,20 @@ def corner_box(frame: Optional[Sequence[float]]) -> List[float]:
             round(fx1 + CORNER[2] * w, 4), round(fy1 + CORNER[3] * h, 4)]
 
 
+# Где в вырезке угла стоит сам знак: у правого края рамки, в верхней части
+# угла (доли вырезки). Рамкой поля была вся вырезка угла — на 0,28 ширины
+# листа, и поле на листе стояло левее знака на 0,08.
+CORNER_SIGN = (0.55, 0.0, 1.0, 0.65)
+
+
+def corner_sign_box(box: Sequence[float]) -> List[float]:
+    """Рамка поля общего знака шероховатости внутри вырезки угла `box`."""
+    x1, y1, x2, y2 = (float(v) for v in box)
+    w, h = x2 - x1, y2 - y1
+    return [round(x1 + CORNER_SIGN[0] * w, 4), round(y1 + CORNER_SIGN[1] * h, 4),
+            round(x1 + CORNER_SIGN[2] * w, 4), round(y1 + CORNER_SIGN[3] * h, 4)]
+
+
 def corner_roughness(data: Any) -> Optional[str]:
     """
     Ответ модели про знак в углу -> «Ra 6,3 (√)» / «Ra 6,3» или None.
