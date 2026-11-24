@@ -1513,7 +1513,9 @@ class DrawingProcessor:
         # Графы поля подшивки, прочитанные с боковой колонки, стоят в ней, а
         # не в области штампа (DRAWING_MARGIN_COLUMNS). Клетку каждой графы
         # потом уточняет проход граф подшивки, если он идёт на этом листе.
-        side_box = (payload.get("side_column") or {}).get("bbox")             if settings.DRAWING_MARGIN_COLUMNS and side is not None else None
+        side_box = None
+        if settings.DRAWING_MARGIN_COLUMNS and side is not None:
+            side_box = (payload.get("side_column") or {}).get("bbox")
         if settings.DRAWING_DIMENSION_FIDELITY:
             # «7:1» в графе «Масштаб» — это «1:1»: курсивная «1» похожа на
             # «7», а ряд масштабов по ГОСТ 2.302 узкий. Правка делается до
