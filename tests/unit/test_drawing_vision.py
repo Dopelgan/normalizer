@@ -233,3 +233,44 @@ class TestOrientationA4:
         inner = found[2]["inner_frame"]
         assert inner[0] == pytest.approx(20 / 210, abs=0.01)   # рамка, а не обрез листа
         assert inner[3] > 0.95                                  # линия штампа — не рамка
+
+
+class TestInnerFrameExtent:
+    """
+    Низ внутренней рамки — по концам её боковых сторон (DRAWING_INNER_FRAME_EXTENT).
+    Линии сняты с листа фланца ТАДУ 302389.001.01.02.001 (A4, 1654×2338):
+    горизонталь штампа на 0,9165 идёт во всю ширину рамки.
+    """
+
+    W, H = 1654, 2338
+
+    def _lines(self, trim=False):
+        w, h = self.W, self.H
+        horizontals = [(0.0395 * h, 0.052 * w, 0.953 * w), (0.7875 * h, 0.113 * w, 0.96 * w),
+                       (0.9165 * h, 0.115 * w, 0.96 * w), (0.9645 * h, 0.079 * w, 0.962 * w)]
+        verticals = [(0.1146 * w, 0.039 * h, 0.965 * h), (0.9604 * w, 0.04 * h, 0.965 * h)]
+        if trim:
+            # Обрез листа на скане: линии у самого края, длиннее рамки.
+            horizontals += [(0.996 * h, 0.0, w), (0.003 * h, 0.0, w)]
+            verticals += [(0.003 * w, 0.0, h), (0.997 * w, 0.0, h)]
+        return horizontals, verticals
+
+    @pytest.mark.parametrize("trim", [False, True])
+    def test_stamp_line_is_not_the_frame_bottom(self, monkeypatch, trim):
+        monkeypatch.setattr(vision.settings, "DRAWING_INNER_FRAME_EXTENT", True)
+        inner = vision._inner_frame(*self._lines(trim), self.W, self.H)
+        assert inner[3] == pytest.approx(0.9645, abs=0.001)
+        assert inner[1] == pytest.approx(0.0395, abs=0.001)
+        assert inner[0] == pytest.approx(0.1146, abs=0.001)
+
+    def test_stamp_of_the_flange_keeps_the_name_column(self, monkeypatch):
+        monkeypatch.setattr(vision.settings, "DRAWING_INNER_FRAME_EXTENT", True)
+        inner = vision._inner_frame(*self._lines(), self.W, self.H)
+        stamp = vision._stamp_in(inner, (self.W, self.H))
+        # Основная надпись — во всю ширину рамки A4, с графой наименования.
+        assert stamp[0] < 0.2 and stamp[3] == pytest.approx(0.9645, abs=0.001)
+
+    def test_flag_off_keeps_old_choice(self, monkeypatch):
+        monkeypatch.setattr(vision.settings, "DRAWING_INNER_FRAME_EXTENT", False)
+        inner = vision._inner_frame(*self._lines(), self.W, self.H)
+        assert inner[3] == pytest.approx(0.9165, abs=0.001)

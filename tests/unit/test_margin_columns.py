@@ -117,12 +117,14 @@ def test_margin_read_extends_half_page_tail(temp_storage, monkeypatch):
     assert stats["extended"] == 1 and stats["status"] == "read"
 
 
-def test_conflicting_margin_read_keeps_sheet_value_for_review(temp_storage, monkeypatch):
+def test_conflicting_margin_read_wins_and_goes_to_review(temp_storage, monkeypatch):
+    # Значение листа с подписью графы подшивки прочитано не с её клетки
+    # (штамп отдал даты своих граф «Дата»): остаётся чтение клетки.
     other = dict(HALF_PAGE, value="Инв. № подл.: 7777 (рукописно)")
     sheet, _ = run(temp_storage, monkeypatch, answer(inventory="1012-05"), [DIM, other])
     (field,) = labelled(sheet, "Инв. № подл.")
-    assert field.value == other["value"] and field.needs_review is True
-    assert "Инв. № подл.: 1012-05 (рукописно)" in [r["value"] for r in field.readings]
+    assert field.value == "Инв. № подл.: 1012-05 (рукописно)" and field.needs_review is True
+    assert other["value"] in [r["value"] for r in field.readings]
     assert field.bbox[2] <= FRAME[0] + 1e-4          # рамка — клетка графы
     assert sheet.content.structured_payload["margin_columns"]["conflict"] == 1
 

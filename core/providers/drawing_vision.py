@@ -556,7 +556,47 @@ def _inner_frame(horizontals, verticals, width: int, height: int) -> Optional[Li
     right = [x for x in long_v if x >= 1 - _EDGE_BAND]
     if not (top and bottom and left and right):
         return None
-    return [round(max(left), 4), round(max(top), 4), round(min(right), 4), round(min(bottom), 4)]
+    inner_top, inner_bottom = max(top), min(bottom)
+    if settings.DRAWING_INNER_FRAME_EXTENT:
+        inner_top, inner_bottom = _frame_rows(top, bottom, verticals, max(left) * width,
+                                              min(right) * width, height,
+                                              (inner_top, inner_bottom))
+    return [round(max(left), 4), round(inner_top, 4), round(min(right), 4), round(inner_bottom, 4)]
+
+
+# Линия рамки и конец её боковой стороны расходятся не больше этого (доли
+# высоты листа): толщина линии и неровный скан.
+_FRAME_END_SLACK = 0.008
+
+
+def _frame_rows(top, bottom, verticals, left_px: float, right_px: float, height: int,
+                fallback: Tuple[float, float]) -> Tuple[float, float]:
+    """
+    Верх и низ внутренней рамки по её боковым сторонам (DRAWING_INNER_FRAME_EXTENT).
+
+    Ближайшая к середине длинная линия у нижнего края — не всегда рамка: у
+    листа A4 горизонтали штампа идут во всю ширину рамки и лежат в той же
+    полосе. На листе фланца ТАДУ 302389.001.01.02.001 низом рамки стала
+    линия штампа на 0,917 высоты вместо 0,965: вырезка штампа ужалась до
+    блока «Масса | Масштаб» (без наименования), а полоса поля подшивки
+    потеряла низ графы «Инв. № подл.» («05» вместо «1012-05»).
+
+    Боковые стороны внутренней рамки кончаются ровно на её верхней и нижней
+    линии, поэтому из линий полосы берётся та, что ближе к концам сторон.
+    Нет сторон или ни одна линия не сходится с их концами — прежний выбор.
+    """
+    sides = [v for v in verticals
+             if min(abs(v[0] - left_px), abs(v[0] - right_px)) <= 2.0 and v[2] - v[1] >= 0.7 * height]
+    if not sides:
+        return fallback
+    start = min(v[1] for v in sides) / height
+    end = max(v[2] for v in sides) / height
+
+    def nearest(candidates, edge, default):
+        best = min(candidates, key=lambda y: abs(y - edge))
+        return best if abs(best - edge) <= _FRAME_END_SLACK else default
+
+    return nearest(top, start, fallback[0]), nearest(bottom, end, fallback[1])
 
 
 def _tables(horizontals, verticals, width: int, height: int) -> List[Region]:

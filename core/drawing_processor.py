@@ -1509,7 +1509,11 @@ class DrawingProcessor:
         if parsed is None and side is None:
             logger.warning("Штамп не прочитан")
             return False
-        parsed = _merge_blocks(parsed, side)
+        parsed = _merge_blocks(parsed, side, margin_first=settings.DRAWING_MARGIN_COLUMNS)
+        # Графы поля подшивки, прочитанные с боковой колонки, стоят в ней, а
+        # не в области штампа (DRAWING_MARGIN_COLUMNS). Клетку каждой графы
+        # потом уточняет проход граф подшивки, если он идёт на этом листе.
+        side_box = (payload.get("side_column") or {}).get("bbox")             if settings.DRAWING_MARGIN_COLUMNS and side is not None else None
         if settings.DRAWING_DIMENSION_FIDELITY:
             # «7:1» в графе «Масштаб» — это «1:1»: курсивная «1» похожа на
             # «7», а ряд масштабов по ГОСТ 2.302 узкий. Правка делается до
@@ -1538,7 +1542,7 @@ class DrawingProcessor:
             fields.append(_field(
                 category=category,
                 text=title_block.mark(text, by_hand),
-                bbox=region.bbox,
+                bbox=side_box if side_box and name in _MARGIN_LABELS else region.bbox,
                 # Рукописное прочитано с той же вырезки, но проверить его
                 # правилами нечем: уверенность ниже печатной графы.
                 confidence=_HANDWRITTEN if by_hand else _FROM_REGION,
@@ -2192,20 +2196,36 @@ def _deduplicate(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [best[key] for key in order]
 
 
+# Графы поля подшивки (ГОСТ 2.104, графы 19–25): в основной надписи их нет.
+_MARGIN_KEYS = ("inventory", "inventory_dup", "replaced_inventory", "first_use", "reference",
+                "signed_date")
+_MARGIN_LABELS = frozenset(title_block.label(key) for key in _MARGIN_KEYS)
+
+
 def _merge_blocks(
-    block: Optional[Dict[str, Any]], side: Optional[Dict[str, Any]]
+    block: Optional[Dict[str, Any]], side: Optional[Dict[str, Any]], margin_first: bool = False,
 ) -> Dict[str, Any]:
     """
     Графы штампа и графы боковой колонки в один разбор. Штамп главнее:
     одну и ту же графу (обозначение бывает и там и там) он переопределяет,
     а боковая колонка добавляет то, чего в штампе нет.
+
+    `margin_first` (DRAWING_MARGIN_COLUMNS): графы поля подшивки берутся
+    только с прочитанной боковой колонки. В вырезке штампа их нет, и то,
+    что модель называет там «Подп. и дата» или «Инв. № подл.», — значения
+    других граф: на листе крышки ТАДУ 687000.001.001 даты граф «Дата»
+    штампа («2.09.75; 14.10.16») заменили дату графы подшивки «09.2025».
     """
     merged: Dict[str, Any] = {"fields": {}, "handwritten": {}, "unknown": {}, "rows": []}
     for part in (side, block):
         if not part:
             continue
         for key in ("fields", "handwritten", "unknown"):
-            merged[key].update(part.get(key) or {})
+            values = dict(part.get(key) or {})
+            if margin_first and side and part is block and key != "unknown":
+                for margin_key in _MARGIN_KEYS:
+                    values.pop(margin_key, None)
+            merged[key].update(values)
         merged["rows"] = part.get("rows") or merged["rows"]
     # Одно и то же значение, названное и печатным, и рукописным, остаётся
     # одним — рукописным. Разные значения сохраняются оба: выбрать между

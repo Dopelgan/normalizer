@@ -301,6 +301,25 @@ class TestProcessorPass:
         assert "Изм.: 2 Нов. ТАДУ.409-23" in shown
         assert "Инв. № подл.: 1085-02 (рукописно)" in shown
 
+    def test_side_column_graph_stands_in_the_column(self, storage, monkeypatch):
+        """
+        DRAWING_MARGIN_COLUMNS: поле графы подшивки с боковой колонки — в
+        колонке слева от рамки, а не в области штампа справа внизу.
+        """
+        monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
+        monkeypatch.setattr(settings, "DRAWING_MARGIN_COLUMNS", True)
+        monkeypatch.setattr(settings, "DRAWING_SIDE_COLUMN_READ", True)
+        strip = [0.0, 0.03, 0.06, 0.96]
+        monkeypatch.setattr(drawing_vision, "side_column", lambda layout: strip)
+        qwen = FakeQwen(
+            block=title_block.parse({"fields": {"Обозначение": "ТАДУ 421451.001"}}),
+            side=title_block.parse({"fields": {"Инв. № подл.": "1085-02"}, "handwritten": ["Инв. № подл."]}),
+        )
+        fragment = DrawingProcessor(storage, qwen=qwen).enrich_fragments([sheet_fragment()], {})[0]
+        fields = {f.value: f.bbox for f in fragment.content.structured_drawing_fields}
+        assert fields["Инв. № подл.: 1085-02 (рукописно)"] == strip
+        assert fields["Обозначение: ТАДУ 421451.001"] != strip
+
     def test_side_column_alone_is_enough(self, storage, monkeypatch):
         """Штамп не прочитан, боковая колонка прочитана — область не потеряна."""
         monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
@@ -461,6 +480,32 @@ class TestMergeBlocks:
              "unknown": {}, "rows": []},
         )
         assert merged["fields"]["designation"] == "ТАДУ 302182.001 ГЧ"
+
+    def test_margin_graphs_come_only_from_side_column(self):
+        """
+        DRAWING_MARGIN_COLUMNS: лист крышки ТАДУ 687000.001.001 — штамп отдал
+        в «Подп. и дата» даты своих граф «Дата», колонка подшивки — «09.2025».
+        В вырезке штампа граф подшивки нет, их значение — только с колонки.
+        """
+        from core.drawing_processor import _merge_blocks
+
+        block = {"fields": {"designation": "ТАДУ 687000.001.001"},
+                 "handwritten": {"signed_date": "2.09.75; 14.10.16", "inventory": "254"},
+                 "unknown": {}, "rows": []}
+        side = {"fields": {}, "handwritten": {"inventory": "254-2", "signed_date": "09.2025"},
+                "unknown": {}, "rows": []}
+        merged = _merge_blocks(block, side, margin_first=True)
+        assert merged["handwritten"] == {"inventory": "254-2", "signed_date": "09.2025"}
+        assert merged["fields"]["designation"] == "ТАДУ 687000.001.001"
+        # Без флага — прежнее: штамп главнее.
+        assert _merge_blocks(block, side)["handwritten"]["signed_date"] == "2.09.75; 14.10.16"
+
+    def test_margin_graphs_of_stamp_kept_when_side_not_read(self):
+        from core.drawing_processor import _merge_blocks
+
+        block = {"fields": {}, "handwritten": {"inventory": "254-2"}, "unknown": {}, "rows": []}
+        merged = _merge_blocks(block, None, margin_first=True)
+        assert merged["handwritten"]["inventory"] == "254-2"
 
 
 class TestUpright:

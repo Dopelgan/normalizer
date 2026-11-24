@@ -290,9 +290,12 @@ def merge(fields: List[Dict[str, Any]], reads: List[Dict[str, Any]]) -> Dict[str
     * То же значение — поле листа остаётся (`confirmed`).
     * Одно значение содержит другое («05» и «1012-05»: лист прочитал хвост) —
       остаётся более длинное, другое — прочтением в `readings` (`extended`).
-    * Значения расходятся иначе — остаётся значение листа: какое из двух
-      верно, правилом не решить. Чтение графы — второе прочтение, поле на
-      сверку (`conflict`).
+    * Значения расходятся иначе — остаётся чтение графы, прежнее значение
+      уходит в `readings`, поле на сверку (`conflict`). Графы поля подшивки
+      в основной надписи нет, поэтому значение листа с той же подписью
+      прочитано не с этой клетки: на листе крышки ТАДУ 687000.001.001 штамп
+      отдал в «Подп. и дата» даты из своих граф «Дата» («2.09.75; 14.10.16»),
+      а в клетке графы — «09.2025». Вырезка клетки — прочтение именно графы.
     * Графы на листе не было — поле добавляется (`added`).
     """
     stats = {"added": 0, "confirmed": 0, "extended": 0, "conflict": 0}
@@ -329,13 +332,16 @@ def merge(fields: List[Dict[str, Any]], reads: List[Dict[str, Any]]) -> Dict[str
             fields[index] = replaced
             stats["extended"] += 1
             continue
+        if not _contains(old_value, value):
+            replaced = dict(read)
+            replaced["readings"] = _with_reading(old, SOURCE, read["value"])
+            replaced["needs_review"] = True
+            fields[index] = replaced
+            stats["conflict"] += 1
+            continue
         old["readings"] = _with_reading(old, SOURCE, read["value"])
         old["bbox"] = list(read["bbox"])
-        if not _contains(old_value, value):
-            old["needs_review"] = True
-            stats["conflict"] += 1
-        else:
-            stats["extended"] += 1
+        stats["extended"] += 1
     return stats
 
 
