@@ -224,6 +224,8 @@
 | `DRAWING_SENSE_RULES` | `false` | `core/drawing_processor.py::_enrich_fragments` и `_dimension_links` → `core/providers/sense_rules.py` (`apply`, `check_links`) |
 | `DRAWING_SENSE_POSITIONS` | `false` | `core/providers/sense_rules.py::_position_rule` (из `apply_page`) |
 | `DRAWING_MARGIN_DATE_FIX` | `false` | `core/providers/title_block.py::fix_month_year` (из `parse`), `core/providers/margin_columns.py::parse` |
+| `DRAWING_FIELDS_FROM_TEXT` | `false` | `core/drawing_processor.py::process` → `_fields_from_text` (`_text_cells`, `_text_category`); фильтр в `_what_drawn_pass` |
+| `DRAWING_KEEP_REPEATS` | `false` | `core/drawing_processor.py::_deduplicate` → `_deduplicate_by_place` (`_same_place`) |
 | `DRAWING_CORNER_ROUGHNESS` | `false` | `core/drawing_processor.py::_process` → `_corner_roughness`; `core/providers/qwen_client.py::read_corner_roughness` |
 | `DRAWING_MARGIN_COLUMNS` | `false` | `core/drawing_processor.py::_process` → `_margin_columns` → `core/providers/margin_columns.py`; `qwen_client.read_margin_columns` |
 | `DRAWING_INNER_FRAME_EXTENT` | `false` | `core/providers/drawing_vision.py::_inner_frame` → `_frame_rows` |
