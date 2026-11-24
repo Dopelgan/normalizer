@@ -1546,6 +1546,9 @@ class DrawingProcessor:
             readable, _ = drawing_text.looks_like_text(text)
             if not readable:
                 continue
+            if side_box and name in _MARGIN_LABELS and _is_graph_caption(text):
+                # «Подп. и дата: Копировал» — подпись соседней графы, а не значение.
+                continue
             category = "material" if _is_material(name, text) else "title_block"
             fields.append(_field(
                 category=category,
@@ -2208,6 +2211,12 @@ def _deduplicate(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 _MARGIN_KEYS = ("inventory", "inventory_dup", "replaced_inventory", "first_use", "reference",
                 "signed_date")
 _MARGIN_LABELS = frozenset(title_block.label(key) for key in _MARGIN_KEYS)
+
+
+def _is_graph_caption(text: str) -> bool:
+    from core.providers import margin_columns
+
+    return margin_columns.is_caption(text)
 
 
 def _merge_blocks(

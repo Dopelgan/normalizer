@@ -313,11 +313,13 @@ class TestProcessorPass:
         monkeypatch.setattr(drawing_vision, "side_column", lambda layout: strip)
         qwen = FakeQwen(
             block=title_block.parse({"fields": {"Обозначение": "ТАДУ 421451.001"}}),
-            side=title_block.parse({"fields": {"Инв. № подл.": "1085-02"}, "handwritten": ["Инв. № подл."]}),
+            side=title_block.parse({"fields": {"Инв. № подл.": "1085-02", "Подп. и дата": "Копировал"},
+                                    "handwritten": ["Инв. № подл."]}),
         )
         fragment = DrawingProcessor(storage, qwen=qwen).enrich_fragments([sheet_fragment()], {})[0]
         fields = {f.value: f.bbox for f in fragment.content.structured_drawing_fields}
         assert fields["Инв. № подл.: 1085-02 (рукописно)"] == strip
+        assert not any(value.startswith("Подп. и дата") for value in fields)
         assert fields["Обозначение: ТАДУ 421451.001"] != strip
 
     @pytest.mark.parametrize("flag", [True, False])
