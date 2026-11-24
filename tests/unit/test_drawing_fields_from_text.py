@@ -57,54 +57,60 @@ def _sheet_fields(temp_storage, monkeypatch, annotations, lines, from_text=True,
 
 
 STAMP = {"category": "title_block", "value": "Разраб.: Бабанин", "bbox": [0.7, 0.9, 0.8, 0.92]}
+NOTE = {"category": "note", "value": "1 Электромонтаж вести проводом ПуГВ-1,0.", "bbox": [0.1, 0.1, 0.5, 0.12]}
 ROWS = [
     "Поз. обозначение | Наименование | Кол.",
     "HL1, HL2 | Лампа СКЛ 14 А-Ж-2-220 желтая | 2",
     "QF1, QF2 | Выключатель автоматический трехполюсный 10А | 2",
-    "Бабанин",
+    "Разраб. | Бабанин",
+    "Масса | 1,2",
     "3 Провода свить в витые пары.",
+    "1. Электромонтаж вести проводом ПуГВ-1,0",
+    "⌀57x3",
+    "10",
+    "Вход охлаждающей воды",
 ]
 
 
-def test_scheme_table_rows_give_position_and_name_fields(temp_storage, monkeypatch):
-    fields, payload = _sheet_fields(temp_storage, monkeypatch, [STAMP], ROWS)
-    by_value = {f["value"]: f for f in fields}
-    assert by_value["HL1, HL2"]["category"] == "position"
-    assert by_value["QF1, QF2"]["category"] == "position"
-    name = by_value["Лампа СКЛ 14 А-Ж-2-220 желтая"]
+def test_only_strict_patterns_become_fields(temp_storage, monkeypatch):
+    fields, payload = _sheet_fields(temp_storage, monkeypatch, [STAMP, NOTE], ROWS)
+    added = [(f["category"], f["value"]) for f in fields if f["provenance"] == "full_page_ocr"]
+    assert added == [
+        ("position", "HL1, HL2"), ("position", "QF1, QF2"), ("title_block", "Масса: 1,2"),
+        ("note", "3 Провода свить в витые пары."), ("size", "⌀57x3"),
+    ]
     # Место неизвестно, значение не подтверждено: запись скажет «сверить».
-    assert name["bbox"] == [0.0, 0.0, 1.0, 1.0]
-    assert name["confidence"] < 0.95 and name["provenance"] == "full_page_ocr"
-    assert "3 Провода свить в витые пары." in by_value
-    assert payload["fields_from_text"] == len(fields) - 1
+    assert all(f["bbox"] == [0.0, 0.0, 1.0, 1.0] and f["confidence"] < 0.95
+               for f in fields if f["provenance"] == "full_page_ocr")
+    assert payload["fields_from_text"] == len(added)
 
 
 def test_line_already_in_a_field_is_not_repeated(temp_storage, monkeypatch):
-    fields, _ = _sheet_fields(temp_storage, monkeypatch, [STAMP], ROWS)
+    fields, _ = _sheet_fields(temp_storage, monkeypatch, [STAMP, NOTE], ROWS)
     values = [f["value"] for f in fields]
-    # «Бабанин» уже есть в графе «Разраб.»; «2» — одно и то же количество.
-    assert "Бабанин" not in values
+    # «Разраб.: Бабанин» уже прочитан штампом; пункт 1 — тот же, что примечание.
     assert values.count("Разраб.: Бабанин") == 1
+    assert not any(v.startswith("1. Электромонтаж") for v in values)
     assert len(values) == len(set(values))
 
 
 def test_flag_off_keeps_fields_as_before(temp_storage, monkeypatch):
-    fields, payload = _sheet_fields(temp_storage, monkeypatch, [STAMP], ROWS, from_text=False)
-    assert [f["value"] for f in fields] == ["Разраб.: Бабанин"]
+    fields, payload = _sheet_fields(temp_storage, monkeypatch, [STAMP, NOTE], ROWS, from_text=False)
+    assert [f["value"] for f in fields] == [STAMP["value"], NOTE["value"]]
     assert "fields_from_text" not in payload
 
 
-def test_table_cells_skip_headers_and_known_values():
+def test_table_gives_positions_not_names():
     from core.drawing_processor import _fields_from_text
     from core.providers import drawing_vision
 
     table = {"kind": drawing_vision.KIND_TABLE, "headers": ["Поз.", "Наименование"],
-             "rows": [["R1", "Резистор С2-33"], ["Поз.", "Наименование"], ["2", "Кнопка IP67"]]}
-    known = [{"category": "note", "value": "Кнопка IP67", "bbox": [0.1, 0.1, 0.2, 0.12]}]
-    added = _fields_from_text(known, [], [table])
-    assert [(f["category"], f["value"]) for f in added] == [
-        ("position", "R1"), ("note", "Резистор С2-33"), ("position", "2"),
-    ]
+             "rows": [["R1", "Резистор С2-33"], ["2", "Кнопка IP67"], ["R1", "Резистор"]]}
+    added = _fields_from_text([], [], [table])
+    assert [(f["category"], f["value"]) for f in added] == [("position", "R1"), ("position", "2")]
+    # Без графы «Поз.» голое число позицией не считается.
+    table["headers"] = ["Обозначение", "Наименование"]
+    assert [f["value"] for f in _fields_from_text([], [], [table])] == ["R1"]
 
 
 SIZE_A = {"category": "size", "value": "15±0,1", "bbox": [0.10, 0.20, 0.14, 0.22]}

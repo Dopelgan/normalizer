@@ -62,6 +62,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core import filetypes
@@ -2399,62 +2400,83 @@ def _deduplicate_by_place(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 TEXT_PROVENANCE = "full_page_ocr"
 TEXT_CONFIDENCE = 0.5
 TEXT_MAX_CHARS = 400
-TEXT_FIELDS_MAX = 400
+TEXT_FIELDS_MAX = 150
 _WHOLE_SHEET = [0.0, 0.0, 1.0, 1.0]
 # Сравнение надписей: без пробелов и знаков, латиница-двойник — кириллицей.
 _LOOKALIKE = str.maketrans("aceopxykmhtb", "асеорхукмнтв")
 _LOOSE = re.compile(r"[^0-9a-zа-яё⌀±°№]")
 _LABEL = re.compile(r"^[^:]{2,25}:\s*(.+)$")
-# Обозначение элемента схемы или позиция: «R1», «HL4, HL6...HL18», «ВП4,5», «12».
+# Обозначение элемента схемы: буквы с номером — «R1», «HL4, HL6...HL18», «ВП4,5».
 _DESIGNATOR = re.compile(
-    r"^(?:\d{1,3}|[A-ZА-ЯЁ]{1,4}\d{0,3}(?:\.\d+)?"
-    r"(?:\s*(?:,|\.\.\.|…|-|–)\s*[A-ZА-ЯЁ]{0,4}\d+(?:\.\d+)?)*)$"
+    r"^[A-ZА-ЯЁ]{1,4}\d{1,3}(?:\.\d+)?"
+    r"(?:\s*(?:,|\.\.\.|…|-|–)\s*(?:[A-ZА-ЯЁ]{1,4})?\d+(?:\.\d+)?)*$"
 )
-# Графы основной надписи (ГОСТ 2.104) и децимальное обозначение документа.
+# Номер позиции в графе «Поз.» таблицы листа.
+_POSITION_NUMBER = re.compile(r"^\d{1,3}$")
+# Графа основной надписи (ГОСТ 2.104) — подпись целиком, без значения.
 _STAMP_CAPTION = re.compile(
-    r"^(?:Разраб|Пров|Т\.?\s?контр|Н\.?\s?контр|Утв|Лит|Масса|Масштаб|Листов|Лист|Изм|"
-    r"№\s?докум|Подп|Дата|Инв\.?\s?№|Взам\.?\s?инв|Перв\.?\s?примен|Справ\.?\s?№|Копировал|Формат)"
-    r"(?![а-яё])",
+    r"^(?:Разраб|Пров|Т\.?\s?контр|Н\.?\s?контр|Утв|Лит|Масса|Масштаб|Листов|Лист|"
+    r"Инв\.?\s?№\s?подл|Взам\.?\s?инв\.?\s?№|Инв\.?\s?№\s?дубл|Перв\.?\s?примен|Справ\.?\s?№|Формат)"
+    r"\.?$",
     re.IGNORECASE,
 )
-_DESIGNATION = re.compile(r"^[А-ЯЁA-Z]{2,4}[.\s]?\d{6}\.\d{3}")
+# Пункт технических требований: «3 Провода свить…», «12. Покрытие…».
+_REQUIREMENT = re.compile(r"^\d{1,2}[.)]?\s+[А-ЯЁA-Z]")
+_REQUIREMENT_MIN_CHARS = 15
+# Похожесть пункта требований на уже прочитанное примечание — тот же пункт.
+_REQUIREMENT_SAME = 0.8
+_NUMERIC_TEXT = ("size", "tolerance", "thread", "roughness", "radius")
+_BARE_NUMBER = re.compile(r"^\d{1,4}(?:[.,]\d+)?$")
 
 
 def _loose(text: str) -> str:
     return _LOOSE.sub("", str(text).lower().translate(_LOOKALIKE))
 
 
-def _text_category(text: str, first_cell: bool) -> str:
-    """Категория строки текста — только правилами, без модели."""
-    if first_cell and _DESIGNATOR.match(text):
-        return "position"
-    if _category_strict():
-        decisive = vector_drawing.decisive_category(text)
-        if decisive is not None:
-            return decisive
-    by_rules, _ = vector_drawing.classify(text)
-    if by_rules == "note" and (_STAMP_CAPTION.match(text) or _DESIGNATION.match(text)):
-        return "title_block"
-    return by_rules
-
-
-def _text_cells(lines: Any, tables: Any):
-    """(ячейка, первая ли в строке таблицы) из текста листа и таблиц листа."""
+def _text_rows(lines: Any, tables: Any):
+    """(ячейки строки, таблица ли листа, есть ли у таблицы графа «Поз.»)."""
     for line in lines or []:
-        cells = [c for c in str(line).split(" | ")]
-        for n, cell in enumerate(cells):
-            yield cell, len(cells) > 1 and n == 0, ()
+        yield str(line).split(" | "), False, False
     for table in tables or []:
         if not isinstance(table, dict) or table.get("kind") != drawing_vision.KIND_TABLE:
             continue
-        headers = tuple(_loose(h) for h in (table.get("headers") or []) if str(h).strip())
+        headers = [str(h or "") for h in (table.get("headers") or [])]
+        has_position = bool(headers) and "поз" in headers[0].lower()
         for row in table.get("rows") or []:
             if isinstance(row, dict):
                 row = list(row.values())
             elif isinstance(row, str):
                 row = row.split(" | ")
-            for n, cell in enumerate(row or []):
-                yield str(cell if cell is not None else ""), n == 0, headers
+            yield [str(c if c is not None else "") for c in row or []], True, has_position
+
+
+def _strict_text_field(cells: List[str], n: int, from_table: bool, position_column: bool):
+    """
+    (категория, значение) для ячейки, если она проходит строгий образец, иначе
+    None. Свободный текст полей не даёт: на 22 эталонных листах он удваивал
+    число полей и вдвое снижал долю верных.
+    """
+    text = cells[n]
+    in_table = from_table or len(cells) > 1
+    if in_table and n == 0 and _DESIGNATOR.match(text):
+        return "position", text
+    if from_table and position_column and n == 0 and _POSITION_NUMBER.match(text):
+        return "position", text
+    if _STAMP_CAPTION.match(text):
+        # Подпись графы и значение следующей ячейкой: «Разраб. | Бабанин».
+        if n + 1 < len(cells):
+            value = drawing_text.normalize(cells[n + 1]).strip()
+            if value and not _STAMP_CAPTION.match(value) and drawing_text.looks_like_text(value)[0]:
+                return "title_block", "%s: %s" % (text.rstrip(":").strip(), value)
+        return None
+    by_rules, _ = vector_drawing.classify(text)
+    if _category_strict():
+        by_rules = vector_drawing.decisive_category(text) or by_rules
+    if by_rules in _NUMERIC_TEXT and not _BARE_NUMBER.match(text):
+        return by_rules, text
+    if (not in_table and len(text) >= _REQUIREMENT_MIN_CHARS and _REQUIREMENT.match(text)):
+        return "note", text
+    return None
 
 
 def _fields_from_text(
@@ -2462,44 +2484,52 @@ def _fields_from_text(
 ) -> List[Dict[str, Any]]:
     """
     Новые поля из строк текста листа и ячеек таблиц, которых в полях нет.
-    Ячейка пропускается, если она уже есть в поле (с подписью графы и без
-    неё), если короткая ячейка совпадает с полем целиком или если поле
-    занимает почти всю ячейку; повторы ячеек сводятся в одну.
+    Берётся только то, что проходит строгий образец (`_strict_text_field`):
+    обозначение элемента или номер позиции в первой графе таблицы, величина
+    с размерным знаком, пара «графа штампа: значение», пункт требований.
+    Пропускается уже прочитанное (с подписью графы и без неё; пункт
+    требований — и похожий на прочитанное примечание); повторы — одно поле.
     """
     known: List[str] = []
+    notes: List[str] = []
     for field in fields:
         value = str(field.get("value") or "")
         known.append(_loose(value))
         labelled = _LABEL.match(value)
         if labelled:
             known.append(_loose(labelled.group(1)))
+        if field.get("category") == "note":
+            notes.append(_loose(value))
     known = [k for k in known if k]
     exact = set(known)
     seen: set = set()
     added: List[Dict[str, Any]] = []
-    for cell, first_cell, headers in _text_cells(lines, tables):
-        text = drawing_text.normalize(cell).strip()
-        if not text or len(text) > TEXT_MAX_CHARS:
-            continue
-        readable, _ = drawing_text.looks_like_text(text)
-        key = _loose(text)
-        if not readable or not key or key in seen or key in headers:
-            continue
-        if len(key) < 2 and not first_cell:
-            continue
-        if key in exact:
-            continue
-        if len(key) > 3 and any(key in k for k in known):
-            continue
-        if any(len(k) >= max(4, 0.6 * len(key)) and k in key for k in known):
-            continue
-        seen.add(key)
-        field = _field(category=_text_category(text, first_cell), text=text,
-                       bbox=list(_WHOLE_SHEET), confidence=TEXT_CONFIDENCE)
-        field["provenance"] = TEXT_PROVENANCE
-        added.append(field)
-        if len(added) >= TEXT_FIELDS_MAX:
-            break
+    for raw_cells, from_table, position_column in _text_rows(lines, tables):
+        cells = [drawing_text.normalize(c).strip() for c in raw_cells]
+        for n, text in enumerate(cells):
+            if not text or len(text) > TEXT_MAX_CHARS or not drawing_text.looks_like_text(text)[0]:
+                continue
+            found = _strict_text_field(cells, n, from_table, position_column)
+            if found is None:
+                continue
+            category, value = found
+            key = _loose(value)
+            bare = _loose(_LABEL.match(value).group(1)) if _LABEL.match(value) else key
+            if not key or key in seen or key in exact or bare in exact:
+                continue
+            if len(key) > 3 and any(key in k for k in known):
+                continue
+            if category == "note" and any(
+                    k in key and len(k) >= 0.6 * len(key)
+                    or SequenceMatcher(None, key, k).ratio() >= _REQUIREMENT_SAME for k in notes):
+                continue
+            seen.add(key)
+            field = _field(category=category, text=value, bbox=list(_WHOLE_SHEET),
+                           confidence=TEXT_CONFIDENCE)
+            field["provenance"] = TEXT_PROVENANCE
+            added.append(field)
+            if len(added) >= TEXT_FIELDS_MAX:
+                return added
     return added
 
 
