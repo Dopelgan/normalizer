@@ -602,3 +602,14 @@ class TestContentPass:
         session = FakeSession(FakeResponse(answer({"sheet_type": "detail", "annotations": []})))
         client(session).read_sheet(picture())
         assert len(session.requests) == 1
+
+
+@pytest.mark.parametrize("flag", [True, False])
+@pytest.mark.parametrize("compact", [True, False])
+def test_keep_repeats_rule_in_sheet_prompt(mocker, flag, compact):
+    """Карточка D: правило «не повторяй» заменяется правилом «столько раз, сколько стоит»."""
+    mocker.patch.object(qwen_client.settings, "DRAWING_KEEP_REPEATS", flag)
+    mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_COMPACT_JSON", compact)
+    prompt = client(FakeSession())._sheet_prompt("")
+    assert ("столько раз, сколько она стоит" in prompt) is flag
+    assert ("Не повторяй одну надпись дважды" in prompt) is (not flag)
