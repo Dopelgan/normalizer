@@ -68,6 +68,8 @@ ROWS = [
     "1. Электромонтаж вести проводом ПуГВ-1,0",
     "⌀57x3",
     "10",
+    "M3",
+    "M20x1,5",
     "Вход охлаждающей воды",
 ]
 
@@ -75,9 +77,10 @@ ROWS = [
 def test_only_strict_patterns_become_fields(temp_storage, monkeypatch):
     fields, payload = _sheet_fields(temp_storage, monkeypatch, [STAMP, NOTE], ROWS)
     added = [(f["category"], f["value"]) for f in fields if f["provenance"] == "full_page_ocr"]
+    # Обозначения элементов («HL1, HL2») и резьба без шага («M3») — не поля.
     assert added == [
-        ("position", "HL1, HL2"), ("position", "QF1, QF2"), ("title_block", "Масса: 1,2"),
-        ("note", "3 Провода свить в витые пары."), ("size", "⌀57x3"),
+        ("title_block", "Масса: 1,2"), ("note", "3 Провода свить в витые пары."),
+        ("size", "⌀57x3"), ("thread", "M20x1,5"),
     ]
     # Место неизвестно, значение не подтверждено: запись скажет «сверить».
     assert all(f["bbox"] == [0.0, 0.0, 1.0, 1.0] and f["confidence"] < 0.95
@@ -100,17 +103,17 @@ def test_flag_off_keeps_fields_as_before(temp_storage, monkeypatch):
     assert "fields_from_text" not in payload
 
 
-def test_table_gives_positions_not_names():
+def test_table_gives_position_numbers_only_with_a_name():
     from core.drawing_processor import _fields_from_text
     from core.providers import drawing_vision
 
     table = {"kind": drawing_vision.KIND_TABLE, "headers": ["Поз.", "Наименование"],
-             "rows": [["R1", "Резистор С2-33"], ["2", "Кнопка IP67"], ["R1", "Резистор"]]}
+             "rows": [["R1", "Резистор С2-33"], ["2", "Кнопка IP67"], ["3", ""], ["4", "5"]]}
     added = _fields_from_text([], [], [table])
-    assert [(f["category"], f["value"]) for f in added] == [("position", "R1"), ("position", "2")]
+    assert [(f["category"], f["value"]) for f in added] == [("position", "2")]
     # Без графы «Поз.» голое число позицией не считается.
     table["headers"] = ["Обозначение", "Наименование"]
-    assert [f["value"] for f in _fields_from_text([], [], [table])] == ["R1"]
+    assert _fields_from_text([], [], [table]) == []
 
 
 SIZE_A = {"category": "size", "value": "15±0,1", "bbox": [0.10, 0.20, 0.14, 0.22]}

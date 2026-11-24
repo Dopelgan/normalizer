@@ -2406,11 +2406,6 @@ _WHOLE_SHEET = [0.0, 0.0, 1.0, 1.0]
 _LOOKALIKE = str.maketrans("aceopxykmhtb", "асеорхукмнтв")
 _LOOSE = re.compile(r"[^0-9a-zа-яё⌀±°№]")
 _LABEL = re.compile(r"^[^:]{2,25}:\s*(.+)$")
-# Обозначение элемента схемы: буквы с номером — «R1», «HL4, HL6...HL18», «ВП4,5».
-_DESIGNATOR = re.compile(
-    r"^[A-ZА-ЯЁ]{1,4}\d{1,3}(?:\.\d+)?"
-    r"(?:\s*(?:,|\.\.\.|…|-|–)\s*(?:[A-ZА-ЯЁ]{1,4})?\d+(?:\.\d+)?)*$"
-)
 # Номер позиции в графе «Поз.» таблицы листа.
 _POSITION_NUMBER = re.compile(r"^\d{1,3}$")
 # Графа основной надписи (ГОСТ 2.104) — подпись целиком, без значения.
@@ -2427,6 +2422,10 @@ _REQUIREMENT_MIN_CHARS = 15
 _REQUIREMENT_SAME = 0.8
 _NUMERIC_TEXT = ("size", "tolerance", "thread", "roughness", "radius")
 _BARE_NUMBER = re.compile(r"^\d{1,4}(?:[.,]\d+)?$")
+# Резьба из текста — только с диаметром и шагом: «M20x1,5», «G1/2x14», «Tr40x7».
+# Голое «M3» на схеме — обозначение элемента, а не резьба.
+_THREAD_WITH_PITCH = re.compile(
+    r"^(?:M|G|Tr|Rc)\s?\d+(?:[.,/]\d+)?\s?[xх×]\s?\d+(?:[.,]\d+)?", re.IGNORECASE)
 
 
 def _loose(text: str) -> str:
@@ -2458,9 +2457,11 @@ def _strict_text_field(cells: List[str], n: int, from_table: bool, position_colu
     """
     text = cells[n]
     in_table = from_table or len(cells) > 1
-    if in_table and n == 0 and _DESIGNATOR.match(text):
-        return "position", text
-    if from_table and position_column and n == 0 and _POSITION_NUMBER.match(text):
+    # Обозначения элементов схемы («R1», «HL4, HL6...HL18») полями не
+    # становятся: на 22 эталонных листах из 133 добавленных верных было 23.
+    if (from_table and position_column and n == 0 and _POSITION_NUMBER.match(text)
+            and any(any(ch.isalpha() for ch in cell) for cell in cells[1:])):
+        # Номер в графе «Поз.» — только в строке с обозначением или наименованием.
         return "position", text
     if _STAMP_CAPTION.match(text):
         # Подпись графы и значение следующей ячейкой: «Разраб. | Бабанин».
@@ -2472,7 +2473,10 @@ def _strict_text_field(cells: List[str], n: int, from_table: bool, position_colu
     by_rules, _ = vector_drawing.classify(text)
     if _category_strict():
         by_rules = vector_drawing.decisive_category(text) or by_rules
-    if by_rules in _NUMERIC_TEXT and not _BARE_NUMBER.match(text):
+    if by_rules == "thread" and not _THREAD_WITH_PITCH.match(text):
+        return None
+    if by_rules in _NUMERIC_TEXT and not _BARE_NUMBER.match(text) and not (in_table and n == 0):
+        # Первая ячейка строки таблицы — обозначение («R1», «M3»), а не величина.
         return by_rules, text
     if (not in_table and len(text) >= _REQUIREMENT_MIN_CHARS and _REQUIREMENT.match(text)):
         return "note", text
@@ -2485,8 +2489,9 @@ def _fields_from_text(
     """
     Новые поля из строк текста листа и ячеек таблиц, которых в полях нет.
     Берётся только то, что проходит строгий образец (`_strict_text_field`):
-    обозначение элемента или номер позиции в первой графе таблицы, величина
-    с размерным знаком, пара «графа штампа: значение», пункт требований.
+    номер позиции в графе «Поз.» строки с наименованием, величина с
+    размерным знаком (резьба — с шагом), пара «графа штампа: значение»,
+    пункт требований.
     Пропускается уже прочитанное (с подписью графы и без неё; пункт
     требований — и похожий на прочитанное примечание); повторы — одно поле.
     """
