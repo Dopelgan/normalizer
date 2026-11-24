@@ -1354,12 +1354,12 @@ def _fix_table(
         # разрешении; не прочитала — обычная выправка по слою ниже.
         #
         # Многостраничную спецификацию MinerU отдаёт одной таблицей в рамке
-        # первой страницы, а вырезка — только эта страница. Строки со второй
-        # шапки («Обозначение», «Наименование» ещё раз) — продолжение со
-        # следующих листов: они остаются от MinerU после строк модели.
-        own, rest = _spec_continuation(block.table_data)
+        # первой страницы, а вырезка — только эта страница. Строки MinerU,
+        # цифр которых (обозначение, позиция) у модели нет, — продолжение со
+        # следующих листов или пропуск модели: они остаются после её строк.
         read = table_reader(block)
-        if read and len(read["rows"]) * 2 >= _filled_rows({"rows": own}):
+        if read and len(read["rows"]) >= _SPEC_MIN_ROWS:
+            rest = _rows_not_read(block.table_data, read)
             block.table_data = dict(read, rows=list(read["rows"]) + rest)
             block.table_html = None
             block.method = METHOD_VLM_TABLE
@@ -2092,22 +2092,47 @@ def table_vlm_spec(table_data: Optional[Dict[str, Any]]) -> bool:
     return eskd_spec(table_data)
 
 
-def _spec_continuation(table_data: Optional[Dict[str, Any]]) -> Tuple[List[Any], List[Any]]:
-    """
-    Строки спецификации -> (строки первой страницы, продолжение со второй
-    шапки). Шапка — строка, которая сама проходит `eskd_spec`.
-    """
-    rows = list((table_data or {}).get("rows") or [])
-    for index, row in enumerate(rows):
-        if index and table_vlm_spec({"headers": row, "rows": []}):
-            return rows[:index], rows[index:]
-    return rows, []
+# Меньше строк у модели — это не таблица, а сбой чтения.
+_SPEC_MIN_ROWS = 5
+_DIGIT_RUN = re.compile(r"\d+")
 
 
-def _filled_rows(table_data: Optional[Dict[str, Any]]) -> int:
-    """Строк таблицы MinerU, где есть хоть одна непустая ячейка."""
-    rows = (table_data or {}).get("rows") or []
-    return sum(1 for row in rows if any(str(cell).strip() for cell in row))
+def _spec_row_keys(row: Sequence[Any]) -> Tuple[str, str]:
+    """
+    Строка спецификации -> (самая длинная группа цифр без точек и пробелов
+    внутри ячейки, все цифры строки подряд). Обозначение «ТАДУ 305364.002.00»
+    и его прочтение MinerU «& 1 TARY 305364.00200» дают одну группу
+    «30536400200»; у стандартного изделия «DIN 933 M6x14» группы короткие,
+    и строка узнаётся по всем цифрам.
+    """
+    runs = [run for cell in row for run in _DIGIT_RUN.findall(str(cell).replace(".", "").replace(" ", ""))]
+    longest = max(runs, key=len) if runs else ""
+    return longest, "".join(_DIGIT_RUN.findall(" ".join(str(c) for c in row)))
+
+
+def _rows_not_read(mineru: Optional[Dict[str, Any]], read: Dict[str, Any]) -> List[Any]:
+    """
+    Строки MinerU, которых нет у модели: продолжение спецификации со
+    следующих листов или строка, пропущенная моделью. Строка узнаётся по
+    обозначению (группа от 5 цифр) или, без него, по всем цифрам строки (от
+    4). Строка без цифр (раздел, примечание) не возвращается — её слова
+    уходят текстом через `_lines_with_new_words`.
+    """
+    model = [_spec_row_keys(row) for row in read.get("rows") or []]
+    longs = [run for run, _ in model]
+    alls = [joined for _, joined in model]
+    rest = []
+    for row in (mineru or {}).get("rows") or []:
+        longest, joined = _spec_row_keys(row)
+        if len(longest) >= 5:
+            known = any(longest in run or (len(run) >= 5 and run in longest) for run in longs)
+        elif len(joined) >= 4:
+            known = any(joined in other for other in alls)
+        else:
+            continue
+        if not known:
+            rest.append(list(row))
+    return rest
 
 
 def _lines_with_new_words(
