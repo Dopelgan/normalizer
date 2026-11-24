@@ -273,3 +273,9 @@ def test_stamp_date_under_margin_label_is_dropped():
     # Без полосы — прежнее поведение: ничего не снимается.
     again = [dict(fields[0]), {"category": "title_block", "value": "Подп. и дата: 1.1.24", "bbox": [0.6, 0.8, 0.9, 0.9]}]
     assert margin_columns.merge(again, [])["dropped"] == 0 and len(again) == 2
+
+
+def test_margin_read_month_year_fixed(monkeypatch):
+    monkeypatch.setattr(settings, "DRAWING_MARGIN_DATE_FIX", True)
+    parsed = margin_columns.parse({"columns": {"signed_date": {"value": "18 22", "handwritten": True}}})
+    assert parsed["columns"]["signed_date"][0] == "08.22"

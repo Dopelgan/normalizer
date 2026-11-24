@@ -808,3 +808,15 @@ class TestStampAllPages:
         qwen = FakeQwen(block=title_block.parse({"fields": {"Обозначение": "ТАДУ 687000.001", "Лист": "3"}}))
         out = DrawingProcessor(storage, qwen=qwen)._stamp_pages([spec], {"source_path": SHEET_URI})
         assert [s.position.page for s in out] == [3]
+
+
+@pytest.mark.parametrize("raw, flag, expected", [
+    ("18 22", True, "08.22"), ("09 2025", True, "09.2025"), ("08.22", True, "08.22"),
+    ("18 22", False, "18 22"), ("35 22", True, "35 22"), ("10.02.2022", True, "10.02.2022"),
+    ("Иванов 06.05.24", True, "Иванов 06.05.24"),
+])
+def test_margin_month_year(monkeypatch, raw, flag, expected):
+    """ГЧ ТАДУ 302182.001 (демо 24.11): «Подп. и дата» «18 22» вместо «08.22»."""
+    monkeypatch.setattr(settings, "DRAWING_MARGIN_DATE_FIX", flag)
+    parsed = title_block.parse({"fields": {"Подп. и дата": raw}, "handwritten": ["Подп. и дата"]})
+    assert parsed["handwritten"]["signed_date"] == expected

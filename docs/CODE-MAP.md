@@ -223,6 +223,7 @@
 | `DRAWING_READINGS_RECONCILED` | `false` | `core/drawing_processor.py::enrich_fragments` → `core/providers/reading_reconcile.apply`; пометка в записи — `core/drawing_record._with_tolerance` |
 | `DRAWING_SENSE_RULES` | `false` | `core/drawing_processor.py::_enrich_fragments` и `_dimension_links` → `core/providers/sense_rules.py` (`apply`, `check_links`) |
 | `DRAWING_SENSE_POSITIONS` | `false` | `core/providers/sense_rules.py::_position_rule` (из `apply_page`) |
+| `DRAWING_MARGIN_DATE_FIX` | `false` | `core/providers/title_block.py::fix_month_year` (из `parse`), `core/providers/margin_columns.py::parse` |
 | `DRAWING_CORNER_ROUGHNESS` | `false` | `core/drawing_processor.py::_process` → `_corner_roughness`; `core/providers/qwen_client.py::read_corner_roughness` |
 | `DRAWING_MARGIN_COLUMNS` | `false` | `core/drawing_processor.py::_process` → `_margin_columns` → `core/providers/margin_columns.py`; `qwen_client.read_margin_columns` |
 | `DRAWING_INNER_FRAME_EXTENT` | `false` | `core/providers/drawing_vision.py::_inner_frame` → `_frame_rows` |

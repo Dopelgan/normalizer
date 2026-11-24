@@ -292,6 +292,31 @@ def _split_triples(head: str) -> str:
 # Разбор ответа модели
 # ===========================================================================
 
+# «Подп. и дата» поля подшивки — месяц и год: «08.22», «09.2025». Модель
+# отдаёт «18 22» (ГЧ ТАДУ 302182.001, демо 24.11): точка потеряна, ноль
+# месяца прочитан единицей.
+_MONTH_YEAR = re.compile(r"^(\d{2})[\s.,]+(\d{2}|\d{4})$")
+
+
+def fix_month_year(text: str) -> str:
+    """
+    «18 22» -> «08.22», «09 2025» -> «09.2025» (DRAWING_MARGIN_DATE_FIX).
+    Только запись из двух чисел: месяц больше 12, начинающийся с «1», — это
+    «0» месяца; иначе правится только разделитель. Прочее не трогается.
+    """
+    from core.config import settings
+
+    match = _MONTH_YEAR.match(str(text or "").strip())
+    if not settings.DRAWING_MARGIN_DATE_FIX or not match:
+        return text
+    month, year = match.groups()
+    if int(month) > 12 and month.startswith("1") and 1 <= int(month[1]) <= 9:
+        month = "0" + month[1]
+    if not 1 <= int(month) <= 12:
+        return text
+    return f"{month}.{year}"
+
+
 def parse(answer: Dict[str, Any]) -> Dict[str, Any]:
     """
     Ответ модели по вырезке штампа -> {'fields', 'handwritten', 'rows'}.
@@ -329,6 +354,8 @@ def parse(answer: Dict[str, Any]) -> Dict[str, Any]:
             text = fixed
         elif key in ("signed_date", "changes"):
             text = _collapse(text)
+            if key == "signed_date":
+                text = fix_month_year(text)
         by_hand = (_fold(name) in marked or _is_handwritten(value)) and key in _HAND_FILLED
         (handwritten if by_hand else fields).setdefault(key, text)
 

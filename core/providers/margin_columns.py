@@ -201,6 +201,8 @@ def parse(data: Any) -> Dict[str, Any]:
             continue
         if key in ("first_use",):
             text = title_block.fix_designation(text)
+        if key in ("signed_date", "signed_date_dup"):
+            text = title_block.fix_month_year(text)
         # Рукописной может быть только графа, которая заполняется от руки.
         by_hand = handwritten and _LABEL_KEY.get(key, key) in title_block._HAND_FILLED
         result["columns"][key] = (text, by_hand)
