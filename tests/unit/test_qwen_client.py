@@ -554,3 +554,51 @@ class TestStableCalls:
         session = FakeSession(FakeResponse(answer("{}")))
         client(session).read_title_block_fields(picture())
         assert len(session.requests) == 1
+
+
+class TestContentPass:
+    """Карточка B (DRAWING_SHEET_CONTENT_PASS): содержание без рамок, место — от прохода с рамками."""
+
+    def test_items_and_codes(self):
+        items = qwen_client.content_items([["s", "15±0,1"], ["n", "1. * Размеры для справок."], ["x", "п.4"],
+                                           ["tb", ""], "мусор", ["s"]])
+        assert items == [{"category": "size", "value": "15±0,1"},
+                         {"category": "note", "value": "1. * Размеры для справок."},
+                         {"category": "note", "value": "п.4"}]
+
+    def test_repeats_take_boxes_in_order_and_located_rest_is_kept(self):
+        content = qwen_client.SheetReading(sheet_type="detail", annotations=[
+            {"category": "size", "value": "15±0,1"}, {"category": "size", "value": "15±0,1"},
+            {"category": "size", "value": "15 ± 0,1"}, {"category": "note", "value": "Острые кромки притупить"}])
+        located = qwen_client.SheetReading(sheet_type="unknown", annotations=[
+            {"category": "size", "value": "15±0,1", "bbox": [0.1, 0.1, 0.2, 0.2]},
+            {"category": "size", "value": "15±0,1", "bbox": [0.5, 0.5, 0.6, 0.6]},
+            {"category": "radius", "value": "R2", "bbox": [0.7, 0.7, 0.72, 0.72]}])
+        merged = qwen_client.merge_content(content, located)
+        assert merged.sheet_type == "detail"
+        boxes = [a.get("bbox") for a in merged.annotations]
+        assert boxes[:4] == [[0.1, 0.1, 0.2, 0.2], [0.5, 0.5, 0.6, 0.6], None, None]
+        assert merged.annotations[-1]["value"] == "R2"
+
+    def test_schema_requires_both_keys(self):
+        schema = qwen_client.content_schema()["json_schema"]["schema"]
+        assert schema["required"] == ["sheet_type", "annotations"]
+
+    def test_flag_on_makes_content_call_at_its_own_side(self, mocker):
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_CONTENT_PASS", True)
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_CONTENT_MAX_SIDE", 700)
+        located = answer({"sheet_type": "detail", "annotations": [
+            {"category": "size", "value": "⌀315", "bbox": [0.4, 0.3, 0.45, 0.4]}]})
+        content = answer({"sheet_type": "detail", "annotations": [["s", "⌀315"], ["s", "18*"]]})
+        session = FakeSession(FakeResponse(located), FakeResponse(content))
+        reading = client(session).read_sheet(picture((1400, 1000)))
+        assert len(session.requests) == 2
+        assert session.requests[1]["json"]["response_format"]["type"] == "json_schema"
+        values = [(a["value"], a.get("bbox")) for a in reading.annotations]
+        assert values == [("⌀315", [0.4, 0.3, 0.45, 0.4]), ("18*", None)]
+
+    def test_flag_off_is_one_call(self, mocker):
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_CONTENT_PASS", False)
+        session = FakeSession(FakeResponse(answer({"sheet_type": "detail", "annotations": []})))
+        client(session).read_sheet(picture())
+        assert len(session.requests) == 1
