@@ -893,7 +893,7 @@ def reconcile_with_text_layer(
                 # значения выправляются по слою.
                 replacements, kept = _fix_table(
                     block, matched, stats, vocab, exact=source.exact, turn=turn,
-                    table_reader=table_reader,
+                    table_reader=table_reader, page_count=layer.page_count,
                 )
                 extra_blocks.extend(replacements)
                 leftovers.extend(_confident(kept, line_floor, stats))
@@ -1322,6 +1322,7 @@ def _fix_table(
     exact: bool = False,
     turn: int = 0,
     table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]] = None,
+    page_count: int = 0,
 ) -> Tuple[List[ParsedBlock], List[TextLine]]:
     """
     Содержимое ячеек — по строкам слоя. Возвращает блоки, которыми таблицу
@@ -1359,14 +1360,22 @@ def _fix_table(
         # следующих листов или пропуск модели: они остаются после её строк.
         read = table_reader(block)
         if read and len(read["rows"]) >= _SPEC_MIN_ROWS:
+            from core.providers import table_vlm
+
             rest = _rows_not_read(block.table_data, read)
-            block.table_data = dict(read, rows=list(read["rows"]) + rest)
+            # Продолжение — листы после этого: каждый читается своей вырезкой
+            # в той же рамке (форма 2а та же), таблица — на своей странице.
+            # Прочитан хоть один — строки MinerU из продолжения не нужны.
+            following = _spec_continuation_pages(block, table_reader, page_count) if rest else []
+            if following:
+                rest = []
+            block.table_data = table_vlm.clean_spec(dict(read, rows=list(read["rows"]) + _spec_rows(rest)))
             block.table_html = None
             block.method = METHOD_VLM_TABLE
-            stats.vlm_tables += 1
+            stats.vlm_tables += 1 + len(following)
             kept = _lines_with_new_words(matched, block)
             stats.table_lines_kept += len(kept)
-            return [], kept
+            return following, kept
     if latex_text.mangled_cells(block.table_data):
         stats.mangled_tables += 1
         if not table_from_lines.repair_cells(block, _upright_lines(matched, turn)):
@@ -2095,6 +2104,44 @@ def table_vlm_spec(table_data: Optional[Dict[str, Any]]) -> bool:
 # Меньше строк у модели — это не таблица, а сбой чтения.
 _SPEC_MIN_ROWS = 5
 _DIGIT_RUN = re.compile(r"\d+")
+
+
+def _spec_continuation_pages(block: ParsedBlock, table_reader, page_count: int) -> List[ParsedBlock]:
+    """Листы спецификации после `block.page` — своими вырезками, пока читаются строки."""
+    from core.providers import table_vlm
+
+    found: List[ParsedBlock] = []
+    for page in range(block.page + 1, min(page_count, block.page + _SPEC_MAX_FOLLOWING) + 1):
+        # Таблица MinerU остаётся у вырезки: по ней читатель узнаёт спецификацию.
+        piece = block.model_copy(update={"page": page})
+        read = table_reader(piece)
+        if not read or len(read["rows"]) < _SPEC_MIN_FOLLOWING_ROWS:
+            break
+        found.append(block.model_copy(update={
+            "page": page, "table_data": table_vlm.clean_spec(read), "table_html": None,
+            "method": METHOD_VLM_TABLE, "image_ref": None,
+        }))
+    return found
+
+
+# Строка продолжения MinerU годится, если в ней есть русское слово от трёх
+# букв, обозначение или номер стандарта; иначе это штамп или графа подшивки
+# («23 aM. TAДУ.655-25 As 22.052», «ор п upo 520260»).
+_SPEC_ROW_WORD = re.compile(r"[А-Яа-яЁё]{3,}|\d{6}\.\d{3}|\b(?:ГОСТ|ТУ|DIN|ISO)\s?\d")
+_SPEC_STAMP = re.compile(r"\b(?:Изм|Разраб|Пров|Н\.?\s?контр|Утв|Копировал|Формат|№\s?докум)\b|"
+                         r"[А-ЯЁA-Z]{3,4}\.\d{3}-\d{2}", re.IGNORECASE)
+_SPEC_MAX_FOLLOWING = 6
+_SPEC_MIN_FOLLOWING_ROWS = 3
+
+
+def _spec_rows(rows: List[Any]) -> List[Any]:
+    """Строки продолжения MinerU без штампа и мусора поля подшивки."""
+    kept = []
+    for row in rows:
+        text = " ".join(str(cell) for cell in row)
+        if _SPEC_ROW_WORD.search(text) and not _SPEC_STAMP.search(text):
+            kept.append(row)
+    return kept
 
 
 def _spec_row_keys(row: Sequence[Any]) -> Tuple[str, str]:

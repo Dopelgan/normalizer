@@ -58,6 +58,7 @@
 
 import contextvars
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1044,6 +1045,8 @@ class DrawingProcessor:
             self._what_drawn_pass(result)
         if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
             result.extend(self._rescan_poor_pages(result, metadata))
+        if settings.DRAWING_STAMP_ALL_PAGES:
+            result.extend(self._stamp_pages(result, metadata))
         # Модель не ответила документу ни разу и отказывала как сервис:
         # непрочитанные листы — свойство минуты, а не документа. С
         # PARSE_REQUEUE_ON_OUTAGE документ ставится в очередь (ServiceOutage).
@@ -1141,6 +1144,87 @@ class DrawingProcessor:
             payload["rescan_reason"] = verdict.as_dict()
             sheets.append(sheet)
         return sheets
+
+    def _stamp_pages(self, fragments: List[Fragment], metadata: Dict[str, Any]) -> List[Fragment]:
+        """
+        Штамп страниц, у которых нет ни одного поля основной надписи
+        (DRAWING_STAMP_ALL_PAGES).
+
+        Демо-проверка 24.11: лист 1 СБ ТАДУ 687000.001 и все 4 листа его
+        спецификации прошли текстовым путём (OCR и таблицы MinerU): ветка
+        чертежей читала только область рисунков или не читала ничего, и
+        наименования изделия «Коробка соединительная клеммная СКК-01» не
+        было нигде. Страница со штампом узнаётся по подписям граф в её
+        тексте («Изм.», «Разраб.», «Пров.», «Утв.», «Лист», «№ докум.»);
+        штамп читается тем же проходом штампа (с боковой колонкой), по сетке,
+        рамке или месту ГОСТ, и уходит отдельным чертёжным фрагментом только
+        с полями штампа.
+        """
+        source_uri = str(metadata.get("source_path") or "")
+        if not source_uri or not self.qwen.available:
+            return []
+        stamped = {
+            int(f.position.page) for f in fragments
+            if f.type == "drawing" and f.position is not None
+            and any(field.category == "title_block" for field in f.content.structured_drawing_fields or [])
+        }
+        texts: Dict[int, List[str]] = {}
+        for fragment in fragments:
+            if fragment.position is None:
+                continue
+            content = fragment.content
+            parts = [content.text or ""]
+            if content.table_data:
+                parts += [" ".join(str(c) for c in row) for row in content.table_data.get("rows") or []]
+            texts.setdefault(int(fragment.position.page), []).extend(parts)
+        pages = [page for page in sorted(texts)
+                 if page not in stamped and _stamp_marks("\n".join(texts[page])) >= _STAMP_MARKS_MIN]
+        sheets: List[Fragment] = []
+        for page in pages[: settings.DRAWING_STAMP_ALL_PAGES_MAX]:
+            left = deadline.remaining()
+            if left is not None and left < settings.VLM_TIMEOUT:
+                logger.warning("Штамп страницы %d не прочитан: до срока задачи %.0f с", page, left)
+                break
+            try:
+                sheet = self._stamp_page(source_uri, metadata, page)
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 — штамп не роняет документ
+                logger.error("Штамп страницы %d файла %s не прочитан: %s", page, source_uri, exc)
+                continue
+            if sheet is not None:
+                sheets.append(sheet)
+        return sheets
+
+    def _stamp_page(self, source_uri: str, metadata: Dict[str, Any], page: int) -> Optional[Fragment]:
+        image = self._open(source_uri, page)
+        if image is None:
+            return None
+        layout = drawing_vision.analyse(image) if self.vision_enabled else drawing_vision.plain(image)
+        region = layout.title_block or drawing_vision.fallback_title_block(layout)
+        if region is None:
+            return None
+        fields: List[Dict[str, Any]] = []
+        payload: Dict[str, Any] = {"layout": layout.as_dict(), "tables": [], "stamp_only": True,
+                                   "coordinate_reference": "deskewed_page"}
+        if not self._read_title_block(layout, region, fields, payload) or not fields:
+            return None
+        anchor = Fragment(
+            fragment_id=f"{metadata.get('doc_id') or 'doc'}-stamp-{page:03d}",
+            type="image",
+            content=Content(image_ref=source_uri),
+            position=Position(page=int(page), bbox=[0.0, 0.0, 1.0, 1.0], order=0),
+            confidence=0.0, completeness=0.0,
+            provenance=Provenance(method="vlm_full_page", strategy_level=7, source="drawing"),
+        )
+        result = {
+            "detected_count": len(fields), "parsed_fields": fields,
+            "avg_confidence": sum(f["confidence"] for f in fields) / len(fields),
+            "completeness": None, "structure_score": 0.0, "missing_regions": [], "warnings": [],
+            "completeness_mechanisms": {}, "mode": MODE_VISION_VLM, "payload": payload,
+        }
+        logger.info("Штамп страницы %d прочитан отдельно: граф %d", page, len(fields))
+        return self.build_fragment(result, anchor, metadata)
 
     # -------------------------------------------------- лист-картинка целиком
     def _sheet_drawings(
@@ -2065,6 +2149,20 @@ def _readings_key(field: Dict[str, Any]) -> str:
     if not isinstance(readings, list) or not any(r.get("source") == reading_reconcile.SHEET for r in readings):
         return ""
     return repr([(r.get("source"), r.get("value")) for r in readings])
+
+
+# Подписи граф основной надписи (ГОСТ 2.104) в тексте страницы: по ним
+# страница скана узнаётся как лист со штампом.
+_STAMP_WORDS = re.compile(
+    r"\b(?:Изм\.|Разраб\.?|Пров\.|Т\.?\s?контр|Н\.?\s?контр|Утв\.|№\s?докум|Копировал|Листов|Лит\.)",
+    re.IGNORECASE,
+)
+_STAMP_MARKS_MIN = 3
+
+
+def _stamp_marks(text: str) -> int:
+    """Сколько разных подписей граф штампа есть в тексте страницы."""
+    return len({match.group(0).casefold().replace(" ", "") for match in _STAMP_WORDS.finditer(text)})
 
 
 def _render_pdf_page(data: bytes, page: int):

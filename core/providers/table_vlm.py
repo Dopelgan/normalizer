@@ -22,6 +22,8 @@ from typing import Any, Callable, Dict, List, Optional
 from celery.exceptions import SoftTimeLimitExceeded
 
 from core import deadline, filetypes
+import re
+
 from core.config import settings
 from core.models.parse_result import ParsedBlock
 
@@ -71,7 +73,7 @@ def table_reader(file_bytes: Optional[bytes], file_type: str, client=None) -> Op
                 return None
             piece = _upright(_crop(page, block.bbox))
             if spec:
-                table = client.read_table(piece, max_side=settings.TABLE_VLM_SPEC_MAX_SIDE)
+                table = client.read_table(piece, max_side=settings.TABLE_VLM_SPEC_MAX_SIDE, spec=True)
             else:
                 table = client.read_table(piece)
         except SoftTimeLimitExceeded:
@@ -106,7 +108,72 @@ def eskd_spec(table_data: Optional[Dict[str, Any]]) -> bool:
         return False
     rows = [table_data.get("headers") or []] + list(table_data.get("rows") or [])[:2]
     text = " ".join(str(cell) for row in rows for cell in row).casefold()
-    return all(word in text for word in _SPEC_GRAPHS) and any(word in text for word in _SPEC_ANY)
+    if all(word in text for word in _SPEC_GRAPHS) and any(word in text for word in _SPEC_ANY):
+        return True
+    # Шапка первого листа спецификации на скане приходит неузнаваемой
+    # (ТАДУ 687000.001, изм. 2): зато в строках — обозначения документов
+    # и изделий «ТАДУ 687000.001 СБ». Три таких ячейки — спецификация.
+    cells = [str(cell) for row in table_data.get("rows") or [] for cell in row]
+    return sum(1 for cell in cells if _SPEC_DESIGNATION.search(cell)) >= 3
+
+
+# Обозначение по ГОСТ 2.201: код организации и «xxxxxx.xxx» (точка может
+# потеряться на скане: «ТАДУ 687000001001»).
+_SPEC_DESIGNATION = re.compile(r"[А-ЯЁA-Z]{2,4}\s?\d{6}\.?\d{3}")
+
+# Коды документов ЕСКД (ГОСТ 2.102), которые в спецификации стоят после
+# обозначения: скан отдаёт их латиницей и цифрами («P3» вместо «РЭ»).
+DOC_CODES = frozenset({
+    "СБ", "ТУ", "РЭ", "ЭТ", "ПС", "ФО", "ВО", "ГЧ", "МЧ", "ТЧ", "УЧ", "ВС", "ВП", "ВД", "ПТ", "ЭП", "ТП",
+    "ИМ", "МЭ", "ТБ", "РР", "ПЭ3", "Э3", "Э4", "Э5", "Э6", "Э7", "Д1", "Д2", "Д3", "ПЗ", "КД", "ЗИ", "ЭД",
+})
+_CODE_LOOKALIKE = str.maketrans({"P": "Р", "C": "С", "B": "В", "T": "Т", "E": "Е", "O": "О", "H": "Н",
+                                 "K": "К", "M": "М", "X": "Х", "A": "А", "3": "Э", "6": "Б"})
+_CODE_AFTER = re.compile(r"(\d{6}\.?\d{3}(?:\.\d{2,3})*(?:-\d{2,4})?)\s+([A-ZА-ЯЁ0-9]{2,3})\b")
+# Латинская буква, неотличимая от кириллической, внутри русского слова.
+_CYR_LOOKALIKE = str.maketrans({"a": "а", "e": "е", "o": "о", "p": "р", "c": "с", "x": "х", "y": "у",
+                                "A": "А", "B": "В", "E": "Е", "K": "К", "M": "М", "H": "Н", "O": "О",
+                                "P": "Р", "C": "С", "T": "Т", "X": "Х"})
+_WORD = re.compile(r"[A-Za-zА-Яа-яЁё]+")
+_CYRILLIC = re.compile(r"[А-Яа-яЁё]")
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+def _doc_code(match: "re.Match") -> str:
+    code = match.group(2)
+    if code in DOC_CODES:
+        return match.group(0)
+    for candidate in (code.translate(_CODE_LOOKALIKE),):
+        # «3T» -> «ЭТ», «P3» -> «РЭ»: цифра 3 — это «Э» только в коде документа.
+        if candidate in DOC_CODES:
+            return f"{match.group(1)} {candidate}"
+    return match.group(0)
+
+
+def clean_spec_cell(text: Any) -> str:
+    """
+    Ячейка спецификации: латинские буквы-двойники внутри русского слова —
+    кириллицей («Шaйба» -> «Шайба»), код документа после обозначения — по
+    ГОСТ 2.102 («ТАДУ 687000.001 P3» -> «… РЭ»). Слово целиком латиницей
+    («DIN», тип ввода «k») не трогается.
+    """
+    value = str(text or "")
+
+    def word(match: "re.Match") -> str:
+        token = match.group(0)
+        if _CYRILLIC.search(token) and _LATIN.search(token):
+            fixed = token.translate(_CYR_LOOKALIKE)
+            if not _LATIN.search(fixed):
+                return fixed
+        return token
+
+    value = _WORD.sub(word, value)
+    return _CODE_AFTER.sub(_doc_code, value)
+
+
+def clean_spec(table_data: Dict[str, Any]) -> Dict[str, Any]:
+    rows = [[clean_spec_cell(cell) for cell in row] for row in table_data.get("rows") or []]
+    return dict(table_data, rows=rows)
 
 
 def _table_data(table: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

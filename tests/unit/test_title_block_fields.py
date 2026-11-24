@@ -11,7 +11,7 @@ import pytest
 
 from core.config import settings
 from core.drawing_processor import DrawingProcessor
-from core.models.contract import Content, Fragment, Position, Provenance
+from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import drawing_vision, title_block
 from core.providers.qwen_client import SheetReading
 
@@ -724,3 +724,61 @@ class TestFidelityOnTitleBlockPass:
         monkeypatch.setattr(settings, "DRAWING_DIMENSION_FIDELITY", False)
         getattr(client, method)(object())
         assert "Ербасов" not in asked[-1]
+
+
+class TestStampAllPages:
+    """
+    DRAWING_STAMP_ALL_PAGES: страница скана со штампом в тексте, но без полей
+    основной надписи (спецификация ТАДУ 687000.001, лист 1 СБ), получает
+    отдельный фрагмент с полями штампа.
+    """
+
+    def _fragments(self):
+        text = Fragment(
+            fragment_id="doc-1-frag-002", type="text",
+            content=Content(text="Изм. Лист Nдокум. Подп. Дата Разраб. Белянинова Пров. Постнов Утв. Шаповалов"),
+            position=Position(page=1, bbox=[0.05, 0.8, 0.95, 0.98], order=2),
+            confidence=0.6, completeness=1.0,
+            provenance=Provenance(method="ocr_layer", strategy_level=5, source="scanned_pdf"),
+        )
+        prose = Fragment(
+            fragment_id="doc-1-frag-003", type="text", content=Content(text="Технические требования"),
+            position=Position(page=2, bbox=[0.1, 0.1, 0.9, 0.2], order=3),
+            confidence=0.6, completeness=1.0,
+            provenance=Provenance(method="ocr_layer", strategy_level=5, source="scanned_pdf"),
+        )
+        return [text, prose]
+
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_stamp_read_for_page_without_title_block(self, storage, monkeypatch, flag):
+        monkeypatch.setattr(settings, "DRAWING_STAMP_ALL_PAGES", flag)
+        monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
+        monkeypatch.setattr(settings, "DRAWING_VISION_ENABLED", False)
+        qwen = FakeQwen(block=title_block.parse({"fields": {
+            "Обозначение": "ТАДУ 687000.001", "Наименование": "Коробка соединительная клеммная СКК-01"}}))
+        out = DrawingProcessor(storage, qwen=qwen)._stamp_pages(self._fragments(), {"source_path": SHEET_URI,
+                                                                                    "doc_id": "doc-1"}) \
+            if flag else []
+        if not flag:
+            assert out == []
+            return
+        (sheet,) = out
+        assert sheet.type == "drawing" and sheet.position.page == 1
+        assert sheet.content.structured_payload["stamp_only"] is True
+        values = [f.value for f in sheet.content.structured_drawing_fields]
+        assert "Наименование: Коробка соединительная клеммная СКК-01" in values
+
+    def test_page_with_title_block_is_not_read_again(self, storage, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_VISION_ENABLED", False)
+        fragments = self._fragments()
+        fragments.append(Fragment(
+            fragment_id="doc-1-frag-004", type="drawing",
+            content=Content(structured_drawing_fields=[DrawingField(
+                category="title_block", value="Обозначение: ТАДУ 687000.001", bbox=[0.6, 0.9, 0.9, 0.95],
+                confidence=0.8)]),
+            position=Position(page=1, bbox=[0, 0, 1, 1], order=4), confidence=0.8, completeness=1.0,
+            provenance=Provenance(method="vlm_full_page", strategy_level=7, source="drawing"),
+        ))
+        qwen = FakeQwen(block=title_block.parse({"fields": {"Обозначение": "X"}}))
+        assert DrawingProcessor(storage, qwen=qwen)._stamp_pages(fragments, {"source_path": SHEET_URI}) == []
+        assert qwen.asked == []

@@ -304,8 +304,9 @@ class TestEskdSpec:
         class Client:
             available = True
 
-            def read_table(self, image, max_side=None):
+            def read_table(self, image, max_side=None, spec=False):
                 seen["max_side"] = max_side
+                seen["spec"] = spec
                 return {"headers": [], "rows": [["1"]]}
 
         def render(data, ftype, page, dpi=None):
@@ -316,7 +317,7 @@ class TestEskdSpec:
         monkeypatch.setattr(table_vlm, "_upright", lambda image: image)
         read = table_vlm.table_reader(b"%PDF", "pdf", client=Client())
         read(spec_block())
-        assert seen == {"dpi": settings.TABLE_VLM_SPEC_DPI, "max_side": settings.TABLE_VLM_SPEC_MAX_SIDE}
+        assert seen == {"dpi": settings.TABLE_VLM_SPEC_DPI, "max_side": settings.TABLE_VLM_SPEC_MAX_SIDE, "spec": True}
 
     def test_continuation_from_next_sheet_is_kept(self, monkeypatch):
         """
@@ -337,3 +338,59 @@ class TestEskdSpec:
         # Строки MinerU, прочитанные моделью, не повторяются.
         assert not any("TAAY 687000001001" in " ".join(r) for r in rows)
         assert rows[-1] == ["A", "", "19", "ТАДУ 687000.001.003", "Панель монтажная", "*2", "", ""]
+
+
+class TestEskdSpecSheets:
+    """Демо-проверка 24.11: спецификация ТАДУ 687000.001 (изм. 2), 4 листа."""
+
+    @pytest.mark.parametrize("raw, fixed", [
+        ("Шaйба DIN 125-6,4-A2", "Шайба DIN 125-6,4-A2"),
+        ("ТАДУ 687000.001 P3", "ТАДУ 687000.001 РЭ"),
+        ("ТАДУ 687000.001 3T", "ТАДУ 687000.001 ЭТ"),
+        ("ТАДУ 687000.001 СБ", "ТАДУ 687000.001 СБ"),
+        ("Ввод кабельный типа \"k\"", "Ввод кабельный типа \"k\""),
+        ("Болт DIN 933 M6x14-A2", "Болт DIN 933 M6x14-A2"),
+    ])
+    def test_cell_cleanup(self, raw, fixed):
+        assert table_vlm.clean_spec_cell(raw) == fixed
+
+    def test_first_sheet_with_garbled_header_is_a_spec(self):
+        data = {"headers": ["oN", "a да", "шwdoф", "DHOE"],
+                "rows": [["A3", "", "ТАДУ 687000.001 СБ", "Сборочный чертеж"],
+                         ["A4", "", "ТАДУ 687000.001 ТУ", "Технические условия"],
+                         ["", "", "ТАДУ 750749.001 Д1", "Ведомость замены клемм"]]}
+        assert table_vlm.eskd_spec(data)
+
+    def test_following_sheets_are_read_on_their_own_pages(self, monkeypatch):
+        monkeypatch.setattr(settings, "TABLE_VLM_ESKD_SPEC", True)
+        block = spec_block()
+        block.table_data["rows"] += [
+            ["", "wowoф", "DH", "210", "Обозначение", "Наименование", "", "Приме-чание"],
+            ["A", "", "19", "ТАДУ 687000.001.003", "Панель монтажная", "*2", "", ""],
+            ["23", "aM.", "TAДУ.655-25", "As", "22.052", "", "", ""],
+        ]
+        page3 = {"headers": SPEC_QWEN["headers"], "total_row": None, "rows": [
+            ["A4", "", "19", "ТАДУ 687000.001.003", "Панель монтажная", "*2", ""],
+            ["", "", "27", "", "Шайба DIN 125-6,4-A2", "*2", ""],
+            ["", "", "33", "", "Бирка маркировочная вертикальная", "*2", ""]]}
+        read_pages = []
+
+        def reader(b):
+            read_pages.append(b.page)
+            return {1: SPEC_QWEN, 2: page3}.get(b.page)
+
+        layer = TextLayer(pages={1: spec_layer().pages[1], 2: [], 3: []}, page_count=3)
+        blocks, stats = reconcile_with_text_layer([spec_block_with(block)], layer, source=OCR_LAYER,
+                                                  table_reader=reader)
+        tables = [b for b in blocks if b.type == "table"]
+        assert read_pages == [1, 2, 3]
+        assert {t.page for t in tables} == {1, 2}
+        first = next(t for t in tables if t.page == 1)
+        # Продолжение прочитано своим листом: строки MinerU и штамп не приклеены к первому.
+        assert not any("Панель" in " ".join(r) or "655-25" in " ".join(r) for r in first.table_data["rows"])
+        second = next(t for t in tables if t.page == 2)
+        assert second.table_data["rows"][2][4] == "Бирка маркировочная вертикальная"
+
+
+def spec_block_with(block):
+    return block
