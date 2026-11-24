@@ -406,6 +406,31 @@ def _stamp_in(frame: Any, size: Tuple[int, int]) -> Optional[List[float]]:
     return [round(max(0.0, min(1.0, value)), 4) for value in stamp]
 
 
+# Область штампа по месту, когда ни рамки, ни сетки штампа нет
+# (DRAWING_STAMP_FALLBACK): правый нижний угол с запасом. Книжный лист — это
+# почти всегда A4, где штамп во всю ширину рамки; альбомный — A3 и крупнее,
+# где штамп 185 мм — не больше половины ширины.
+_FALLBACK_PORTRAIT = [0.05, 0.74, 1.0, 1.0]
+_FALLBACK_LANDSCAPE = [0.5, 0.74, 1.0, 1.0]
+
+
+def fallback_title_block(layout: "SheetLayout") -> Optional[Region]:
+    """
+    Область штампа по ГОСТ 2.104 без рамки и сетки (DRAWING_STAMP_FALLBACK).
+
+    На скане факса ТАДУ 305179.001.01.01.004 (173 dpi) рамка не нашлась, и
+    прохода штампа не было вовсе: ни обозначения, ни наименования. Штамп
+    формы 1 стоит в правом нижнем углу всегда, поэтому вырезка этого угла
+    с запасом читается тем же проходом штампа. `None` — у листа уже есть
+    штамп или картинки нет.
+    """
+    if layout.image is None or layout.title_block is not None:
+        return None
+    width, height = layout.image.size
+    box = _FALLBACK_PORTRAIT if height >= width else _FALLBACK_LANDSCAPE
+    return Region(kind=KIND_TITLE_BLOCK, bbox=list(box))
+
+
 def title_block_crop(layout: "SheetLayout", region: Region) -> List[float]:
     """
     Что вырезать под чтение штампа: область по ГОСТ, если формат листа

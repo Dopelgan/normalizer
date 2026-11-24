@@ -293,6 +293,12 @@ class DrawingProcessor:
             layout.regions,
             key=lambda r: r.kind != drawing_vision.KIND_TITLE_BLOCK,
         )
+        if settings.DRAWING_STAMP_FALLBACK and not text_only and log_page is None:
+            # Рамка и сетка штампа не нашлись: штамп — по месту по ГОСТ.
+            fallback = drawing_vision.fallback_title_block(layout)
+            if fallback is not None:
+                regions.insert(0, fallback)
+                payload["title_block_fallback"] = True
         gated = self._gate_table_regions(regions, page, sheet, whole_page=log_page is None)
         if gated:
             regions = [region for region in regions if not any(region is g for g in gated)]

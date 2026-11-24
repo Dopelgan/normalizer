@@ -320,6 +320,22 @@ class TestProcessorPass:
         assert fields["Инв. № подл.: 1085-02 (рукописно)"] == strip
         assert fields["Обозначение: ТАДУ 421451.001"] != strip
 
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_stamp_by_position_when_nothing_found(self, storage, monkeypatch, flag):
+        """
+        DRAWING_STAMP_FALLBACK: рамка и сетка штампа не нашлись (скан факса
+        ТАДУ 305179.001.01.01.004) — штамп всё равно читается, по месту.
+        """
+        monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
+        monkeypatch.setattr(settings, "DRAWING_VISION_ENABLED", False)
+        monkeypatch.setattr(settings, "DRAWING_STAMP_FALLBACK", flag)
+        qwen = FakeQwen(block=title_block.parse({"fields": {"Обозначение": "ТАДУ 305179.001.01.01.004"}}))
+        result = DrawingProcessor(storage, qwen=qwen).process(SHEET_URI, {})
+        asked = [kind for kind, _ in qwen.asked if kind == "fields"]
+        assert bool(asked) is flag
+        stamp = (result["payload"].get("title_block") or {}).get("designation")
+        assert (stamp == "ТАДУ 305179.001.01.01.004") is flag
+
     def test_side_column_alone_is_enough(self, storage, monkeypatch):
         """Штамп не прочитан, боковая колонка прочитана — область не потеряна."""
         monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
