@@ -467,6 +467,21 @@ _VALUES_PROMPT = """На картинке {count} пронумерованных
 - Если на вырезке надписи нет или она не читается — пропусти этот номер.
 """
 
+# Знак общей шероховатости в правом верхнем углу листа
+# (`DRAWING_CORNER_ROUGHNESS`): проход листа целиком его не читает — знак
+# мелкий и стоит вне видов.
+_CORNER_ROUGHNESS_PROMPT = """На картинке — правый верхний угол чертежа детали.
+Найди знак общей шероховатости поверхностей (галочка √ с числом, например
+«√Ra 6,3 (√)») и верни JSON:
+
+{"value": "Ra 6,3", "check_mark": true, "unsure": false}
+
+Правила:
+- value — только параметр и число: «Ra 6,3», «Rz 20». Десятичную запятую не теряй.
+- check_mark — true, если после числа в скобках стоит знак «(√)».
+- Знака нет, это не шероховатость или ты не уверен — верни {"value": "", "unsure": true}.
+"""
+
 # Знак отклонения и справочная звёздочка (`DRAWING_DIMENSION_FIDELITY`).
 # В транскрипции листа «30±10*» приходило как «30+10*», а на вырезке вида
 # знак был верный: модель подменяет «±» на «+» сама, и правится это запросом.
@@ -949,6 +964,13 @@ class QwenVisionClient:
         if data is None:
             return None
         return disputed_reread.parse_values(data, count)
+
+    def read_corner_roughness(self, image) -> Optional[Dict[str, Any]]:
+        """
+        Вырезка правого верхнего угла листа (DRAWING_CORNER_ROUGHNESS) ->
+        ответ модели как есть; разбирает его `sense_rules.corner_roughness`.
+        """
+        return self._ask(image, _CORNER_ROUGHNESS_PROMPT, settings.DRAWING_REREAD_MAX_SIDE, max_tokens=64)
 
     def read_dimension_links(self, image, prompt: str, count: int) -> Optional[Dict[str, Any]]:
         """

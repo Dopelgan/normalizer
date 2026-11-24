@@ -71,7 +71,7 @@ from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
     dimension_fidelity, disputed_reread, drawing_text, drawing_vision, field_placement, gpu_gate,
-    raster_drawing, reading_reconcile, title_block, vector_drawing,
+    raster_drawing, reading_reconcile, sense_rules, title_block, vector_drawing,
 )
 from core.providers.qwen_client import (
     CATEGORIES, GUARD_MIN_TEXT_LINES, REJECT_EMPTY, QwenVisionClient,
@@ -478,6 +478,13 @@ class DrawingProcessor:
                 dimension_fidelity.adopt_transcript_signs(
                     fields, payload.get("transcript_lines")
                 )
+        whole_sheet = log_page is None or image_ref in getattr(self, "_whole_images", ())
+        if (settings.DRAWING_CORNER_ROUGHNESS and whole_sheet and not text_only
+                and reading is not None and reading.sheet_type in ("detail", "unknown")):
+            # Знак общей шероховатости в углу листа: проход листа его не видит.
+            # Только лист целиком (у вырезки вида угла листа нет) и не схема
+            # и не сборка: общий знак ставится на чертеже детали.
+            fields.extend(self._corner_roughness(layout, fields, payload, budget_started))
         crops = self._reread_crops
         if settings.DRAWING_DISPUTED_REREAD and fields and crops is not None:
             # Сведение D3 (DRAWING_READINGS_RECONCILED) идёт по всему документу
@@ -701,6 +708,13 @@ class DrawingProcessor:
             for item in fields:
                 item.pop("link", None)
             return {"error": type(exc).__name__}
+        if settings.DRAWING_SENSE_RULES:
+            # Связь «радиус» у величины без «R» (или «диаметр» без «⌀») —
+            # связь неверного прочтения: значение остаётся, связь снимается.
+            wrong = sense_rules.check_links(fields)
+            if wrong:
+                stats["dropped"]["type_mismatch"] = stats["dropped"].get("type_mismatch", 0) + wrong
+                stats["linked"] = max(0, stats.get("linked", 0) - wrong)
         stats["seconds"] = round(time.monotonic() - started, 2)
         logger.info(
             "Связь размеров листа %s: величин %d, по геометрии %d, моделью %d, отказов %d за %.1f с",
@@ -922,6 +936,11 @@ class DrawingProcessor:
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_SKIPPED_NO_TIME"]))
                 result.append(fragment)
                 continue
+            if settings.DRAWING_CORNER_ROUGHNESS and _covers_page(fragment):
+                # Картинка MinerU на всю страницу — лист целиком, хотя и
+                # читается как вырезка: у неё есть угол рамки со знаком
+                # общей шероховатости (`_corner_roughness`).
+                self._whole_images = getattr(self, "_whole_images", set()) | {fragment.content.image_ref}
             try:
                 sheet_page = int(fragment.position.page) if fragment.position else 0
                 drawing_result = self.process(
@@ -965,6 +984,14 @@ class DrawingProcessor:
             if self._reread_crops is not None:
                 # D3 свёл прочтения, D4 дочитывает то, что осталось спорным.
                 self._reread_reconciled(result)
+        if settings.DRAWING_SENSE_RULES:
+            # После сведения и дочитывания: правила смотрят на итог прочтений
+            # (толщина из штампа против «50,5*», шероховатость поверх размера,
+            # вид величины против вида связи). До размещения полей: рамки
+            # вырезок здесь ещё в долях вырезки, как их понимает D3.
+            changed = sense_rules.apply(result)
+            if any(changed.values()):
+                logger.info("Правила здравого смысла: %s", changed)
         if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
             result.extend(self._rescan_poor_pages(result, metadata))
         # Модель не ответила документу ни разу и отказывала как сервис:
@@ -1583,6 +1610,40 @@ class DrawingProcessor:
             fields.append(field)
         return fields
 
+    def _corner_roughness(
+        self, layout, fields: List[Dict[str, Any]], payload: Dict[str, Any], started: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        Знак общей шероховатости из правого верхнего угла рамки
+        (DRAWING_CORNER_ROUGHNESS): одна вырезка — один короткий вызов.
+        Лист уже выправлен и повёрнут штампом в правый нижний угол
+        (`layout.turn`), поэтому угол берётся у `layout.image` как есть.
+        Вызов не начинается, если бюджета листа на него не хватает.
+        """
+        budget = settings.DRAWING_TIME_BUDGET
+        if budget and gpu_gate.budget_now() + settings.VLM_TIMEOUT > started + budget:
+            payload["corner_roughness"] = "no_time"
+            return []
+        left = deadline.remaining()
+        if left is not None and left < settings.VLM_TIMEOUT:
+            payload["corner_roughness"] = "no_time"
+            return []
+        box = sense_rules.corner_box(layout.frame)
+        try:
+            piece = drawing_vision.crop(layout.image, box, padding=0.0,
+                                        max_side=settings.DRAWING_REREAD_MAX_SIDE)
+            value = sense_rules.corner_roughness(self.qwen.read_corner_roughness(piece))
+        except (SoftTimeLimitExceeded, deadline.Cancelled):
+            raise
+        except Exception as exc:  # noqa: BLE001 — угол не роняет лист
+            logger.error("Знак шероховатости в углу листа не прочитан: %s", exc)
+            return []
+        if value is None or sense_rules.roughness_known(value, fields):
+            payload["corner_roughness"] = "none" if value is None else "known"
+            return []
+        payload["corner_roughness"] = "added"
+        return [_field("roughness", value, box, 0.7, label=sense_rules.CORNER_LABEL)]
+
     def _reread_disputed(
         self, image, fields: List[Dict[str, Any]], payload: Dict[str, Any], started: float,
     ) -> List[Dict[str, Any]]:
@@ -1776,6 +1837,15 @@ def _value_view_links() -> bool:
     настроек: pydantic отказывается заводить неизвестное поле даже на запись.
     """
     return bool(getattr(settings, "DRAWING_VALUE_VIEW_LINKS", False))
+
+
+def _covers_page(fragment: Fragment) -> bool:
+    """Картинка занимает почти всю страницу (от 80 % площади): это лист, а не вид."""
+    bbox = list(fragment.position.bbox or []) if fragment.position else []
+    if len(bbox) != 4:
+        return False
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1) >= 0.8
 
 
 def _dimension_links() -> bool:
