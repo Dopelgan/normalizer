@@ -303,7 +303,7 @@ def test_weld_mark_read_as_thread_becomes_callout(value):
     assert stats["thread_weld"] == 1
 
 
-@pytest.mark.parametrize("value", ["M1", "M11", "М2", "M1(2)"])
+@pytest.mark.parametrize("value", ["M1", "M11", "М2", "M1(2)", "M111", "M12-15"])
 def test_scheme_designator_is_not_a_thread(value):
     """Схема Э4: «M1» — двигатель по ГОСТ 2.710, а не резьба М1."""
     sheet = drawing([field(value, [0.3, 0.3, 0.32, 0.32], category="thread")])
@@ -313,7 +313,7 @@ def test_scheme_designator_is_not_a_thread(value):
 
 
 @pytest.mark.parametrize("value, sheet_type", [
-    ("M1", "detail"), ("M6", "assembly"), ("M6-6H", "scheme"), ("M20x1,5", "scheme"),
+    ("M1", "detail"), ("M6", "assembly"), ("M6-6H", "scheme"), ("M12-6g", "scheme"), ("M20x1,5", "scheme"),
     ("2 отв. M3", "detail"), ("2 M3", "detail"), ("G1/2", "detail"),
 ])
 def test_real_threads_stay(value, sheet_type):
