@@ -361,6 +361,27 @@ _COMPACT_LEGEND = (
     "p — номер позиции у выноски, n — примечание"
 )
 
+# Содержание листа без рамок (DRAWING_SHEET_CONTENT_PASS, карточка B): на
+# рамки уходило ~77 из ~87 токенов надписи, и модель перечисляла меньше
+# надписей, когда должна была их ещё и разместить (59 против 83 на листе
+# крышки). Место надписи берётся у прохода с рамками.
+_CONTENT_PROMPT = """Прочитай чертёж и перечисли все надписи листа. Верни JSON:
+
+{{"sheet_type": "detail|assembly|scheme|unknown",
+  "annotations": [["<код>", "надпись как на листе"]]}}
+
+Коды: {codes}.
+
+Правила:
+- Порядок — как читают лист: сверху вниз, слева направо; основная надпись (штамп) — в конце.
+- Одинаковые надписи в разных местах листа перечисляй столько раз, сколько они стоят.
+- Знак диаметра пиши как ⌀, допуск как ±, шероховатость как Ra/Rz.
+- Размер, посадку и допуск пиши одной надписью, как на листе: «⌀44H7», «20±0,1».
+- Пункт технических требований — одной надписью целиком, с номером.
+- Служебные графы бланка («Инв. № подл.», «Взам. инв. №», «Подп. и дата») пропускай.
+- Не выдумывай надписей, которых нет.
+"""
+
 _SHEET_PROMPT_COMPACT = """Прочитай чертёж и верни JSON:
 
 {{"sheet_type": "detail|assembly|scheme|unknown",
@@ -698,6 +719,45 @@ class QwenVisionClient:
         return bool(self.endpoint)
 
     def read_sheet(
+        self, image, hint: str = "", until: Optional[float] = None,
+    ) -> Optional[SheetReading]:
+        """
+        Лист целиком (см. `_read_sheet_located`). С DRAWING_SHEET_CONTENT_PASS
+        сначала — содержание листа без рамок (`read_sheet_content`): короткий
+        ответ «[код, надпись]» в родном разрешении; место каждой надписи —
+        от прежнего прохода с рамками (`merge_content`).
+        """
+        located = self._read_sheet_located(image, hint, until)
+        if not settings.DRAWING_SHEET_CONTENT_PASS:
+            return located
+        content = self.read_sheet_content(image)
+        if content is None:
+            return located
+        return merge_content(content, located)
+
+    def read_sheet_content(self, image) -> Optional[SheetReading]:
+        """
+        Содержание листа без рамок (карточка B). Ответ под схемой с
+        обязательными ключами: пустого «{}» под ней не бывает. Сторона
+        картинки — DRAWING_SHEET_CONTENT_MAX_SIDE (A3 в 200 dpi — родная).
+        """
+        answer = self._ask_text(
+            image, _CONTENT_PROMPT.format(codes=_COMPACT_LEGEND), settings.DRAWING_SHEET_CONTENT_MAX_SIDE,
+            max_tokens=settings.DRAWING_SHEET_MAX_TOKENS, response_format=content_schema(),
+        )
+        if answer is None:
+            return None
+        data = extract_json(answer[0])
+        if not isinstance(data, dict):
+            logger.warning("Содержание листа: ответ не JSON (finish=%s)", answer[1])
+            return None
+        items = content_items(data.get("annotations"))
+        sheet_type = str(data.get("sheet_type") or "unknown")
+        if sheet_type not in ("detail", "assembly", "scheme", "unknown"):
+            sheet_type = "unknown"
+        return SheetReading(sheet_type=sheet_type, annotations=items, raw=data, cut=answer[1] == "length")
+
+    def _read_sheet_located(
         self, image, hint: str = "", until: Optional[float] = None,
     ) -> Optional[SheetReading]:
         """
@@ -1884,6 +1944,69 @@ def _box_from_thousandths(annotation: Dict[str, Any]) -> Dict[str, Any]:
     if max(box) <= 1.5 or min(box) < 0 or max(box) > 1000:
         return annotation
     return {**annotation, "bbox": [round(float(v) / 1000.0, 4) for v in box]}
+
+
+def content_schema() -> Dict[str, Any]:
+    """Схема ответа содержания листа: оба ключа обязательны, надпись — пара строк."""
+    return {"type": "json_schema", "json_schema": {"name": "sheet_content", "schema": {
+        "type": "object",
+        "properties": {
+            "sheet_type": {"type": "string", "enum": ["detail", "assembly", "scheme", "unknown"]},
+            "annotations": {"type": "array", "items": {
+                "type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}},
+        },
+        "required": ["sheet_type", "annotations"],
+    }}}
+
+
+def content_items(items: Any) -> List[Dict[str, Any]]:
+    """
+    Ответ содержания листа -> надписи `{category, value}` без рамки. Код —
+    из `_COMPACT_CODES` (или полное имя категории); неизвестный код —
+    примечание: текст на листе есть, а категорию решат правила.
+    """
+    found: List[Dict[str, Any]] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        code, value = str(item[0]).strip(), " ".join(str(item[1]).split())
+        if not value:
+            continue
+        category = _COMPACT_CODES.get(code.lower(), code if code in CATEGORIES else "note")
+        found.append({"category": category, "value": value})
+    return found
+
+
+def _content_key(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).casefold().replace(",", ".")
+
+
+def merge_content(content: "SheetReading", located: Optional["SheetReading"]) -> "SheetReading":
+    """
+    Содержание листа (без рамок) и проход с рамками в одно чтение.
+
+    Надпись содержания получает рамку надписи прохода с той же записью (по
+    порядку: повторы — по очереди); без пары — без рамки (разбор поставит
+    рамку по умолчанию). Надписи прохода с рамками, которых в содержании
+    нет, добавляются: содержание полнее, но не всегда.
+    """
+    pool: Dict[str, List[Dict[str, Any]]] = {}
+    for item in (located.annotations if located is not None else []):
+        pool.setdefault(_content_key(item.get("value")), []).append(item)
+    merged: List[Dict[str, Any]] = []
+    for item in content.annotations:
+        twins = pool.get(_content_key(item["value"]))
+        if twins:
+            twin = twins.pop(0)
+            merged.append({**item, "bbox": twin.get("bbox")})
+        else:
+            merged.append(dict(item))
+    for rest in pool.values():
+        merged.extend(rest)
+    base = located if located is not None else SheetReading()
+    sheet_type = content.sheet_type if content.sheet_type != "unknown" else base.sheet_type
+    return SheetReading(sheet_type=sheet_type, annotations=merged, raw=base.raw, cut=base.cut,
+                        tiles=base.tiles, failed=base.failed, lost=base.lost, rejected=base.rejected)
 
 
 def as_annotations(
