@@ -17,8 +17,11 @@
   арифметика сходится на прочитанных величинах.
 
 Связь величины с элементом из `DRAWING_DIMENSION_LINKS` (подпись
-`link.target_label`) идёт в запрос подсказкой и предпочитается ответу
-модели: она построена по выноске на самом листе.
+`link.target_label`) идёт в запрос подсказкой. Смысл из подписи берётся,
+только если она того же рода, что ответ модели по этой величине
+(диаметр, радиус, толщина, длина, высота, ширина, угол), и сходится со
+знаком; иначе смысла у величины нет. Смысл одной модели остаётся, если
+сходится со знаком.
 """
 
 from __future__ import annotations
@@ -33,6 +36,13 @@ DIM_CATEGORIES = frozenset({"size", "radius", "roughness", "thread", "tolerance"
 # Сколько прочих надписей (позиции, буквы видов, примечания) идёт в запрос.
 CONTEXT_MAX = 30
 NOTES_MAX = 12
+# Потолки запроса и ответа: лист с сотнями надписей не раздувает запрос, а
+# зацикленный ответ — итог.
+DIMS_MAX = 100
+PROMPT_TEXT_MAX = 80
+VIEWS_MAX = 12
+TEXT_MAX = 300
+OBJECT_MAX = 400
 
 SCHEMA = """{"object": "<1-2 предложения: что изображено, форма, примерный размер по величинам>",
  "how_parts_fit": "<1 предложение: как главные части и размеры связаны между собой, например «общая высота 505 = корпус 305 + патрубки сверху и снизу»; только то, что видно на листе>",
@@ -84,13 +94,23 @@ def _label(item: Dict[str, Any]) -> str:
     return ""
 
 
+def _marked(item: Dict[str, Any], value: str) -> bool:
+    """Размер со знаком (⌀, R, S, °) или допуском — первый в очереди при потолке."""
+    return bool(item.get("tolerance")) or bool(re.search(r"^[⌀ØøRS]|°|±|[+\-]\d", value))
+
+
+def sheet_numbers(fields: Sequence[Dict[str, Any]]) -> frozenset:
+    """Все числа надписей листа: в описании листа они не выдуманы."""
+    return frozenset(n.replace(".", ",") for item in fields for n in _NUMBER.findall(str(item.get("value") or "")))
+
+
 def build_prompt(fields: Sequence[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Текст запроса и пронумерованные величины листа:
     `[{"id": "v1", "value": ..., "bbox": ..., "link": <подпись связи или "">}]`.
     Величин нет — текст пустой, вызова не будет.
     """
-    dims: List[Dict[str, Any]] = []
+    found: List[Tuple[int, Dict[str, Any]]] = []
     context: List[Dict[str, Any]] = []
     title, notes, seen = "", [], set()
     for item in fields:
@@ -99,8 +119,8 @@ def build_prompt(fields: Sequence[Dict[str, Any]]) -> Tuple[str, List[Dict[str, 
             continue
         category = item.get("category")
         if category in DIM_CATEGORIES:
-            dims.append({"id": f"v{len(dims) + 1}", "value": value, "bbox": _box(item.get("bbox")),
-                         "link": _label(item)})
+            found.append((len(found), {"value": value, "bbox": _box(item.get("bbox")), "link": _label(item),
+                                       "first": _marked(item, value)}))
             continue
         if category == "title_block" and value.startswith(_TITLE_PREFIX) and not title:
             title = value[len(_TITLE_PREFIX):].strip()
@@ -109,6 +129,13 @@ def build_prompt(fields: Sequence[Dict[str, Any]]) -> Tuple[str, List[Dict[str, 
         if value not in seen and len(context) < CONTEXT_MAX:
             seen.add(value)
             context.append({"value": value[:80], "bbox": _box(item.get("bbox"))})
+    # Больше DIMS_MAX величин — сначала размеры со знаком или допуском,
+    # порядок листа сохраняется.
+    chosen = sorted(found, key=lambda pair: (not pair[1]["first"], pair[0]))[:DIMS_MAX]
+    dims = []
+    for _, d in sorted(chosen, key=lambda pair: pair[0]):
+        d.pop("first")
+        dims.append({"id": f"v{len(dims) + 1}", **d})
     if not dims:
         return "", []
     lines = ["Это лист машиностроительного чертежа. Объясни новичку, что на нём изображено."]
@@ -118,8 +145,8 @@ def build_prompt(fields: Sequence[Dict[str, Any]]) -> Tuple[str, List[Dict[str, 
         lines.append("Примечания листа: " + " | ".join(notes))
     lines.append("Размеры, уже прочитанные с листа (id, значение, рамка надписи в долях листа):")
     for d in dims:
-        hint = f"  выноска ведёт к: {d['link']}" if d["link"] else ""
-        lines.append(f"{d['id']}: {d['value']}  рамка {d['bbox']}{hint}")
+        hint = f"  выноска ведёт к: {d['link'][:PROMPT_TEXT_MAX]}" if d["link"] else ""
+        lines.append(f"{d['id']}: {d['value'][:PROMPT_TEXT_MAX]}  рамка {d['bbox']}{hint}")
     if context:
         lines.append("Для справки (не размеры: номера позиций, буквы видов, надписи):")
         lines.append("; ".join(f"{c['value']} {c['bbox']}" for c in context))
@@ -170,6 +197,28 @@ def contradicts(value: str, meaning: str) -> bool:
     return False
 
 
+# Род смысла величины: по нему подпись связи сверяется с ответом модели.
+_KINDS = {
+    "diameter": ("диаметр", "отверст", "окружност", "круг"),
+    "radius": ("радиус", "скругл", "дуг"),
+    "thickness": ("толщин",),
+    "length": ("длин",),
+    "height": ("высот",),
+    "width": ("ширин",),
+    "angle": ("угол", "наклон"),
+}
+
+
+def kinds(meaning: str) -> set:
+    m = (meaning or "").lower()
+    return {kind for kind, words in _KINDS.items() if any(w in m for w in words)}
+
+
+def _same_kind(first: str, second: str) -> bool:
+    """Оба смысла названы одним родом (диаметр, радиус, толщина, длина, высота, ширина, угол)."""
+    return bool(kinds(first) & kinds(second))
+
+
 def _norm_meaning(meaning: str) -> str:
     m = re.sub(r"\s+на\s+(главном виде|виде\s+\S+|разрезе\s+\S+|выносном элементе\s+\S+).*$", "",
                (meaning or "").lower())
@@ -186,7 +235,7 @@ def _invents_numbers(text: str, known: set) -> bool:
 
 def parts_fit(sentence: Any, dims: Sequence[Dict[str, Any]]) -> Optional[str]:
     """Фраза о связи частей — только без чужих чисел и со сходящейся суммой."""
-    if not isinstance(sentence, str) or not sentence.strip():
+    if not isinstance(sentence, str) or not sentence.strip() or len(sentence) > TEXT_MAX:
         return None
     sentence = sentence.strip()
     values = " ".join(d["value"] for d in dims)
@@ -208,42 +257,66 @@ def _text(raw: Any) -> str:
     return re.sub(r"\s+", " ", raw).strip() if isinstance(raw, str) else ""
 
 
-def parse(data: Any, dims: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _honest(text: str, known: set, limit: int) -> str:
+    """Текст без предложений с числами, которых на листе нет; не длиннее `limit`."""
+    kept = [part for part in re.split(r"(?<=[.!?])\s+", text) if part and not _invents_numbers(part, known)]
+    return " ".join(kept)[:limit].strip()
+
+
+def parse(data: Any, dims: Sequence[Dict[str, Any]],
+          sheet: frozenset = frozenset()) -> Optional[Dict[str, Any]]:
     """
     Ответ модели -> `what_drawn` листа или None (ответа нет, он пустой).
-    `dims` — величины из `build_prompt`.
+    `dims` — величины из `build_prompt`, `sheet` — числа всех надписей листа
+    (`sheet_numbers`): в описании и видах других чисел быть не должно.
     """
     if not isinstance(data, dict):
         return None
-    obj = _text(data.get("object"))
+    known = _known_numbers(dims)
+    described = known | set(sheet)
+    obj = _honest(_text(data.get("object")), described, OBJECT_MAX)
     views = []
-    for view in data.get("views") or []:
-        if isinstance(view, dict) and _text(view.get("name")) and _text(view.get("shows")):
-            views.append({"name": _text(view.get("name")), "shows": _text(view.get("shows"))})
+    raw_views = data.get("views")
+    for view in raw_views if isinstance(raw_views, list) else []:
+        if len(views) >= VIEWS_MAX:
+            break
+        if not isinstance(view, dict):
+            continue
+        name = _text(view.get("name"))[:TEXT_MAX]
+        shows = _honest(_text(view.get("shows")), described, TEXT_MAX)
+        if name and shows:
+            views.append({"name": name, "shows": shows})
     features = {}
-    for feat in data.get("features") or []:
+    raw_features = data.get("features")
+    for feat in raw_features if isinstance(raw_features, list) else []:
         if isinstance(feat, dict) and isinstance(feat.get("id"), str) and _text(feat.get("where")):
-            features[feat["id"]] = _text(feat.get("where"))
+            features[feat["id"]] = _text(feat.get("where"))[:TEXT_MAX]
     by_id = {d["id"]: d for d in dims}
     model: Dict[str, Dict[str, Any]] = {}
-    for row in data.get("dimensions") or []:
+    raw_rows = data.get("dimensions")
+    for row in raw_rows if isinstance(raw_rows, list) else []:
         # Неизвестный номер — величина, которой на листе не прочитано.
-        if isinstance(row, dict) and row.get("value_id") in by_id and row["value_id"] not in model:
+        if (isinstance(row, dict) and isinstance(row.get("value_id"), str)
+                and row["value_id"] in by_id and row["value_id"] not in model):
             model[row["value_id"]] = row
-    known = _known_numbers(dims)
     picked: List[Tuple[Dict[str, Any], str, Optional[str]]] = []
     meanings: Dict[str, set] = {}
     for d in dims:
         row = model.get(d["id"])
-        if d["link"]:
-            meaning = d["link"]
-        elif row is not None and row.get("confidence") == "high":
-            meaning = _text(row.get("measures"))
-        else:
+        said = _text(row.get("measures"))[:TEXT_MAX] if row is not None and row.get("confidence") == "high" else ""
+        if not said:
             continue
+        meaning = said
+        if d["link"]:
+            # Подпись связи — только если она того же рода, что ответ модели:
+            # на замере неверные подписи связей дали 6 из 10 ошибочных смыслов.
+            if not _same_kind(d["link"], said) or contradicts(d["value"], d["link"]):
+                continue
+            meaning = d["link"]
         if contradicts(d["value"], meaning) or _invents_numbers(meaning, known):
             continue
-        feature = features.get(row.get("feature_id")) if row is not None else None
+        fid = row.get("feature_id") if row is not None else None
+        feature = features.get(fid) if isinstance(fid, str) else None
         meanings.setdefault(d["value"], set()).add(_norm_meaning(meaning))
         picked.append((d, meaning, feature))
     # Одна величина — один смысл: разные смыслы у одинаковых значений — ни одного.

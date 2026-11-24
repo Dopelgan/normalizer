@@ -552,10 +552,13 @@ class DrawingProcessor:
             # смысла документа (`_what_drawn_pass`), чтобы величины были
             # окончательными. Здесь — как открыть лист заново и сколько
             # осталось от бюджета листа: рендер до конца документа не держится.
+            # Срок — по общим часам: время дочитывания D4 и прочих листов
+            # между записью и вызовом идёт в счёт бюджета этого листа.
             budget = settings.DRAWING_TIME_BUDGET
             self._what_drawn_sheets[(image_ref, sheet)] = {
                 "image_ref": image_ref, "page": page, "angle": layout.angle, "turn": layout.turn,
-                "left": budget_started + budget - gpu_gate.budget_now() if budget else None,
+                "until": (time.monotonic() + budget_started + budget - gpu_gate.budget_now()
+                          if budget else None),
             }
         mode = MODE_VISION_VLM if (self.vision_enabled and layout.regions) else MODE_SHEET_ONLY
         if not fields and not payload["tables"] and not payload.get("transcript_lines"):
@@ -1834,6 +1837,7 @@ class DrawingProcessor:
         from core.providers import what_drawn
 
         done = set()
+        pass_started = time.monotonic()
         for fragment in fragments:
             if fragment.type != "drawing" or not fragment.content.structured_drawing_fields:
                 continue
@@ -1842,28 +1846,41 @@ class DrawingProcessor:
             sheet = self._what_drawn_sheets.get(key)
             if sheet is None or key in done:
                 continue
+            if len(done) >= WHAT_DRAWN_SHEETS_MAX:
+                logger.info("«Что изображено»: прочитано %d листов документа, остальные пропущены", len(done))
+                return
             done.add(key)
-            prompt, dims = what_drawn.build_prompt(
-                [f.model_dump() for f in fragment.content.structured_drawing_fields])
+            fields = [f.model_dump() for f in fragment.content.structured_drawing_fields]
+            prompt, dims = what_drawn.build_prompt(fields)
             if not dims:
                 continue
             left = deadline.remaining()
-            if ((sheet["left"] is not None and sheet["left"] < settings.VLM_TIMEOUT)
-                    or (left is not None and left < settings.VLM_TIMEOUT)):
-                logger.info("«Что изображено» пропущено для %s: не хватает времени", key[0])
-                continue
+            if left is not None and left < settings.VLM_TIMEOUT:
+                logger.info("«Что изображено» пропущено: до срока задачи %.0f с", left)
+                return
+            if left is None and time.monotonic() - pass_started + settings.VLM_TIMEOUT > 2 * settings.VLM_TIMEOUT:
+                # Без срока задачи весь проход — не дольше двух VLM_TIMEOUT.
+                logger.info("«Что изображено»: время прохода вышло, остальные листы пропущены")
+                return
             started = time.monotonic()
-            try:
-                image = self._open(sheet["image_ref"], sheet["page"])
-                if image is None:
+            # Остаток бюджета листа — на свои часы, без ожидания мест на
+            # видеокарте, как у дочитывания D4.
+            with gpu_gate.budget_clock():
+                if sheet["until"] is not None and sheet["until"] - gpu_gate.budget_now() < settings.VLM_TIMEOUT:
+                    logger.info("«Что изображено» пропущено для %s: бюджет листа исчерпан", key[0])
                     continue
-                image = drawing_vision.reproduce(image, sheet["angle"], sheet["turn"])
-                result = what_drawn.parse(self.qwen.read_what_drawn(image, prompt), dims)
-            except (SoftTimeLimitExceeded, deadline.Cancelled):
-                raise
-            except Exception as exc:  # noqa: BLE001 — описание листа не роняет документ
-                logger.error("«Что изображено» не прочитано: %s", exc)
-                continue
+                try:
+                    image = self._open(sheet["image_ref"], sheet["page"])
+                    if image is None:
+                        continue
+                    image = drawing_vision.reproduce(image, sheet["angle"], sheet["turn"])
+                    result = what_drawn.parse(self.qwen.read_what_drawn(image, prompt), dims,
+                                              what_drawn.sheet_numbers(fields))
+                except (SoftTimeLimitExceeded, deadline.Cancelled):
+                    raise
+                except Exception as exc:  # noqa: BLE001 — описание листа не роняет документ
+                    logger.error("«Что изображено» не прочитано: %s", exc)
+                    continue
             if result is None:
                 continue
             payload = dict(fragment.content.structured_payload or {})
@@ -1898,6 +1915,10 @@ class DrawingProcessor:
 # ===========================================================================
 # Поля
 # ===========================================================================
+
+# «Что изображено» (DRAWING_WHAT_DRAWN): не больше стольких листов на документ.
+WHAT_DRAWN_SHEETS_MAX = 6
+
 
 def _is_text_document(fragments: List[Fragment], metadata: Dict[str, Any]) -> bool:
     """

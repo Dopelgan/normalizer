@@ -113,15 +113,39 @@ def test_invented_number_in_meaning_dropped():
     assert [r["value"] for r in parsed(answer=answer)["dimensions"]] == ["⌀40", "R5"]
 
 
-def test_link_label_preferred_over_model():
+def _linked(label, said, confidence="high"):
     fields = copy.deepcopy(FIELDS)
-    fields[1]["link"] = {"target_label": "длина втулки", "target_bbox": [0, 0, 1, 1], "method": "vector"}
+    fields[1]["link"] = {"target_label": label, "target_bbox": [0, 0, 1, 1], "method": "vector"}
     prompt, dims = what_drawn.build_prompt(fields)
-    assert "выноска ведёт к: длина втулки" in prompt
     answer = copy.deepcopy(ANSWER)
-    answer["dimensions"][1]["measures"] = "высота"
-    rows = what_drawn.parse(answer, dims)["dimensions"]
-    assert {"value": "120", "measures": "длина втулки", "feature": None} in rows
+    answer["dimensions"][1]["measures"] = said
+    answer["dimensions"][1]["confidence"] = confidence
+    return prompt, [r for r in what_drawn.parse(answer, dims)["dimensions"] if r["value"] == "120"]
+
+
+def test_link_label_used_when_model_agrees():
+    prompt, rows = _linked("длина корпуса", "длина втулки на главном виде")
+    assert "выноска ведёт к: длина корпуса" in prompt
+    assert rows == [{"value": "120", "measures": "длина корпуса", "feature": None}]
+
+
+def test_link_label_disagreeing_with_model_drops_meaning():
+    _, rows = _linked("высота стенки", "длина втулки")
+    assert rows == []
+
+
+def test_link_label_against_sign_drops_meaning():
+    _, rows = _linked("диаметр и длина", "длина втулки")    # тот же род, но «диаметр» у числа без ⌀
+    assert rows == []
+
+
+def test_link_label_without_model_meaning_drops_meaning():
+    _, rows = _linked("длина корпуса", "длина втулки", confidence="low")
+    assert rows == []
+
+
+def test_model_meaning_kept_without_link():
+    assert {"value": "120", "measures": "длина втулки на главном виде", "feature": None} in parsed()["dimensions"]
 
 
 @pytest.mark.parametrize("answer", [None, "текст", {}, {"object": "", "views": [], "dimensions": []}])
@@ -234,3 +258,89 @@ def test_flag_off_output_identical(temp_storage, monkeypatch):
     assert "what_drawn" not in off.content.structured_payload
     # Пустой ответ при включённом флаге даёт тот же фрагмент, что и выключенный флаг.
     assert off.model_dump() == empty.model_dump()
+
+
+# ------------------------------------------------------------ потолки и срок
+
+def test_prompt_caps_dimensions_signed_first_and_truncates():
+    plain = [{"category": "size", "value": str(100 + n), "bbox": [0.1, 0.1, 0.2, 0.2]} for n in range(120)]
+    signed = [{"category": "size", "value": "⌀" + "9" * 90, "bbox": [0.1, 0.1, 0.2, 0.2],
+               "link": {"target_label": "диаметр " * 30}}]
+    prompt, dims = what_drawn.build_prompt(plain + signed)
+    assert len(dims) == what_drawn.DIMS_MAX
+    assert dims[-1]["value"] == "⌀" + "9" * 90          # знак — первым в очереди, значение целиком
+    line = next(x for x in prompt.splitlines() if x.startswith(dims[-1]["id"] + ":"))
+    assert "9" * 90 not in line and len(line) < 260
+
+
+def test_parse_caps_and_drops_invented_numbers_in_texts():
+    answer = copy.deepcopy(ANSWER)
+    answer["object"] = "Втулка длиной 120. Весит 7 кг. " + "очень " * 200
+    answer["views"] = [{"name": f"вид {n}", "shows": "сбоку"} for n in range(20)]
+    answer["views"][0]["shows"] = "сбоку. Толщина 9 мм."
+    answer["dimensions"].insert(0, {"value_id": ["v1"], "measures": "диаметр", "confidence": "high"})
+    answer["dimensions"][1]["feature_id"] = {"id": "f1"}
+    result = parsed(answer=answer)
+    assert result["object"].startswith("Втулка длиной 120.") and "7 кг" not in result["object"]
+    assert len(result["object"]) <= what_drawn.OBJECT_MAX
+    assert len(result["views"]) == what_drawn.VIEWS_MAX
+    assert result["views"][0]["shows"] == "сбоку."
+    assert result["dimensions"][0] == {"value": "⌀40", "measures": "наружный диаметр втулки", "feature": None}
+
+
+def test_sheet_numbers_allow_title_digits_in_object():
+    fields = [*FIELDS, {"category": "title_block", "value": "Обозначение: АБВГ.301", "bbox": [0, 0, 1, 1]}]
+    answer = dict(ANSWER, object="Втулка АБВГ.301 длиной 120.")
+    _, dims = what_drawn.build_prompt(fields)
+    assert what_drawn.parse(copy.deepcopy(answer), dims, what_drawn.sheet_numbers(fields))["object"] == \
+        "Втулка АБВГ.301 длиной 120."
+
+
+def _drawing(n):
+    from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
+
+    return Fragment(
+        fragment_id=f"doc-d{n}", type="drawing",
+        content=Content(image_ref=f"assets/doc/s{n}.png",
+                        structured_drawing_fields=[DrawingField(**f) for f in FIELDS[:3]]),
+        position=Position(page=n, bbox=[0.0, 0.0, 1.0, 1.0], order=n), confidence=0.9, completeness=1.0,
+        provenance=Provenance(method="mineru_image", strategy_level=2, source="vector_pdf"),
+    )
+
+
+def _pass(temp_storage, monkeypatch, sheets, until_in):
+    import time
+
+    from core.drawing_processor import DrawingProcessor
+
+    monkeypatch.setattr(settings, "VLM_TIMEOUT", 30)
+    data = BytesIO()
+    Image.new("RGB", (400, 300), "white").save(data, format="PNG")
+    fragments = []
+    for n in range(1, sheets + 1):
+        temp_storage.write_file(f"assets/doc/s{n}.png", data.getvalue())
+        fragments.append(_drawing(n))
+    qwen = WhatQwen(ANSWER)
+    processor = DrawingProcessor(temp_storage, qwen=qwen)
+    processor._what_drawn_sheets = {
+        (f"assets/doc/s{n}.png", n): {"image_ref": f"assets/doc/s{n}.png", "page": 1, "angle": 0.0, "turn": 0,
+                                      "until": time.monotonic() + until_in}
+        for n in range(1, sheets + 1)
+    }
+    processor._what_drawn_pass(fragments)
+    return qwen, fragments
+
+
+def test_pass_counts_time_spent_after_snapshot(temp_storage, monkeypatch):
+    # Бюджет листа ушёл на дочитывание D4 после записи: остатка меньше VLM_TIMEOUT.
+    qwen, fragments = _pass(temp_storage, monkeypatch, 1, until_in=5)
+    assert qwen.calls == [] and "what_drawn" not in (fragments[0].content.structured_payload or {})
+
+
+def test_pass_reads_at_most_six_sheets(temp_storage, monkeypatch):
+    from core import deadline
+
+    monkeypatch.setattr(deadline, "remaining", lambda: 10_000)
+    qwen, fragments = _pass(temp_storage, monkeypatch, 8, until_in=600)
+    assert len(qwen.calls) == 6
+    assert sum("what_drawn" in (f.content.structured_payload or {}) for f in fragments) == 6
