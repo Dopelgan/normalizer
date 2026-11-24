@@ -1752,7 +1752,7 @@ class DrawingProcessor:
                 confidence=_HANDWRITTEN if by_hand else _FROM_REGION,
                 label=margin_columns.label(key),
             ))
-        stats: Dict[str, Any] = margin_columns.merge(fields, reads)
+        stats: Dict[str, Any] = margin_columns.merge(fields, reads, geometry["strip"])
         stats["designation"] = margin_columns.check_designation(fields, parsed["designation"])
         stats["status"] = "read"
         payload["margin_columns"] = stats

@@ -281,7 +281,8 @@ def _with_reading(field: Dict[str, Any], source: str, value: str) -> List[Dict[s
     return readings
 
 
-def merge(fields: List[Dict[str, Any]], reads: List[Dict[str, Any]]) -> Dict[str, int]:
+def merge(fields: List[Dict[str, Any]], reads: List[Dict[str, Any]],
+          strip: Optional[Sequence[float]] = None) -> Dict[str, int]:
     """
     Поля граф (`reads`, с рамкой своей клетки) сводятся с полями листа на месте.
     Место графы известно из геометрии, поэтому поле этой графы в любом
@@ -298,7 +299,7 @@ def merge(fields: List[Dict[str, Any]], reads: List[Dict[str, Any]]) -> Dict[str
       а в клетке графы — «09.2025». Вырезка клетки — прочтение именно графы.
     * Графы на листе не было — поле добавляется (`added`).
     """
-    stats = {"added": 0, "confirmed": 0, "extended": 0, "conflict": 0}
+    stats = {"added": 0, "confirmed": 0, "extended": 0, "conflict": 0, "dropped": 0}
     used: set = set()
     for read in reads:
         name, value = split_value(read["value"])
@@ -342,7 +343,35 @@ def merge(fields: List[Dict[str, Any]], reads: List[Dict[str, Any]]) -> Dict[str
         old["readings"] = _with_reading(old, SOURCE, read["value"])
         old["bbox"] = list(read["bbox"])
         stats["extended"] += 1
+    if strip is not None:
+        stats["dropped"] = _drop_outside(fields, used, strip)
     return stats
+
+
+_MARGIN_FOLDED = frozenset(title_block._fold(label(key)) for key in keys())
+
+
+def _drop_outside(fields: List[Dict[str, Any]], used: set, strip: Sequence[float]) -> int:
+    """
+    Поле с подписью графы подшивки, которое не сведено с чтением графы и
+    стоит не в полосе поля подшивки, — значение чужой графы: на листе
+    ТАДУ 305179.001.01.01.003 «Подп. и дата: 20.06.2025» с рамкой штампа —
+    даты граф «Дата» основной надписи. Графы прочитаны с клетки, поэтому
+    такое поле снимается. Индексы `used` — поля, уже сведённые с графами.
+    """
+    right = float(strip[2])
+    drop = []
+    for n, item in enumerate(fields):
+        if n in used or item.get("category") != "title_block":
+            continue
+        if title_block._fold(split_value(item.get("value", ""))[0]) not in _MARGIN_FOLDED:
+            continue
+        box = item.get("bbox") or []
+        if len(box) == 4 and (float(box[0]) + float(box[2])) / 2 > right:
+            drop.append(n)
+    for n in reversed(drop):
+        fields.pop(n)
+    return len(drop)
 
 
 def check_designation(fields: List[Dict[str, Any]], designation: str) -> str:

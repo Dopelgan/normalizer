@@ -254,3 +254,22 @@ def test_compose_rotates_strip_and_box():
 ])
 def test_parse(raw, expected):
     assert margin_columns.parse(raw)["columns"] == expected
+
+
+def test_stamp_date_under_margin_label_is_dropped():
+    """
+    ТАДУ 305179.001.01.01.003: «Подп. и дата: 20.06.2025» с рамкой штампа —
+    даты граф «Дата» основной надписи; графы подшивки прочитаны с клетки.
+    """
+    strip = [0.0, 0.03, 0.057, 0.97]
+    fields = [
+        {"category": "title_block", "value": "Подп. и дата: 20.06.2025 (рукописно)", "bbox": [0.54, 0.76, 0.93, 0.96]},
+        {"category": "title_block", "value": "Разраб.: Иванов", "bbox": [0.55, 0.86, 0.6, 0.88]},
+    ]
+    reads = [{"category": "title_block", "value": "Инв. № подл.: 2068-06", "bbox": [0.03, 0.89, 0.057, 0.97]}]
+    stats = margin_columns.merge(fields, reads, strip)
+    assert [f["value"] for f in fields] == ["Разраб.: Иванов", "Инв. № подл.: 2068-06"]
+    assert stats["dropped"] == 1
+    # Без полосы — прежнее поведение: ничего не снимается.
+    again = [dict(fields[0]), {"category": "title_block", "value": "Подп. и дата: 1.1.24", "bbox": [0.6, 0.8, 0.9, 0.9]}]
+    assert margin_columns.merge(again, [])["dropped"] == 0 and len(again) == 2
