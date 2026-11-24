@@ -84,8 +84,9 @@ def test_ocr_only_value_enters_only_when_model_reads_the_same():
     assert stats["added"] == 1 and stats["reread"] == 2
 
 
-def test_low_score_and_stamp_lines_are_not_candidates():
-    lines = [line("315", [0.4, 0.3, 0.42, 0.32], score=0.5), line("3,74", [0.82, 0.86, 0.86, 0.88], region="stamp")]
+def test_low_score_stamp_and_bare_numbers_are_not_candidates():
+    lines = [line("315", [0.4, 0.3, 0.42, 0.32], score=0.5), line("3,74", [0.82, 0.86, 0.86, 0.88], region="stamp"),
+             line("16", [0.5, 0.5, 0.52, 0.52]), line("1221", [0.6, 0.6, 0.63, 0.62])]
     assert ocr_hints.candidates([], lines) == []
 
 

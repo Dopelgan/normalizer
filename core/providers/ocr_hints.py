@@ -61,6 +61,10 @@ _HAND = re.compile(r"\s*\((?:рукописно|из OCR[^)]*)\)\s*$", re.IGNORE
 # Что дочитывать из OCR: короткая запись величины или знака, а не слово.
 _MEASURE = re.compile(r"^(?:\d+\s*(?:отв\.?|x)\s*)?(?:[⌀RМMG]|Ra\s?|Rz\s?|S)?\s?\d+(?:[.,]\d+)?"
                       r"(?:\s?[±+\-]\s?\d+(?:[.,]\d+)?)*\*?$", re.IGNORECASE)
+# Голое целое число на листе — номер вывода, провода, позиции или размер:
+# без знака величины («⌀», «R», «M», «±», «*», десятичная запятая) OCR-строка
+# не дочитывается. На схемах Э4 такие числа давали десятки ложных «размеров».
+_MARKED = re.compile(r"[⌀ØRrМMS±*]|\d[.,]\d")
 _INVENTORY = re.compile(r"^\d{3,5}\s?-\s?\d{2,3}$")
 _DESIGNATION = re.compile(r"^[А-ЯЁA-Z]{2,5}\s?\d{6}\.\d{3}(?:\.\d{2,3})*(?:\s?-\d{2,3})?(?:\s?[А-ЯЁA-Z]{1,3}\d?)?$")
 # Поле с рамкой больше этого (доли листа) — область, а не место надписи.
@@ -258,7 +262,7 @@ def candidates(fields: Sequence[Dict[str, Any]], lines: Sequence[Dict[str, Any]]
         text = " ".join(str(line["text"]).split())
         if line.get("region") != "field" or float(line.get("score") or 0) < MIN_SCORE:
             continue
-        if not _MEASURE.match(text) or norm(text) in known:
+        if not _MEASURE.match(text) or not _MARKED.search(text) or norm(text) in known:
             continue
         if any(_overlap(line["box"], f["bbox"]) for f in placed):
             continue
