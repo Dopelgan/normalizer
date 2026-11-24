@@ -320,8 +320,10 @@ def fill_empty(fields: List[Dict[str, Any]], lines: Sequence[Dict[str, Any]], st
     for label, region, pattern in wanted:
         if label in labels:
             continue
+        values = {norm(value_of(f.get("value"))) for f in fields}
         found = [line for line in lines if line.get("region") == region
-                 and float(line.get("score") or 0) >= MIN_SCORE and pattern.match(" ".join(line["text"].split()))]
+                 and float(line.get("score") or 0) >= MIN_SCORE and pattern.match(" ".join(line["text"].split()))
+                 and norm(line["text"]) not in values]
         if not found:
             continue
         best = max(found, key=lambda line: (line["box"][2] - line["box"][0]) * (line["box"][3] - line["box"][1]))
