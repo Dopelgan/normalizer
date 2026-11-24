@@ -287,3 +287,37 @@ def test_whole_thickness_bare_55_stays_starred_55_rewritten():
     sense_rules.apply([sheet])
     values = [f.value for f in sheet.content.structured_drawing_fields]
     assert values[1:] == ["55", "S5*"]
+
+
+# ---------------------------------------------------------------------------
+# Резьба, которой на листе нет (метка шва, обозначение элемента схемы)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["2M3", "2M", "2N*1", "4№1"])
+def test_weld_mark_read_as_thread_becomes_callout(value):
+    """Пробка ЭК150 СБ: метка шва «2№3» приходила резьбой «2M3»."""
+    sheet = drawing([field(value, [0.7, 0.2, 0.75, 0.23], category="thread")])
+    stats = sense_rules.apply([sheet])
+    (mark,) = sheet.content.structured_drawing_fields
+    assert mark.category == "callout" and mark.value == value and mark.needs_review
+    assert stats["thread_weld"] == 1
+
+
+@pytest.mark.parametrize("value", ["M1", "M11", "М2", "M1(2)"])
+def test_scheme_designator_is_not_a_thread(value):
+    """Схема Э4: «M1» — двигатель по ГОСТ 2.710, а не резьба М1."""
+    sheet = drawing([field(value, [0.3, 0.3, 0.32, 0.32], category="thread")])
+    sheet.content.structured_payload = {"sheet_type": "scheme"}
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].category == "position"
+
+
+@pytest.mark.parametrize("value, sheet_type", [
+    ("M1", "detail"), ("M6", "assembly"), ("M6-6H", "scheme"), ("M20x1,5", "scheme"),
+    ("2 отв. M3", "detail"), ("2 M3", "detail"), ("G1/2", "detail"),
+])
+def test_real_threads_stay(value, sheet_type):
+    sheet = drawing([field(value, [0.3, 0.3, 0.32, 0.32], category="thread")])
+    sheet.content.structured_payload = {"sheet_type": sheet_type}
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].category == "thread"

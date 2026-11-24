@@ -464,10 +464,44 @@ def _material_texts(drawings: Sequence[Fragment]) -> List[str]:
     return texts
 
 
+# Метка сварного шва ГОСТ 2.312 «2№3» (два места, шов №3), прочитанная
+# резьбой: «2M3», «2M», «2N*1». Резьба так не пишется: количество отверстий
+# стоит отдельно («2 отв. M3»), а знак «№» модель отдаёт буквой M или N.
+_WELD_AS_THREAD = re.compile(r"^\d+[MМNН№]\*?\d{0,2}$")
+# Позиционное обозначение элемента на схеме ГОСТ 2.710: «M1» — двигатель,
+# «M11», «M1(2)». У резьбы М1 на схеме места нет: схема изделия не чертёж.
+_SCHEME_DESIGNATOR = re.compile(r"^[MМ]\d{1,2}(?:\(\d+\))?$")
+
+
+def _thread_rule(items: List[_Item], stats: Dict[str, int]) -> None:
+    """
+    Резьба, которой на листе нет: метка шва «2№3» на сборке пробки ЭК150 и
+    обозначения элементов «M1», «M11» на электрических схемах Э4 приходили
+    резьбой и попадали в индекс как «резьбы листа». Значение не меняется,
+    меняется только род: метка шва — выноска, обозначение — позиция.
+    """
+    for item in items:
+        field = item.field
+        if item.gone or field.category != "thread":
+            continue
+        value = " ".join(str(field.value or "").split())
+        payload = item.fragment.content.structured_payload or {}
+        if _WELD_AS_THREAD.match(value):
+            field.category = "callout"
+            field.needs_review = True
+            field.link = None
+            stats["thread_weld"] += 1
+        elif payload.get("sheet_type") == "scheme" and _SCHEME_DESIGNATOR.match(value):
+            field.category = "position"
+            field.link = None
+            stats["thread_designator"] += 1
+
+
 def apply_page(drawings: List[Fragment]) -> Dict[str, int]:
     """Правила для чертёжных фрагментов одной страницы; правит их на месте."""
     stats = {"thickness": 0, "thickness_merged": 0, "roughness_dropped": 0,
-             "roughness_to_size": 0, "roughness_review": 0, "links_dropped": 0}
+             "roughness_to_size": 0, "roughness_review": 0, "links_dropped": 0,
+             "thread_weld": 0, "thread_designator": 0}
     t = thickness(_material_texts(drawings))
     items = [
         _Item(fragment, field, reading_reconcile._is_whole_sheet(fragment))
@@ -475,6 +509,7 @@ def apply_page(drawings: List[Fragment]) -> Dict[str, int]:
         for field in list(fragment.content.structured_drawing_fields or [])
     ]
     _roughness_rule(items, t, stats)
+    _thread_rule(items, stats)
     if t is not None:
         _thickness_rule(items, t, stats)
         _deduplicate_thickness(items, t, stats)
