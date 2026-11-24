@@ -525,6 +525,15 @@ class DrawingProcessor:
             # разрешении. Здесь — после сведения прочтений листа и до того,
             # как поля уйдут соседним фрагментам страницы и привязке к виду.
             fields = self._reread_disputed(layout.image, fields, payload, budget_started)
+        if settings.DRAWING_FIELDS_FROM_TEXT:
+            # Строки текста листа и таблиц, которых нет в полях (RC2). Место —
+            # после всех проходов, дающих поля, и после выбора спорных рамок:
+            # у новых полей рамка «весь лист», дочитывать их нечем, и вызовов
+            # модели они не добавляют.
+            extra = _fields_from_text(fields, payload.get("transcript_lines"), payload.get("tables"))
+            if extra:
+                fields.extend(extra)
+                payload["fields_from_text"] = len(extra)
         if settings.DRAWING_CONSENSUS_READS > 1:
             # Согласие N чтений листа нужно только выбору спорных полей выше;
             # в контракт поля оно не выходит (у D3 там свои значения).
@@ -1964,7 +1973,10 @@ class DrawingProcessor:
                 logger.info("«Что изображено»: прочитано %d листов документа, остальные пропущены", len(done))
                 return
             done.add(key)
-            fields = [f.model_dump() for f in fragment.content.structured_drawing_fields]
+            # Поля из текста листа (DRAWING_FIELDS_FROM_TEXT) места не знают:
+            # в запрос «что изображено» идут только надписи, прочитанные на месте.
+            fields = [f.model_dump() for f in fragment.content.structured_drawing_fields
+                      if f.provenance != TEXT_PROVENANCE]
             prompt, dims = what_drawn.build_prompt(fields)
             if not dims:
                 continue
@@ -2308,6 +2320,8 @@ def _deduplicate(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     Одна надпись, прочитанная и на листе, и в области, — одно поле.
     Остаётся то, у которого выше уверенность.
     """
+    if settings.DRAWING_KEEP_REPEATS:
+        return _deduplicate_by_place(fields)
     best: Dict[tuple, Dict[str, Any]] = {}
     order: List[tuple] = []
     for field in fields:
@@ -2318,6 +2332,175 @@ def _deduplicate(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif field["confidence"] > best[key]["confidence"]:
             best[key] = field
     return [best[key] for key in order]
+
+
+# Повтор одной надписи (DRAWING_KEEP_REPEATS): центры рамок ближе этого по
+# каждой оси (доля стороны листа) — одно место.
+REPEAT_DISTANCE = 0.05
+
+
+def _place_box(bbox: Any) -> Optional[Tuple[float, float, float, float]]:
+    """Рамка поля, если она указывает место; рамка «весь лист» места не знает."""
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = (float(v) for v in bbox)
+    except (TypeError, ValueError):
+        return None
+    if x2 <= x1 or y2 <= y1 or (x2 - x1 >= 0.99 and y2 - y1 >= 0.99):
+        return None
+    return x1, y1, x2, y2
+
+
+def _same_place(a: Any, b: Any) -> bool:
+    """
+    Одно ли место у двух прочтений. Без места — одно (не различить). Центр
+    одной рамки внутри другой — одно: поле штампа с рамкой всей области и
+    та же надпись листа с точной рамкой. Иначе — центры ближе REPEAT_DISTANCE.
+    """
+    box_a, box_b = _place_box(a), _place_box(b)
+    if box_a is None or box_b is None:
+        return True
+    ca = ((box_a[0] + box_a[2]) / 2, (box_a[1] + box_a[3]) / 2)
+    cb = ((box_b[0] + box_b[2]) / 2, (box_b[1] + box_b[3]) / 2)
+    inside = lambda c, box: box[0] <= c[0] <= box[2] and box[1] <= c[1] <= box[3]  # noqa: E731
+    if inside(ca, box_b) or inside(cb, box_a):
+        return True
+    return abs(ca[0] - cb[0]) <= REPEAT_DISTANCE and abs(ca[1] - cb[1]) <= REPEAT_DISTANCE
+
+
+def _deduplicate_by_place(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Как `_deduplicate`, но повтор — та же категория и значение в одном месте
+    (`_same_place`). Размер, проставленный на двух видах, остаётся дважды:
+    в эталоне так 59 надписей на 22 листах.
+    """
+    kept: List[Dict[str, Any]] = []
+    groups: Dict[tuple, List[int]] = {}
+    for field in fields:
+        key = (field["category"], field["value"].strip().lower())
+        hit = next((n for n in groups.get(key, ()) if _same_place(kept[n].get("bbox"), field.get("bbox"))),
+                   None)
+        if hit is None:
+            groups.setdefault(key, []).append(len(kept))
+            kept.append(field)
+        elif field["confidence"] > kept[hit]["confidence"]:
+            kept[hit] = field
+    return kept
+
+
+# ------------------------------------------- поля из текста листа и таблиц
+# DRAWING_FIELDS_FROM_TEXT: строки прохода «весь текст листа» и строки
+# таблиц листа читаются лучше, чем надписи прохода по категориям, но в поля
+# не попадали — на 22 эталонных листах 187 надписей были в тексте и не были
+# в полях. Здесь они становятся полями без вызовов модели: место неизвестно
+# (рамка — весь лист), уверенность ниже порога подтверждения (запись скажет
+# «сверить с чертежом»), источник — `full_page_ocr`.
+TEXT_PROVENANCE = "full_page_ocr"
+TEXT_CONFIDENCE = 0.5
+TEXT_MAX_CHARS = 400
+TEXT_FIELDS_MAX = 400
+_WHOLE_SHEET = [0.0, 0.0, 1.0, 1.0]
+# Сравнение надписей: без пробелов и знаков, латиница-двойник — кириллицей.
+_LOOKALIKE = str.maketrans("aceopxykmhtb", "асеорхукмнтв")
+_LOOSE = re.compile(r"[^0-9a-zа-яё⌀±°№]")
+_LABEL = re.compile(r"^[^:]{2,25}:\s*(.+)$")
+# Обозначение элемента схемы или позиция: «R1», «HL4, HL6...HL18», «ВП4,5», «12».
+_DESIGNATOR = re.compile(
+    r"^(?:\d{1,3}|[A-ZА-ЯЁ]{1,4}\d{0,3}(?:\.\d+)?"
+    r"(?:\s*(?:,|\.\.\.|…|-|–)\s*[A-ZА-ЯЁ]{0,4}\d+(?:\.\d+)?)*)$"
+)
+# Графы основной надписи (ГОСТ 2.104) и децимальное обозначение документа.
+_STAMP_CAPTION = re.compile(
+    r"^(?:Разраб|Пров|Т\.?\s?контр|Н\.?\s?контр|Утв|Лит|Масса|Масштаб|Листов|Лист|Изм|"
+    r"№\s?докум|Подп|Дата|Инв\.?\s?№|Взам\.?\s?инв|Перв\.?\s?примен|Справ\.?\s?№|Копировал|Формат)"
+    r"(?![а-яё])",
+    re.IGNORECASE,
+)
+_DESIGNATION = re.compile(r"^[А-ЯЁA-Z]{2,4}[.\s]?\d{6}\.\d{3}")
+
+
+def _loose(text: str) -> str:
+    return _LOOSE.sub("", str(text).lower().translate(_LOOKALIKE))
+
+
+def _text_category(text: str, first_cell: bool) -> str:
+    """Категория строки текста — только правилами, без модели."""
+    if first_cell and _DESIGNATOR.match(text):
+        return "position"
+    if _category_strict():
+        decisive = vector_drawing.decisive_category(text)
+        if decisive is not None:
+            return decisive
+    by_rules, _ = vector_drawing.classify(text)
+    if by_rules == "note" and (_STAMP_CAPTION.match(text) or _DESIGNATION.match(text)):
+        return "title_block"
+    return by_rules
+
+
+def _text_cells(lines: Any, tables: Any):
+    """(ячейка, первая ли в строке таблицы) из текста листа и таблиц листа."""
+    for line in lines or []:
+        cells = [c for c in str(line).split(" | ")]
+        for n, cell in enumerate(cells):
+            yield cell, len(cells) > 1 and n == 0, ()
+    for table in tables or []:
+        if not isinstance(table, dict) or table.get("kind") != drawing_vision.KIND_TABLE:
+            continue
+        headers = tuple(_loose(h) for h in (table.get("headers") or []) if str(h).strip())
+        for row in table.get("rows") or []:
+            if isinstance(row, dict):
+                row = list(row.values())
+            elif isinstance(row, str):
+                row = row.split(" | ")
+            for n, cell in enumerate(row or []):
+                yield str(cell if cell is not None else ""), n == 0, headers
+
+
+def _fields_from_text(
+    fields: List[Dict[str, Any]], lines: Any, tables: Any,
+) -> List[Dict[str, Any]]:
+    """
+    Новые поля из строк текста листа и ячеек таблиц, которых в полях нет.
+    Ячейка пропускается, если она уже есть в поле (с подписью графы и без
+    неё), если короткая ячейка совпадает с полем целиком или если поле
+    занимает почти всю ячейку; повторы ячеек сводятся в одну.
+    """
+    known: List[str] = []
+    for field in fields:
+        value = str(field.get("value") or "")
+        known.append(_loose(value))
+        labelled = _LABEL.match(value)
+        if labelled:
+            known.append(_loose(labelled.group(1)))
+    known = [k for k in known if k]
+    exact = set(known)
+    seen: set = set()
+    added: List[Dict[str, Any]] = []
+    for cell, first_cell, headers in _text_cells(lines, tables):
+        text = drawing_text.normalize(cell).strip()
+        if not text or len(text) > TEXT_MAX_CHARS:
+            continue
+        readable, _ = drawing_text.looks_like_text(text)
+        key = _loose(text)
+        if not readable or not key or key in seen or key in headers:
+            continue
+        if len(key) < 2 and not first_cell:
+            continue
+        if key in exact:
+            continue
+        if len(key) > 3 and any(key in k for k in known):
+            continue
+        if any(len(k) >= max(4, 0.6 * len(key)) and k in key for k in known):
+            continue
+        seen.add(key)
+        field = _field(category=_text_category(text, first_cell), text=text,
+                       bbox=list(_WHOLE_SHEET), confidence=TEXT_CONFIDENCE)
+        field["provenance"] = TEXT_PROVENANCE
+        added.append(field)
+        if len(added) >= TEXT_FIELDS_MAX:
+            break
+    return added
 
 
 # Графы поля подшивки (ГОСТ 2.104, графы 19–25): в основной надписи их нет.
