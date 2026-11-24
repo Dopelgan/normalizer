@@ -394,3 +394,29 @@ class TestEskdSpecSheets:
 
 def spec_block_with(block):
     return block
+
+
+def test_sheet_with_own_table_is_not_read_twice(monkeypatch):
+    """Лист 1 спецификации не дочитывает лист 2, у которого своя таблица MinerU."""
+    monkeypatch.setattr(settings, "TABLE_VLM_ESKD_SPEC", True)
+    first = spec_block()
+    first.table_data["rows"].append(["A", "", "19", "ТАДУ 687000.001.003", "Панель монтажная", "*2", "", ""])
+    second = spec_block().model_copy(update={"page": 2})
+    read_pages = []
+
+    def reader(b):
+        read_pages.append(b.page)
+        return SPEC_QWEN
+
+    layer = TextLayer(pages={1: spec_layer().pages[1], 2: [line_on(2)]}, page_count=2)
+    blocks, _ = reconcile_with_text_layer([first, second], layer, source=OCR_LAYER, table_reader=reader)
+    assert read_pages == [1, 2]
+    first_rows = next(b for b in blocks if b.type == "table" and b.page == 1).table_data["rows"]
+    assert not any("Панель" in " ".join(r) for r in first_rows)
+
+
+def line_on(page):
+    from tests.unit.test_mangled_tables import line
+
+    item = line("Крышка", 0.5, 0.6)
+    return item.model_copy(update={"page": page}) if hasattr(item, "model_copy") else item

@@ -791,3 +791,20 @@ class TestStampAllPages:
         qwen = FakeQwen(block=title_block.parse({"fields": {"Обозначение": "X"}}))
         assert DrawingProcessor(storage, qwen=qwen)._stamp_pages(fragments, {"source_path": SHEET_URI}) == []
         assert qwen.asked == []
+
+    def test_spec_page_read_by_vision_counts_as_sheet(self, storage, monkeypatch):
+        """Таблица спецификации, прочитанная моделью, штампа не содержит — страница всё равно лист ЕСКД."""
+        from core.models.contract import TableData
+
+        monkeypatch.setattr(settings, "DRAWING_TITLE_BLOCK_PASS", True)
+        monkeypatch.setattr(settings, "DRAWING_VISION_ENABLED", False)
+        spec = Fragment(
+            fragment_id="doc-1-frag-006", type="table",
+            content=Content(table_data=TableData(headers=["Формат", "Поз.", "Обозначение", "Наименование"],
+                                                 rows=[["A4", "19", "ТАДУ 687000.001.003", "Панель монтажная"]])),
+            position=Position(page=3, bbox=[0.1, 0.05, 0.95, 0.8], order=1), confidence=0.8, completeness=1.0,
+            provenance=Provenance(method="vlm_escalation", strategy_level=6, source="scanned_pdf"),
+        )
+        qwen = FakeQwen(block=title_block.parse({"fields": {"Обозначение": "ТАДУ 687000.001", "Лист": "3"}}))
+        out = DrawingProcessor(storage, qwen=qwen)._stamp_pages([spec], {"source_path": SHEET_URI})
+        assert [s.position.page for s in out] == [3]

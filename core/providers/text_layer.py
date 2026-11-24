@@ -830,6 +830,9 @@ def reconcile_with_text_layer(
     # страницы, а на страницах-продолжениях — пустую рамку. Строки из такой
     # рамки иначе уезжают в индекс плоским текстом второй копией.
     parsed_tables = _table_index(blocks)
+    # Страницы со своей таблицей: продолжение спецификации на них не читается
+    # чужой вырезкой (TABLE_VLM_ESKD_SPEC). Пополняется прочитанными листами.
+    spec_pages: Set[int] = {b.page for b in blocks if b.type == "table" and _carries_own_text(b)}
 
     for page in pages:
         page_blocks = by_page.get(page, [])
@@ -893,7 +896,7 @@ def reconcile_with_text_layer(
                 # значения выправляются по слою.
                 replacements, kept = _fix_table(
                     block, matched, stats, vocab, exact=source.exact, turn=turn,
-                    table_reader=table_reader, page_count=layer.page_count,
+                    table_reader=table_reader, page_count=layer.page_count, skip_pages=spec_pages,
                 )
                 extra_blocks.extend(replacements)
                 leftovers.extend(_confident(kept, line_floor, stats))
@@ -1323,6 +1326,7 @@ def _fix_table(
     turn: int = 0,
     table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]] = None,
     page_count: int = 0,
+    skip_pages: Optional[Set[int]] = None,
 ) -> Tuple[List[ParsedBlock], List[TextLine]]:
     """
     Содержимое ячеек — по строкам слоя. Возвращает блоки, которыми таблицу
@@ -1366,8 +1370,10 @@ def _fix_table(
             # Продолжение — листы после этого: каждый читается своей вырезкой
             # в той же рамке (форма 2а та же), таблица — на своей странице.
             # Прочитан хоть один — строки MinerU из продолжения не нужны.
-            following = _spec_continuation_pages(block, table_reader, page_count) if rest else []
-            if following:
+            following = _spec_continuation_pages(block, table_reader, page_count, skip_pages) if rest else []
+            if following or (skip_pages is not None and block.page + 1 in skip_pages):
+                # Продолжение прочитано своими листами или у следующего листа
+                # своя таблица: строки MinerU здесь — искажённые повторы.
                 rest = []
             block.table_data = table_vlm.clean_spec(dict(read, rows=list(read["rows"]) + _spec_rows(rest)))
             block.table_html = None
@@ -2106,12 +2112,21 @@ _SPEC_MIN_ROWS = 5
 _DIGIT_RUN = re.compile(r"\d+")
 
 
-def _spec_continuation_pages(block: ParsedBlock, table_reader, page_count: int) -> List[ParsedBlock]:
-    """Листы спецификации после `block.page` — своими вырезками, пока читаются строки."""
+def _spec_continuation_pages(block: ParsedBlock, table_reader, page_count: int,
+                             skip_pages: Optional[Set[int]] = None) -> List[ParsedBlock]:
+    """
+    Листы спецификации после `block.page` — своими вырезками, пока читаются
+    строки. Лист со своей таблицей MinerU (или уже прочитанный) не читается:
+    его таблица придёт своим путём, а второе чтение было бы повтором.
+    """
     from core.providers import table_vlm
 
+    skip = skip_pages if skip_pages is not None else set()
     found: List[ParsedBlock] = []
     for page in range(block.page + 1, min(page_count, block.page + _SPEC_MAX_FOLLOWING) + 1):
+        if page in skip:
+            break
+        skip.add(page)
         # Таблица MinerU остаётся у вырезки: по ней читатель узнаёт спецификацию.
         piece = block.model_copy(update={"page": page})
         read = table_reader(piece)

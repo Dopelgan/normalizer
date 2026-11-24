@@ -1174,16 +1174,26 @@ class DrawingProcessor:
             and any(field.category == "title_block" for field in f.content.structured_drawing_fields or [])
         }
         texts: Dict[int, List[str]] = {}
+        sheets_like: set = set()
         for fragment in fragments:
             if fragment.position is None:
                 continue
+            page = int(fragment.position.page)
             content = fragment.content
+            table = content.table_data
             parts = [content.text or ""]
-            rows = getattr(content.table_data, "rows", None) or []
-            parts += [" ".join(str(c) for c in row) for row in rows]
-            texts.setdefault(int(fragment.position.page), []).extend(parts)
-        pages = [page for page in sorted(texts)
-                 if page not in stamped and _stamp_marks("\n".join(texts[page])) >= _STAMP_MARKS_MIN]
+            parts += [" ".join(str(c) for c in row) for row in getattr(table, "rows", None) or []]
+            texts.setdefault(page, []).extend(parts)
+            # Лист ЕСКД и без подписей штампа в тексте: на странице есть
+            # чертёжный фрагмент (вырезка рисунка) или спецификация, прочитанная
+            # моделью, — штамп в её таблицу модель не переписывает.
+            headers = " ".join(getattr(table, "headers", None) or []).casefold()
+            if fragment.type == "drawing" or (
+                    fragment.provenance is not None and fragment.provenance.method == "vlm_escalation"
+                    and "обозначение" in headers and "наименование" in headers):
+                sheets_like.add(page)
+        pages = [page for page in sorted(texts) if page not in stamped and (
+            page in sheets_like or _stamp_marks("\n".join(texts[page])) >= _STAMP_MARKS_MIN)]
         sheets: List[Fragment] = []
         for page in pages[: settings.DRAWING_STAMP_ALL_PAGES_MAX]:
             left = deadline.remaining()
