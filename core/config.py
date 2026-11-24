@@ -1129,6 +1129,19 @@ class Settings(BaseSettings):
     # модели на страницу. По умолчанию выключено.
     DRAWING_STAMP_ALL_PAGES: bool = False
     DRAWING_STAMP_ALL_PAGES_MAX: int = 8
+||||||| parent of 70f097c (OCR-подсказки листа: подтверждение, сверка в одном знаке, дочитывание моделью, пустые графы из OCR (DRAWING_OCR_HINTS))
+    # OCR-подсказки листа (core/providers/ocr_hints.py): строки PP-OCRv5 по
+    # вырезкам ГОСТ (штамп, левая графа, поле плитками) подтверждают поля
+    # модели, ставят на сверку расхождение в одном знаке (S/5, №/М), строки,
+    # которых у модели нет, — дочитываются моделью по вырезке (один вызов на
+    # лист, до 12 строк), пустые «Инв. № подл.» и «Обозначение» заполняются
+    # с пометкой «из OCR, требует сверки». Строки — из каталога
+    # DRAWING_OCR_HINTS_DIR (подготовлены заранее) или сервиса
+    # DRAWING_OCR_HINTS_ENDPOINT (tools/ocr_hints_server.py). По умолчанию выключено.
+    DRAWING_OCR_HINTS: bool = False
+    DRAWING_OCR_HINTS_DIR: str = ""
+    DRAWING_OCR_HINTS_ENDPOINT: str = ""
+    DRAWING_OCR_HINTS_TIMEOUT: int = 60
     # «Что изображено» (core/providers/what_drawn.py): один вызов модели на
     # лист детали или сборки целиком после связи размеров и правил здравого
     # смысла — что изображено, что показывает каждый вид и что измеряет

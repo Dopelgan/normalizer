@@ -506,6 +506,11 @@ class DrawingProcessor:
             # формы 1 с полем подшивки. Поля правятся на месте
             # (`margin_columns.merge`).
             self._margin_columns(layout, fields, payload, budget_started)
+        if settings.DRAWING_OCR_HINTS and whole_sheet and not text_only and not layout.turn:
+            # Строки OCR по вырезкам ГОСТ: подтверждение, сверка в одном
+            # знаке, дочитывание моделью того, чего у неё нет. Только лист
+            # целиком без поворота: рамки строк — в долях страницы.
+            fields = self._ocr_hints(layout, fields, payload, metadata, page, budget_started)
         crops = self._reread_crops
         if settings.DRAWING_DISPUTED_REREAD and fields and crops is not None:
             # Сведение D3 (DRAWING_READINGS_RECONCILED) идёт по всему документу
@@ -1859,6 +1864,41 @@ class DrawingProcessor:
         stats["status"] = "read"
         payload["margin_columns"] = stats
         logger.info("Графы поля подшивки: %s", stats)
+
+    def _ocr_hints(
+        self, layout, fields: List[Dict[str, Any]], payload: Dict[str, Any],
+        metadata: Dict[str, Any], page: int, started: float,
+    ) -> List[Dict[str, Any]]:
+        """OCR-подсказки (DRAWING_OCR_HINTS). Итог — `structured_payload.ocr_hints`."""
+        from core.providers import ocr_hints
+
+        stats = ocr_hints.new_stats()
+        lines = None
+        if settings.DRAWING_OCR_HINTS_DIR:
+            lines = ocr_hints.from_dir(settings.DRAWING_OCR_HINTS_DIR, metadata, page)
+        if lines is None and settings.DRAWING_OCR_HINTS_ENDPOINT:
+            dpi = layout.image.info.get("dpi", (settings.DRAWING_RENDER_DPI,))[0] or settings.DRAWING_RENDER_DPI
+            lines = ocr_hints.from_endpoint(layout.image, float(dpi))
+        if not lines:
+            payload["ocr_hints"] = {"status": "none"}
+            return fields
+        stats["lines"] = len(lines)
+        ocr_hints.match(fields, lines, stats)
+        budget = settings.DRAWING_TIME_BUDGET
+        left = deadline.remaining()
+        in_time = not ((budget and gpu_gate.budget_now() + settings.VLM_TIMEOUT > started + budget)
+                       or (left is not None and left < settings.VLM_TIMEOUT))
+        found = ocr_hints.candidates(fields, lines) if in_time else []
+        try:
+            fields.extend(ocr_hints.reread(self.qwen, layout.image, found, stats))
+        except (SoftTimeLimitExceeded, deadline.Cancelled):
+            raise
+        except Exception as exc:  # noqa: BLE001 — дочитывание по OCR не роняет лист
+            logger.error("Дочитывание строк OCR не удалось: %s", exc)
+        ocr_hints.fill_empty(fields, lines, stats)
+        payload["ocr_hints"] = dict(stats, status="read")
+        logger.info("OCR-подсказки: %s", stats)
+        return fields
 
     def _reread_disputed(
         self, image, fields: List[Dict[str, Any]], payload: Dict[str, Any], started: float,
