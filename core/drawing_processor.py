@@ -1046,7 +1046,12 @@ class DrawingProcessor:
         if settings.DRAWING_RESCAN_POOR_OCR_PAGES:
             result.extend(self._rescan_poor_pages(result, metadata))
         if settings.DRAWING_STAMP_ALL_PAGES:
-            result.extend(self._stamp_pages(result, metadata))
+            try:
+                result.extend(self._stamp_pages(result, metadata))
+            except (SoftTimeLimitExceeded, deadline.Cancelled):
+                raise
+            except Exception as exc:  # noqa: BLE001 — штамп страниц не роняет документ
+                logger.error("Штамп страниц без полей штампа не прочитан: %s", exc)
         # Модель не ответила документу ни разу и отказывала как сервис:
         # непрочитанные листы — свойство минуты, а не документа. С
         # PARSE_REQUEUE_ON_OUTAGE документ ставится в очередь (ServiceOutage).
@@ -1174,8 +1179,8 @@ class DrawingProcessor:
                 continue
             content = fragment.content
             parts = [content.text or ""]
-            if content.table_data:
-                parts += [" ".join(str(c) for c in row) for row in content.table_data.get("rows") or []]
+            rows = getattr(content.table_data, "rows", None) or []
+            parts += [" ".join(str(c) for c in row) for row in rows]
             texts.setdefault(int(fragment.position.page), []).extend(parts)
         pages = [page for page in sorted(texts)
                  if page not in stamped and _stamp_marks("\n".join(texts[page])) >= _STAMP_MARKS_MIN]

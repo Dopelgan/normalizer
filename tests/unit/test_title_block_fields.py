@@ -747,7 +747,16 @@ class TestStampAllPages:
             confidence=0.6, completeness=1.0,
             provenance=Provenance(method="ocr_layer", strategy_level=5, source="scanned_pdf"),
         )
-        return [text, prose]
+        from core.models.contract import TableData
+
+        table = Fragment(
+            fragment_id="doc-1-frag-005", type="table",
+            content=Content(table_data=TableData(headers=["Поз.", "Обозначение"], rows=[["1", "ТАДУ 1"]])),
+            position=Position(page=2, bbox=[0.1, 0.3, 0.9, 0.6], order=5),
+            confidence=0.6, completeness=1.0,
+            provenance=Provenance(method="mineru_table", strategy_level=5, source="scanned_pdf"),
+        )
+        return [text, prose, table]
 
     @pytest.mark.parametrize("flag", [True, False])
     def test_stamp_read_for_page_without_title_block(self, storage, monkeypatch, flag):
