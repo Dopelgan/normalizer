@@ -10,8 +10,12 @@
    Защита рамок (`FRAME_TABLE_GUARD_ENABLED`) её не сняла: при
    `OCR_KEEP_STRUCTURED_TABLES` «таблица» с короткими ячейками считается
    спецификацией. Здесь таблица на половину листа и больше снимается, если
-   осмысленных слов в ней меньше 40 % (`gibberish_share` ≥ 0,6). Снятие —
-   в `text_layer.reconcile_with_text_layer` до защиты рамок.
+   на странице чертежа в ней есть сильный признак мусора (ряд цифр длиннее
+   10 или смесь регистров «oN», «vohP») и мусорных токенов (они же и
+   латиница в одну-две буквы) не меньше 40 % (`junk_share`). Сигнал — по
+   признакам мусора, а не по словарю: английская таблица и русская из
+   сокращений остаются. Снятие — в `text_layer.reconcile_with_text_layer`
+   до защиты рамок.
 2. **Поле с рамкой на полстраницы.** Рамка области, где поле прочли (весь
    штамп, половина листа), рисуется на просмотре как рамка поля. Поле с
    рамкой больше 0,2 страницы теряет рамку (`placeable: false`, рамка —
@@ -29,14 +33,14 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-# Таблица на такую долю листа и больше проверяется на бессмыслицу (порог
-# тот же, что у защиты рамок `text_layer._FRAME_TABLE_AREA`).
+# Таблица на такую долю листа и больше проверяется на мусор (порог тот же,
+# что у защиты рамок `text_layer._FRAME_TABLE_AREA`).
 PAGE_TABLE_AREA = 0.5
-# Доля бессмысленных слов, с которой таблица — мусор.
-GIBBERISH_SHARE = 0.6
-# Меньше слов — судить не по чему, таблица остаётся.
+# Доля мусорных токенов, с которой таблица — мусор.
+JUNK_SHARE = 0.4
+# Меньше токенов — судить не по чему, таблица остаётся.
 MIN_TOKENS = 8
 # Рамка поля больше этой доли страницы — область, а не место надписи.
 FIELD_AREA = 0.2
@@ -45,29 +49,20 @@ WHOLE_SHEET_CATEGORIES = frozenset({"note"})
 
 _TAG = re.compile(r"<[^>]+>")
 _EDGE = re.compile(r"^[\s.,;:!?()\[\]{}«»\"'*_|]+|[\s.,;:!?()\[\]{}«»\"'*_|]+$")
-# Число: «4», «3,74», «1:2», «0,5*», «±0,1». Длинный ряд цифр без
-# разделителей («0000001006800006») числом листа не бывает.
-_NUMBER = re.compile(r"^[±+\-−]?\d{1,6}(?:[.,:/]\d{1,6})*%?$")
-# Обозначение и марка: «АБВГ.123456.001», «1012-05», «М6х20», «7798-70»,
-# «Ra6,3», «12Х18Н10Т», «Ст3».
-_DESIGNATION = re.compile(
-    r"^(?=.*\d)[A-Za-zА-Яа-яЁё]{0,5}[.\s]?\d{1,8}(?:[.,\-/xх×][A-Za-zА-Яа-яЁё]{0,3}\d{1,8})*"
-    r"[A-Za-zА-Яа-яЁё]{0,3}\d{0,3}$"
-)
-_STEEL = re.compile(r"^(?:\d{1,2}[A-ZА-ЯЁ]{1,2}\d{0,2}){2,}[A-ZА-ЯЁ]?$")
-_CYR = re.compile(r"^[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*$")
-_LAT = re.compile(r"^[A-Za-z]+$")
-_CYR_VOWELS = set("аеёиоуыэюяАЕЁИОУЫЭЮЯ")
-_LAT_VOWELS = set("aeiouyAEIOUY")
-# Короткие слова, которые встречаются в спецификации и примечаниях.
-_SHORT_WORDS = frozenset({
-    "и", "в", "с", "к", "у", "о", "а", "на", "по", "из", "до", "от", "не", "за", "то",
-    "мм", "шт", "кг", "м", "см", "г", "№", "ед", "кол", "поз", "зона",
-})
-# Латиница в русском чертеже — почти всегда обозначения стандартов и знаки.
-_LATIN_TERMS = frozenset({
-    "gost", "iso", "din", "en", "astm", "aisi", "ra", "rz", "max", "min", "hrc", "hb",
-    "it", "dn", "pn", "sw", "ost",
+# Признаки мусора повёрнутого текста. Сигнал строится на них, а не на «нет
+# такого слова»: английская таблица из обычных слов и русская из сокращений
+# («Кол.», «Прим.», «НИ») словарю не обязаны, а мусором не являются.
+# * ряд цифр длиннее 10 без разделителей: «0000001006800006»;
+_LONG_DIGITS = re.compile(r"\d{11,}")
+# * смесь регистров внутри латинского слова: «oN», «vohP», «uN»;
+_MIXED_CASE = re.compile(r"^[A-Za-z]*[a-z][A-Z][A-Za-z]*$")
+# * латиница в одну-две буквы: «WD», «HM», «xq».
+_SHORT_LATIN = re.compile(r"^[A-Za-z]{1,2}$")
+# Короткая латиница, которая бывает и в настоящей таблице: служебные слова
+# английского текста, единицы, шероховатость, обозначения.
+_SHORT_LATIN_OK = frozenset({
+    "a", "an", "of", "in", "to", "on", "at", "by", "or", "is", "it", "as", "be", "no",
+    "we", "up", "do", "if", "so", "mm", "cm", "kg", "km", "ra", "rz", "id", "ok", "pc",
 })
 
 
@@ -80,43 +75,30 @@ def _tokens(text: str) -> List[str]:
     return tokens
 
 
-def _case_ok(word: str) -> bool:
-    """Слово целиком строчными, с большой буквы или целиком прописными."""
-    return word.islower() or word.isupper() or (word[0].isupper() and word[1:].islower())
+def junk(token: str) -> bool:
+    """Токен с признаком мусора повёрнутого текста (см. выше)."""
+    if _LONG_DIGITS.search(token):
+        return True
+    if _MIXED_CASE.match(token):
+        return True
+    return bool(_SHORT_LATIN.match(token)) and token.lower() not in _SHORT_LATIN_OK
 
 
-def meaningful(token: str) -> bool:
+def _strong(token: str) -> bool:
+    """Признак, которого в настоящей таблице не бывает: длинный ряд цифр или смесь регистров."""
+    return bool(_LONG_DIGITS.search(token) or _MIXED_CASE.match(token))
+
+
+def junk_share(text: str) -> float:
     """
-    Токен похож на смысл: число, обозначение или марка, подпись графы,
-    русское слово (от трёх букв, с гласной, без смеси регистров), короткое
-    служебное слово или латинский термин стандарта. Латиница вообще
-    считается словом только с четырёх букв и с гласной: в русском чертеже
-    короткая латиница — это остатки повёрнутого текста («oN», «WD», «HM»).
+    Доля мусорных токенов; 0, если токенов меньше `MIN_TOKENS` или нет ни
+    одного сильного признака (длинный ряд цифр, смесь регистров): одни
+    короткие латинские сокращения таблицу мусором не делают.
     """
-    from core.providers import margin_columns
-
-    if _NUMBER.match(token) or _DESIGNATION.match(token) or _STEEL.match(token):
-        return True
-    if margin_columns.is_caption(token):
-        return True
-    lower = token.lower()
-    if lower in _SHORT_WORDS or lower in _LATIN_TERMS:
-        return True
-    if _CYR.match(token):
-        letters = token.replace("-", "")
-        return len(letters) >= 3 and _case_ok(letters) and bool(set(letters) & _CYR_VOWELS)
-    if _LAT.match(token):
-        return len(token) >= 4 and _case_ok(token) and bool(set(token) & _LAT_VOWELS)
-    return False
-
-
-def gibberish_share(text: str) -> float:
-    """Доля бессмысленных токенов; 0, если токенов меньше `MIN_TOKENS`."""
     tokens = _tokens(text)
-    if len(tokens) < MIN_TOKENS:
+    if len(tokens) < MIN_TOKENS or not any(_strong(t) for t in tokens):
         return 0.0
-    bad = sum(1 for token in tokens if not meaningful(token))
-    return bad / len(tokens)
+    return sum(1 for token in tokens if junk(token)) / len(tokens)
 
 
 def table_text(block: Any) -> str:
@@ -133,20 +115,33 @@ def table_text(block: Any) -> str:
     return str(getattr(block, "text", "") or "")
 
 
-def is_gibberish_page_table(block: Any) -> bool:
-    """Таблица на полстраницы и больше, ячейки которой — бессмыслица."""
+def is_junk_page_table(block: Any) -> bool:
+    """Таблица на полстраницы и больше, ячейки которой — мусор повёрнутого текста."""
     if getattr(block, "type", None) != "table":
         return False
     try:
         area = float(block.area())
     except Exception:  # noqa: BLE001 — без рамки не судим
         return False
-    return area >= PAGE_TABLE_AREA and gibberish_share(table_text(block)) >= GIBBERISH_SHARE
+    return area >= PAGE_TABLE_AREA and junk_share(table_text(block)) >= JUNK_SHARE
 
 
-def drop_gibberish_tables(blocks: Sequence[Any]) -> List[Any]:
-    """Блоки без таблиц-бессмыслиц во весь лист."""
-    return [block for block in blocks if not is_gibberish_page_table(block)]
+def drop_gibberish_tables(
+    blocks: Sequence[Any], drawing_page: Optional[Callable[[int], bool]] = None,
+) -> List[Any]:
+    """
+    Блоки без таблиц-мусора во весь лист. Снимаются только на страницах
+    чертежей (`drawing_page(page)`; без него — на любой): мусор этот — из
+    повёрнутых граф рамки ЕСКД, а в тексте договора такой таблице неоткуда
+    взяться. Проверка страницы идёт только для таблицы-кандидата: она
+    может стоить рендера страницы.
+    """
+    kept = []
+    for block in blocks:
+        if is_junk_page_table(block) and (drawing_page is None or drawing_page(block.page)):
+            continue
+        kept.append(block)
+    return kept
 
 
 def _area(bbox: Sequence[float]) -> float:

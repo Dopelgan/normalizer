@@ -80,9 +80,10 @@ _COUNT = (r"^\s*(?:\d+\s*(?:[xх×*]|отв(?:ерстия|ерстий|ерст
 _RADIUS_VALUE = re.compile(_COUNT + r"S?R\s?\d")
 # Знак диаметра: ⌀, Ø, ∅ и буква «Ф», которой его пишут на скане.
 _DIAMETER_SIGN = r"[⌀Øø∅ФфΦ]"
-_DIAMETER_VALUE = re.compile(_COUNT + r"(?:" + _DIAMETER_SIGN + r"|[MМ])\s?\d")
+# «S⌀20» — диаметр сферы.
+_DIAMETER_VALUE = re.compile(_COUNT + r"S?(?:" + _DIAMETER_SIGN + r"|[MМ])\s?\d")
 # Отверстие: диаметр или резьба — M, G, Rc, Tr, коническая «К».
-_HOLE_VALUE = re.compile(_COUNT + r"(?:" + _DIAMETER_SIGN + r"|[MМ]|G|Rc|Tr|К)\s?\d")
+_HOLE_VALUE = re.compile(_COUNT + r"(?:S?" + _DIAMETER_SIGN + r"|[MМ]|G|Rc|Tr|К)\s?\d")
 
 
 # ===========================================================================

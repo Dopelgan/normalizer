@@ -41,46 +41,77 @@ def _layer():
     ]}, page_count=1)
 
 
-def _reconcile(blocks, drop):
+def _english_table():
+    words = ("bolt washer nut cover spring gasket housing shaft bearing seal plate "
+             "screw of the in a to pin").split()
+    rows = [[w, "steel", "zinc plated", "4"] for w in words]
+    return ParsedBlock(type="table", text="", page=1, bbox=[0.03, 0.02, 0.97, 0.98],
+                       table_data={"rows": rows})
+
+
+def _abbreviation_table():
+    rows = [["Поз.", "Обозн.", "Наим.", "Кол.", "Прим."]] + [
+        [str(i), "НИ", "ТУ", "Шт.", "Ст3 сп", "ОТК", "М8", "Ø6", "№п/п", "ГН"] for i in range(1, 8)]
+    return ParsedBlock(type="table", text="", page=1, bbox=[0.03, 0.02, 0.97, 0.98],
+                       table_data={"rows": rows})
+
+
+def _reconcile(blocks, drop, drawing_page=None):
     return reconcile_with_text_layer(
         blocks, _layer(), source=OCR_LAYER, frame_table_guard=True,
-        keep_structured_tables=True, drop_gibberish_tables=drop)
+        keep_structured_tables=True, drop_gibberish_tables=drop, drawing_page=drawing_page)
+
+
+def _tables(result):
+    return [b for b in result if b.type == "table"]
 
 
 def test_gibberish_page_table_dropped_even_when_structured_tables_kept():
-    assert block_cleanup.gibberish_share(" ".join(GIBBERISH)) >= block_cleanup.GIBBERISH_SHARE
-    result, stats = _reconcile([_gibberish_table()], drop=True)
-    assert not [b for b in result if b.type == "table"]
+    assert block_cleanup.junk_share(" ".join(GIBBERISH)) >= block_cleanup.JUNK_SHARE
+    result, stats = _reconcile([_gibberish_table()], drop=True, drawing_page=lambda page: True)
+    assert not _tables(result)
     assert stats.as_dict()["gibberish_tables"] == 1
+
+
+def test_prod_like_margin_gibberish_scores_as_junk():
+    text = "nad a 0000001006800006 oN godu upo vohP oN HM При НИ WD upo"
+    assert block_cleanup.junk_share(text) >= block_cleanup.JUNK_SHARE
+
+
+def test_gibberish_table_kept_on_text_page():
+    result, _ = _reconcile([_gibberish_table()], drop=True, drawing_page=lambda page: False)
+    assert _tables(result)
 
 
 def test_gibberish_table_kept_without_flag():
     result, stats = _reconcile([_gibberish_table()], drop=False)
-    assert [b for b in result if b.type == "table"]
+    assert _tables(result)
     assert "gibberish_tables" not in stats.as_dict()
 
 
-def test_real_spec_table_kept():
-    assert block_cleanup.gibberish_share(block_cleanup.table_text(_spec_table())) < 0.2
-    result, _ = _reconcile([_spec_table()], drop=True)
-    assert [b for b in result if b.type == "table"]
+@pytest.mark.parametrize("make", [_spec_table, _english_table, _abbreviation_table])
+def test_real_tables_kept_on_drawing_page(make):
+    assert block_cleanup.junk_share(block_cleanup.table_text(make())) < block_cleanup.JUNK_SHARE
+    result, _ = _reconcile([make()], drop=True, drawing_page=lambda page: True)
+    assert _tables(result)
 
 
 def test_small_table_is_not_judged():
     small = _gibberish_table()
     small.bbox = [0.1, 0.1, 0.4, 0.4]
-    assert not block_cleanup.is_gibberish_page_table(small)
+    assert not block_cleanup.is_junk_page_table(small)
 
 
 @pytest.mark.parametrize("token", ["1012-05", "АБВГ.123456.001", "М6х20", "3,74", "1:2", "12Х18Н10Т",
-                                   "Сталь", "ГОСТ", "Лит.", "и", "Ra"])
-def test_meaningful_tokens(token):
-    assert block_cleanup.meaningful(token)
+                                   "Сталь", "ГОСТ", "Лит.", "и", "Ra", "НИ", "bolt", "of", "a", "Ø6",
+                                   "№п/п", "mm", "00000010"])
+def test_valid_tokens(token):
+    assert not block_cleanup.junk(token)
 
 
-@pytest.mark.parametrize("token", ["oN", "vohP", "WD", "НИ", "0000001006800006", "nad"])
-def test_gibberish_tokens(token):
-    assert not block_cleanup.meaningful(token)
+@pytest.mark.parametrize("token", ["oN", "vohP", "WD", "HM", "xq", "0000001006800006"])
+def test_junk_tokens(token):
+    assert block_cleanup.junk(token)
 
 
 # ---------------------------------------------------------------- рамки полей

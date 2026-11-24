@@ -267,18 +267,35 @@ def _same(a: str, b: str) -> bool:
     return notation(a) == notation(b)
 
 
+def _contains(longer: str, shorter: str) -> bool:
+    from core.providers.reading_reconcile import notation
+
+    a, b = notation(longer), notation(shorter)
+    return bool(b) and len(a) > len(b) and b in a
+
+
+def _with_reading(field: Dict[str, Any], source: str, value: str) -> List[Dict[str, str]]:
+    readings = list(field.get("readings") or [{"source": SHEET_SOURCE, "value": str(field.get("value") or "")}])
+    if not any(r.get("value") == value for r in readings):
+        readings.append({"source": source, "value": value})
+    return readings
+
+
 def merge(fields: List[Dict[str, Any]], reads: List[Dict[str, Any]]) -> Dict[str, int]:
     """
     Поля граф (`reads`, с рамкой своей клетки) сводятся с полями листа на месте.
+    Место графы известно из геометрии, поэтому поле этой графы в любом
+    случае получает рамку клетки (прежде у него была рамка всей области).
 
-    * Та же графа с тем же значением — поле листа остаётся, но получает
-      рамку клетки (прежде у него была рамка всей области штампа).
-    * Та же графа с другим значением — поле листа заменяется чтением графы,
-      прежнее значение остаётся первым прочтением в `readings`
-      (`[{"source": "sheet"}, {"source": "margin_column"}]`), поле — на сверку.
-    * Графы на листе не было — поле добавляется.
+    * То же значение — поле листа остаётся (`confirmed`).
+    * Одно значение содержит другое («05» и «1012-05»: лист прочитал хвост) —
+      остаётся более длинное, другое — прочтением в `readings` (`extended`).
+    * Значения расходятся иначе — остаётся значение листа: какое из двух
+      верно, правилом не решить. Чтение графы — второе прочтение, поле на
+      сверку (`conflict`).
+    * Графы на листе не было — поле добавляется (`added`).
     """
-    stats = {"added": 0, "confirmed": 0, "replaced": 0}
+    stats = {"added": 0, "confirmed": 0, "extended": 0, "conflict": 0}
     used: set = set()
     for read in reads:
         name, value = split_value(read["value"])
@@ -294,35 +311,42 @@ def merge(fields: List[Dict[str, Any]], reads: List[Dict[str, Any]]) -> Dict[str
             used.add(match)
             stats["confirmed"] += 1
             continue
-        if same_label:
-            index = same_label[0]
-            old = fields[index]
+        if not same_label:
+            fields.append(read)
+            used.add(len(fields) - 1)
+            stats["added"] += 1
+            continue
+        index = same_label[0]
+        old = fields[index]
+        old_value = split_value(old.get("value", ""))[1]
+        used.add(index)
+        if _contains(value, old_value):
             replaced = dict(read)
             replaced["readings"] = [
                 {"source": SHEET_SOURCE, "value": str(old.get("value") or "")},
                 {"source": SOURCE, "value": read["value"]},
             ]
-            replaced["needs_review"] = True
             fields[index] = replaced
-            used.add(index)
-            stats["replaced"] += 1
+            stats["extended"] += 1
             continue
-        fields.append(read)
-        used.add(len(fields) - 1)
-        stats["added"] += 1
+        old["readings"] = _with_reading(old, SOURCE, read["value"])
+        old["bbox"] = list(read["bbox"])
+        if not _contains(old_value, value):
+            old["needs_review"] = True
+            stats["conflict"] += 1
+        else:
+            stats["extended"] += 1
     return stats
 
 
 def check_designation(fields: List[Dict[str, Any]], designation: str) -> str:
     """
-    Графа 26 — повтор обозначения: только подтверждает или правит основное,
-    второго поля обозначения не появляется.
+    Графа 26 — повтор обозначения: только подтверждает основное, значение
+    основного не меняет никогда и второго поля не создаёт.
 
-    `confirmed` — то же обозначение; `corrected` — основное не похоже на
-    обозначение по ГОСТ 2.201, а графа 26 похожа: значение берётся из неё,
-    прежнее остаётся в `readings`; `conflict` — оба похожи и расходятся:
-    значение не меняется, графа 26 — второе прочтение, поле на сверку;
-    `no_main` — основного обозначения нет (графа 26 его не создаёт).
+    `confirmed` — то же обозначение; `conflict` — расходятся: графа 26 —
+    второе прочтение в `readings`, поле на сверку; `no_main` — основного
+    обозначения нет; `none` — графа 26 пуста.
     """
     if not designation:
         return "none"
@@ -336,17 +360,6 @@ def check_designation(fields: List[Dict[str, Any]], designation: str) -> str:
     name, main = split_value(field["value"])
     if _same(main, designation):
         return "confirmed"
-    readings = list(field.get("readings") or [{"source": SHEET_SOURCE, "value": field["value"]}])
-    readings.append({"source": SOURCE, "value": f"{name}: {designation}"})
-    field["readings"] = readings
+    field["readings"] = _with_reading(field, SOURCE, f"{name}: {designation}")
     field["needs_review"] = True
-    if _looks_like_designation(designation) and not _looks_like_designation(main):
-        field["value"] = f"{name}: {designation}"
-        return "corrected"
     return "conflict"
-
-
-def _looks_like_designation(text: str) -> bool:
-    """Обозначение по ГОСТ 2.201: код организации и группы цифр через точки."""
-    return bool(re.match(r"^[А-ЯЁA-Z]{2,4}[ .]?\d{6}\.\d{3}(?:[.\-]\d{2,3})*(?:\s?[А-ЯЁ]{1,3}\d?)?$",
-                         str(text).strip()))

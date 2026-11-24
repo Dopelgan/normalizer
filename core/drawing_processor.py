@@ -489,10 +489,13 @@ class DrawingProcessor:
             # чертёж детали: общий знак ставится там, а на листе неизвестного
             # рода (текст, схема без штампа) лишний вызов искал бы знак зря.
             fields.extend(self._corner_roughness(layout, fields, payload, budget_started))
-        if settings.DRAWING_MARGIN_COLUMNS and whole_sheet and not text_only:
+        if (settings.DRAWING_MARGIN_COLUMNS and whole_sheet and not text_only
+                and reading is not None and reading.sheet_type in ("detail", "assembly")):
             # Графы поля подшивки и графа 26: повёрнутые надписи, которых проход
-            # листа не читает. Только лист целиком: у вырезки вида поля
-            # подшивки нет. Поля правятся на месте (`margin_columns.merge`).
+            # листа не читает. Только лист целиком (у вырезки вида поля
+            # подшивки нет) и только чертёж детали или сборки — у них рамка
+            # формы 1 с полем подшивки. Поля правятся на месте
+            # (`margin_columns.merge`).
             self._margin_columns(layout, fields, payload, budget_started)
         crops = self._reread_crops
         if settings.DRAWING_DISPUTED_REREAD and fields and crops is not None:

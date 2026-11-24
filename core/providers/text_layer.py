@@ -772,6 +772,7 @@ def reconcile_with_text_layer(
     split_columns: bool = False,
     table_reader: Optional[Callable[[ParsedBlock], Optional[Dict[str, Any]]]] = None,
     drop_gibberish_tables: bool = False,
+    drawing_page: Optional[Callable[[int], bool]] = None,
 ) -> Tuple[List[ParsedBlock], ReconcileStats]:
     """
     Текст блоков берётся из слоя, а не из OCR; всё, что не попало ни в одну
@@ -810,7 +811,7 @@ def reconcile_with_text_layer(
         # защиты рамок: `keep_structured_tables` принял бы её за спецификацию.
         from core.providers import block_cleanup
 
-        kept = block_cleanup.drop_gibberish_tables(blocks)
+        kept = block_cleanup.drop_gibberish_tables(blocks, drawing_page)
         stats.gibberish_tables += len(blocks) - len(kept)
         blocks = kept
     if frame_table_guard:

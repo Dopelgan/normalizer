@@ -81,6 +81,31 @@ logger = logging.getLogger(__name__)
 _MINERU_PAGE_TEXT_CHARS = 200
 
 
+def _raster_drawing_page(file_bytes: bytes, file_type: str):
+    """
+    Страница скана -> чертёж ли она (DRAWING_BLOCK_CLEANUP): вектора нет,
+    поэтому вердикт — по растру страницы (`raster_drawing`). Страница
+    рендерится лениво и один раз — только когда на ней нашлась таблица-
+    кандидат во весь лист; отказ рендера — «не чертёж», и таблица остаётся.
+    """
+    verdicts: Dict[int, bool] = {}
+
+    def check(page: int) -> bool:
+        if page not in verdicts:
+            try:
+                from core.providers import raster_drawing, table_vlm
+
+                image = table_vlm._render_page(file_bytes, file_type, page, dpi=72)
+                verdicts[page] = bool(image is not None
+                                      and raster_drawing.analyse_image(image).is_drawing)
+            except Exception as exc:  # noqa: BLE001 — уборка не роняет разбор
+                logger.warning("Вердикт чертежа по стр. %d не снят: %s", page, exc)
+                verdicts[page] = False
+        return verdicts[page]
+
+    return check
+
+
 def drop_low_confidence_lines(
     layer: TextLayer, blocks: List[ParsedBlock], threshold: float
 ) -> TextLayer:
@@ -606,6 +631,8 @@ class MinerUParserProvider(DocumentParserProvider):
                 result.blocks, layer,
                 frame_table_guard=settings.FRAME_TABLE_GUARD_ENABLED,
                 drop_gibberish_tables=settings.DRAWING_BLOCK_CLEANUP,
+                drawing_page=lambda page: bool(drawing_verdicts.get(page)
+                                               and drawing_verdicts[page].is_drawing),
             )
             blocks = self._apply_vector_drawings(blocks, layer, drawing_verdicts)
             dimension_fixes = self._fix_dimensions(blocks, drawing_verdicts)
@@ -637,6 +664,7 @@ class MinerUParserProvider(DocumentParserProvider):
                     frame_table_guard=settings.FRAME_TABLE_GUARD_ENABLED,
                     keep_structured_tables=settings.OCR_KEEP_STRUCTURED_TABLES,
                     drop_gibberish_tables=settings.DRAWING_BLOCK_CLEANUP,
+                    drawing_page=_raster_drawing_page(file_bytes, file_type),
                     table_line_min_confidence=settings.OCR_TABLE_LINE_MIN_CONFIDENCE,
                     split_columns=settings.OCR_SPLIT_WIDE_GAPS,
                     table_reader=blank_table_ocr.table_reader(file_bytes, file_type),

@@ -28,13 +28,14 @@ class MarginQwen:
     available = True
     model = "fake-vl"
 
-    def __init__(self, answer, sheet_fields=()):
+    def __init__(self, answer, sheet_fields=(), sheet_type="detail"):
         self.answer = answer
         self.sheet_fields = list(sheet_fields)
+        self.sheet_type = sheet_type
         self.margin_calls = []
 
     def read_sheet(self, image, hint="", **_):
-        return SheetReading(sheet_type="detail", annotations=list(self.sheet_fields))
+        return SheetReading(sheet_type=self.sheet_type, annotations=list(self.sheet_fields))
 
     def read_title_block(self, image):
         return None
@@ -51,7 +52,8 @@ def layout_with_frame(image):
     return drawing_vision.SheetLayout(image=image, signals={"inner_frame": list(FRAME)})
 
 
-def run(temp_storage, monkeypatch, answer, sheet_fields=(), flag=True, budget_left=True, frame=True):
+def run(temp_storage, monkeypatch, answer, sheet_fields=(), flag=True, budget_left=True, frame=True,
+        sheet_type="detail"):
     from core.drawing_processor import DrawingProcessor
     from core.models.contract import Content, Fragment, Position, Provenance
 
@@ -70,7 +72,7 @@ def run(temp_storage, monkeypatch, answer, sheet_fields=(), flag=True, budget_le
         position=Position(page=1, bbox=[0.0, 0.0, 1.0, 1.0], order=1), confidence=0.9, completeness=1.0,
         provenance=Provenance(method="mineru_image", strategy_level=2, source="vector_pdf"),
     )
-    qwen = MarginQwen(answer, sheet_fields)
+    qwen = MarginQwen(answer, sheet_fields, sheet_type)
     out = DrawingProcessor(temp_storage, qwen=qwen).enrich_fragments([fragment], {})
     sheet = next(f for f in out if f.content.image_ref == "assets/doc/sheet.png")
     return sheet, qwen
@@ -98,7 +100,7 @@ def inside(box, outer):
             and box[2] <= outer[2] + 1e-4 and box[3] <= outer[3] + 1e-4)
 
 
-def test_margin_read_replaces_half_page_field(temp_storage, monkeypatch):
+def test_margin_read_extends_half_page_tail(temp_storage, monkeypatch):
     sheet, qwen = run(temp_storage, monkeypatch, answer(inventory="1012-05"), [DIM, HALF_PAGE])
     assert len(qwen.margin_calls) == 1
     (field,) = labelled(sheet, "Инв. № подл.")
@@ -108,12 +110,34 @@ def test_margin_read_replaces_half_page_field(temp_storage, monkeypatch):
     x1, y1, x2, y2 = field.bbox
     assert (x2 - x1) * (y2 - y1) < 0.01            # клетка графы, а не пол-листа
     assert y2 == pytest.approx(FRAME[3], abs=1e-3)  # нижняя графа колонки
-    # Прежнее прочтение не теряется.
+    # «05» — хвост «1012-05»: остаётся длинное, прежнее — прочтением.
     assert [r["source"] for r in field.readings] == ["sheet", "margin_column"]
     assert field.readings[0]["value"] == HALF_PAGE["value"]
-    assert field.needs_review is True
     stats = sheet.content.structured_payload["margin_columns"]
-    assert stats["replaced"] == 1 and stats["status"] == "read"
+    assert stats["extended"] == 1 and stats["status"] == "read"
+
+
+def test_conflicting_margin_read_keeps_sheet_value_for_review(temp_storage, monkeypatch):
+    other = dict(HALF_PAGE, value="Инв. № подл.: 7777 (рукописно)")
+    sheet, _ = run(temp_storage, monkeypatch, answer(inventory="1012-05"), [DIM, other])
+    (field,) = labelled(sheet, "Инв. № подл.")
+    assert field.value == other["value"] and field.needs_review is True
+    assert "Инв. № подл.: 1012-05 (рукописно)" in [r["value"] for r in field.readings]
+    assert field.bbox[2] <= FRAME[0] + 1e-4          # рамка — клетка графы
+    assert sheet.content.structured_payload["margin_columns"]["conflict"] == 1
+
+
+def test_longer_sheet_value_kept_over_margin_tail():
+    fields = [{"category": "title_block", "value": "Инв. № подл.: 1012-05", "bbox": [0.1, 0.5, 0.9, 0.9]}]
+    read = {"category": "title_block", "value": "Инв. № подл.: 05", "bbox": [0.05, 0.9, 0.09, 0.98]}
+    stats = margin_columns.merge(fields, [read])
+    assert fields[0]["value"] == "Инв. № подл.: 1012-05" and stats["extended"] == 1
+    assert fields[0]["bbox"] == read["bbox"] and not fields[0].get("needs_review")
+
+
+def test_scheme_sheet_makes_no_call(temp_storage, monkeypatch):
+    _, qwen = run(temp_storage, monkeypatch, answer(inventory="1012-05"), [DIM], sheet_type="scheme")
+    assert qwen.margin_calls == []
 
 
 def test_same_value_keeps_field_with_cell_box(temp_storage, monkeypatch):
@@ -174,14 +198,16 @@ def test_top_box_confirms_designation_without_second_field(temp_storage, monkeyp
     assert sheet.content.structured_payload["margin_columns"]["designation"] == "confirmed"
 
 
-def test_top_box_corrects_broken_designation(temp_storage, monkeypatch):
+def test_top_box_never_changes_designation(temp_storage, monkeypatch):
     broken = dict(DESIGNATION, value="Обозначение: АБВГ 123456001")
     data = answer()
-    data["top_designation"] = "АБВГ.123456.001"
+    data["top_designation"] = "АБВГ.123456.002"
     sheet, _ = run(temp_storage, monkeypatch, data, [DIM, broken])
     (field,) = labelled(sheet, "Обозначение")
-    assert field.value == "Обозначение: АБВГ.123456.001"
-    assert field.readings[0]["value"] == "Обозначение: АБВГ 123456001"
+    assert field.value == "Обозначение: АБВГ 123456001" and field.needs_review is True
+    assert [r["value"] for r in field.readings] == ["Обозначение: АБВГ 123456001",
+                                                    "Обозначение: АБВГ.123456.002"]
+    assert sheet.content.structured_payload["margin_columns"]["designation"] == "conflict"
 
 
 def test_top_box_without_main_designation_adds_nothing():
