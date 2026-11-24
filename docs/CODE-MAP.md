@@ -106,6 +106,8 @@
 | Сведение прочтений поля по странице (`DRAWING_READINGS_RECONCILED`) | `core/providers/reading_reconcile.py` | `apply`, `reconcile_page`, `choose`; свидетельство вырезки D4 — `witness` |
 | Связь размера с измеряемым элементом (`DRAWING_DIMENSION_LINKS`) | `core/providers/dimension_links.py` | `apply`; геометрия PDF — `geometry_from_page`, `vector_link`; модель — `vlm_prompt`, `marked_image`, `validate_vlm`; место вызова — `DrawingProcessor._dimension_links` сразу после `_value_links` |
 | Размещение полей на странице, повторы, классы (`DRAWING_FIELD_PLACEMENT_V2`) | `core/providers/field_placement.py` | `apply` (перевод вырезка→страница `place_fragment`/`box_to_page`, `reclassify`, `mark_quality`, `dedupe_page`); вызов — последним в `DrawingProcessor._enrich_fragments`; размер картинки — `layout.source_size` в `_process` |
+| Правила здравого смысла полей (`DRAWING_SENSE_RULES`) | `core/providers/sense_rules.py` | `apply`, `apply_page`, `thickness`, `misread_thickness`, `link_fits`, `check_links`; место вызова — `DrawingProcessor._enrich_fragments` после D3/D4, связи — `_dimension_links` |
+| Знак общей шероховатости в углу листа (`DRAWING_CORNER_ROUGHNESS`) | `core/drawing_processor.py::_corner_roughness` | угол и разбор ответа — `sense_rules.corner_box`, `corner_roughness`, `roughness_known`; вызов модели — `qwen_client.read_corner_roughness` |
 | Дочитывание спорных чисел вырезками (`DRAWING_DISPUTED_REREAD`) | `core/providers/disputed_reread.py` | `apply`, `targets`; без D3 — `DrawingProcessor._reread_disputed` в проходе листа, с D3 — `_reread_reconciled` после `reading_reconcile.apply` |
 | **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
 | Качество фрагмента чертежа | `core/drawing_quality.py` | `apply_drawing_quality` (7), `document_quality` (71) |
@@ -215,6 +217,8 @@
 | `DRAWING_SHEET_GUARDED`, `DRAWING_SHEET_SCHEMA` | `false`, `false` | `core/providers/qwen_client.py` (`read_sheet`, `_ask_sheet_guarded`, `sheet_verdict`, `sheet_answer_accepted`; кэш — `accept` в `_ask_text`); пустой ответ — `core/drawing_processor.py::_guard_empty_sheet`; отчёт по кэшу — `tools/vlm_cache_guard_report.py` |
 | `VLM_SAME_REQUEST_ONCE` | `false` | `core/providers/qwen_client.py` (`_ask_text`: `_join_flight`/`_land_flight` — одинаковые запросы в полёте; `rejected_get`/`rejected_put` и `sheet_answer_repeats` — отложенные отказы листа `<ключ>.rejected` рядом с кэшем); токены вызова — `_post` (`parse.vlm_prompt_tokens`, `parse.vlm_completion_tokens`, `parse.vlm_reused`) |
 | `DRAWING_READINGS_RECONCILED` | `false` | `core/drawing_processor.py::enrich_fragments` → `core/providers/reading_reconcile.apply`; пометка в записи — `core/drawing_record._with_tolerance` |
+| `DRAWING_SENSE_RULES` | `false` | `core/drawing_processor.py::_enrich_fragments` и `_dimension_links` → `core/providers/sense_rules.py` (`apply`, `check_links`) |
+| `DRAWING_CORNER_ROUGHNESS` | `false` | `core/drawing_processor.py::_process` → `_corner_roughness`; `core/providers/qwen_client.py::read_corner_roughness` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
 
