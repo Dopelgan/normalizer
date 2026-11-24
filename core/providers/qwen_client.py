@@ -999,7 +999,7 @@ class QwenVisionClient:
         Вырезка правого верхнего угла листа (DRAWING_CORNER_ROUGHNESS) ->
         ответ модели как есть; разбирает его `sense_rules.corner_roughness`.
         """
-        return self._ask(image, _CORNER_ROUGHNESS_PROMPT, settings.DRAWING_REREAD_MAX_SIDE, max_tokens=64)
+        return self._ask_short(image, _CORNER_ROUGHNESS_PROMPT, settings.DRAWING_REREAD_MAX_SIDE, max_tokens=64)
 
     def read_margin_columns(self, image) -> Optional[Dict[str, Any]]:
         """

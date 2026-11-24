@@ -483,10 +483,11 @@ class DrawingProcessor:
                 )
         whole_sheet = log_page is None or image_ref in getattr(self, "_whole_images", ())
         if (settings.DRAWING_CORNER_ROUGHNESS and whole_sheet and not text_only
-                and reading is not None and reading.sheet_type in ("detail", "unknown")):
+                and reading is not None and reading.sheet_type == "detail"):
             # Знак общей шероховатости в углу листа: проход листа его не видит.
-            # Только лист целиком (у вырезки вида угла листа нет) и не схема
-            # и не сборка: общий знак ставится на чертеже детали.
+            # Только лист целиком (у вырезки вида угла листа нет) и только
+            # чертёж детали: общий знак ставится там, а на листе неизвестного
+            # рода (текст, схема без штампа) лишний вызов искал бы знак зря.
             fields.extend(self._corner_roughness(layout, fields, payload, budget_started))
         if settings.DRAWING_MARGIN_COLUMNS and whole_sheet and not text_only:
             # Графы поля подшивки и графа 26: повёрнутые надписи, которых проход
@@ -888,10 +889,15 @@ class DrawingProcessor:
         self._reread_crops = (
             {} if settings.DRAWING_DISPUTED_REREAD and settings.DRAWING_READINGS_RECONCILED else None
         )
+        # Картинки MinerU во весь лист — только этого документа: обработчик
+        # живёт дольше документа, и ссылка прошлого документа не должна
+        # делать листом вырезку следующего.
+        self._whole_images = set()
         try:
             return self._enrich_fragments(fragments, metadata)
         finally:
             self._reread_crops = None
+            self._whole_images = set()
 
     def _enrich_fragments(
         self, fragments: List[Fragment], metadata: Dict[str, Any]
@@ -948,7 +954,7 @@ class DrawingProcessor:
                 # Картинка MinerU на всю страницу — лист целиком, хотя и
                 # читается как вырезка: у неё есть угол рамки со знаком
                 # общей шероховатости (`_corner_roughness`).
-                self._whole_images = getattr(self, "_whole_images", set()) | {fragment.content.image_ref}
+                self._whole_images.add(fragment.content.image_ref)
             try:
                 sheet_page = int(fragment.position.page) if fragment.position else 0
                 drawing_result = self.process(
@@ -1625,8 +1631,12 @@ class DrawingProcessor:
         Знак общей шероховатости из правого верхнего угла рамки
         (DRAWING_CORNER_ROUGHNESS): одна вырезка — один короткий вызов.
         Лист уже выправлен и повёрнут штампом в правый нижний угол
-        (`layout.turn`), поэтому угол берётся у `layout.image` как есть.
-        Вызов не начинается, если бюджета листа на него не хватает.
+        (`layout.turn`), и рамка `layout.frame` найдена заново на повёрнутом
+        листе (`drawing_vision.analyse`), поэтому угол берётся у
+        `layout.image` как есть. Вызов не начинается, если бюджета листа или
+        срока задачи на него не хватает; место на видеокарте он берёт, как
+        все вызовы (`QwenClient._post_attempts`), а таймаут чтения не
+        повторяет (`QwenClient._ask_short`): резерв бюджета — один VLM_TIMEOUT.
         """
         budget = settings.DRAWING_TIME_BUDGET
         if budget and gpu_gate.budget_now() + settings.VLM_TIMEOUT > started + budget:
