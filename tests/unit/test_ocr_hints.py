@@ -165,3 +165,22 @@ def test_flag_on_reads_hints_for_whole_sheet(temp_storage, monkeypatch):
     stats = result["payload"]["ocr_hints"]
     assert stats["status"] == "read" and stats["filled"] == 1
     assert any(f["value"] == "Инв. № подл.: 1012-05 (из OCR, требует сверки)" for f in result["parsed_fields"])
+
+
+def test_endpoint_lines_come_back_in_sheet_fractions(requests_mock, monkeypatch):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "DRAWING_OCR_HINTS_ENDPOINT", "http://ocr-hints:8090/")
+    requests_mock.post("http://ocr-hints:8090/", json={"lines": [{"text": "315", "score": 0.99, "box": [0, 0, 10, 10]}]})
+    lines = ocr_hints.from_endpoint(Image.new("RGB", (2480, 3508), "white"), 300)
+    regions = {line["region"] for line in lines}
+    assert regions == {"stamp", "margin", "field"}
+    assert all(0.0 <= v <= 1.0 for line in lines for v in line["box"])
+
+
+def test_endpoint_failure_gives_no_hints(requests_mock, monkeypatch):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "DRAWING_OCR_HINTS_ENDPOINT", "http://ocr-hints:8090/")
+    requests_mock.post("http://ocr-hints:8090/", status_code=500)
+    assert ocr_hints.from_endpoint(Image.new("RGB", (800, 600), "white"), 200) is None

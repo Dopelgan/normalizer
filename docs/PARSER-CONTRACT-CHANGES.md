@@ -1188,6 +1188,14 @@ deskewed_page`); при `turn != 0` они не совпадают с исход
 `table_html` — `null`, `provenance.method` — `vlm_escalation`. Схема не
 меняется; без флага таблица — как прежде, от MinerU с выправкой по слою.
 
+`DRAWING_OCR_HINTS` (24.11). Схема не меняется. В `readings` поля может
+появиться источник `ocr`; новые поля из дочитывания по OCR — с `readings`
+`[{"source": "ocr"}, {"source": "crop"}]` и уверенностью 0,6; графы «Инв. № подл.»
+и «Обозначение», заполненные из OCR, — значение с пометкой «(из OCR, требует
+сверки)», `needs_review: true`, уверенность 0,5. Учёт — необязательный ключ
+`structured_payload.ocr_hints` (`status`, `lines`, `confirmed`, `one_char`,
+`not_thread`, `reread`, `added`, `filled`).
+
 `DRAWING_BLOCK_CLEANUP`.
 - Таблица MinerU на половину страницы и больше на странице чертежа, в
   ячейках которой есть ряд цифр длиннее 10 или смесь регистров, а мусорных
