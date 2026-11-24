@@ -1352,9 +1352,15 @@ def _fix_table(
         # строки, и строка съезжает на две графы. Слоем OCR это не выправить:
         # он не знает граф. Модель зрения читает таблицу по вырезке в своём
         # разрешении; не прочитала — обычная выправка по слою ниже.
+        #
+        # Многостраничную спецификацию MinerU отдаёт одной таблицей в рамке
+        # первой страницы, а вырезка — только эта страница. Строки со второй
+        # шапки («Обозначение», «Наименование» ещё раз) — продолжение со
+        # следующих листов: они остаются от MinerU после строк модели.
+        own, rest = _spec_continuation(block.table_data)
         read = table_reader(block)
-        if read and len(read["rows"]) * 2 >= _filled_rows(block.table_data):
-            block.table_data = read
+        if read and len(read["rows"]) * 2 >= _filled_rows({"rows": own}):
+            block.table_data = dict(read, rows=list(read["rows"]) + rest)
             block.table_html = None
             block.method = METHOD_VLM_TABLE
             stats.vlm_tables += 1
@@ -2084,6 +2090,18 @@ def table_vlm_spec(table_data: Optional[Dict[str, Any]]) -> bool:
     from core.providers.table_vlm import eskd_spec
 
     return eskd_spec(table_data)
+
+
+def _spec_continuation(table_data: Optional[Dict[str, Any]]) -> Tuple[List[Any], List[Any]]:
+    """
+    Строки спецификации -> (строки первой страницы, продолжение со второй
+    шапки). Шапка — строка, которая сама проходит `eskd_spec`.
+    """
+    rows = list((table_data or {}).get("rows") or [])
+    for index, row in enumerate(rows):
+        if index and table_vlm_spec({"headers": row, "rows": []}):
+            return rows[:index], rows[index:]
+    return rows, []
 
 
 def _filled_rows(table_data: Optional[Dict[str, Any]]) -> int:

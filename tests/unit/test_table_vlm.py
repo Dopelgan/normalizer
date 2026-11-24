@@ -316,3 +316,21 @@ class TestEskdSpec:
         read = table_vlm.table_reader(b"%PDF", "pdf", client=Client())
         read(spec_block())
         assert seen == {"dpi": settings.TABLE_VLM_SPEC_DPI, "max_side": settings.TABLE_VLM_SPEC_MAX_SIDE}
+
+    def test_continuation_from_next_sheet_is_kept(self, monkeypatch):
+        """
+        Многостраничную спецификацию MinerU отдаёт одной таблицей: вырезка —
+        только первая страница, строки со второй шапки остаются от MinerU.
+        """
+        monkeypatch.setattr(settings, "TABLE_VLM_ESKD_SPEC", True)
+        block = spec_block()
+        block.table_data["rows"] += [
+            ["", "wowoф", "DH", "210", "Обозначение", "Наименование", "", "Приме-чание"],
+            ["A", "", "19", "ТАДУ 687000.001.003", "Панель монтажная", "*2", "", ""],
+        ]
+        blocks, stats = reconcile_with_text_layer([block], spec_layer(), source=OCR_LAYER,
+                                                  table_reader=lambda b: SPEC_QWEN)
+        rows = next(b for b in blocks if b.type == "table").table_data["rows"]
+        assert stats.vlm_tables == 1
+        assert rows[:4] == SPEC_QWEN["rows"]
+        assert rows[-1] == ["A", "", "19", "ТАДУ 687000.001.003", "Панель монтажная", "*2", "", ""]
