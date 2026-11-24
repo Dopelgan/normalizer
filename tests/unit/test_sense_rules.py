@@ -124,7 +124,10 @@ def test_thickness_from_material(texts, expected):
 
 def test_misread_thickness_rules():
     assert sense_rules.misread_thickness("50,5*", "0,5") == "S0,5*"
-    assert sense_rules.misread_thickness("50.5", "0,5") == "S0,5"
+    # Голый «50,5» без звёздочки — правдоподобный размер (правка ревью 1).
+    assert sense_rules.misread_thickness("50.5", "0,5") is None
+    assert sense_rules.misread_thickness("55", "5") is None
+    assert sense_rules.misread_thickness("55*", "5") == "S5*"
     assert sense_rules.misread_thickness("52", "2") is None      # размер 52 правдоподобен
     assert sense_rules.misread_thickness("52*", "2") == "S2*"
     assert sense_rules.misread_thickness("150,5*", "0,5") is None
@@ -166,3 +169,121 @@ def test_flag_off_does_not_call_rules(temp_storage, monkeypatch):
     reference_sheet, reference_view = three_readings()
     reading_reconcile.apply([reference_sheet, reference_view])
     assert [f.model_dump() for f in out] == [f.model_dump() for f in (reference_sheet, reference_view)]
+
+
+# ---------------------------------------------------------------- правки ревью
+
+MATERIAL = ("Лист 0,5 ГОСТ 19904-90", [0.7, 0.9, 0.95, 0.93])
+
+
+def sheet_with(*fields):
+    return drawing([field(MATERIAL[0], MATERIAL[1], category="material"), *fields])
+
+
+def test_bare_size_on_thin_sheet_stays():
+    sheet = sheet_with(field("50,5", MARK))
+    sense_rules.apply([sheet])
+    size = sheet.content.structured_drawing_fields[1]
+    assert size.value == "50,5" and size.readings is None
+
+
+def test_bare_size_with_s_reading_becomes_thickness():
+    sheet = sheet_with(field("50,5", MARK, readings=[{"source": "sheet", "value": "50,5"},
+                                                     {"source": "crop", "value": "S0,5"}]))
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[1].value == "S0,5"
+
+
+def test_unrelated_size_with_stray_s_reading_stays():
+    sheet = sheet_with(field("120", MARK, readings=[{"source": "sheet", "value": "120"},
+                                                    {"source": "crop", "value": "S0,5"}]))
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[1].value == "120"
+
+
+def test_starred_roughness_without_s_or_thickness_stays_for_review():
+    sheet = drawing([field("Сталь 45 ГОСТ 1050-88", MATERIAL[1], category="material"),
+                     field("Ra 3,2*", [0.2, 0.2, 0.24, 0.22], category="roughness")])
+    sense_rules.apply([sheet])
+    rough = sheet.content.structured_drawing_fields[1]
+    assert rough.category == "roughness" and rough.value == "Ra 3,2*" and rough.needs_review is True
+
+
+def test_roughness_not_removable_is_not_converted_into_duplicate_size():
+    sheet = sheet_with(field("50,5*", MARK))
+    view = drawing([field("Ra 0,5*", MARK_IN_VIEW, category="roughness")], bbox=VIEW, name="view")
+    stats = sense_rules.apply([sheet, view])
+    (rough,) = view.content.structured_drawing_fields
+    assert rough.category == "roughness" and rough.needs_review is True
+    assert stats["roughness_to_size"] == 0 and stats["roughness_dropped"] == 0
+
+
+def test_dropped_roughness_readings_go_to_survivor():
+    sheet = sheet_with(field("50,5*", MARK), field("Ra 0,5*", [0.805, 0.085, 0.835, 0.105],
+                                                   category="roughness"))
+    sense_rules.apply([sheet])
+    values = [f.value for f in sheet.content.structured_drawing_fields]
+    assert "Ra 0,5*" not in values
+    mark = next(f for f in sheet.content.structured_drawing_fields if f.value == "S0,5*")
+    assert "Ra 0,5*" in [r["value"] for r in mark.readings]
+
+
+def test_large_box_centre_does_not_swallow_small_roughness():
+    # Центр крупной рамки попал в мелкую надпись, а центр надписи — вне
+    # крупной: по строгому правилу это не одно место.
+    big = [0.4, 0.3, 0.6, 0.7]
+    small = [0.45, 0.48, 0.95, 0.52]
+    assert sense_rules.overlaps(small, big) is True
+    assert sense_rules.overlaps(small, big, strict=True) is False
+    assert sense_rules.overlaps(big, small, strict=True) is False
+    # Мелкая надпись внутри крупной — одно место и по строгому правилу.
+    assert sense_rules.overlaps([0.45, 0.4, 0.5, 0.45], big, strict=True) is True
+
+
+@pytest.mark.parametrize("value, label, fits", [
+    ("R5", "радиус", True), ("SR10", "радиус сферы", True), ("(R5)", "радиус", True),
+    ("4×R1", "радиус", True), ("Ra 6,3", "радиус", False), ("Rz 20", "радиус", False),
+    ("⌀6", "диаметр", True), ("Ø6", "диаметр", True), ("Ф6", "диаметр", True), ("ф6", "диаметр", True),
+    ("Φ6", "диаметр", True), ("(⌀6)", "диаметр", True), ("12", "диаметр вала", False),
+    ("M8", "резьбовое отверстие", True), ("G1/2", "отверстие", True), ("Rc1/4", "отверстие", True),
+    ("Tr20x4", "отверстие", True), ("К1/8", "отверстие", True),
+    ("4 отверстия ⌀6", "отверстие", True), ("2 места ⌀8", "отверстие", True),
+    ("2 отв. ⌀8", "отверстие", True), ("R5", "отверстие", False),
+])
+def test_link_fits_forms(value, label, fits):
+    assert sense_rules.link_fits(value, label) is fits
+
+
+def test_rewrite_recomputes_derived_metadata():
+    from core.providers import vector_drawing
+
+    sheet = drawing([field(MATERIAL[0], MATERIAL[1], category="material"),
+                     field("Ra 0,5*", [0.2, 0.2, 0.24, 0.22], category="roughness",
+                           unit="мкм", tolerance="±0,1")])
+    sense_rules.apply([sheet])
+    size = sheet.content.structured_drawing_fields[1]
+    assert size.value == "S0,5*" and size.category == "size"
+    assert size.tolerance == vector_drawing.extract_tolerance("S0,5*")
+    assert size.unit == vector_drawing.extract_unit("S0,5*", "size")
+
+
+@pytest.mark.parametrize("texts, expected", [
+    (["Лист 0,5"], "0,5"),                               # конец записи — только в графе материала
+    ([("Лист 0,5", False)], None),
+    ([("S0,5 ГОСТ 19903", False)], None),                # «S» — только из графы материала
+    (["С 20 ГОСТ 1050-88"], None),                       # кириллическая «С» — не толщина
+    (["Лист 1/2"], None), (["Лист 1 Листов 2"], None),   # счётчик листов
+    ([("Лист 1,5 ГОСТ 19903-74", False)], "1,5"),        # с ГОСТ — и в прочей графе
+    (["Лист 5 ГОСТ 19903-74"], "5"),
+    (["Лист 0,5 ГОСТ 19904-90", "S0,8"], None),          # противоречие — не гадать
+])
+def test_thickness_sources(texts, expected):
+    assert sense_rules.thickness(texts) == expected
+
+
+def test_whole_thickness_bare_55_stays_starred_55_rewritten():
+    sheet = drawing([field("Лист 5 ГОСТ 19903-74", MATERIAL[1], category="material"),
+                     field("55", [0.3, 0.3, 0.33, 0.32]), field("55*", MARK)])
+    sense_rules.apply([sheet])
+    values = [f.value for f in sheet.content.structured_drawing_fields]
+    assert values[1:] == ["55", "S5*"]
