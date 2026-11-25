@@ -448,12 +448,21 @@ def check_links(fields: Iterable[Any]) -> int:
     return removed
 
 
-def _page_texts(fragment: Fragment) -> List[str]:
-    """Текст страницы для толщины: весь текст листа и текст прочих фрагментов."""
+def _page_texts(fragment: Fragment, evidence: bool = False) -> List[str]:
+    """
+    Текст страницы для толщины: весь текст листа и текст прочих фрагментов.
+
+    `build_fragment` убирает `transcript_lines` из payload и кладёт весь
+    текст листа в `content.text` чертёжного фрагмента: к правилам строки
+    листа приходят только оттуда. С `evidence` (DRAWING_THICKNESS_EVIDENCE)
+    текст чертёжного фрагмента берётся построчно; без него — как раньше.
+    """
     content = fragment.content
     if fragment.type == "drawing":
-        lines = (content.structured_payload or {}).get("transcript_lines") or []
-        return [str(line) for line in lines if line]
+        lines = [str(line) for line in (content.structured_payload or {}).get("transcript_lines") or [] if line]
+        if evidence and content.text:
+            lines.extend(line for line in content.text.splitlines() if line.strip())
+        return lines
     return [content.text] if content.text else []
 
 
@@ -476,6 +485,18 @@ def _material_texts(drawings: Sequence[Fragment]) -> List[str]:
                 label = value.split(":", 1)[0].strip().casefold() if ":" in value else ""
                 texts.append((value, label == "материал"))
     return texts
+
+
+# Листовой прокат без толщины в графе материала или в примечании:
+# «Лист Б-ПН-НО ГОСТ 19903-74», «Лента ГОСТ 503-81». Слово с заглавной буквы
+# и ГОСТ/ТУ в той же строке: «листа» и «лист 2» без ГОСТ — не материал.
+_SHEET_METAL = re.compile(r"(?<![А-Яа-яЁёA-Za-z])(?:Лист|Лента|Полоса)(?![А-Яа-яЁё])[^\n]{0,60}?(?:ГОСТ|ТУ)")
+
+
+def _sheet_metal(entries: Iterable[Tuple[str, bool]], notes: Iterable[str]) -> bool:
+    """Графа материала (или примечание) называет листовой прокат."""
+    texts = [text for text, material in entries if material] + list(notes)
+    return any(_SHEET_METAL.search(str(text or "")) for text in texts)
 
 
 # Метка сварного шва ГОСТ 2.312 «2№3» (два места, шов №3), прочитанная
@@ -591,14 +612,17 @@ def _twin_rule(items: List[_Item], stats: Dict[str, int]) -> None:
             stats["twins_merged"] += 1
 
 
-def _reference_thickness_rule(items: List[_Item], notes: str, stats: Dict[str, int]) -> None:
+def _reference_thickness_rule(items: List[_Item], notes: str, stats: Dict[str, int],
+                              sheet_metal: bool = False) -> None:
     """
     Толщина без графы материала: размер «5<x>*», среди прочтений которого
     есть «S<x>», на листе с примечанием «* Размеры для справок» становится
     «S<x>*». Звёздочка справочная, и прочтение «S» того же места — два
-    свидетельства вместо графы материала.
+    свидетельства вместо графы материала. `sheet_metal`
+    (DRAWING_THICKNESS_EVIDENCE) — второе свидетельство вместо примечания:
+    графа материала называет листовой прокат, но без толщины.
     """
-    if not _REFERENCE_NOTE.search(notes):
+    if not (_REFERENCE_NOTE.search(notes) or sheet_metal):
         return
     for item in items:
         field = item.field
@@ -625,7 +649,15 @@ def apply_page(drawings: List[Fragment], texts: Sequence[str] = ()) -> Dict[str,
     stats = {"thickness": 0, "thickness_merged": 0, "roughness_dropped": 0,
              "roughness_to_size": 0, "roughness_review": 0, "links_dropped": 0,
              "thread_weld": 0, "thread_designator": 0, "twins_merged": 0, "weld_marks": 0, "positions": 0}
-    t = thickness(_material_texts(drawings))
+    from core.config import settings
+
+    evidence = settings.DRAWING_THICKNESS_EVIDENCE
+    material = _material_texts(drawings)
+    t = thickness(material)
+    if t is None and evidence:
+        # Примечание «Материал заготовки: Лист 0,5 ГОСТ 19904-90» — та же
+        # толщина; только строгий образец: «лист 2» в примечании — ссылка.
+        t = thickness([(note, False) for note in _notes(drawings)])
     if t is None and texts:
         t = thickness([(text, False) for text in texts])
     items = [
@@ -635,15 +667,14 @@ def apply_page(drawings: List[Fragment], texts: Sequence[str] = ()) -> Dict[str,
     ]
     _roughness_rule(items, t, stats)
     _thread_rule(items, stats)
-    from core.config import settings
-
     if settings.DRAWING_SENSE_POSITIONS:
         _position_rule(items, stats)
     if t is not None:
         _thickness_rule(items, t, stats)
         _deduplicate_thickness(items, t, stats)
     else:
-        _reference_thickness_rule(items, "\n".join(_notes(drawings)) + "\n" + "\n".join(texts), stats)
+        _reference_thickness_rule(items, "\n".join(_notes(drawings)) + "\n" + "\n".join(texts), stats,
+                                  sheet_metal=evidence and _sheet_metal(material, _notes(drawings)))
     _twin_rule(items, stats)
     for fragment in drawings:
         stats["links_dropped"] += check_links(fragment.content.structured_drawing_fields or [])
@@ -652,13 +683,16 @@ def apply_page(drawings: List[Fragment], texts: Sequence[str] = ()) -> Dict[str,
 
 def apply(fragments: List[Fragment]) -> Dict[str, int]:
     """Правила по страницам документа; фрагменты правятся на месте."""
+    from core.config import settings
+
+    evidence = settings.DRAWING_THICKNESS_EVIDENCE
     pages: Dict[Optional[int], List[Fragment]] = {}
     texts: Dict[Optional[int], List[str]] = {}
     for fragment in fragments:
         page = reading_reconcile._page(fragment)
         if fragment.type == "drawing" and fragment.content.structured_drawing_fields:
             pages.setdefault(page, []).append(fragment)
-        texts.setdefault(page, []).extend(_page_texts(fragment))
+        texts.setdefault(page, []).extend(_page_texts(fragment, evidence))
     total: Dict[str, int] = {}
     for page, drawings in pages.items():
         for key, value in apply_page(drawings, texts.get(page, [])).items():

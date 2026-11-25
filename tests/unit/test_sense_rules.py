@@ -418,3 +418,97 @@ def test_detail_sheet_callouts_stay(monkeypatch):
     sheet.content.structured_payload = {"sheet_type": "detail"}
     sense_rules.apply([sheet])
     assert sheet.content.structured_drawing_fields[0].category == "callout"
+
+
+# ---------------------------------------------------------------------------
+# N-S1, DRAWING_THICKNESS_EVIDENCE: текст листа в content.text, примечания,
+# листовой прокат без толщины в графе материала
+# ---------------------------------------------------------------------------
+
+STOCK_LINES = "Бирка\nЛист 0,5 ГОСТ 19904-90\nЛист 1 Листов 1"
+
+
+def radius_misread(**extra):
+    """«S0,5*» прочитана «50,5*» и привязана к радиусу скругления."""
+    return field("50,5*", MARK, link=link("радиус скругления"), **extra)
+
+
+@pytest.fixture
+def evidence_on(monkeypatch):
+    monkeypatch.setattr(settings, "DRAWING_THICKNESS_EVIDENCE", True)
+
+
+def test_evidence_flag_is_off_by_default():
+    assert settings.DRAWING_THICKNESS_EVIDENCE is False
+
+
+def test_thickness_from_sheet_text_in_content(evidence_on):
+    """
+    Как на проде: `build_fragment` кладёт текст листа в `content.text`, в
+    payload его нет. «Лист 0,5 ГОСТ 19904-90» оттуда -> «50,5*» = «S0,5*».
+    """
+    sheet = drawing([radius_misread()], text=STOCK_LINES)
+    sense_rules.apply([sheet])
+    size = sheet.content.structured_drawing_fields[0]
+    assert size.value == "S0,5*" and size.category == "size"
+    assert "50,5*" in [r["value"] for r in size.readings]
+    assert size.needs_review is True and size.link is None
+
+
+def test_thickness_from_note(evidence_on):
+    sheet = drawing([
+        radius_misread(),
+        field("1. Материал заготовки: Лист 0,5 ГОСТ 19904-90", [0.1, 0.8, 0.5, 0.82], category="note"),
+    ])
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].value == "S0,5*"
+
+
+def test_sheet_metal_material_and_s_reading(evidence_on):
+    """Графа материала — лист без толщины, прочтение «S0,5*» того же места: толщина."""
+    sheet = drawing([
+        field("Лист Б-ПН-НО ГОСТ 19903-74", [0.70, 0.90, 0.95, 0.93], category="material"),
+        radius_misread(readings=[{"source": "sheet", "value": "50,5*"}, {"source": "crop", "value": "S0,5*"}]),
+    ])
+    sense_rules.apply([sheet])
+    size = sheet.content.structured_drawing_fields[1]
+    assert size.value == "S0,5*" and size.needs_review is True and size.link is None
+
+
+def test_sheet_metal_without_s_reading_leaves_size(evidence_on):
+    sheet = drawing([
+        field("Лист Б-ПН-НО ГОСТ 19903-74", [0.70, 0.90, 0.95, 0.93], category="material"),
+        radius_misread(),
+    ])
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[1].value == "50,5*"
+
+
+def test_plain_size_stays_with_known_thickness(evidence_on):
+    """Голый «50,5» без звёздочки и без прочтения «S» — размер, хоть толщина и 0,5."""
+    sheet = drawing([field("50,5", MARK)], text=STOCK_LINES)
+    sense_rules.apply([sheet])
+    size = sheet.content.structured_drawing_fields[0]
+    assert size.value == "50,5" and size.category == "size" and not size.needs_review
+
+
+def test_sheet_number_in_content_is_not_thickness(evidence_on):
+    sheet = drawing([field("51*", MARK)], text="Лист 1\nЛистов 2\nЛист 1 Листов 2")
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].value == "51*"
+
+
+def test_evidence_flag_off_changes_nothing():
+    """Без флага прежний вывод: текст листа, примечание и прокат без толщины не учитываются."""
+    cases = [
+        drawing([radius_misread()], text=STOCK_LINES),
+        drawing([radius_misread(), field("Материал: Лист 0,5 ГОСТ 19904-90", [0.1, 0.8, 0.5, 0.82],
+                                         category="note")]),
+        drawing([field("Лист Б-ПН-НО ГОСТ 19903-74", [0.70, 0.90, 0.95, 0.93], category="material"),
+                 radius_misread(readings=[{"source": "sheet", "value": "50,5*"},
+                                          {"source": "crop", "value": "S0,5*"}])]),
+    ]
+    for sheet in cases:
+        sense_rules.apply([sheet])
+        size = next(f for f in sheet.content.structured_drawing_fields if f.category == "size")
+        assert size.value == "50,5*" and not size.needs_review
