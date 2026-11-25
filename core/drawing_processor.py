@@ -127,11 +127,20 @@ _TEXT_DOC_MIN_CHARS_PER_PAGE = 300
 # (`DrawingProcessor._read_sheets`).
 _NO_TIME = object()
 
+# Вырезка MinerU не ушла в модель: исчерпан потолок вырезок документа
+# (DRAWING_CROP_GATE, DRAWING_CROP_MAX_PER_DOC).
+_CROP_CAPPED = "DRAWING_CROP_SKIPPED_CAP"
+# Картинка-«страница текста» с таким числом длинных линий — таблица или
+# перечень, и в модель она уходит (DRAWING_CROP_GATE).
+_CROP_TABLE_RULES = 3
+
 # MuPDF не поддерживает работу из нескольких потоков одновременно, даже с
 # разными документами, а листы одного документа могут читаться параллельно
 # (VLM_SHEET_CONCURRENCY). Рендер страницы — доли секунды против десятков
 # секунд модели, поэтому он просто идёт по очереди.
 _PDF_RENDER_LOCK = threading.Lock()
+# Кэш байтов документа (DRAWING_SOURCE_CACHE): листы читаются из потоков.
+_SOURCE_CACHE_LOCK = threading.Lock()
 
 
 class _Either:
@@ -208,6 +217,10 @@ class DrawingProcessor:
     _reread_crops: Optional[Dict[Any, Any]] = None
     # Листы для «Что изображено» (DRAWING_WHAT_DRAWN); живут только на время документа.
     _what_drawn_sheets: Optional[Dict[Any, Dict[str, Any]]] = None
+    # Байты файлов и открытые PDF документа (DRAWING_SOURCE_CACHE); вне
+    # документа — None, и каждый вызов читает хранилище сам.
+    _source_cache: Optional[Dict[str, bytes]] = None
+    _pdf_cache: Optional[Dict[str, Any]] = None
 
     def __init__(
         self,
@@ -229,6 +242,7 @@ class DrawingProcessor:
         self, image_ref: str, metadata: Dict[str, Any], page: int = 1,
         transcribe: bool = False, log_page: Optional[int] = None,
         text_only: bool = False, page_fields: Optional[List[Dict[str, Any]]] = None,
+        crop_lines: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Возвращает:
@@ -245,17 +259,22 @@ class DrawingProcessor:
         сквозной и пополняется здесь же — прочтения вырезок доходят до
         прохода по странице (`dimension_fidelity.adopt_page_signs`). Без
         него (None) сведение остаётся в точности прежним, внутри вызова.
+
+        `crop_lines` — текст страницы внутри вырезки MinerU
+        (DRAWING_FIELDS_FROM_TEXT_WIDE): у вырезки нет «всего текста листа»,
+        и поля из текста берутся из него.
         """
         # Бюджет листа меряется часами без ожидания мест на видеокарте
         # (GPU_GATE_ENABLED); у каждого листа свои часы.
         with gpu_gate.budget_clock():
             return self._process(image_ref, metadata, page, transcribe, log_page,
-                                 text_only, page_fields)
+                                 text_only, page_fields, crop_lines)
 
     def _process(
         self, image_ref: str, metadata: Dict[str, Any], page: int,
         transcribe: bool, log_page: Optional[int], text_only: bool,
         page_fields: Optional[List[Dict[str, Any]]],
+        crop_lines: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         if not self.qwen.available:
             logger.error(
@@ -304,7 +323,11 @@ class DrawingProcessor:
                 and not text_only and log_page is None):
             # Рамка и сетка штампа не нашлись: штамп — по месту по ГОСТ.
             # С DRAWING_NATIVE_TILES — всегда: вырезка в родном разрешении.
-            fallback = drawing_vision.fallback_title_block(layout)
+            fallback = (
+                drawing_vision.fallback_title_block(layout, dpi=_image_dpi(image))
+                if settings.DRAWING_STAMP_FALLBACK_GOST
+                else drawing_vision.fallback_title_block(layout)
+            )
             if fallback is not None:
                 regions.insert(0, fallback)
                 payload["title_block_fallback"] = True
@@ -514,14 +537,17 @@ class DrawingProcessor:
                 )
         whole_sheet = log_page is None or image_ref in getattr(self, "_whole_images", ())
         if (settings.DRAWING_CORNER_ROUGHNESS and whole_sheet and not text_only
-                and reading is not None and reading.sheet_type == "detail"):
+                and reading is not None
+                and (reading.sheet_type == "detail" or _sheet_by_geometry(layout, reading))):
             # Знак общей шероховатости в углу листа: проход листа его не видит.
             # Только лист целиком (у вырезки вида угла листа нет) и только
             # чертёж детали: общий знак ставится там, а на листе неизвестного
             # рода (текст, схема без штампа) лишний вызов искал бы знак зря.
             fields.extend(self._corner_roughness(layout, fields, payload, budget_started))
         if (settings.DRAWING_MARGIN_COLUMNS and whole_sheet and not text_only
-                and reading is not None and reading.sheet_type in ("detail", "assembly")):
+                and reading is not None
+                and (reading.sheet_type in ("detail", "assembly")
+                     or _sheet_by_geometry(layout, reading))):
             # Графы поля подшивки и графа 26: повёрнутые надписи, которых проход
             # листа не читает. Только лист целиком (у вырезки вида поля
             # подшивки нет) и только чертёж детали или сборки — у них рамка
@@ -547,12 +573,17 @@ class DrawingProcessor:
             # разрешении. Здесь — после сведения прочтений листа и до того,
             # как поля уйдут соседним фрагментам страницы и привязке к виду.
             fields = self._reread_disputed(layout.image, fields, payload, budget_started)
-        if settings.DRAWING_FIELDS_FROM_TEXT:
+        if settings.DRAWING_FIELDS_FROM_TEXT or settings.DRAWING_FIELDS_FROM_TEXT_WIDE:
             # Строки текста листа и таблиц, которых нет в полях (RC2). Место —
             # после всех проходов, дающих поля, и после выбора спорных рамок:
             # у новых полей рамка «весь лист», дочитывать их нечем, и вызовов
             # модели они не добавляют.
-            extra = _fields_from_text(fields, payload.get("transcript_lines"), payload.get("tables"))
+            text_lines = payload.get("transcript_lines")
+            if not text_lines and settings.DRAWING_FIELDS_FROM_TEXT_WIDE:
+                # Вырезка MinerU «всего текста листа» не имеет: текст страницы
+                # внутри вырезки (N-04).
+                text_lines = crop_lines
+            extra = _fields_from_text(fields, text_lines, payload.get("tables"))
             if extra:
                 fields.extend(extra)
                 payload["fields_from_text"] = len(extra)
@@ -590,7 +621,9 @@ class DrawingProcessor:
             payload["dimension_geometry"] = self._dimension_geometry(image_ref, layout, fields)
         if (settings.DRAWING_WHAT_DRAWN and self._what_drawn_sheets is not None and whole_sheet
                 and not text_only and fields
-                and reading is not None and reading.sheet_type in ("detail", "assembly")):
+                and reading is not None
+                and (reading.sheet_type in ("detail", "assembly")
+                     or _sheet_by_geometry(layout, reading))):
             # «Что изображено» — после сведения, дочитывания и правил здравого
             # смысла документа (`_what_drawn_pass`), чтобы величины были
             # окончательными. Здесь — как открыть лист заново и сколько
@@ -1034,12 +1067,17 @@ class DrawingProcessor:
         # Листы для «Что изображено» (DRAWING_WHAT_DRAWN): по (image_ref, страница
         # документа), как их находит фрагмент листа.
         self._what_drawn_sheets = {}
+        if settings.DRAWING_SOURCE_CACHE:
+            # Байты файлов и открытые PDF — на время документа (N-18).
+            self._source_cache = {}
+            self._pdf_cache = {}
         try:
             return self._enrich_fragments(fragments, metadata)
         finally:
             self._reread_crops = None
             self._whole_images = set()
             self._what_drawn_sheets = None
+            self._drop_source_cache()
 
     def _enrich_fragments(
         self, fragments: List[Fragment], metadata: Dict[str, Any]
@@ -1054,6 +1092,11 @@ class DrawingProcessor:
         # Страницы, которые ветвь «лист целиком» прочитает сама: мелкие
         # вырезки с них в модель не уходят (DRAWING_SKIP_SMALL_CROPS).
         whole_pages = self._pages_read_whole(metadata)
+        # Вырезки, отданные модели (потолок DRAWING_CROP_MAX_PER_DOC), и
+        # вырезки для одновременного чтения (DRAWING_CROPS_PARALLEL).
+        crops_sent = 0
+        parallel_crops = max(1, int(settings.DRAWING_CROPS_PARALLEL or 1))
+        crop_jobs: List[Tuple[int, Fragment]] = []
         for fragment in fragments:
             # Векторный чертёж уже разобран парсером по текстовому слою —
             # там точные значения и углы, читать нечего.
@@ -1084,6 +1127,21 @@ class DrawingProcessor:
                 # допуска — то есть потерялись бы.
                 result.append(fragment)
                 continue
+            if settings.DRAWING_CROP_GATE:
+                gate = self._crop_gate(fragment, crops_sent)
+                if gate == _CROP_CAPPED:
+                    # Потолок вырезок документа (N-06): картинка остаётся
+                    # картинкой, пометка говорит, что модель её не видела.
+                    fragment.warnings = list(dict.fromkeys(fragment.warnings + [_CROP_CAPPED]))
+                if gate is not None:
+                    result.append(fragment)
+                    continue
+                crops_sent += 1
+            if parallel_crops > 1:
+                # Срок проверяется, когда вырезка начинается (`_read_crops_parallel`).
+                crop_jobs.append((len(result), fragment))
+                result.append(fragment)
+                continue
             left = deadline.remaining()
             if left is not None and left < settings.VLM_TIMEOUT:
                 # До срока задачи не уложится даже один вызов модели: лучше
@@ -1092,35 +1150,16 @@ class DrawingProcessor:
                 fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_SKIPPED_NO_TIME"]))
                 result.append(fragment)
                 continue
-            if ((settings.DRAWING_CORNER_ROUGHNESS or settings.DRAWING_MARGIN_COLUMNS
-                    or settings.DRAWING_WHAT_DRAWN) and _covers_page(fragment)):
-                # Картинка MinerU на всю страницу — лист целиком, хотя и
-                # читается как вырезка: у неё есть угол рамки со знаком
-                # общей шероховатости (`_corner_roughness`).
-                self._whole_images.add(fragment.content.image_ref)
-            try:
-                sheet_page = int(fragment.position.page) if fragment.position else 0
-                drawing_result = self.process(
-                    fragment.content.image_ref, metadata,
-                    log_page=fragment.position.page if fragment.position else None,
-                    page_fields=page_fields.setdefault(sheet_page, []),
-                )
-                enriched = self.build_fragment(drawing_result, fragment, metadata)
-            except SoftTimeLimitExceeded:
-                raise
-            except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
-                logger.error("Обработка чертежа %s не удалась: %s",
-                             fragment.content.image_ref, exc)
-                enriched = None
-            if enriched is None and self._source_is_raster_drawing(metadata):
-                fragment.review_required = True
-                fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
-            result.append(enriched or fragment)
+            result.append(self._read_crop(fragment, fragments, metadata, page_fields))
+        if crop_jobs:
+            self._read_crops_parallel(crop_jobs, result, fragments, metadata, page_fields,
+                                      parallel_crops)
 
         had_drawings = any(f.type == "drawing" for f in result)
         sheets = self._sheet_drawings(result, metadata, page_fields)
         pdf_full_read = self._full_read_pdf(metadata)
-        if sheets and (pdf_full_read or (had_drawings and settings.DRAWING_SHEET_MISSING_PAGES)):
+        if sheets and (pdf_full_read or (had_drawings and settings.DRAWING_SHEET_MISSING_PAGES)
+                       or self._per_page_sheets(metadata) is not None):
             # Дочитанный лист встаёт перед фрагментами своей страницы, а не
             # в начало документа: порядок страниц сохраняется.
             for sheet in sheets:
@@ -1193,6 +1232,137 @@ class DrawingProcessor:
             # вырезок и выправленного листа, а наружу поля уходят в долях страницы.
             result = field_placement.apply(result)
         return result
+
+    # ------------------------------------------------------- вырезки MinerU
+    def _read_crop(
+        self, fragment: Fragment, fragments: List[Fragment], metadata: Dict[str, Any],
+        page_fields: Dict[int, List[Dict[str, Any]]],
+        fields: Optional[List[Dict[str, Any]]] = None, in_pool: bool = False,
+    ) -> Fragment:
+        """
+        Вырезка MinerU -> фрагмент чертежа; не вышло — сама вырезка.
+        `in_pool` — вызов из `_read_crops_parallel`: отмена вырезки уходит
+        наверх, к потоку страницы; по очереди всё ловится, как раньше.
+        """
+        if ((settings.DRAWING_CORNER_ROUGHNESS or settings.DRAWING_MARGIN_COLUMNS
+                or settings.DRAWING_WHAT_DRAWN) and _covers_page(fragment)):
+            # Картинка MinerU на всю страницу — лист целиком, хотя и
+            # читается как вырезка: у неё есть угол рамки со знаком
+            # общей шероховатости (`_corner_roughness`).
+            self._whole_images.add(fragment.content.image_ref)
+        try:
+            sheet_page = int(fragment.position.page) if fragment.position else 0
+            # Текст страницы внутри вырезки — только с широкими полями из
+            # текста (N-04): без флага вызов прежний.
+            extra = {}
+            if settings.DRAWING_FIELDS_FROM_TEXT_WIDE:
+                lines = _crop_lines(fragment, fragments)
+                if lines:
+                    extra["crop_lines"] = lines
+            drawing_result = self.process(
+                fragment.content.image_ref, metadata,
+                log_page=fragment.position.page if fragment.position else None,
+                page_fields=(page_fields.setdefault(sheet_page, []) if fields is None else fields),
+                **extra,
+            )
+            enriched = self.build_fragment(drawing_result, fragment, metadata)
+        except SoftTimeLimitExceeded:
+            raise
+        except deadline.Cancelled as exc:
+            if in_pool:
+                raise
+            logger.error("Обработка чертежа %s не удалась: %s",
+                         fragment.content.image_ref, exc)
+            enriched = None
+        except Exception as exc:  # noqa: BLE001 — чертёж не должен ронять документ
+            logger.error("Обработка чертежа %s не удалась: %s",
+                         fragment.content.image_ref, exc)
+            enriched = None
+        if enriched is None and self._source_is_raster_drawing(metadata):
+            fragment.review_required = True
+            fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_NOT_RECOGNIZED"]))
+        return enriched or fragment
+
+    def _read_crops_parallel(
+        self, jobs: List[Tuple[int, Fragment]], result: List[Fragment],
+        fragments: List[Fragment], metadata: Dict[str, Any],
+        page_fields: Dict[int, List[Dict[str, Any]]], workers: int,
+    ) -> None:
+        """
+        Вырезки разных страниц — одновременно (DRAWING_CROPS_PARALLEL, N-20),
+        вырезки одной страницы — по очереди и в порядке документа: они
+        делят список прочтений страницы. Вызовы модели по-прежнему проходят
+        места GPU_GATE и пул соединений клиента. Результат встаёт на место
+        вырезки в `result`.
+        """
+        by_page: Dict[int, List[Tuple[int, Fragment]]] = {}
+        for index, fragment in jobs:
+            page = int(fragment.position.page) if fragment.position else 0
+            by_page.setdefault(page, []).append((index, fragment))
+        lists = {page: page_fields.setdefault(page, []) for page in by_page}
+        abort = threading.Event()
+
+        def run(page: int) -> List[Tuple[int, Fragment]]:
+            done: List[Tuple[int, Fragment]] = []
+            for index, fragment in by_page[page]:
+                left = deadline.remaining()
+                if abort.is_set() or (left is not None and left < settings.VLM_TIMEOUT):
+                    fragment.review_required = True
+                    fragment.warnings = list(dict.fromkeys(
+                        fragment.warnings + ["DRAWING_SKIPPED_NO_TIME"]))
+                    done.append((index, fragment))
+                    continue
+                try:
+                    with deadline.cancel_on(abort):
+                        done.append((index, self._read_crop(
+                            fragment, fragments, metadata, page_fields, lists[page],
+                            in_pool=True)))
+                except deadline.Cancelled:
+                    done.append((index, fragment))
+            return done
+
+        pool = ThreadPoolExecutor(max_workers=min(workers, len(by_page)),
+                                  thread_name_prefix="drawing-crop")
+        try:
+            # Срок задачи хранится в contextvars: потоку нужна копия контекста.
+            futures = [pool.submit(contextvars.copy_context().run, run, page) for page in by_page]
+            for future in futures:
+                for index, fragment in future.result():
+                    result[index] = fragment
+        except BaseException:
+            # Обрыв задачи: вырезки из очереди не начинаются, начатые бросают
+            # работу перед следующим вызовом модели (как у листов).
+            abort.set()
+            raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _crop_gate(self, fragment: Fragment, sent: int) -> Optional[str]:
+        """
+        Пропустить ли вырезку мимо модели (DRAWING_CROP_GATE, N-06). `None` —
+        читать; `_CROP_CAPPED` — потолок документа исчерпан; иное — причина
+        (мала, не похожа на чертёж). Похожесть — по растровому детектору:
+        фото, снимок экрана, пустая или слишком мелкая картинка и страница
+        текста без линий таблицы чертежом не бывают.
+        """
+        share = _page_area_share(fragment)
+        if share is not None and share < float(settings.DRAWING_CROP_MIN_AREA):
+            return "small"
+        data = self._read(str(fragment.content.image_ref or ""))
+        if data:
+            verdict = raster_drawing.analyse(data)
+            signals = verdict.signals or {}
+            if verdict.kind in (raster_drawing.KIND_PHOTO, raster_drawing.KIND_SCREENSHOT):
+                return verdict.kind
+            if verdict.kind == raster_drawing.KIND_UNREADABLE and (
+                    "ink" not in signals or float(signals["ink"]) < raster_drawing._INK_BLANK):
+                return "unreadable"
+            if (verdict.kind == raster_drawing.KIND_TEXT_SCAN
+                    and int(signals.get("long_rules") or 0) < _CROP_TABLE_RULES):
+                return "text"
+        if sent >= max(0, int(settings.DRAWING_CROP_MAX_PER_DOC)):
+            return _CROP_CAPPED
+        return None
 
     # ------------------------------------------- перечитывание плохого скана
     def _rescan_poor_pages(
@@ -1385,13 +1555,18 @@ class DrawingProcessor:
         открывается, и ветка молча вернула бы пустой результат.
         """
         full_read = self._full_read_image(metadata) or self._full_read_pdf(metadata)
+        # Листы по каждой странице (DRAWING_SHEETS_PER_PAGE, N-08): решает
+        # детектор страницы, а не доля чертежей в документе.
+        per_page = self._per_page_sheets(metadata)
+        if per_page is not None:
+            full_read = full_read or self._per_page_full_read(metadata)
         drawings = [fragment for fragment in fragments if fragment.type == "drawing"]
         drawn_pages = {int(f.position.page) for f in drawings if f.position is not None}
         # Нарезанные MinerU картинки листа — это виды, а не лист: штамп,
         # номер листа и примечания остаются за ними. При полном чтении
         # картинки лист читается целиком и в этом случае.
         only_undrawn = False
-        if not full_read and drawings:
+        if per_page is None and not full_read and drawings:
             # Листы без единого фрагмента drawing (повёрнутый лист, который
             # MinerU принял за таблицу) иначе не читались моделью вовсе.
             # Фрагмент без страницы не даёт сказать, какой лист уже прочитан.
@@ -1400,7 +1575,7 @@ class DrawingProcessor:
                     or not self._source_is_raster_drawing(metadata)):
                 return []
             only_undrawn = True
-        if not full_read and not self._source_is_raster_drawing(metadata):
+        if per_page is None and not full_read and not self._source_is_raster_drawing(metadata):
             return []
 
         source_uri = str(metadata.get("source_path") or "")
@@ -1409,13 +1584,18 @@ class DrawingProcessor:
 
         signals = (metadata.get("classification") or {}).get("signals") or {}
         pages = list(signals.get("raster_drawing_pages") or signals.get("drawing_pages") or [1])
+        if per_page is not None:
+            pages = per_page
         if only_undrawn:
             pages = [page for page in pages if int(page) not in drawn_pages]
             if not pages:
                 return []
         sheets: List[Fragment] = []
-        skipped = pages[settings.DRAWING_MAX_SHEETS:]
-        chosen = pages[: settings.DRAWING_MAX_SHEETS]
+        # Без потолка числа листов при чтении по страницам: ограничивает срок
+        # задачи (`_NO_TIME`), недочитанное — DRAWING_SHEETS_SKIPPED.
+        limit = len(pages) if per_page is not None else settings.DRAWING_MAX_SHEETS
+        skipped = pages[limit:]
+        chosen = pages[:limit]
         # Списки прочтений берутся здесь, в порядке страниц: потоки листов
         # получают каждый свой список и общий словарь не трогают.
         fields_of = [
@@ -1553,6 +1733,31 @@ class DrawingProcessor:
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
+    @staticmethod
+    def _per_page_sheets(metadata: Dict[str, Any]) -> Optional[List[int]]:
+        """
+        Страницы для чтения листа целиком по каждой странице
+        (DRAWING_SHEETS_PER_PAGE): растровый источник и страницы, где
+        детектор видит чертёж или рамку формата (`raster_sheet_pages` из
+        классификации). `None` — флаг выключен или таких страниц нет.
+        """
+        if not settings.DRAWING_SHEETS_PER_PAGE:
+            return None
+        classification = metadata.get("classification") or {}
+        if classification.get("source") != SOURCE_RASTER:
+            return None
+        pages = (classification.get("signals") or {}).get("raster_sheet_pages") or []
+        found = sorted({int(page) for page in pages if int(page) >= 1})
+        return found or None
+
+    @staticmethod
+    def _per_page_full_read(metadata: Dict[str, Any]) -> bool:
+        """Лист по странице читается со всем текстом — по флагу полного чтения своего типа."""
+        file_type = str(metadata.get("file_type") or "").lower().lstrip(".")
+        if file_type == "pdf":
+            return bool(settings.DRAWING_PDF_FULL_READ)
+        return filetypes.is_image(file_type) and bool(settings.DRAWING_IMAGE_FULL_READ)
+
     def _pages_read_whole(self, metadata: Dict[str, Any]) -> frozenset:
         """
         Номера страниц, которые ветвь «лист целиком» прочитает сама.
@@ -1685,8 +1890,15 @@ class DrawingProcessor:
         """
         if settings.DRAWING_TITLE_BLOCK_PASS or settings.DRAWING_NATIVE_TILES:
             return self._read_title_block_fields(layout, region, fields, payload, native=native)
-        piece = drawing_vision.crop(layout.image, region.bbox)
-        block = self.qwen.read_title_block(piece)
+        cap = int(settings.DRAWING_STAMP_MAX_SIDE or 0)
+        if cap > 0:
+            # Свой потолок стороны вырезки штампа (N-15) — и при вырезке, и
+            # при отправке модели, иначе увеличение съест второй потолок.
+            piece = drawing_vision.crop(layout.image, region.bbox, max_side=cap)
+            block = self.qwen.read_title_block(piece, max_side=cap)
+        else:
+            piece = drawing_vision.crop(layout.image, region.bbox)
+            block = self.qwen.read_title_block(piece)
         if block is None:
             logger.warning("Штамп не прочитан")
             return False
@@ -2172,7 +2384,9 @@ class DrawingProcessor:
 
         def render(dpi: float):
             data = self._read(image_ref)
-            raw = _render_pdf_page(data, page, dpi=dpi) if data[:5] == b"%PDF-" else None
+            cached = ({"documents": self._pdf_cache, "key": image_ref}
+                      if self._pdf_cache is not None else {})
+            raw = _render_pdf_page(data, page, dpi=dpi, **cached) if data[:5] == b"%PDF-" else None
             return None if raw is None else drawing_vision.reproduce(raw, layout.angle, layout.turn)
 
         return native_tiles.NativeSheet(layout.image, float(rendered), render)
@@ -2184,18 +2398,46 @@ class DrawingProcessor:
         if data[:5] == b"%PDF-":
             # Скан чертежа в PDF: лист рендерится в растр, иначе модель
             # получала бы «картинку», которая не открывается.
+            if self._pdf_cache is not None:
+                return _render_pdf_page(data, page, documents=self._pdf_cache, key=image_ref)
             return _render_pdf_page(data, page)
-        image = raster_drawing.open_image(data)
+        if settings.RASTER_ALL_FRAMES:
+            # Кадр многокадрового TIFF — страница листа (N-17).
+            image = raster_drawing.open_image(data, frame=max(0, int(page or 1) - 1))
+        else:
+            image = raster_drawing.open_image(data)
         if image is None:
             logger.error("Чертёж %s не открылся как растр", image_ref)
         return image
 
     def _read(self, uri: str) -> bytes:
+        cache = self._source_cache
+        if cache is not None:
+            with _SOURCE_CACHE_LOCK:
+                cached = cache.get(uri)
+            if cached is not None:
+                return cached
         try:
-            return self.storage.read_bytes(uri)
+            data = self.storage.read_bytes(uri)
         except Exception as exc:  # noqa: BLE001
             logger.error("Не удалось прочитать %s: %s", uri, exc)
             return b""
+        if cache is not None and data:
+            with _SOURCE_CACHE_LOCK:
+                cache.setdefault(uri, data)
+        return data
+
+    def _drop_source_cache(self) -> None:
+        """Конец документа: байты отпускаются, открытые PDF закрываются (N-18)."""
+        documents = self._pdf_cache or {}
+        self._source_cache = None
+        self._pdf_cache = None
+        with _PDF_RENDER_LOCK:
+            for document in documents.values():
+                try:
+                    document.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 # ===========================================================================
@@ -2295,6 +2537,59 @@ def _value_view_links() -> bool:
     return bool(getattr(settings, "DRAWING_VALUE_VIEW_LINKS", False))
 
 
+def _image_dpi(image) -> Optional[float]:
+    """Разрешение листа: рендера PDF или из сведений растра; неизвестно — None."""
+    rendered = (getattr(image, "info", None) or {}).get("render_dpi")
+    if rendered:
+        return float(rendered)
+    return native_tiles.raster_dpi(image)
+
+
+def _sheet_by_geometry(layout, reading) -> bool:
+    """
+    Проходы листа по геометрии (DRAWING_PASSES_BY_GEOMETRY, N-16): рамка
+    формата найдена или род листа модель не назвала. Без флага — False, и
+    решает `sheet_type`, как раньше.
+    """
+    if not settings.DRAWING_PASSES_BY_GEOMETRY:
+        return False
+    if layout.frame or (layout.signals or {}).get("inner_frame"):
+        return True
+    return str(getattr(reading, "sheet_type", "") or "unknown") == "unknown"
+
+
+def _crop_lines(fragment: Fragment, fragments: List[Fragment]) -> List[str]:
+    """
+    Текст страницы внутри вырезки MinerU (DRAWING_FIELDS_FROM_TEXT_WIDE):
+    текст самой картинки и текстовые и табличные фрагменты той же страницы,
+    центр которых лежит в рамке вырезки. Строка таблицы — ячейки через « | ».
+    """
+    lines: List[str] = []
+    if fragment.content.text:
+        lines.extend(line.strip() for line in fragment.content.text.splitlines() if line.strip())
+    if fragment.position is None or len(fragment.position.bbox or []) != 4:
+        return lines
+    page = fragment.position.page
+    x1, y1, x2, y2 = (float(v) for v in fragment.position.bbox)
+    for other in fragments:
+        if other is fragment or other.position is None or other.position.page != page:
+            continue
+        box = other.position.bbox or []
+        if len(box) != 4:
+            continue
+        cx, cy = (float(box[0]) + float(box[2])) / 2, (float(box[1]) + float(box[3])) / 2
+        if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+            continue
+        if other.type == "table" and other.content.table_data is not None:
+            for row in other.content.table_data.rows:
+                cells = [str(cell if cell is not None else "") for cell in row]
+                if any(cell.strip() for cell in cells):
+                    lines.append(" | ".join(cells))
+        elif other.type == "text" and other.content.text:
+            lines.extend(line.strip() for line in other.content.text.splitlines() if line.strip())
+    return lines
+
+
 def _covers_page(fragment: Fragment) -> bool:
     """Картинка занимает почти всю страницу (от 80 % площади): это лист, а не вид."""
     bbox = list(fragment.position.bbox or []) if fragment.position else []
@@ -2352,11 +2647,15 @@ def _stamp_marks(text: str) -> int:
     return len({match.group(0).casefold().replace(" ", "") for match in _STAMP_WORDS.finditer(text)})
 
 
-def _render_pdf_page(data: bytes, page: int, dpi: Optional[float] = None):
+def _render_pdf_page(data: bytes, page: int, dpi: Optional[float] = None,
+                     documents: Optional[Dict[str, Any]] = None, key: str = ""):
     """
     Страница PDF как растр в рабочем разрешении чертежей (или в `dpi`). Своё
     разрешение рендер помнит в `info["render_dpi"]`: по нему лист в родном
     разрешении (DRAWING_NATIVE_TILES) знает, что его можно отрисовать заново.
+
+    `documents` — открытые PDF документа по `key` (DRAWING_SOURCE_CACHE):
+    файл разбирается один раз, закрывает его `_drop_source_cache`.
     """
     try:
         import fitz
@@ -2364,11 +2663,17 @@ def _render_pdf_page(data: bytes, page: int, dpi: Optional[float] = None):
     except ImportError:  # pragma: no cover
         return None
     with _PDF_RENDER_LOCK:
-        try:
-            document = fitz.open(stream=data, filetype="pdf")
-        except Exception as exc:  # noqa: BLE001
-            logger.error("PDF чертежа не открылся: %s", exc)
-            return None
+        document = documents.get(key) if documents is not None else None
+        keep = document is not None
+        if document is None:
+            try:
+                document = fitz.open(stream=data, filetype="pdf")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("PDF чертежа не открылся: %s", exc)
+                return None
+            if documents is not None:
+                documents[key] = document
+                keep = True
         try:
             if not 1 <= page <= document.page_count:
                 return None
@@ -2378,7 +2683,8 @@ def _render_pdf_page(data: bytes, page: int, dpi: Optional[float] = None):
             image.info["render_dpi"] = resolution
             return image
         finally:
-            document.close()
+            if not keep:
+                document.close()
 
 
 def _field(
@@ -2629,6 +2935,11 @@ def _strict_text_field(cells: List[str], n: int, from_table: bool, position_colu
             and any(any(ch.isalpha() for ch in cell) for cell in cells[1:])):
         # Номер в графе «Поз.» — только в строке с обозначением или наименованием.
         return "position", text
+    if settings.DRAWING_FIELDS_FROM_TEXT_WIDE:
+        # Строка перечня элементов — до правил величин: «R1» в ней не радиус.
+        element = _element_row_field(cells, n)
+        if element is not None:
+            return element
     if _STAMP_CAPTION.match(text):
         # Подпись графы и значение следующей ячейкой: «Разраб. | Бабанин».
         if n + 1 < len(cells):
@@ -2645,6 +2956,62 @@ def _strict_text_field(cells: List[str], n: int, from_table: bool, position_colu
         # Первая ячейка строки таблицы — обозначение («R1», «M3»), а не величина.
         return by_rules, text
     if (not in_table and len(text) >= _REQUIREMENT_MIN_CHARS and _REQUIREMENT.match(text)):
+        return "note", text
+    if settings.DRAWING_FIELDS_FROM_TEXT_WIDE:
+        return _wide_text_field(cells, n)
+    return None
+
+
+# DRAWING_FIELDS_FROM_TEXT_WIDE (N-04). Позиционное обозначение элемента схемы
+# (ГОСТ 2.710): одна-три буквы и номер — «R1», «C12», «DA3», «XT21»; список
+# и диапазон — «HL4, HL6...HL18», «R1-R3».
+_DESIGNATOR = r"[A-ZА-ЯЁ]{1,3}\d{1,4}"
+_DESIGNATOR_CELL = re.compile(
+    r"^%s(?:\s*(?:,|-|–|\.{2,3}|…)\s*%s)*$" % (_DESIGNATOR, _DESIGNATOR))
+# Строка перечня одной строкой текста: «XT21 Клемма OptiDin СКЛ 1/4 12».
+_DESIGNATOR_LINE = re.compile(
+    r"^(%s(?:\s*(?:,|-|–|\.{2,3}|…)\s*%s)*)\s+(.+)$" % (_DESIGNATOR, _DESIGNATOR))
+# Наименование: хотя бы одно слово от трёх букв.
+_NAME_WORD = re.compile(r"[A-Za-zА-Яа-яЁё]{3,}")
+# Обозначение документа по ГОСТ 2.201: код организации, классификационная
+# характеристика и номер — «АБВГ.123456.001», с исполнением и кодом документа.
+_DESIGNATION = re.compile(
+    r"(?<![\w.])[А-ЯЁA-Z]{2,4}\.\d{6}\.\d{3}(?:-\d{2,3})?(?:\s?[А-ЯЁA-Z]{1,3}\d{0,2})?(?![\w.])")
+# Нумерованный пункт примечаний или требований короче строгого образца:
+# «2. Острые кромки притупить», «3) Покрыть грунтом».
+_NUMBERED_NOTE = re.compile(r"^\*?\d{1,2}[.)]\s*[А-ЯЁA-Zа-яё]")
+_NUMBERED_NOTE_MIN_CHARS = 8
+
+
+def _element_row_field(cells: List[str], n: int):
+    """
+    Строка перечня элементов (N-04): позиционное обозначение с наименованием
+    — ячейками таблицы или одной строкой текста. Голое обозначение без
+    наименования полем не становится: проверить его нечем.
+    """
+    text = cells[n]
+    if n == 0 and len(cells) > 1 and _DESIGNATOR_CELL.match(text):
+        name = next((cell for cell in cells[1:] if _NAME_WORD.search(cell)), "")
+        if name:
+            return "position", "%s %s" % (text, name)
+    if len(cells) == 1:
+        line = _DESIGNATOR_LINE.match(text)
+        if line and _NAME_WORD.search(line.group(2)) and not _DESIGNATION.search(text):
+            return "position", text
+    return None
+
+
+def _wide_text_field(cells: List[str], n: int):
+    """
+    Остальные широкие образцы N-04 (DRAWING_FIELDS_FROM_TEXT_WIDE):
+    обозначение документа по ГОСТ 2.201 и короткий нумерованный пункт.
+    """
+    text = cells[n]
+    designation = _DESIGNATION.search(text)
+    if designation:
+        return "callout", designation.group(0).strip()
+    if (len(cells) == 1 and len(text) >= _NUMBERED_NOTE_MIN_CHARS
+            and _NUMBERED_NOTE.match(text) and _NAME_WORD.search(text)):
         return "note", text
     return None
 
