@@ -47,7 +47,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -503,15 +503,143 @@ def _kind(label: str) -> str:
     return "other"
 
 
-def _replace_words(text: str, notes: List[Dict[str, str]]) -> str:
-    """Те же замены слов в тексте листа: запись и поля называют одинаково."""
-    for note in notes:
-        if note["kind"] not in (SIGNER, TERM) or not note["after"]:
+# Подписи одной графы: «Пров.» и «Проверил» — одна и та же графа.
+_LABEL_GROUPS: Tuple[Tuple[str, ...], ...] = (
+    ("разраб", "разработал"), ("пров", "проверил"), ("тконтр", "техконтроль"),
+    ("нконтр", "нормоконтроль"), ("утв", "утвердил"), tuple(sorted(SIGNATURE_LABELS)),
+)
+# Ключи `title_block` и `title_block_handwritten` -> подписи их граф.
+_KEY_LABELS: Dict[str, Tuple[str, ...]] = {
+    "developed": _LABEL_GROUPS[0], "checked": _LABEL_GROUPS[1], "tech_control": _LABEL_GROUPS[2],
+    "norm_control": _LABEL_GROUPS[3], "approved": _LABEL_GROUPS[4], "signed_date": _LABEL_GROUPS[5],
+}
+_LEFT = r"(?<![0-9A-Za-zА-Яа-яЁё])"
+_RIGHT = r"(?![0-9A-Za-zА-Яа-яЁё])"
+_LABEL_SEP = r"[\s.,:;№\-_|]"
+# Правки слов, которые переносятся в текст листа и в прочтения поля.
+_WORD_KINDS = (SIGNER, TERM, DROPPED)
+
+Located = Tuple[Dict[str, str], Set[str], str]
+
+
+def _words(note: Dict[str, str]) -> List[str]:
+    """
+    Что искать: само прочтение, а у снятой подписи — и фамилию без
+    инициалов (другой проход мог прочитать её без них).
+    """
+    found = [note["before"]]
+    if note["kind"] == DROPPED:
+        bare = surname(note["before"])
+        if bare and bare != note["before"]:
+            found.append(bare)
+    return found
+
+
+def _label_group(folded: str) -> Tuple[str, ...]:
+    for group in _LABEL_GROUPS:
+        if folded in group:
+            return group
+    return (folded,) if folded else ()
+
+
+def _label_pattern(folded: str) -> str:
+    """Подпись графы в тексте: те же буквы, между ними точки и пробелы («Т. контр.»)."""
+    chars = ["[её]" if char == "е" else re.escape(char) for char in folded]
+    return "(?i:" + (_LABEL_SEP + "*").join(chars) + ")"
+
+
+def _labels_before(value: str, word: str) -> Set[str]:
+    """Подписи граф, за которыми слово стоит в самом значении («Разраб. Иванов»)."""
+    found: Set[str] = set()
+    for label in ROLE_LABELS | SIGNATURE_LABELS:
+        pattern = _LEFT + _label_pattern(label) + _LABEL_SEP + "*" + re.escape(word) + _RIGHT
+        if re.search(pattern, value):
+            found.update(_label_group(label))
+    return found
+
+
+def _context(note: Dict[str, str], labels: Iterable[str], line: str) -> Located:
+    return note, set(labels) | _labels_before(line, note["before"]), line
+
+
+def _replace_at(text: str, spans: Iterable[Tuple[int, int]], after: str) -> str:
+    """Замена по местам с конца; снятое слово уносит и пробелы за собой."""
+    for start, end in sorted(set(spans), reverse=True):
+        if after:
+            text = text[:start] + after + text[end:]
             continue
-        pattern = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])" + re.escape(note["before"])
-                             + r"(?![0-9A-Za-zА-Яа-яЁё])")
-        text = pattern.sub(note["after"], text)
+        stop = end
+        while stop < len(text) and text[stop] in " \t":
+            stop += 1
+        if stop == len(text) or text[stop] == "\n":
+            while start > 0 and text[start - 1] in " \t":
+                start -= 1
+        text = text[:start] + text[stop:]
     return text
+
+
+def _replace_words(text: str, located: Sequence[Located]) -> str:
+    """
+    Те же замены слов в тексте листа: запись и поля называют одинаково.
+
+    Слово меняется только там, где оно стоит за подписью своей графы
+    («Пров. Зорубякин») или в строке, совпадающей с прочтением поля целиком.
+    По всему тексту не меняется: то же слово в другом месте листа может
+    быть верным. Не нашлось такого места — текст не трогается.
+    """
+    for note, labels, line in located:
+        if note["kind"] not in _WORD_KINDS or note["before"] == note["after"]:
+            continue
+        # Строка из одного слова — не место поля, если у поля есть подпись графы.
+        by_line = bool(line.strip()) and (not labels or line.strip() != note["before"])
+        for before in _words(note):
+            word = re.escape(before)
+            spans: List[Tuple[int, int]] = []
+            for label in labels:
+                pattern = _LEFT + _label_pattern(label) + _LABEL_SEP + "*(" + word + ")" + _RIGHT
+                spans += [match.span(1) for match in re.finditer(pattern, text)]
+            if by_line:
+                whole = r"^[ \t]*" + re.escape(line.strip()) + r"[ \t]*$"
+                for row in re.finditer(whole, text, re.MULTILINE):
+                    spans += [(row.start() + match.start(), row.start() + match.end())
+                              for match in re.finditer(_LEFT + word + _RIGHT, row.group(0))]
+            if spans:
+                text = _replace_at(text, spans, note["after"])
+    return text
+
+
+def _fix_readings(field: Any, found: Sequence[Dict[str, str]]) -> None:
+    """
+    Прочтения поля (`readings`, `alternatives`) — с той же правкой, что и
+    значение: прежнее неверное прочтение остаётся только в учёте
+    (`completeness_mechanisms`), иначе оно вернулось бы в индекс.
+    """
+    def fix(value: str) -> str:
+        changed = False
+        for note in found:
+            if note["kind"] not in _WORD_KINDS or note["before"] == note["after"]:
+                continue
+            for before in _words(note):
+                spans = [m.span() for m in re.finditer(_LEFT + re.escape(before) + _RIGHT, value)]
+                if spans:
+                    value, changed = _replace_at(value, spans, note["after"]), True
+        return " ".join(value.split()) if changed else value
+
+    if field.readings:
+        readings = []
+        for reading in field.readings:
+            value = reading.get("value") if isinstance(reading, dict) else None
+            if not isinstance(value, str):
+                readings.append(reading)
+                continue
+            fixed = fix(value)
+            if not _EMPTY_LEFT.match(fixed):
+                readings.append({**reading, "value": fixed})
+        field.readings = readings
+    if field.alternatives:
+        alternatives = [fix(value) if isinstance(value, str) else value for value in field.alternatives]
+        field.alternatives = list(dict.fromkeys(
+            value for value in alternatives if not (isinstance(value, str) and _EMPTY_LEFT.match(value))))
 
 
 def apply_fragment(fragment: Any, lexicon: Lexicon) -> Dict[str, int]:
@@ -520,14 +648,18 @@ def apply_fragment(fragment: Any, lexicon: Lexicon) -> Dict[str, int]:
     content = fragment.content
     payload = content.structured_payload if isinstance(content.structured_payload, dict) else {}
     notes: List[Dict[str, str]] = []
+    # Правки с местом, где их искать в тексте листа (`_replace_words`).
+    located: List[Located] = []
 
     kept = []
     for field in content.structured_drawing_fields or []:
         head, body, tail = _split(field.value)
         kind = _kind(head) if head else "other"
         fixed, unverified, found = _fix_value(body, kind, bool(tail), field.category, lexicon)
+        labels = _label_group(_label_fold(head)) if head else ()
         for note in found:
             note["where"] = head or field.category
+            located.append(_context(note, labels, field.value))
         notes += found
         if unverified:
             field.unverified_signer = True
@@ -540,6 +672,8 @@ def apply_fragment(fragment: Any, lexicon: Lexicon) -> Dict[str, int]:
                 continue
             field.value = _join(head, fixed, tail)
             stats["changed"] += 1
+        if found:
+            _fix_readings(field, found)
         kept.append(field)
     if content.structured_drawing_fields is not None:
         content.structured_drawing_fields = kept
@@ -554,6 +688,7 @@ def apply_fragment(fragment: Any, lexicon: Lexicon) -> Dict[str, int]:
             fixed, _, found = _fix_value(value, kind, False, category, lexicon)
             for note in found:
                 note["where"] = f"title_block.{key}"
+                located.append(_context(note, _KEY_LABELS.get(key, ()), value))
             notes += found
             block[key] = fixed
     hand = payload.get("title_block_handwritten")
@@ -566,6 +701,7 @@ def apply_fragment(fragment: Any, lexicon: Lexicon) -> Dict[str, int]:
             fixed, _, found = _fix_value(value, kind, True, "title_block", lexicon)
             for note in found:
                 note["where"] = f"title_block_handwritten.{key}"
+                located.append(_context(note, _KEY_LABELS.get(key, ()), value))
             notes += found
             if kind == "signature" and _EMPTY_LEFT.match(fixed):
                 del hand[key]
@@ -577,7 +713,7 @@ def apply_fragment(fragment: Any, lexicon: Lexicon) -> Dict[str, int]:
         for note in found:
             note["where"] = "text"
         notes += found
-        content.text = _replace_words(text, notes)
+        content.text = _replace_words(text, located)
 
     if notes:
         diagnostics = dict(fragment.completeness_mechanisms.get(_DIAGNOSTICS) or {})
