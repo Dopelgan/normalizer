@@ -2,7 +2,10 @@
 
 import time
 
+import pytest
+
 from core import document_delete
+from core.config import settings
 from core.models.contract import DocumentResult
 from core.repositories import ChunkRepository, DocumentRepository
 from core.result_aggregator import get_request_state, init_request_state
@@ -14,6 +17,11 @@ task_db = test_tasks.task_db
 pipeline = test_tasks.pipeline
 
 FILEID = "file-1"
+
+
+@pytest.fixture(autouse=True)
+def delete_enabled(monkeypatch):
+    monkeypatch.setattr(settings, "NORMALIZER_DELETE_ENABLED", True)
 
 
 def _rows(task_db, doc_id):
@@ -67,3 +75,10 @@ def test_request_after_delete_is_saved(pipeline, task_db, fake_redis):
 
 def test_deleted_stub_matches_contract():
     DocumentResult(**document_delete.deleted_document(FILEID, generate_doc_id(FILEID)))
+
+
+def test_flag_off_ignores_tombstone(pipeline, task_db, fake_redis, monkeypatch):
+    monkeypatch.setattr(settings, "NORMALIZER_DELETE_ENABLED", False)
+    init_request_state("req-1", [FILEID])
+    document_delete.write_tombstone(fake_redis, generate_doc_id(FILEID))
+    assert process_document("req-1", FILEID)["status"] == "success"

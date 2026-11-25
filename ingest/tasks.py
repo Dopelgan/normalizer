@@ -732,14 +732,18 @@ def process_document(
         # не сохраняется (надгробие — core/document_delete.py). Проверка — под
         # блокировкой строки: удаление, начатое позже, дождётся сохранения и
         # снимет его само.
-        started_at = document_delete.parse_started_at(get_client(), request_id, task_started)
+        # Без NORMALIZER_DELETE_ENABLED надгробий нет и сохранение прежнее.
+        guard_deleted = settings.NORMALIZER_DELETE_ENABLED
+        started_at = (document_delete.parse_started_at(get_client(), request_id, task_started)
+                      if guard_deleted else task_started)
         try:
             with telemetry.measure("parse.save", doc_id=doc_id), session.begin():
                 chunk_repo = ChunkRepository(session)
                 doc_repo = DocumentRepository(session)
-                doc_repo.get(doc_id, for_update=True)
-                if document_delete.tombstoned(get_client(), doc_id, started_at):
-                    raise _Tombstoned()
+                if guard_deleted:
+                    doc_repo.get(doc_id, for_update=True)
+                    if document_delete.tombstoned(get_client(), doc_id, started_at):
+                        raise _Tombstoned()
 
                 chunk_repo.delete_by_doc_id(doc_id)
                 rows = [
@@ -849,7 +853,7 @@ def process_document(
         finalize(request_id, s3_fileid, result, dialog_id, event_id)
         # Удаление прошло между сохранением и публикацией: его чистка Redis
         # могла опередить эту запись — результат заменяется пустым.
-        if document_delete.tombstoned(get_client(), doc_id, started_at):
+        if guard_deleted and document_delete.tombstoned(get_client(), doc_id, started_at):
             put_document_result(
                 request_id, s3_fileid, document_delete.deleted_document(s3_fileid, doc_id))
 
