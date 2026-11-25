@@ -218,6 +218,7 @@ def code_digest() -> str:
 # флагом они ничего не меняют, и ключ остаётся прежним — кэш, собранный до
 # флага, не теряется.
 WHEN_ON: Dict[str, Tuple[str, ...]] = {
+    "DRAWING_DIMENSION_GEOMETRY": ("DRAWING_DIMENSION_GEOMETRY",),
     "DRAWING_NATIVE_TILES": (
         "DRAWING_NATIVE_TILES", "DRAWING_NATIVE_TILES_MIN_CAP_PX", "DRAWING_NATIVE_TILES_DPI",
         "DRAWING_NATIVE_TILES_MIN_DPI", "DRAWING_NATIVE_TILES_MAX_SIDE", "DRAWING_NATIVE_TILES_OVERLAP",
