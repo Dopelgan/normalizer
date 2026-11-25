@@ -66,6 +66,7 @@ app = FastAPI(
 )
 telemetry.install_metrics_endpoint(app)
 app.add_event_handler("startup", api_auth.ensure_configured)
+api_auth.protect_docs(app)
 # Все ручки, кроме проб /health и /metrics, — под общим токеном (core/api_auth.py).
 PROTECTED = [Depends(api_auth.require_api_token)]
 

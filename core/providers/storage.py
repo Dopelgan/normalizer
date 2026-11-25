@@ -24,6 +24,14 @@ class ReadOnlyStorageError(RuntimeError):
     """Попытка записать в хранилище, выданное только на чтение."""
 
 
+class PartialDeleteError(RuntimeError):
+    """Часть объектов под префиксом не удалена; `failed_keys` — какие."""
+
+    def __init__(self, failed_keys):
+        self.failed_keys = list(failed_keys)
+        super().__init__(f"Не удалены объекты: {len(self.failed_keys)}")
+
+
 class StorageProvider(ABC):
     """Базовый интерфейс для всех провайдеров хранилища."""
 
@@ -218,12 +226,20 @@ class S3StorageProvider(StorageProvider):
             raise ValueError("Удаление всего бакета запрещено")
         key = key if key.endswith("/") else key + "/"
         removed = 0
+        failed = []
         paginator = self.s3_client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket, Prefix=key):
             objects = [{"Key": item["Key"]} for item in page.get("Contents") or []]
-            if objects:
-                self.s3_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
-                removed += len(objects)
+            if not objects:
+                continue
+            # delete_objects отвечает 200 и тогда, когда часть ключей не удалена:
+            # отказы лежат в Errors по ключу.
+            answer = self.s3_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+            errors = [item.get("Key", "") for item in (answer or {}).get("Errors") or []]
+            failed.extend(errors)
+            removed += len(objects) - len(errors)
+        if failed:
+            raise PartialDeleteError(failed)
         return removed
 
     @staticmethod
