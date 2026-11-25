@@ -26,6 +26,10 @@
    «радиус» — у «R…»/«SR…» («Ra», «Rz» — не радиус), «диаметр» — у
    «⌀/Ø/Ф…» или «M…», «отверстие» — у них же и у резьб «G», «Rc», «Tr»,
    «К». Несовпадение — связь снимается, значение остаётся.
+
+Под своими флагами (по умолчанию выключены) — классы полей (C11), позиции
+по спецификации сборки (C12), ряд шероховатости ГОСТ 2789 (S1) и общий знак
+шероховатости в углу листа (C14); см. раздел в конце модуля.
 """
 
 from __future__ import annotations
@@ -648,13 +652,15 @@ def _reference_thickness_rule(items: List[_Item], notes: str, stats: Dict[str, i
         stats["thickness"] += 1
 
 
-def apply_page(drawings: List[Fragment], texts: Sequence[str] = ()) -> Dict[str, int]:
+def apply_page(drawings: List[Fragment], texts: Sequence[str] = (),
+               positions: Optional[set] = None) -> Dict[str, int]:
     """
     Правила для чертёжных фрагментов одной страницы; правит их на месте.
 
     `texts` — прочий текст той же страницы (весь текст листа, строки OCR):
     толщина из него берётся только по строгому образцу «Лист 0,5 ГОСТ …»
-    и только если графы материала нет.
+    и только если графы материала нет. `positions` — номера графы «Поз.»
+    спецификации документа (DRAWING_SENSE_SPEC_POSITIONS).
     """
     stats = {"thickness": 0, "thickness_merged": 0, "roughness_dropped": 0,
              "roughness_to_size": 0, "roughness_review": 0, "links_dropped": 0,
@@ -696,6 +702,15 @@ def apply_page(drawings: List[Fragment], texts: Sequence[str] = ()) -> Dict[str,
         _reference_thickness_rule(items, "\n".join(_notes(drawings)) + "\n" + "\n".join(texts), stats,
                                   sheet_metal=evidence and _sheet_metal(material, _notes(drawings)))
     _twin_rule(items, stats)
+    if settings.DRAWING_SENSE_CLASS_RULES:
+        _class_rule(items, stats)
+    if settings.DRAWING_SENSE_SPEC_POSITIONS and positions:
+        _spec_position_rule(items, positions, stats)
+    if settings.DRAWING_SENSE_RA_SERIES:
+        _ra_series_rule(items, stats)
+    if settings.DRAWING_CORNER_ROUGHNESS_V2:
+        # После ряда: «Ra 63» в углу сначала становится «Ra 6,3».
+        _corner_rule(drawings, items, stats)
     for fragment in drawings:
         stats["links_dropped"] += check_links(fragment.content.structured_drawing_fields or [])
     return stats
@@ -713,9 +728,11 @@ def apply(fragments: List[Fragment]) -> Dict[str, int]:
         if fragment.type == "drawing" and fragment.content.structured_drawing_fields:
             pages.setdefault(page, []).append(fragment)
         texts.setdefault(page, []).extend(_page_texts(fragment, evidence))
+    # Спецификация — документа целиком: она бывает на своём листе.
+    positions = spec_positions(fragments) if settings.DRAWING_SENSE_SPEC_POSITIONS else None
     total: Dict[str, int] = {}
     for page, drawings in pages.items():
-        for key, value in apply_page(drawings, texts.get(page, [])).items():
+        for key, value in apply_page(drawings, texts.get(page, []), positions).items():
             total[key] = total.get(key, 0) + value
     return total
 
@@ -780,3 +797,346 @@ def roughness_known(value: str, fields: Iterable[Dict[str, Any]]) -> bool:
         if reading_reconcile.notation(own) == wanted:
             return True
     return False
+
+
+# ===========================================================================
+# Классы полей, позиции по спецификации, ряд шероховатости, общий знак в углу
+# (DRAWING_SENSE_CLASS_RULES, DRAWING_SENSE_SPEC_POSITIONS,
+# DRAWING_SENSE_RA_SERIES, DRAWING_CORNER_ROUGHNESS_V2)
+# ===========================================================================
+
+def _count(stats: Dict[str, int], key: str) -> None:
+    # Ключ появляется только при срабатывании под своим флагом: без флагов
+    # учёт `apply` тот же, что и раньше.
+    stats[key] = stats.get(key, 0) + 1
+
+
+def _note_value(item: _Item, value: str, review: bool) -> None:
+    """
+    Новая запись поля без спора прочтений: прежняя остаётся первым
+    прочтением в `readings`, выведенная — с источником `sense_rule`.
+    Связь не снимается: правило меняет запись, а не место величины.
+    """
+    from core.providers import vector_drawing
+
+    field = item.field
+    readings = list(field.readings or [{"source": _source(item), "value": field.value}])
+    readings.append({"source": SENSE, "value": value})
+    field.readings = readings
+    field.value = value
+    field.tolerance = vector_drawing.extract_tolerance(value)
+    field.nature = vector_drawing.determine_nature(value)
+    field.source_of_tolerance = vector_drawing.tolerance_source(value)
+    field.unit = vector_drawing.extract_unit(value, field.category)
+    if review:
+        field.needs_review = True
+
+
+def _recategorise(field: DrawingField, category: str) -> None:
+    from core.providers import vector_drawing
+
+    field.category = category
+    field.unit = vector_drawing.extract_unit(field.value or "", category)
+
+
+# --- C11: смешение категорий ------------------------------------------------
+
+# Количество мест или отверстий без величины: «2 места», «4 отв.», «3 отверстия».
+# Это пояснение к размеру (примечание), а не выноска с номером.
+_COUNT_NOTE = re.compile(
+    r"^\d{1,3}\s*(?:мест[аo]?|отв(?:ерсти[яей]|ерстие)?)\.?$", re.IGNORECASE)
+# Величина с номиналом и симметричным отклонением: «30°±2°», «12±0,1»,
+# «⌀20±0,05», «45°30′±1°». Номинал обязателен: «±0,1» без него — допуск.
+_ANGLE_OR_NUMBER = r"\d+(?:[.,]\d+)?\s*(?:°(?:\s*\d+\s*['′])?|['′])?"
+_SIZE_WITH_PM = re.compile(
+    r"^(?:" + _DIAMETER_SIGN + r"\s?)?" + _ANGLE_OR_NUMBER + r"\s*±\s*" + _ANGLE_OR_NUMBER + r"$")
+
+
+def _class_rule(items: List[_Item], stats: Dict[str, int]) -> None:
+    """
+    Однозначные смешения категорий (DRAWING_SENSE_CLASS_RULES):
+    «2 места», «4 отв.» в выноске или позиции — примечание `note`;
+    «30°±2°» в допуске — размер с допуском `size` (допуск остаётся в
+    `tolerance`), повтор того же места размером снимается; метка шва «№1»,
+    «2№3» в позиции — выноска на листе любого вида. Значение не меняется.
+    """
+    for item in items:
+        field = item.field
+        if item.gone:
+            continue
+        value = " ".join(str(field.value or "").split())
+        if field.category in ("callout", "position") and _COUNT_NOTE.match(value):
+            _recategorise(field, "note")
+            _count(stats, "class_count_note")
+        elif field.category == "position" and _WELD_MARK.match(value):
+            _recategorise(field, "callout")
+            _count(stats, "class_weld_mark")
+        elif field.category == "tolerance" and _SIZE_WITH_PM.match(value):
+            twin = next((other for other in items
+                         if other is not item and not other.gone and other.field.category == "size"
+                         and reading_reconcile.notation(other.field.value) == reading_reconcile.notation(value)
+                         and _comparable(item, other)), None)
+            if twin is not None and _removable(item):
+                _merge_readings(twin, item)
+                _drop(item)
+                _count(stats, "class_pm_merged")
+            else:
+                _recategorise(field, "size")
+                _count(stats, "class_pm_size")
+
+
+# --- C12: позиции по спецификации ------------------------------------------
+
+_SPEC_POSITION = re.compile(r"^\d{1,3}$")
+
+
+def _position_column(headers: Sequence[Any]) -> Optional[int]:
+    for n, header in enumerate(headers or []):
+        if str(header or "").strip().casefold().startswith("поз"):
+            return n
+    return None
+
+
+def _rows_positions(headers: Sequence[Any], rows: Iterable[Any]) -> List[int]:
+    """Номера графы «Поз.» в строках с обозначением или наименованием."""
+    rows = list(rows or [])
+    column = _position_column(headers)
+    if column is None and rows and isinstance(rows[0], (list, tuple)):
+        # Шапка прочитана первой строкой таблицы.
+        column = _position_column(rows[0])
+        rows = rows[1:]
+    if column is None:
+        return []
+    found = []
+    for row in rows:
+        if isinstance(row, dict):
+            row = list(row.values())
+        elif isinstance(row, str):
+            row = row.split(" | ")
+        cells = [str(c if c is not None else "").strip() for c in row or []]
+        if column >= len(cells) or not _SPEC_POSITION.match(cells[column]):
+            continue
+        if any(any(ch.isalpha() for ch in cell) for n, cell in enumerate(cells) if n != column):
+            number = int(cells[column])
+            if number > 0:
+                found.append(number)
+    return found
+
+
+def spec_positions(fragments: Iterable[Fragment]) -> Optional[set]:
+    """
+    Номера позиций спецификации документа: графа «Поз.» таблиц листа
+    (`structured_payload.tables`) и табличных фрагментов. Спецификации нет —
+    None: без неё правило позиций не делает ничего.
+    """
+    from core.providers.drawing_vision import KIND_TABLE
+
+    found: List[int] = []
+    for fragment in fragments:
+        content = fragment.content
+        if fragment.type == "drawing":
+            for table in (content.structured_payload or {}).get("tables") or []:
+                if isinstance(table, dict) and table.get("kind") == KIND_TABLE:
+                    found.extend(_rows_positions(table.get("headers") or [], table.get("rows")))
+        elif content.table_data is not None:
+            found.extend(_rows_positions(content.table_data.headers, content.table_data.rows))
+    # Одна строка — ещё не спецификация: по ней нельзя судить о прочих номерах.
+    unique = set(found)
+    return unique if len(unique) >= 2 else None
+
+
+def _on_leader(field: DrawingField) -> bool:
+    """Голое число стоит на полке выноски: категория «выноска»."""
+    return field.category == "callout"
+
+
+def _spec_position_rule(items: List[_Item], positions: set, stats: Dict[str, int]) -> None:
+    """
+    Позиция сверяется со спецификацией той же сборки
+    (DRAWING_SENSE_SPEC_POSITIONS). «Позиция» с номером, которого в графе
+    «Поз.» нет, — размер, если у неё есть связь с элементом, иначе выноска
+    (с `needs_review`). Голое число на выноске с номером из спецификации —
+    позиция. Метки швов «№N» не трогаются. Только лист сборки.
+    """
+    for item in items:
+        field = item.field
+        if item.gone:
+            continue
+        payload = item.fragment.content.structured_payload or {}
+        if payload.get("sheet_type") != "assembly":
+            continue
+        value = " ".join(str(field.value or "").split())
+        if not _SPEC_POSITION.match(value) or int(value) == 0:
+            continue
+        number = int(value)
+        if field.category == "position" and number not in positions:
+            _recategorise(field, "size" if field.link is not None else "callout")
+            field.needs_review = True
+            _count(stats, "spec_position_dropped")
+        elif number in positions and _on_leader(field):
+            _recategorise(field, "position")
+            _count(stats, "spec_position_added")
+
+
+# --- S1: ряд шероховатости ГОСТ 2789 ---------------------------------------
+
+# Предпочтительные значения Ra и Rz, мкм (ГОСТ 2789-73, выделенные в рядах).
+_RA_PREFERRED = (0.012, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.3, 12.5, 25, 50, 100)
+_RZ_PREFERRED = (0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.3, 12.5, 25, 50, 100, 200, 400, 800, 1600)
+# Полный ряд Rz: «Rz 16», «Rz 32», «Rz 320» в нём есть и не правятся. Для Ra
+# правка идёт против предпочтительного ряда: «Ra 16» на чертеже — почти
+# всегда потерянная запятая «Ra 1,6».
+_RZ_FULL = tuple(sorted({
+    round(base * scale, 4)
+    for base in (1.0, 1.25, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 8.0)
+    for scale in (0.01, 0.1, 1, 10, 100, 1000)
+    if 0.025 <= round(base * scale, 4) <= 1600
+}))
+_RA_RECORD = re.compile(r"^(√?\s*)(R[az])(\s*)(\d{2,3})(\s*\*?\s*(?:\(\s*[√Vv✓]\s*\))?)$")
+
+
+def _in(series: Sequence[float], number: float) -> bool:
+    return any(abs(number - v) < 1e-9 for v in series)
+
+
+def ra_series_fix(value: Any) -> Optional[str]:
+    """
+    «Ra 16» -> «Ra 1,6»: число без запятой, которого нет в ряду, становится
+    значением ряда, если вставить запятую ровно в одном месте. Записи,
+    верные как есть («Ra 25», «Ra 100», «Rz 40»), и записи с запятой не
+    меняются. Иначе None.
+    """
+    text = str(value or "").strip()
+    match = _RA_RECORD.match(text)
+    if not match:
+        return None
+    head, letters, gap, number, tail = match.groups()
+    kind = "R" + letters[1].lower()
+    preferred = _RA_PREFERRED if kind == "Ra" else _RZ_PREFERRED
+    valid = _RA_PREFERRED if kind == "Ra" else _RZ_FULL
+    if not number.startswith("0") and _in(valid, float(number)):
+        return None
+    found = []
+    for cut in range(1, len(number)):
+        whole, part = number[:cut], number[cut:]
+        if len(whole) > 1 and whole.startswith("0"):
+            continue
+        if _in(preferred, float(whole + "." + part)):
+            found.append(whole + "," + part)
+    if len(found) != 1:
+        return None
+    return head + letters + gap + found[0] + tail
+
+
+def _ra_series_rule(items: List[_Item], stats: Dict[str, int]) -> None:
+    """Потерянная запятая шероховатости (DRAWING_SENSE_RA_SERIES); сырое прочтение — в `readings`."""
+    for item in items:
+        if item.gone or item.field.category != "roughness":
+            continue
+        fixed = ra_series_fix(item.field.value)
+        if fixed is None:
+            continue
+        _note_value(item, fixed, review=True)
+        _count(stats, "ra_series")
+
+
+# --- C14: общая шероховатость в углу листа ---------------------------------
+
+# Знак общей шероховатости записью: «Ra 6,3 (√)», «√Rz 20 (√)», «√ (√)»
+# (без параметров). Галочку в скобках распознавание отдаёт и буквой V.
+_GENERAL_ROUGHNESS = re.compile(
+    r"^√?\s*(?:(R[az])\s*(\d+(?:[.,]\d+)?))?\s*\(\s*[√Vv✓]\s*\)$", re.IGNORECASE)
+_PLAIN_ROUGHNESS = re.compile(r"^√?\s*(R[az])\s*(\d+(?:[.,]\d+)?)$", re.IGNORECASE)
+
+
+def general_roughness(value: Any) -> Optional[str]:
+    """Запись общего знака -> «Ra 6,3 (√)» или «√ (√)»; иначе None."""
+    text = " ".join(str(value or "").split())
+    match = _GENERAL_ROUGHNESS.match(text)
+    if not match:
+        return None
+    if match.group(1) is None:
+        # «√ (√)» — знак без параметров; «(V)» без знака — не шероховатость.
+        return "√ (√)" if text.startswith("√") else None
+    return "R%s %s (√)" % (match.group(1)[1].lower(), match.group(2).replace(".", ","))
+
+
+def _inside(box: Optional[Sequence[float]], zone: Sequence[float]) -> bool:
+    centre = reading_reconcile._centre(box or [])
+    if centre is None:
+        return False
+    return float(zone[0]) <= centre[0] <= float(zone[2]) and float(zone[1]) <= centre[1] <= float(zone[3])
+
+
+def _plain_general(value: Any) -> Optional[str]:
+    match = _PLAIN_ROUGHNESS.match(" ".join(str(value or "").split()))
+    if not match:
+        return None
+    return "R%s %s (√)" % (match.group(1)[1].lower(), match.group(2).replace(".", ","))
+
+
+def _corner_rule(drawings: Sequence[Fragment], items: List[_Item], stats: Dict[str, int]) -> None:
+    """
+    Общий знак шероховатости (DRAWING_CORNER_ROUGHNESS_V2), без вызовов модели:
+    1) поле с записью «Ra x (√)» / «√ (√)» — шероховатость с этой записью;
+    2) иначе единственная шероховатость «Ra x» листа целиком в правом
+       верхнем углу рамки (`CORNER`), вне вырезок видов, на листе не сборки
+       и не схемы, получает «(√)»;
+    3) иначе строка текста листа ровно «Ra x (√)» даёт поле в углу.
+    Шероховатость внутри вида общей не становится никогда.
+    """
+    general = False
+    for item in items:
+        field = item.field
+        if item.gone or field.category in ("title_block", "material"):
+            continue
+        canonical = general_roughness(field.value)
+        if canonical is None:
+            continue
+        general = True
+        if field.category != "roughness":
+            _recategorise(field, "roughness")
+            _count(stats, "corner_recategorised")
+        if canonical != field.value:
+            _note_value(item, canonical, review=False)
+            _count(stats, "corner_canonical")
+    if general:
+        return
+    sheets = [f for f in drawings if reading_reconcile._is_whole_sheet(f)]
+    if len(sheets) != 1:
+        return
+    sheet = sheets[0]
+    payload = sheet.content.structured_payload or {}
+    if payload.get("sheet_type") in ("assembly", "scheme"):
+        return
+    zone = corner_box((payload.get("layout") or {}).get("frame"))
+    views = [list(f.position.bbox) for f in drawings
+             if f is not sheet and f.position and f.position.bbox and len(f.position.bbox) == 4]
+    candidates = [
+        item for item in items
+        if not item.gone and item.fragment is sheet and item.field.category == "roughness"
+        and _plain_general(item.field.value) is not None
+        and _inside(item.field.bbox, zone)
+        and not any(_inside(item.field.bbox, view) for view in views)
+    ]
+    values = {_plain_general(item.field.value) for item in candidates}
+    if len(values) == 1:
+        value = values.pop()
+        for item in candidates:
+            _note_value(item, value, review=False)
+        _count(stats, "corner_marked")
+        return
+    if candidates:
+        # Разные шероховатости в углу — какая из них общая, правило не решает.
+        return
+    lines = [line for line in (sheet.content.text or "").splitlines() if line.strip()]
+    found = {general_roughness(line) for line in lines} - {None}
+    if len(found) != 1:
+        return
+    from core.providers import vector_drawing
+
+    value = found.pop()
+    sheet.content.structured_drawing_fields = list(sheet.content.structured_drawing_fields or []) + [
+        DrawingField(category="roughness", value=value, bbox=corner_sign_box(zone), confidence=0.7,
+                     provenance="full_page_ocr", unit=vector_drawing.extract_unit(value, "roughness"))]
+    _count(stats, "corner_from_text")
