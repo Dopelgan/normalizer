@@ -177,6 +177,7 @@
 | `DRAWING_MATERIAL_NO_TOLERANCE` | `false` | `core/drawing_processor.py` |
 | `DRAWING_SHEET_MISSING_PAGES` | `false` | `core/drawing_processor.py` |
 | `DRAWING_DESIGNATION_REPAIR` (+ `DESIGNATION_KNOWN_NAMES_PATH`) | `false` | `core/providers/designation_repair.py` (`repair_drawing_fragment`, `known_names`), `core/contract_finalize.py` |
+| `DRAWING_LEXICON_FIX` (+ `DRAWING_LEXICON_SIGNERS_PATH`, `_TERMS_PATH`, `_GOST_PATH`) | `false` | `core/providers/lexicon_fix.py` (`apply`, `nearest`, `fix_gost`), вызов — `core/drawing_processor.py::_enrich_fragments` перед `field_placement`; ключ кэша — `core/ladder/result_cache.py::cache_key` (`_lexicon_digest`); список подписантов — `tools/build_signer_lexicon.py` |
 | `DRAWING_SHEET_NAME_CARRY` | `false` | `core/drawing_sheet_name.py`, `core/contract_finalize.py` |
 | `DRAWING_RECORD_COMPOSED` | `false` | `core/drawing_record.py`, `core/contract_finalize.py`, `core/document_parts.py` |
 | `DRAWING_VALUE_VIEW_LINKS` | `false` | `core/providers/drawing_views.py`, `core/drawing_processor.py` |
