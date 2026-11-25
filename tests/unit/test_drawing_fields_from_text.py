@@ -148,17 +148,41 @@ def test_one_place_still_merges(monkeypatch):
 
 
 @pytest.mark.parametrize("flag", [True, False])
-def test_unplaced_cleanup_skips_bare_captions_and_mixed_script(monkeypatch, flag):
-    # Строки текста листа «Копировал», «Изм. Лист № докум.» — подписи граф
-    # без значения; «Гervasov» — сбой чтения. С DRAWING_UNPLACED_CLEANUP
-    # полями без места они не становятся, марка стали с двойниками остаётся.
+def test_unplaced_cleanup_skips_mixed_script_values(monkeypatch, flag):
+    # Строгие образцы уже не берут голую подпись графы («Копировал»), но пара
+    # «Разраб. | Гervasov» проходит: «Гervasov» — сбой чтения, а не фамилия.
+    # С DRAWING_UNPLACED_CLEANUP такое поле без места не выходит.
     from core.drawing_processor import _fields_from_text
 
     monkeypatch.setattr(settings, "DRAWING_UNPLACED_CLEANUP", flag)
-    lines = ["Копировал", "Изм. Лист № докум.", "Справ. №", "Гervasov", "Лампа СКЛ 14", "12Х18Н10Т"]
-    # Нормализация пишет марку стали латиницей — сравнение по числу полей.
+    lines = ["Копировал", "Разраб. | Гervasov", "Пров. | Бабанин"]
     values = [f["value"] for f in _fields_from_text([], lines, [])]
-    if flag:
-        assert values[0] == "Лампа СКЛ 14" and len(values) == 2
-    else:
-        assert values[:5] == lines[:5] and len(values) == 6
+    expected = ["Пров.: Бабанин"]
+    assert values == (expected if flag else ["Разраб.: Гervasov"] + expected)
+
+
+def test_consensus_reads_content_once(temp_storage, monkeypatch):
+    # DRAWING_CONSENSUS_READS > 1 с DRAWING_SHEET_CONTENT_PASS: содержание
+    # листа читается первым чтением, повторы — только с рамками.
+    from core.drawing_processor import DrawingProcessor
+
+    class CountingQwen(TextQwen):
+        def __init__(self):
+            super().__init__([STAMP], [])
+            self.calls = []
+
+        def read_sheet(self, image, hint="", **kwargs):
+            self.calls.append(kwargs.get("with_content", True))
+            return super().read_sheet(image, hint)
+
+    monkeypatch.setattr(settings, "DRAWING_SHEET_CONTENT_PASS", True)
+    monkeypatch.setattr(settings, "DRAWING_CONSENSUS_READS", 3)
+    monkeypatch.setattr(settings, "DRAWING_VISION_ENABLED", False)
+    monkeypatch.setattr(settings, "DRAWING_SHEET_GUARDED", False)
+    monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 0)
+    data = BytesIO()
+    Image.new("RGB", (1654, 1169), "white").save(data, format="PNG")
+    temp_storage.write_file("assets/doc/sheet.png", data.getvalue())
+    qwen = CountingQwen()
+    DrawingProcessor(temp_storage, qwen=qwen).process("assets/doc/sheet.png", {}, 1)
+    assert qwen.calls == [True, False, False]

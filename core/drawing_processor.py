@@ -335,9 +335,12 @@ class DrawingProcessor:
                     # Номер чтения в подсказке: иначе при нулевой температуре
                     # и кэше ответов повтор — тот же ответ, и сведение
                     # пометило бы согласием всё подряд.
+                    # Содержание листа без рамок (DRAWING_SHEET_CONTENT_PASS)
+                    # уже прочитано первым чтением: повтор — только с рамками.
+                    once = {"with_content": False} if settings.DRAWING_SHEET_CONTENT_PASS else {}
                     more = self.qwen.read_sheet(
                         layout.image, hint=f"{layout.hint()} (чтение {run} из {reads})".strip(),
-                        **deadline_kwargs,
+                        **deadline_kwargs, **once,
                     )
                     if more is not None:
                         runs.append(more.annotations)

@@ -727,16 +727,24 @@ class QwenVisionClient:
         return bool(self.endpoint)
 
     def read_sheet(
-        self, image, hint: str = "", until: Optional[float] = None,
+        self, image, hint: str = "", until: Optional[float] = None, with_content: bool = True,
     ) -> Optional[SheetReading]:
         """
         Лист целиком (см. `_read_sheet_located`). С DRAWING_SHEET_CONTENT_PASS
-        сначала — содержание листа без рамок (`read_sheet_content`): короткий
+        следом — содержание листа без рамок (`read_sheet_content`): короткий
         ответ «[код, надпись]» в родном разрешении; место каждой надписи —
         от прежнего прохода с рамками (`merge_content`).
+
+        Содержание читается раз на лист: `with_content=False` — повторное
+        чтение того же листа (DRAWING_CONSENSUS_READS). Вызов не начинается,
+        если до `until` (часы `gpu_gate.budget_now()`) или до срока задачи
+        меньше VLM_TIMEOUT: бюджет листа общий с частями прохода с рамками.
         """
         located = self._read_sheet_located(image, hint, until)
-        if not settings.DRAWING_SHEET_CONTENT_PASS:
+        if not settings.DRAWING_SHEET_CONTENT_PASS or not with_content:
+            return located
+        if not _time_for_call(until):
+            logger.info("Содержание листа пропущено: бюджет листа исчерпан")
             return located
         content = self.read_sheet_content(image)
         if content is None:
@@ -1421,7 +1429,10 @@ class QwenVisionClient:
         cached = cache_get(key)
         # Ключ прежней версии не знал формата ответа: под схемой (ограждённый
         # проход листа) старый ответ без схемы не берётся.
-        if cached is None and settings.VLM_CACHE_V1_FALLBACK and response_format is None:
+        # С DRAWING_VLM_STABLE рассуждение выключено, а записи прежней версии
+        # сделаны с ним: под ключом нового запроса им не место.
+        if (cached is None and settings.VLM_CACHE_V1_FALLBACK and response_format is None
+                and not settings.DRAWING_VLM_STABLE):
             # Временно (VLM_CACHE_V1_FALLBACK): промах по новому ключу
             # проверяется по ключу прежней версии. Тело запроса у неё было
             # из тех же полей, и все её записи сделаны одним сервером прода,
@@ -1491,7 +1502,9 @@ class QwenVisionClient:
             return answer
         if keep_rejected is not None and keep_rejected(*answer):
             rejected_put(key, answer)
-        _log_rejected(key, answer)
+        if settings.DRAWING_VLM_STABLE or settings.DRAWING_VLM_REJECTED_LOG:
+            # Без флагов вызов прежний: отказ в лог не пишется.
+            _log_rejected(key, answer)
         return answer
 
     def _post(self, body: Dict[str, Any], **limits: Any) -> Optional[Dict[str, Any]]:
@@ -1955,6 +1968,14 @@ def _box_from_thousandths(annotation: Dict[str, Any]) -> Dict[str, Any]:
     if max(box) <= 1.5 or min(box) < 0 or max(box) > 1000:
         return annotation
     return {**annotation, "bbox": [round(float(v) / 1000.0, 4) for v in box]}
+
+
+def _time_for_call(until: Optional[float]) -> bool:
+    """Хватает ли бюджета листа и срока задачи на ещё один вызов модели."""
+    if until is not None and gpu_gate.budget_now() + settings.VLM_TIMEOUT > until:
+        return False
+    left = deadline.remaining()
+    return left is None or left >= settings.VLM_TIMEOUT
 
 
 def content_schema() -> Dict[str, Any]:

@@ -488,6 +488,27 @@ class TestResponseCache:
         assert client(session).read_sheet(picture()).annotations[0]["value"] == "30"
         assert len(session.requests) == 1
 
+    def test_v1_hit_is_not_served_with_thinking_off(self, mocker, cache):
+        # Записи v1 сделаны с рассуждением; с DRAWING_VLM_STABLE запрос другой.
+        mocker.patch.object(qwen_client.settings, "VLM_CACHE_V1_FALLBACK", True)
+        v1_keys = mocker.spy(qwen_client, "cache_key_v1")
+        sheet = picture()
+        client(FakeSession(FakeResponse(answer({"annotations": []})))).read_sheet(sheet)
+        old_key = v1_keys.spy_return
+        for path in cache.rglob("*.json"):
+            path.unlink()
+        old_path = cache / old_key[:2] / f"{old_key}.json"
+        old_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.write_text(
+            '{"content": "{\\"annotations\\": [{\\"value\\": \\"20\\"}]}", "finish": "stop"}',
+            encoding="utf-8",
+        )
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", True)
+        session = FakeSession(FakeResponse(answer({"annotations": [{"value": "30"}]})))
+        reading = client(session).read_sheet(sheet)
+        assert len(session.requests) == 1
+        assert reading.annotations[0]["value"] == "30"
+
     def test_broken_cache_file_is_a_miss(self, cache):
         session = FakeSession(
             FakeResponse(answer({"annotations": []})),
@@ -556,6 +577,16 @@ class TestStableCalls:
         assert len(session.requests) == 1
 
 
+    def test_rejected_answer_is_not_logged_without_flags(self, mocker):
+        # Без DRAWING_VLM_STABLE и DRAWING_VLM_REJECTED_LOG вызов прежний.
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", False)
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_REJECTED_LOG", "")
+        logged = mocker.spy(qwen_client, "_log_rejected")
+        session = FakeSession(FakeResponse(answer({})))
+        assert client(session).read_dimension_links(picture(), "связи", 2) == {}
+        assert logged.call_count == 0
+
+
 class TestContentPass:
     """Карточка B (DRAWING_SHEET_CONTENT_PASS): содержание без рамок, место — от прохода с рамками."""
 
@@ -620,6 +651,23 @@ class TestContentPass:
         assert session.requests[1]["json"]["response_format"]["type"] == "json_schema"
         values = [(a["value"], a.get("bbox")) for a in reading.annotations]
         assert values == [("⌀315", [0.4, 0.3, 0.45, 0.4]), ("18*", None)]
+
+    def test_content_waits_for_no_spent_budget(self, mocker):
+        # Бюджет листа исчерпан частями прохода с рамками: содержание не читается.
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_CONTENT_PASS", True)
+        session = FakeSession(FakeResponse(answer({"sheet_type": "detail", "annotations": []})),
+                              FakeResponse(answer({"sheet_type": "detail", "annotations": [["s", "18*"]]})))
+        reading = client(session).read_sheet(picture(), until=qwen_client.gpu_gate.budget_now() + 1)
+        assert len(session.requests) == 1
+        assert reading.annotations == []
+
+    def test_repeat_read_has_no_content_call(self, mocker):
+        # Повторное чтение листа (DRAWING_CONSENSUS_READS) — только с рамками.
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_CONTENT_PASS", True)
+        session = FakeSession(FakeResponse(answer({"sheet_type": "detail", "annotations": []})),
+                              FakeResponse(answer({"sheet_type": "detail", "annotations": [["s", "18*"]]})))
+        client(session).read_sheet(picture(), with_content=False)
+        assert len(session.requests) == 1
 
     def test_flag_off_is_one_call(self, mocker):
         mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_CONTENT_PASS", False)
