@@ -37,6 +37,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from celery.exceptions import SoftTimeLimitExceeded
+
+from core import deadline
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -129,6 +132,9 @@ class NativeSheet:
             return self.base, self.base_dpi
         try:
             image = self._render(dpi)
+        except (SoftTimeLimitExceeded, deadline.Cancelled):
+            # Срок задачи и отмена — не отказ рендера: их глотать нельзя.
+            raise
         except Exception as exc:  # noqa: BLE001 — рендер не роняет лист
             logger.warning("Лист в родном разрешении не отрисован (%.0f dpi): %s", dpi, exc)
             image = None
@@ -256,6 +262,8 @@ def read(client, native: NativeSheet, located: Any, until: Optional[float]) -> O
 
             try:
                 return client.read_sheet_tile(crop_box(image, box), layout.max_side)
+            except (SoftTimeLimitExceeded, deadline.Cancelled):
+                raise
             except Exception as exc:  # noqa: BLE001 — плитка не роняет лист
                 logger.warning("Плитка листа не прочитана: %s", exc)
                 return None

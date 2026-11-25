@@ -196,6 +196,19 @@ class TestReadSheet:
         assert [a["value"] for a in reading.annotations] == ["C1 Конденсатор"]
         assert reading.native_tiles["read"] == 1
 
+    @pytest.mark.parametrize("stop", ["cancelled", "soft_limit"])
+    def test_cancel_and_soft_limit_are_not_swallowed(self, mocker, tiles_on, stop):
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        from core import deadline
+
+        error = deadline.Cancelled() if stop == "cancelled" else SoftTimeLimitExceeded()
+        client = QwenVisionClient(endpoint="http://gpu-host:8000")
+        mocker.patch.object(client, "_read_sheet_located", return_value=SheetReading(sheet_type="scheme"))
+        mocker.patch.object(client, "read_sheet_tile", side_effect=FakeTiles(error, tile("C1")))
+        with pytest.raises(type(error)):
+            client.read_sheet(Image.new("RGB", (10, 10)), native=a3_sheet())
+
     def test_all_tiles_refused_keeps_previous_reading(self, mocker, tiles_on):
         located = SheetReading(sheet_type="scheme", annotations=[item("R1")], cut=True)
         client = QwenVisionClient(endpoint="http://gpu-host:8000")
@@ -284,6 +297,16 @@ class TestNativeCrop:
         native = native_tiles.NativeSheet(base, 100, render)
         image, dpi = native.image()
         assert image is base and dpi == 100
+
+    def test_render_cancel_is_not_swallowed(self):
+        from core import deadline
+
+        def render(dpi):
+            raise deadline.Cancelled()
+
+        native = native_tiles.NativeSheet(Image.new("RGB", (1000, 700), "white"), 100, render)
+        with pytest.raises(deadline.Cancelled):
+            native.image()
 
 
 # ---------------------------------------------------------------- без флага
