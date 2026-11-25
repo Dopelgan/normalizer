@@ -99,6 +99,33 @@ def deferred(context: DocumentContext) -> bool:
             and classification.genre == GENRE_DRAWING)
 
 
+# Уровни, которые растровый чертёж пропускает (LADDER_SKIP_OCR_ON_RASTER_DRAWING):
+# сплошное распознавание и восстановление с повторным MinerU.
+OCR_LEVELS = (4, 6)
+_LAYOUT_LEVEL = 5
+
+
+def skip_ocr_levels(context: DocumentContext, levels: List[int]) -> bool:
+    """
+    Пропустить уровни 4 и 6 (LADDER_SKIP_OCR_ON_RASTER_DRAWING): файл —
+    растровый чертёж по классификации, чертёжная ветка прочитает его целиком
+    (картинка — DRAWING_IMAGE_FULL_READ, скан PDF — DRAWING_PDF_FULL_READ),
+    и уровень 5 в лестнице есть: без него разбору не из чего было бы выбрать.
+    """
+    if not settings.LADDER_SKIP_OCR_ON_RASTER_DRAWING:
+        return False
+    if _LAYOUT_LEVEL not in levels:
+        return False
+    classification = context.classification
+    if classification.source != SOURCE_RASTER or classification.genre != GENRE_DRAWING:
+        return False
+    if context.kind == filetypes.KIND_IMAGE:
+        return bool(settings.DRAWING_IMAGE_FULL_READ)
+    if context.kind == filetypes.KIND_PDF:
+        return bool(settings.DRAWING_PDF_FULL_READ)
+    return False
+
+
 def unread_frame_sheet(context: DocumentContext, result: ParseResult) -> bool:
     """
     Лист с рамкой формата, который разбор вернул картинкой, ничего не прочитав.

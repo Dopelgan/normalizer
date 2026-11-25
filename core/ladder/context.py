@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from core import filetypes
+from core.config import settings
 from core.providers import raster_drawing
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.text_layer import TextLayer, extract_text_layer
@@ -265,6 +266,10 @@ def classify(context: DocumentContext) -> Classification:
         signals["raster_kind_confidence"] = round(verdict.confidence, 3)
         signals["raster_kind_reason"] = verdict.reason
         genre = _genre_of_raster(verdict)
+        if settings.RASTER_ALL_FRAMES and image is not None:
+            # Многокадровый TIFF: чертёжные кадры — страницы листов. Жанр
+            # остаётся по первому кадру, как раньше (он правит и грифом).
+            _frame_sheet_pages(context.data, signals)
         # Жанровый гейт на листе-картинке: текста в файле нет, поэтому
         # признаки чертежа читаются с самой основной надписи.
         if genre == GENRE_DRAWING and image is not None:
@@ -341,6 +346,10 @@ def _classify_pdf(context: DocumentContext) -> Classification:
             # листах заказчика), а жанр правит грифом доступа. Поэтому скан
             # становится чертёжным только при большинстве чертёжных листов;
             # одиночные листы не делают его «смешанным» и не поднимают гриф.
+            if settings.DRAWING_SHEETS_PER_PAGE:
+                # Листы для чтения целиком — по каждой странице, на всех
+                # страницах; жанр ниже решается, как раньше, по первым.
+                signals["raster_sheet_pages"] = _raster_sheet_pages(context.data)
             if checked and len(raster_pages) / checked >= _DRAWING_GENRE_SHARE:
                 drawing_pages = raster_pages
                 signals["drawing_share"] = round(len(raster_pages) / checked, 3)
@@ -460,6 +469,75 @@ def _raster_drawing_pages(data: bytes):
     finally:
         document.close()
     return pages, checked
+
+
+def _is_sheet(verdict) -> bool:
+    """Лист читается целиком: детектор видит чертёж или рамку формата."""
+    signals = verdict.signals or {}
+    return verdict.is_drawing or bool(signals.get("frame") or signals.get("thin_line_frame"))
+
+
+def _raster_sheet_pages(data: bytes) -> list:
+    """
+    DRAWING_SHEETS_PER_PAGE: номера страниц скана, где детектор видит
+    чертёж или рамку формата, — на всех страницах, а не на первых
+    `_RASTER_DRAWING_PAGES`. Жанровый гейт по тексту страницы — как в
+    `_raster_drawing_pages`: лист текста в рамке (ПОК, ТУ) листом чертежа
+    не становится, если текст это показывает.
+    """
+    try:
+        import fitz
+    except ImportError:  # pragma: no cover
+        return []
+    from core.providers import drawing_genre
+
+    try:
+        document = fitz.open(stream=data, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Скан не открылся для поиска листов: %s", exc)
+        return []
+    pages = []
+    gate_on = drawing_genre.enabled()
+    try:
+        for index in range(document.page_count):
+            png = document[index].get_pixmap(dpi=100).tobytes("png")
+            if not _is_sheet(raster_drawing.analyse(png)):
+                continue
+            if gate_on:
+                try:
+                    text = document[index].get_text("text") or ""
+                except Exception:  # noqa: BLE001
+                    text = ""
+                if text.strip() and drawing_genre.gate(text)["demote"]:
+                    continue
+            pages.append(index + 1)
+    finally:
+        document.close()
+    return pages
+
+
+def _frame_sheet_pages(data: bytes, signals: Dict[str, Any]) -> None:
+    """
+    RASTER_ALL_FRAMES: у многокадровой картинки чертёжные кадры —
+    `raster_drawing_pages`, кадры с чертежом или рамкой — `raster_sheet_pages`
+    (номера с единицы). Однокадровая картинка признаков не получает.
+    """
+    count = raster_drawing.frame_count(data)
+    if count <= 1:
+        return
+    drawings, sheets = [], []
+    for index in range(count):
+        frame = raster_drawing.open_image(data, frame=index)
+        if frame is None:
+            continue
+        verdict = raster_drawing.analyse_image(frame)
+        if verdict.is_drawing:
+            drawings.append(index + 1)
+        if _is_sheet(verdict):
+            sheets.append(index + 1)
+    signals["frame_count"] = count
+    signals["raster_drawing_pages"] = drawings
+    signals["raster_sheet_pages"] = sheets
 
 
 def _looks_structured(data: bytes, signals: Dict[str, Any]) -> bool:

@@ -126,6 +126,15 @@ KEY_SETTINGS: Tuple[str, ...] = (
     "VLM_ENDPOINT", "VLM_PROMPT", "VLM_TIMEOUT",
 )
 
+# Флаги покрытия чертежей (аудит N-08, N-09, N-15, N-17, N-19, N-23),
+# которые читает код лестницы. В ключе — только включённые (`WHEN_ON`):
+# с выключенными ключ прежний.
+_COVERAGE_FLAGS: Tuple[str, ...] = (
+    "DRAWING_SHEETS_PER_PAGE", "DRAWING_KEEP_TITLE_BLOCK_REGION", "DRAWING_STAMP_FALLBACK_GOST",
+    "RASTER_ALL_FRAMES", "RASTER_TINTED_LINE_CHECK", "LADDER_SKIP_OCR_ON_RASTER_DRAWING",
+)
+KEY_SETTINGS = KEY_SETTINGS + _COVERAGE_FLAGS + ("DRAWING_PDF_FULL_READ",)
+
 # Читаются на пути лестницы, но результат не меняют: секреты (в ключ не
 # идут вовсе), доступ к хранилищу и брокеру, места кэшей, параллельность и
 # очередь к видеокарте, повтор задачи при отказе (результат при отказе не
@@ -236,6 +245,10 @@ WHEN_ON: Dict[str, Tuple[str, ...]] = {
     "DRAWING_ASK_SALVAGE": ("DRAWING_ASK_SALVAGE",),
     "DRAWING_TEXT_SYMBOLS": ("DRAWING_TEXT_SYMBOLS",),
     "DRAWING_STAMP_SINGLE_FORM": ("DRAWING_STAMP_SINGLE_FORM",),
+    # Покрытие чертежей (аудит 25.11): флаг в ключе только включённым.
+    **{flag: (flag,) for flag in _COVERAGE_FLAGS},
+    # Пропуск уровней 4 и 6 у скана PDF решает и полное чтение листа PDF.
+    "LADDER_SKIP_OCR_ON_RASTER_DRAWING": ("LADDER_SKIP_OCR_ON_RASTER_DRAWING", "DRAWING_PDF_FULL_READ"),
 }
 
 

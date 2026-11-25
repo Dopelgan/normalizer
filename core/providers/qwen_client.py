@@ -1314,15 +1314,19 @@ class QwenVisionClient:
             rejected=whole.rejected,
         )
 
-    def read_title_block(self, image) -> Optional[Dict[str, Any]]:
-        """Вырезанный штамп -> графы и та же таблица построчно."""
+    def read_title_block(self, image, max_side: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """
+        Вырезанный штамп -> графы и та же таблица построчно. `max_side` —
+        свой потолок стороны (DRAWING_STAMP_MAX_SIDE), без него —
+        QWEN_REGION_MAX_SIDE.
+        """
         prompt = _TITLE_BLOCK_PROMPT
         if settings.DRAWING_DIMENSION_FIDELITY:
             # Фамилии в штампе — мелкий рукописный шрифт: вырезка
             # увеличивается, как и вырезка вида с мелкими отклонениями.
             prompt += _CAREFUL_LETTERS_RULE
             image = enlarge_small(image, settings.DRAWING_SMALL_IMAGE_SIDE)
-        data = self._ask(image, _single_form(prompt), settings.QWEN_REGION_MAX_SIDE,
+        data = self._ask(image, _single_form(prompt), max_side or settings.QWEN_REGION_MAX_SIDE,
                          required=("fields",), salvage=_STAMP_SALVAGE)
         if data is None:
             return None

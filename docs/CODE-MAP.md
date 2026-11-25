@@ -260,6 +260,16 @@
 | `DRAWING_VLM_REJECT_DETAILS` (+ `DRAWING_VLM_REJECT_RAW_MAX`) | `false` | `core/providers/qwen_client.py` (`reject_reason`, `_log_rejected`, `_answer` → `_note_rejected`); в payload — `core/sheet_text_route.attach_rejected` из `_enrich_fragments` |
 | `DRAWING_WHAT_DRAWN` | `false` | `core/drawing_processor.py::_process` (запись листа) → `_enrich_fragments` → `_what_drawn_pass` → `core/providers/what_drawn.py`; `qwen_client.read_what_drawn` |
 | `DRAWING_BLOCK_CLEANUP` | `false` | `core/providers/mineru_parser.py` → `text_layer.reconcile_with_text_layer(drop_gibberish_tables)`; `field_placement.apply`; `DrawingProcessor._process` → `core/providers/block_cleanup.py` |
+| `DRAWING_FIELDS_FROM_TEXT_WIDE` | `false` | `core/drawing_processor.py::_process` → `_fields_from_text` → `_strict_text_field` (`_element_row_field`, `_wide_text_field`); текст вырезки — `_read_crop` → `_crop_lines` |
+| `DRAWING_SHEETS_PER_PAGE` | `false` | `core/ladder/context.py::_classify_pdf` → `_raster_sheet_pages` (признак `raster_sheet_pages`); `core/drawing_processor.py::_sheet_drawings` → `_per_page_sheets` |
+| `DRAWING_KEEP_TITLE_BLOCK_REGION` | `false` | `core/providers/drawing_vision.py::analyse` (до среза `DRAWING_MAX_REGIONS`) |
+| `DRAWING_STAMP_FALLBACK_GOST` | `false` | `core/providers/drawing_vision.py::fallback_title_block` → `gost_fallback_box`; dpi — `core/drawing_processor.py::_image_dpi` |
+| `DRAWING_PASSES_BY_GEOMETRY` | `false` | `core/drawing_processor.py::_process` → `_sheet_by_geometry` (шероховатость в углу, поле подшивки, «что изображено») |
+| `RASTER_ALL_FRAMES` | `false` | `core/providers/raster_drawing.py::open_image` (кадр, EXIF), `core/providers/tesseract_fallback.py::_images_of` → `_image_frames`, `core/ladder/context.py::_frame_sheet_pages`, `core/drawing_processor.py::_open` |
+| `RASTER_TINTED_LINE_CHECK` | `false` | `core/providers/raster_drawing.py::analyse_image` → `_tinted_line_sheet` |
+| `DRAWING_CROP_GATE` | `false` | `core/drawing_processor.py::_enrich_fragments` → `_crop_gate` |
+| `DRAWING_SOURCE_CACHE` | `false` | `core/drawing_processor.py::enrich_fragments` (`_source_cache`, `_pdf_cache`) → `_read`, `_open`, `_native_sheet` → `_render_pdf_page(documents)`; конец документа — `_drop_source_cache` |
+| `LADDER_SKIP_OCR_ON_RASTER_DRAWING` | `false` | `core/ladder/router.py::_parse` → `core/ladder/drawing_route.py::skip_ocr_levels` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
 
@@ -306,6 +316,9 @@
 | `GATEWAY_OCR_PROBE_PAGES`, `GATEWAY_OCR_PROBE_SECONDS` | `2`/`60.0` | `core/gateway/text_probe.py` | — |
 | `INTAKE_MAX_FILES`, `INTAKE_TIMEOUT`, `INTAKE_TASK_(SOFT_)TIME_LIMIT`, `INTAKE_STATE_TTL_SECONDS` | — | `core/models/intake.py`, `gateway/api.py`, `core/intake/pipeline.py`, `core/intake/tasks.py`, `core/intake/state.py` | — |
 | `SOURCE_PREFIX`, `SOURCE_PROBE_EXTENSIONS`, `S3_ATTACHMENTS_BUCKET` | `documents/` | `core/providers/file_locator.py` | где ищется файл |
+| `DRAWING_STAMP_MAX_SIDE` | `0` (= `QWEN_REGION_MAX_SIDE`) | `core/drawing_processor.py::_read_title_block` → `qwen_client.read_title_block(max_side)` | сторона вырезки штампа (N-15) |
+| `DRAWING_CROP_MIN_AREA`, `DRAWING_CROP_MAX_PER_DOC` | `0.02` / `12` | `core/drawing_processor.py::_crop_gate` (при `DRAWING_CROP_GATE`) | какие вырезки MinerU уходят в модель (N-06) |
+| `DRAWING_CROPS_PARALLEL` | `1` | `core/drawing_processor.py::_enrich_fragments` → `_read_crops_parallel` | вырезок разных страниц разом (N-20) |
 | `MAX_IMAGE_PIXELS`, `CONFIDENCE_THRESHOLD`, `HF_TOKEN` | — | **никто** (объявлены в `core/config.py`, чтений в коде нет) | — |
 
 ## 3. Формы данных
