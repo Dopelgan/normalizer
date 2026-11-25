@@ -357,12 +357,18 @@ def _merge(keep: DrawingField, other: DrawingField, relation: str, from_parts: b
 
 def dedupe_page(drawings: List[Fragment]) -> int:
     """Повторы надписей среди полей чертёжных фрагментов одной страницы. Возвращает число снятых."""
+    from core.config import settings
+
     keys: List[Tuple[int, int]] = []
     fields: Dict[Tuple[int, int], DrawingField] = {}
+    frames: Dict[Tuple[int, int], List[float]] = {}
     for fragment in drawings:
+        frame = list(fragment.position.bbox) if fragment.position and fragment.position.bbox else WHOLE
         for n, field in enumerate(fragment.content.structured_drawing_fields or []):
             keys.append((id(fragment), n))
             fields[(id(fragment), n)] = field
+            frames[(id(fragment), n)] = frame
+    no_absorb = settings.DRAWING_UNPLACED_NO_ABSORB
     removed: set = set()
     from_parts: set = set()
     # Сначала поля с точной рамкой: к ним сводятся прочтения областей.
@@ -378,6 +384,11 @@ def dedupe_page(drawings: List[Fragment]) -> int:
                 continue
             relation = _relation(a, b)
             if relation is None:
+                continue
+            if no_absorb and relation in ("part", "part_variant") and (
+                    _unplaced(a, frames[key_a]) or _unplaced(b, frames[key_b])):
+                # Поле без места «перекрывает» всё: частью его была бы любая
+                # клетка листа, и клетка с местом пропала бы в строке таблицы.
                 continue
             region = b if b.bbox_exact is False else (a if a.bbox_exact is False else None)
             if region is not None and relation in ("same", "variant") and _rivals(
@@ -398,6 +409,13 @@ def dedupe_page(drawings: List[Fragment]) -> int:
             if (id(fragment), n) not in removed
         ]
     return len(removed)
+
+
+def _unplaced(field: DrawingField, frame: Sequence[float]) -> bool:
+    """Поле без места: рамка — весь фрагмент (рамка по умолчанию), а не область."""
+    if field.bbox_exact is not False or not field.bbox or len(field.bbox) != 4:
+        return False
+    return all(abs(float(c) - float(f)) <= 1e-3 for c, f in zip(field.bbox, frame))
 
 
 def _rivals(region: DrawingField, fields: Dict[Any, DrawingField], removed: set, pair: set) -> bool:

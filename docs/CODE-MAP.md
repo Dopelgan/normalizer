@@ -111,6 +111,7 @@
 | Графы поля подшивки и графа 26 (`DRAWING_MARGIN_COLUMNS`) | `core/providers/margin_columns.py` | `geometry`, `compose`, `parse`, `merge`, `check_designation`; вызов — `DrawingProcessor._margin_columns`, модель — `qwen_client.read_margin_columns` |
 | «Что изображено» на листе (`DRAWING_WHAT_DRAWN`) | `core/providers/what_drawn.py` | `build_prompt`, `parse`, `contradicts`, `parts_fit`; лист запоминается в `DrawingProcessor._process`, вызов — `_what_drawn_pass` после `sense_rules.apply`, модель — `qwen_client.read_what_drawn` |
 | Уборка мусора листа (`DRAWING_BLOCK_CLEANUP`) | `core/providers/block_cleanup.py` | `drop_gibberish_tables` (в `text_layer.reconcile_with_text_layer`), `unplace_oversized` (конец `field_placement.apply`), `drop_caption_fields` (`DrawingProcessor._process` после `_deduplicate`) |
+| Надписи без места: подписи граф, смешение алфавитов, пара без знаков (`DRAWING_UNPLACED_CLEANUP`); поле без места не поглощает клетки (`DRAWING_UNPLACED_NO_ABSORB`) | `core/providers/unplaced_cleanup.py`, `core/providers/field_placement.py` | `noise`, `loose`; вызовы — `qwen_client.merge_content`, `drawing_processor._fields_from_text`; `field_placement.dedupe_page` → `_unplaced` |
 | Дочитывание спорных чисел вырезками (`DRAWING_DISPUTED_REREAD`) | `core/providers/disputed_reread.py` | `apply`, `targets`; без D3 — `DrawingProcessor._reread_disputed` в проходе листа, с D3 — `_reread_reconciled` после `reading_reconcile.apply` |
 | **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
 | Качество фрагмента чертежа | `core/drawing_quality.py` | `apply_drawing_quality` (7), `document_quality` (71) |
@@ -228,6 +229,8 @@
 | `DRAWING_MARGIN_DATE_FIX` | `false` | `core/providers/title_block.py::fix_month_year` (из `parse`), `core/providers/margin_columns.py::parse` |
 | `DRAWING_FIELDS_FROM_TEXT` | `false` | `core/drawing_processor.py::process` → `_fields_from_text` (`_text_cells`, `_text_category`); фильтр в `_what_drawn_pass` |
 | `DRAWING_KEEP_REPEATS` | `false` | `core/drawing_processor.py::_deduplicate` → `_deduplicate_by_place` (`_same_place`) |
+| `DRAWING_UNPLACED_CLEANUP` | `false` | `core/providers/unplaced_cleanup.py` (`noise`, `loose`); вызов — `qwen_client.merge_content`, `drawing_processor._fields_from_text` |
+| `DRAWING_UNPLACED_NO_ABSORB` | `false` | `core/providers/field_placement.py::dedupe_page` (`_unplaced`) |
 | `DRAWING_CORNER_ROUGHNESS` | `false` | `core/drawing_processor.py::_process` → `_corner_roughness`; `core/providers/qwen_client.py::read_corner_roughness` |
 | `DRAWING_MARGIN_COLUMNS` | `false` | `core/drawing_processor.py::_process` → `_margin_columns` → `core/providers/margin_columns.py`; `qwen_client.read_margin_columns` |
 | `DRAWING_INNER_FRAME_EXTENT` | `false` | `core/providers/drawing_vision.py::_inner_frame` → `_frame_rows` |

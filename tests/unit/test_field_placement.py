@@ -206,3 +206,37 @@ def test_garbled_readings_are_marked_low_quality():
 def test_new_keys_absent_without_placement():
     data = _field("size", "20", [0.1, 0.1, 0.2, 0.2]).model_dump()
     assert not {"bbox_exact", "alternatives", "needs_review", "low_quality"} & set(data)
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_unplaced_row_does_not_absorb_located_cells(monkeypatch, flag):
+    """
+    Сборка ТАДУ 421451.003 СБ: проход «содержание листа» читает строку таблицы
+    швов целиком и без места (рамка «весь лист»), проход с рамками — клетки.
+    Рамка «весь лист» перекрывает всё, и клетки сводились в строку как её
+    части: на листе пропадали ~30 надписей с местом. С
+    DRAWING_UNPLACED_NO_ABSORB клетки остаются, а та же запись без места
+    по-прежнему получает место клетки.
+    """
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "DRAWING_UNPLACED_NO_ABSORB", flag)
+    sheet = _drawing([
+        _field("note", "№ шва", [0.62, 0.30, 0.66, 0.32]),
+        _field("note", "Код ККС", [0.62, 0.40, 0.68, 0.42]),
+        _field("note", "Габариты блока", [0.30, 0.70, 0.40, 0.72]),
+        _field("note", "№ шва Сортамент присоединяемого трубопровода", [0, 0, 1, 1], confidence=0.5),
+        _field("note", "Наименование, исполнение Код ККС 1 блок", [0, 0, 1, 1], confidence=0.5),
+        _field("note", "Габариты блока", [0, 0, 1, 1], confidence=0.5),
+    ], [0, 0, 1, 1])
+    fp.apply([sheet])
+    fields = sheet.content.structured_drawing_fields
+    values = [f.value for f in fields]
+    assert ("№ шва" in values) is flag
+    assert ("Код ККС" in values) is flag
+    # Одинаковая запись сводится в одно поле с местом клетки в обоих случаях.
+    assert values.count("Габариты блока") == 1
+    assert next(f for f in fields if f.value == "Габариты блока").bbox_exact is True
+    if flag:
+        row = next(f for f in fields if f.value.startswith("№ шва Сортамент"))
+        assert row.bbox_exact is False and row.bbox == [0, 0, 1, 1]
