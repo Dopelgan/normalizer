@@ -133,6 +133,8 @@ NOT_IN_KEY: Tuple[str, ...] = (
     "STORAGE_LOCAL_MOUNT", "STORAGE_TYPE", "TEMP_DIR", "TESSERACT_PAGE_WORKERS",
     "VLM_CACHE_V1_FALLBACK", "VLM_RESPONSE_CACHE", "VLM_RESPONSE_CACHE_DIR",
     "DRAWING_VLM_REJECTED_LOG",  # только журнал отказов
+    # U2: причина и сырой ответ отказа — журнал и payload ветки чертежей, не результат лестницы
+    "DRAWING_VLM_REJECT_DETAILS", "DRAWING_VLM_REJECT_RAW_MAX",
     "VLM_SHEET_CONCURRENCY",
 )
 

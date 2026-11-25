@@ -1182,6 +1182,37 @@ class Settings(BaseSettings):
     # модели на страницу. По умолчанию выключено.
     DRAWING_STAMP_ALL_PAGES: bool = False
     DRAWING_STAMP_ALL_PAGES_MAX: int = 8
+    # Текст листа-чертежа — модели, а не OCR (C8, core/sheet_text_route.py).
+    # Лист, у которого ветка чертежей прочитала только область рисунка, а
+    # штамп и технические требования ушли распознаванием, давал 0 граф штампа
+    # и мусор OCR в ТТ. С флагом страница-чертёж (рисунок от
+    # DRAWING_ROUTE_SHEET_TEXT_MIN_SHARE площади, лист целиком или рамка
+    # формата при рисунке на странице, либо растровый чертёж по классификации)
+    # получает проход штампа, если полей штампа на ней нет, а текстовые блоки
+    # вне рисунка перечитываются моделью по вырезке в разрешении
+    # DRAWING_ROUTE_SHEET_TEXT_DPI. Текст OCR остаётся, только если модель не
+    # ответила или ответила заметно короче. Не больше
+    # DRAWING_ROUTE_SHEET_TEXT_MAX_BLOCKS вырезок на документ, в пределах срока
+    # задачи. По умолчанию выключено: без флага вызовов и ключей кэша нет.
+    DRAWING_ROUTE_SHEET_TEXT_VLM: bool = False
+    DRAWING_ROUTE_SHEET_TEXT_MIN_SHARE: float = 0.35
+    DRAWING_ROUTE_SHEET_TEXT_MAX_BLOCKS: int = 24
+    DRAWING_ROUTE_SHEET_TEXT_DPI: int = 300
+    # Схлопнувшееся чтение листа (U2): надписей меньше, чем
+    # DRAWING_COLLAPSE_RATIO от строк того же листа (проход «весь текст
+    # листа» или слой распознавания страницы) при не меньше
+    # DRAWING_COLLAPSE_MIN_LINES строк, — лист перечитывается частями один
+    # раз в пределах DRAWING_TIME_BUDGET; надписи целого ответа сохраняются.
+    # По умолчанию выключено.
+    DRAWING_COLLAPSE_REREAD: bool = False
+    DRAWING_COLLAPSE_RATIO: float = 0.25
+    DRAWING_COLLAPSE_MIN_LINES: int = 20
+    # Сырые отбракованные ответы модели с причиной (U2): в файле
+    # DRAWING_VLM_REJECTED_LOG — причина и ответ до DRAWING_VLM_REJECT_RAW_MAX
+    # символов, в payload первого чертёжного фрагмента документа —
+    # `vlm_rejected` (причина, finish, длина, начало ответа). По умолчанию выключено.
+    DRAWING_VLM_REJECT_DETAILS: bool = False
+    DRAWING_VLM_REJECT_RAW_MAX: int = 20000
     # «Что изображено» (core/providers/what_drawn.py): один вызов модели на
     # лист детали или сборки целиком после связи размеров и правил здравого
     # смысла — что изображено, что показывает каждый вид и что измеряет
