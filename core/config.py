@@ -1303,9 +1303,13 @@ class Settings(BaseSettings):
     DRAWING_FIELDS_FROM_TEXT_WIDE: bool = False
     # N-08: скан PDF — лист целиком читается на каждой странице, где растровый
     # детектор видит чертёж или рамку формата, на всех страницах (не только
-    # первых 8) и без потолка DRAWING_MAX_SHEETS: ограничивает срок задачи,
+    # первых 8) — вместо решения «половина первых 8 страниц — чертежи». Ворота
+    # полного чтения и вырезок прежние; потолок — DRAWING_SHEETS_PER_PAGE_MAX,
     # недочитанное — DRAWING_SHEETS_SKIPPED. Жанр документа (и гриф) прежний.
     DRAWING_SHEETS_PER_PAGE: bool = False
+    # Потолок числа листов при чтении по страницам; остальные —
+    # DRAWING_SHEETS_SKIPPED (как у DRAWING_MAX_SHEETS без флага).
+    DRAWING_SHEETS_PER_PAGE_MAX: int = 40
     # N-09: штамп не срезается потолком DRAWING_MAX_REGIONS — встаёт первым.
     DRAWING_KEEP_TITLE_BLOCK_REGION: bool = False
     # N-15: длинная сторона вырезки штампа в обычном проходе штампа; 0 —

@@ -239,7 +239,7 @@ def per_page_metadata(pages, genre=GENRE_UNKNOWN, file_type="pdf"):
 class TestSheetsPerPage:
     def test_all_pages_are_checked(self):
         data = scan_pdf(drawing_pages={2, 10, 11}, total=12)
-        assert _raster_sheet_pages(data) == [2, 10, 11]
+        assert _raster_sheet_pages(data) == ([2, 10, 11], 12)
 
     def test_classification_genre_unchanged_and_pages_recorded(self, monkeypatch):
         data = scan_pdf(drawing_pages={2, 10, 11}, total=12)
@@ -611,3 +611,124 @@ class TestCropsParallel:
         order = state["order"]
         for page in (1, 2, 3):
             assert order.index(f"assets/c-{page}1.png") < order.index(f"assets/c-{page}2.png")
+
+
+# ------------------------------------------------ правки после ревью ветки
+class TestPerPageKeepsGates:
+    """Чтение по страницам заменяет только решение «документ — чертёж»."""
+
+    def _sheet_pages(self, recording):
+        return [c["page"] for c in recording.calls if c["ref"] == "src/scan.pdf"]
+
+    def test_without_full_read_crops_cancel_the_sheets(self, recording, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_SHEETS_PER_PAGE", True)
+        recording.enrich_fragments([crop(2)], per_page_metadata([2, 10, 11]))
+        assert self._sheet_pages(recording) == []
+
+    def test_without_full_read_missing_pages_reads_only_undrawn(self, recording, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_SHEETS_PER_PAGE", True)
+        monkeypatch.setattr(settings, "DRAWING_SHEET_MISSING_PAGES", True)
+        recording.enrich_fragments([crop(2)], per_page_metadata([2, 10, 11]))
+        assert self._sheet_pages(recording) == [10, 11]
+
+    def test_cap_is_a_setting_and_rest_is_reported(self, recording, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_SHEETS_PER_PAGE", True)
+        monkeypatch.setattr(settings, "DRAWING_PDF_FULL_READ", True)
+        monkeypatch.setattr(settings, "DRAWING_SHEETS_PER_PAGE_MAX", 2)
+        out = recording.enrich_fragments([], per_page_metadata([2, 10, 11]))
+        assert self._sheet_pages(recording) == [2, 10]
+        assert "DRAWING_SHEETS_SKIPPED:11" in out[0].warnings
+
+    def test_small_crop_skip_knows_per_page_sheets(self, temp_storage, monkeypatch):
+        proc = DrawingProcessor(temp_storage, qwen=FakeQwen())
+        monkeypatch.setattr(settings, "DRAWING_SKIP_SMALL_CROPS", True)
+        monkeypatch.setattr(settings, "DRAWING_PDF_FULL_READ", True)
+        monkeypatch.setattr(settings, "DRAWING_SHEETS_PER_PAGE", True)
+        monkeypatch.setattr(settings, "DRAWING_SHEETS_PER_PAGE_MAX", 2)
+        assert proc._pages_read_whole(per_page_metadata([2, 10, 11])) == frozenset({2, 10})
+
+
+class TestSourceCacheBounds:
+    def test_only_source_bytes_are_kept(self, monkeypatch):
+        storage = CountingStorage({"src/scan.pdf": b"%PDF-src", "assets/c.png": b"crop"})
+        proc = DrawingProcessor(storage, qwen=FakeQwen())
+        monkeypatch.setattr(settings, "DRAWING_SOURCE_CACHE", True)
+
+        def process(image_ref, metadata, page=1, **kwargs):
+            for uri in ("src/scan.pdf", "assets/c.png") * 2:
+                proc._read(uri)
+            return result_of()
+
+        monkeypatch.setattr(proc, "process", process)
+        proc.enrich_fragments([crop(1, ref="assets/c.png")], {"doc_id": "d", "source_path": "src/scan.pdf"})
+        assert storage.reads == 1 + 2
+
+    def test_late_thread_does_not_reuse_closed_pdf(self, monkeypatch):
+        data = scan_pdf({1}, 1)
+        storage = CountingStorage({"src/scan.pdf": data})
+        proc = DrawingProcessor(storage, qwen=FakeQwen())
+        monkeypatch.setattr(settings, "DRAWING_SOURCE_CACHE", True)
+        held = {}
+
+        def process(image_ref, metadata, page=1, **kwargs):
+            held["documents"] = proc._pdf_cache
+            assert proc._open(image_ref, page) is not None
+            return result_of()
+
+        monkeypatch.setattr(proc, "process", process)
+        metadata = {"doc_id": "d", "source_path": "src/scan.pdf", "file_type": "pdf",
+                    "classification": {"genre": GENRE_DRAWING, "source": SOURCE_RASTER,
+                                       "signals": {"raster_drawing_pages": [1]}}}
+        proc.enrich_fragments([], metadata)
+        documents = held["documents"]
+        assert [k for k in documents if k != "\0closed"] == []
+        # Поток, взявший словарь до конца документа, открывает PDF заново.
+        from core.drawing_processor import _render_pdf_page
+        assert _render_pdf_page(data, 1, documents=documents, key="src/scan.pdf") is not None
+        assert [k for k in documents if k != "\0closed"] == []
+
+
+class TestCropsSoftLimit:
+    def _processor(self, temp_storage, monkeypatch, failing):
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        proc = DrawingProcessor(temp_storage, qwen=FakeQwen())
+
+        def process(image_ref, metadata, page=1, **kwargs):
+            if image_ref == failing:
+                raise SoftTimeLimitExceeded()
+            return result_of()
+
+        monkeypatch.setattr(proc, "process", process)
+        return proc
+
+    def _fragments(self):
+        return [crop(1, ref="assets/a.png"), crop(2, ref="assets/b.png"),
+                crop(2, bbox=(0.6, 0.6, 0.9, 0.9), ref="assets/c.png"), crop(3, ref="assets/d.png")]
+
+    def test_off_soft_limit_raises(self, temp_storage, monkeypatch):
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        proc = self._processor(temp_storage, monkeypatch, "assets/c.png")
+        with pytest.raises(SoftTimeLimitExceeded):
+            proc.enrich_fragments(self._fragments(), {"doc_id": "d"})
+
+    @pytest.mark.parametrize("workers", [1, 3])
+    def test_robust_keeps_read_crops(self, temp_storage, monkeypatch, workers):
+        monkeypatch.setattr(settings, "DRAWING_ROBUST_PASSES", True)
+        monkeypatch.setattr(settings, "DRAWING_CROPS_PARALLEL", workers)
+        proc = self._processor(temp_storage, monkeypatch, "assets/c.png")
+        out = proc.enrich_fragments(self._fragments(), {"doc_id": "d"})
+        kinds = {f.content.image_ref: f.type for f in out}
+        assert kinds["assets/a.png"] == "drawing" and kinds["assets/b.png"] == "drawing"
+        assert kinds["assets/c.png"] == "image"
+        late = next(f for f in out if f.content.image_ref == "assets/c.png")
+        assert "DRAWING_SKIPPED_NO_TIME" in late.warnings
+
+
+class TestSheetSearchDeadline:
+    def test_rendering_stops_when_time_is_short(self, monkeypatch):
+        data = scan_pdf(drawing_pages={1, 2, 3}, total=3)
+        left = iter([1000.0])
+        monkeypatch.setattr(deadline, "remaining", lambda: next(left, 1.0))
+        assert _raster_sheet_pages(data) == ([1], 1)
