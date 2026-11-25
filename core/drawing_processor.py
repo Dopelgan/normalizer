@@ -79,6 +79,7 @@ from core.providers import (
 from core.providers.qwen_client import (
     CATEGORIES, GUARD_MIN_TEXT_LINES, REJECT_EMPTY, QwenVisionClient,
 )
+from core.providers import qwen_client
 from core.providers.storage import StorageProvider, StorageProviderFactory
 from core.providers.vector_drawing import structure_ratio
 from core.drawing_quality import apply_drawing_quality
@@ -179,6 +180,11 @@ class _Passes:
     def add(self, function):
         if self.pool is None:
             return _Deferred(function)
+        if settings.DRAWING_ROBUST_PASSES or settings.VLM_CACHE_VALIDATE:
+            # Срок задачи, часы бюджета листа и строки слоя живут в
+            # contextvars: проходу в потоке нужна их копия, иначе он не
+            # видит ни срока, ни бюджета (N-05).
+            return self.pool.submit(contextvars.copy_context().run, self._run, function)
         # Срок задачи, часы бюджета листа и сборщик таймингов живут в
         # contextvars: потоку нужна копия контекста.
         return self.pool.submit(contextvars.copy_context().run, self._run, function)
@@ -249,8 +255,31 @@ class DrawingProcessor:
         # Бюджет листа меряется часами без ожидания мест на видеокарте
         # (GPU_GATE_ENABLED); у каждого листа свои часы.
         with gpu_gate.budget_clock():
-            return self._process(image_ref, metadata, page, transcribe, log_page,
-                                 text_only, page_fields)
+            tokens = self._sheet_context(page, log_page)
+            try:
+                return self._process(image_ref, metadata, page, transcribe, log_page,
+                                     text_only, page_fields)
+            finally:
+                for reset, token in reversed(tokens):
+                    reset(token)
+
+    def _sheet_context(self, page: int, log_page: Optional[int]) -> List[Tuple[Any, Any]]:
+        """
+        Контекст вызовов модели одного листа. С DRAWING_ROBUST_PASSES — момент,
+        после которого вызов уже не нужен (бюджет листа DRAWING_TIME_BUDGET):
+        HTTP-срок урезается до него. С VLM_CACHE_VALIDATE — строки слоя
+        распознавания страницы: бедный ответ листа не пишется в кэш. Только
+        лист целиком: у вырезки вида `page` всегда 1. Без флагов пусто.
+        """
+        tokens: List[Tuple[Any, Any]] = []
+        budget = settings.DRAWING_TIME_BUDGET
+        if settings.DRAWING_ROBUST_PASSES and budget:
+            tokens.append((qwen_client.reset_call_until,
+                           qwen_client.set_call_until(time.monotonic() + budget)))
+        if settings.VLM_CACHE_VALIDATE and log_page is None:
+            tokens.append((qwen_client.reset_expected_text_lines,
+                           qwen_client.set_expected_text_lines(self._layer_lines.get(int(page), 0))))
+        return tokens
 
     def _process(
         self, image_ref: str, metadata: Dict[str, Any], page: int,
@@ -455,9 +484,17 @@ class DrawingProcessor:
                     reading = collapsed
                     self._sheet_record(reading, payload)
             if reading is None and not lines:
-                logger.error("Модель не прочитала лист %s", image_ref)
-                self._log_sheet(image_ref, sheet, MODE_NONE, 0, 0, 0, 0, started)
-                return _empty(MODE_NONE)
+                if not settings.DRAWING_ROBUST_PASSES:
+                    logger.error("Модель не прочитала лист %s", image_ref)
+                    self._log_sheet(image_ref, sheet, MODE_NONE, 0, 0, 0, 0, started)
+                    return _empty(MODE_NONE)
+                # Один неудачный вызов листа не отменяет штамп и таблицы
+                # (N-03): их вырезки мелкие и читаются отдельно. Лист пуст,
+                # только если пусто всё (проверка ниже, перед записью листа).
+                logger.error("Модель не прочитала лист %s: дочитываются штамп и таблицы", image_ref)
+                if sheet_job is not None:
+                    missing_regions.append({"kind": "sheet", "bbox": [0.0, 0.0, 1.0, 1.0],
+                                            "reason": "sheet_not_read"})
             if reading is not None:
                 payload["sheet_type"] = reading.sheet_type
                 fields.extend(self._fields_from_annotations(reading.annotations))
@@ -1527,7 +1564,16 @@ class DrawingProcessor:
         if workers <= 1 or len({int(page) for page in pages}) != len(pages):
             readings: List[Any] = []
             for page, fields in zip(pages, fields_of):
-                reading = read(page, fields)
+                try:
+                    reading = read(page, fields)
+                except SoftTimeLimitExceeded:
+                    if not settings.DRAWING_ROBUST_PASSES:
+                        raise
+                    # Мягкий лимит задачи посреди листа (N-05): прочитанные
+                    # листы остаются, этот и следующие — DRAWING_SHEETS_SKIPPED.
+                    logger.warning("Мягкий лимит задачи на листе %s стр. %s: прочитано листов %d",
+                                   source_uri, page, len(readings))
+                    reading = _NO_TIME
                 readings.append(reading)
                 if reading is _NO_TIME:
                     break
@@ -1541,6 +1587,15 @@ class DrawingProcessor:
                 for page, fields in zip(pages, fields_of)
             ]
             return [future.result() for future in futures]
+        except SoftTimeLimitExceeded:
+            abort.set()
+            if not settings.DRAWING_ROBUST_PASSES:
+                raise
+            # Мягкий лимит, пока листы читались разом (N-05): законченные
+            # листы остаются, недочитанные — DRAWING_SHEETS_SKIPPED.
+            logger.warning("Мягкий лимит задачи при чтении листов %s: недочитанные пропущены",
+                           source_uri)
+            return [_finished(future) for future in futures]
         except BaseException:
             # Обрыв задачи (SoftTimeLimitExceeded приходит в главный поток,
             # пока он ждёт ответы): листы из очереди не начинаются, а начатые
@@ -1690,6 +1745,13 @@ class DrawingProcessor:
         if block is None:
             logger.warning("Штамп не прочитан")
             return False
+        if settings.DRAWING_ASK_SALVAGE:
+            if block.get("cut") is True:
+                payload["title_block_cut"] = True
+            if not block.get("fields") and not block.get("rows"):
+                # Ни одной графы: штамп не прочитан, а не прочитан пустым (N-13).
+                logger.warning("Штамп прочитан пустым")
+                return False
 
         payload["title_block"] = block.get("fields", {})
         if block.get("rows"):
@@ -1749,6 +1811,8 @@ class DrawingProcessor:
                 max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE,
             )
         parsed = self.qwen.read_title_block_fields(piece)
+        if settings.DRAWING_ASK_SALVAGE and (parsed or {}).get("cut") is True:
+            payload["title_block_cut"] = True
         side = self._read_side_column(layout, payload, native=native)
         if parsed is None and side is None:
             logger.warning("Штамп не прочитан")
@@ -1876,6 +1940,8 @@ class DrawingProcessor:
             "title": table.get("title", ""),
             "headers": table.get("headers", []),
             "rows": table["rows"],
+            # Ответ оборван, строки спасены не все (DRAWING_ASK_SALVAGE).
+            **({"cut": True} if table.get("cut") is True else {}),
         })
         return True
 
@@ -2204,6 +2270,13 @@ class DrawingProcessor:
 
 # «Что изображено» (DRAWING_WHAT_DRAWN): не больше стольких листов на документ.
 WHAT_DRAWN_SHEETS_MAX = 6
+
+
+def _finished(future) -> Any:
+    """Ответ законченного листа; незаконченный или упавший — `_NO_TIME`."""
+    if not future.done() or future.cancelled() or future.exception() is not None:
+        return _NO_TIME
+    return future.result()
 
 
 def _is_text_document(fragments: List[Fragment], metadata: Dict[str, Any]) -> bool:

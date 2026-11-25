@@ -1,7 +1,56 @@
 """Признаки качества для отбора RAG, без повышения оценок распознавания."""
 
+import re
+
 from core.config import settings
 from core.processing_contract import DRAWING_MIN_COMPLETENESS, DRAWING_MIN_FACT_CONFIDENCE
+
+# Согласие прочтений, которое считается вторым источником (reading_reconcile).
+_SECOND_SOURCE_AGREEMENT = ("agreed", "vector")
+# Значение короче этого (после сжатия) в переписанном тексте находится
+# случайно («1», «А»): им поле не подтверждается.
+_MIN_TEXT_MATCH = 2
+_LOOSE = re.compile(r"[\s ]+")
+
+
+def _fact_threshold() -> float:
+    """Порог `confirmed` (DRAWING_CONFIRMED_MIN_CONFIDENCE); по умолчанию прежний 0.95."""
+    return float(getattr(settings, "DRAWING_CONFIRMED_MIN_CONFIDENCE", DRAWING_MIN_FACT_CONFIDENCE))
+
+
+def _completeness_threshold() -> float:
+    """Порог полноты (DRAWING_REVIEW_MIN_COMPLETENESS); по умолчанию прежний 0.90."""
+    return float(getattr(settings, "DRAWING_REVIEW_MIN_COMPLETENESS", DRAWING_MIN_COMPLETENESS))
+
+
+def _loose(text: str) -> str:
+    return _LOOSE.sub("", text or "").lower()
+
+
+def _second_source(field, transcript: str) -> bool:
+    """
+    Значение поля подтверждено вторым источником (DRAWING_CONFIRMED_CALIBRATED):
+    согласием прочтений разными проходами, текстовым слоем PDF или переписанным
+    текстом листа. Поле, взятое из этого же текста (`full_page_ocr`), им не
+    подтверждается: источник был бы один.
+    """
+    if field.agreement in _SECOND_SOURCE_AGREEMENT or field.provenance == "vector_text_layer":
+        return True
+    if field.provenance == "full_page_ocr" or not transcript:
+        return False
+    value = _loose(field.value)
+    return len(value) >= _MIN_TEXT_MATCH and value in transcript
+
+
+def _confirmed(field, transcript: str) -> bool:
+    if field.confidence >= _fact_threshold():
+        return True
+    if not settings.DRAWING_CONFIRMED_CALIBRATED:
+        return False
+    # Модель не ставит больше DRAWING_VLM_MAX_CONFIDENCE: на её максимуме поле
+    # подтверждается, если значение нашёл и другой источник.
+    return (field.confidence >= float(settings.DRAWING_VLM_MAX_CONFIDENCE)
+            and _second_source(field, transcript))
 
 
 def apply_drawing_quality(fragment):
@@ -9,10 +58,18 @@ def apply_drawing_quality(fragment):
         fragment.completeness = None
     fields = fragment.content.structured_drawing_fields or []
     tables = (fragment.content.structured_payload or {}).get("tables", [])
+    calibrated = bool(settings.DRAWING_CONFIRMED_CALIBRATED)
+    # Запись чертежа (`drawing_record.COMPOSED_KEY`; импорт оттуда был бы
+    # циклическим) уже собрана из самих полей: такой текст — не второй
+    # источник, а подтверждение, данное по переписанному тексту при первой
+    # финализации, сохраняется.
+    composed = bool((fragment.content.structured_payload or {}).get("record_composed"))
+    transcript = _loose(fragment.content.text or "") if calibrated and not composed else ""
     suspicious = False
     for field in fields:
         synthetic = "(dev)" in field.value.lower()
-        field.confirmed = field.confidence >= DRAWING_MIN_FACT_CONFIDENCE and not synthetic
+        kept = calibrated and composed and field.confirmed
+        field.confirmed = (kept or _confirmed(field, transcript)) and not synthetic
         suspicious = suspicious or synthetic
     for table in tables:
         # Для чтения таблицы модель пока не отдаёт калиброванной оценки.
@@ -20,14 +77,14 @@ def apply_drawing_quality(fragment):
         confidence = table.get("confidence")
         table["confirmed"] = bool(
             isinstance(confidence, (int, float))
-            and DRAWING_MIN_FACT_CONFIDENCE <= confidence <= 1
+            and _fact_threshold() <= confidence <= 1
         )
     if suspicious:
         fragment.warnings = list(dict.fromkeys(fragment.warnings + ["SYNTHETIC_DRAWING_VALUE"]))
     fragment.review_required = bool(
         fragment.review_required or fragment.missing_regions or fragment.warnings
         or fragment.completeness is None
-        or fragment.completeness < DRAWING_MIN_COMPLETENESS
+        or fragment.completeness < _completeness_threshold()
         or any(not field.confirmed for field in fields)
         or any(not table["confirmed"] for table in tables)
     )
