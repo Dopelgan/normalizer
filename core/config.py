@@ -1048,6 +1048,32 @@ class Settings(BaseSettings):
     # добавляются. Один вызов модели на лист сверх прежнего. По умолчанию выключено.
     DRAWING_SHEET_CONTENT_PASS: bool = False
     DRAWING_SHEET_CONTENT_MAX_SIDE: int = 3400
+    # Крупный лист плитками в родном разрешении (core/providers/native_tiles.py).
+    # Лист, у которого прописная 2,5 мм после ужатия до QWEN_SHEET_MAX_SIDE
+    # ниже DRAWING_NATIVE_TILES_MIN_CAP_PX (A3 — 12 px, A2 — 8, A1 — 6; A4 —
+    # 17), или лист с оборванным ответом читается плитками с перекрытием
+    # OVERLAP шага сетки: PDF рендерится заново в DPI (не больше
+    # RENDER_MAX_MP мегапикселей), плитка — короткий запрос «[код, надпись]»
+    # без рамок. Сетка — наименьшее число плиток (не больше MAX), при котором
+    # плитка уходит модели не грубее MIN_DPI и не больше MAX_SIDE по стороне:
+    # A3 — 2 плитки, A2 — 4, A1 — 6. Плитки заменяют на таком листе
+    # содержание листа (DRAWING_SHEET_CONTENT_PASS); разом не больше PARALLEL,
+    # в пределах бюджета листа. Одна запись в зоне перекрытия — одна надпись
+    # (повторы — по DRAWING_KEEP_REPEATS). Надпись прохода с рамками
+    # побеждает, плитка добавляет только надписи без пары (без рамки, как
+    # содержание листа). Штамп и боковая колонка вырезаются из
+    # того же родного рендера; если штамп не найден — по месту ГОСТ 2.104.
+    # Отказ плитки оставляет прежнее прочтение листа. По умолчанию выключено.
+    DRAWING_NATIVE_TILES: bool = False
+    DRAWING_NATIVE_TILES_MIN_CAP_PX: float = 16.0
+    DRAWING_NATIVE_TILES_DPI: int = 300
+    DRAWING_NATIVE_TILES_MIN_DPI: int = 250
+    DRAWING_NATIVE_TILES_MAX_SIDE: int = 3400
+    DRAWING_NATIVE_TILES_OVERLAP: float = 0.1
+    DRAWING_NATIVE_TILES_MAX: int = 6
+    DRAWING_NATIVE_TILES_MAX_TOKENS: int = 6144
+    DRAWING_NATIVE_TILES_RENDER_MAX_MP: float = 48.0
+    DRAWING_NATIVE_TILES_PARALLEL: int = 3
     # Устойчивость вызовов модели (карточка E): рассуждение выключено
     # (`chat_template_kwargs.enable_thinking=false`), пустой ответ «{}»
     # переспрашивается один раз и в кэш не пишется. Непринятые ответы —

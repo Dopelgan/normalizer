@@ -73,7 +73,8 @@ from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
     block_cleanup, dimension_fidelity, disputed_reread, drawing_text, drawing_vision, field_placement, gpu_gate,
-    raster_drawing, reading_reconcile, sense_rules, title_block, unplaced_cleanup, vector_drawing,
+    native_tiles, raster_drawing, reading_reconcile, sense_rules, title_block, unplaced_cleanup,
+    vector_drawing,
 )
 from core.providers.qwen_client import (
     CATEGORIES, GUARD_MIN_TEXT_LINES, REJECT_EMPTY, QwenVisionClient,
@@ -278,6 +279,9 @@ class DrawingProcessor:
         fields: List[Dict[str, Any]] = []
         payload: Dict[str, Any] = {"layout": layout.as_dict(), "tables": []}
         payload["coordinate_reference"] = "deskewed_page"
+        # Лист в родном разрешении (DRAWING_NATIVE_TILES): плитки мелкого или
+        # плотного листа и вырезка штампа. Рендер — лениво, только если нужен.
+        native = None if text_only else self._native_sheet(image_ref, page, image, layout)
         if settings.DRAWING_FIELD_PLACEMENT_V2:
             # Размер картинки до выправления: по нему обратный наклон
             # переводит рамки полей в доли исходной картинки (field_placement).
@@ -295,8 +299,10 @@ class DrawingProcessor:
             layout.regions,
             key=lambda r: r.kind != drawing_vision.KIND_TITLE_BLOCK,
         )
-        if settings.DRAWING_STAMP_FALLBACK and not text_only and log_page is None:
+        if ((settings.DRAWING_STAMP_FALLBACK or settings.DRAWING_NATIVE_TILES)
+                and not text_only and log_page is None):
             # Рамка и сетка штампа не нашлись: штамп — по месту по ГОСТ.
+            # С DRAWING_NATIVE_TILES — всегда: вырезка в родном разрешении.
             fallback = drawing_vision.fallback_title_block(layout)
             if fallback is not None:
                 regions.insert(0, fallback)
@@ -318,10 +324,13 @@ class DrawingProcessor:
             # transcript_tile — хотя человеку качество чтения листа не адресовано.
             deadline_kwargs = (
                 {"until": budget_started + budget - settings.DRAWING_SHEET_TILE_RESERVE}
-                if settings.DRAWING_SHEET_TILES and budget else {}
+                if (settings.DRAWING_SHEET_TILES or native is not None) and budget else {}
             )
+            # Плитки в родном разрешении (DRAWING_NATIVE_TILES) — только у
+            # первого чтения: без флага вызов в точности прежний.
+            native_kwargs = {"native": native} if native is not None else {}
             reading = self.qwen.read_sheet(
-                layout.image, hint=layout.hint(), **deadline_kwargs,
+                layout.image, hint=layout.hint(), **deadline_kwargs, **native_kwargs,
             )
             reads = int(settings.DRAWING_CONSENSUS_READS or 1)
             if reading is not None and reads > 1:
@@ -379,7 +388,7 @@ class DrawingProcessor:
             own_fields: List[Dict[str, Any]] = []
             own_payload: Dict[str, Any] = {"tables": []}
             if region.kind == drawing_vision.KIND_TITLE_BLOCK:
-                read = self._read_title_block(layout, region, own_fields, own_payload)
+                read = self._read_title_block(layout, region, own_fields, own_payload, native=native)
                 with_side = bool((own_payload.get("side_column") or {}).get("read"))
                 self._log_pass(
                     sheet, "штамп", pass_started,
@@ -676,6 +685,10 @@ class DrawingProcessor:
         """
         if reading.tiles:
             payload["sheet_tiles"] = reading.tiles
+        if reading.native_tiles:
+            # Учёт плиток в родном разрешении (DRAWING_NATIVE_TILES): сетка,
+            # dpi, прочитано, добавлено без пары. Отказ плиток — не потеря.
+            payload["sheet_native_tiles"] = dict(reading.native_tiles)
         if reading.cut:
             payload["sheet_answer_cut"] = True
         if reading.lost:
@@ -1275,7 +1288,8 @@ class DrawingProcessor:
         fields: List[Dict[str, Any]] = []
         payload: Dict[str, Any] = {"layout": layout.as_dict(), "tables": [], "stamp_only": True,
                                    "coordinate_reference": "deskewed_page"}
-        if not self._read_title_block(layout, region, fields, payload) or not fields:
+        native = self._native_sheet(source_uri, page, image, layout)
+        if not self._read_title_block(layout, region, fields, payload, native=native) or not fields:
             return None
         anchor = Fragment(
             fragment_id=f"{metadata.get('doc_id') or 'doc'}-stamp-{page:03d}",
@@ -1602,10 +1616,15 @@ class DrawingProcessor:
         region: drawing_vision.Region,
         fields: List[Dict[str, Any]],
         payload: Dict[str, Any],
+        native: Optional[native_tiles.NativeSheet] = None,
     ) -> bool:
-        """Штамп: графы превращаются в поля, таблица целиком — в payload."""
-        if settings.DRAWING_TITLE_BLOCK_PASS:
-            return self._read_title_block_fields(layout, region, fields, payload)
+        """
+        Штамп: графы превращаются в поля, таблица целиком — в payload. С
+        DRAWING_NATIVE_TILES — всегда отдельным проходом по графам ГОСТ
+        («Графа: значение»), вырезка — из листа в родном разрешении.
+        """
+        if settings.DRAWING_TITLE_BLOCK_PASS or settings.DRAWING_NATIVE_TILES:
+            return self._read_title_block_fields(layout, region, fields, payload, native=native)
         piece = drawing_vision.crop(layout.image, region.bbox)
         block = self.qwen.read_title_block(piece)
         if block is None:
@@ -1645,9 +1664,13 @@ class DrawingProcessor:
         region: drawing_vision.Region,
         fields: List[Dict[str, Any]],
         payload: Dict[str, Any],
+        native: Optional[native_tiles.NativeSheet] = None,
     ) -> bool:
         """
         Отдельный проход по штампу (DRAWING_TITLE_BLOCK_PASS).
+        С `native` (DRAWING_NATIVE_TILES) штамп и боковая колонка вырезаются
+        из листа в родном разрешении (`NativeSheet.crop`), а не увеличиваются
+        из рабочего растра.
 
         Два отличия от обычного чтения области. Вырезка штампа идёт в
         модель в своём, высоком разрешении: на ужатой вырезке путаются
@@ -1657,13 +1680,16 @@ class DrawingProcessor:
         """
         bbox = drawing_vision.title_block_crop(layout, region)
         payload["title_block_bbox"] = bbox
-        piece = drawing_vision.crop(
-            layout.image, bbox,
-            upscale=settings.QWEN_TITLE_BLOCK_UPSCALE,
-            max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE,
-        )
+        if native is not None:
+            piece = native.crop(bbox, settings.QWEN_TITLE_BLOCK_UPSCALE, settings.QWEN_TITLE_BLOCK_MAX_SIDE)
+        else:
+            piece = drawing_vision.crop(
+                layout.image, bbox,
+                upscale=settings.QWEN_TITLE_BLOCK_UPSCALE,
+                max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE,
+            )
         parsed = self.qwen.read_title_block_fields(piece)
-        side = self._read_side_column(layout, payload)
+        side = self._read_side_column(layout, payload, native=native)
         if parsed is None and side is None:
             logger.warning("Штамп не прочитан")
             return False
@@ -1714,7 +1740,8 @@ class DrawingProcessor:
         return True
 
     def _read_side_column(
-        self, layout: drawing_vision.SheetLayout, payload: Dict[str, Any]
+        self, layout: drawing_vision.SheetLayout, payload: Dict[str, Any],
+        native: Optional[native_tiles.NativeSheet] = None,
     ) -> Optional[Dict[str, Any]]:
         """Колонка дополнительных граф у левого поля, повёрнутая под чтение."""
         if not settings.DRAWING_SIDE_COLUMN_READ:
@@ -1722,10 +1749,15 @@ class DrawingProcessor:
         bbox = drawing_vision.side_column(layout)
         if bbox is None:
             return None
-        piece = drawing_vision.upright(drawing_vision.crop(
-            layout.image, bbox, upscale=settings.QWEN_TITLE_BLOCK_UPSCALE,
-            padding=0.0, max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE,
-        ))
+        if native is not None:
+            strip = native.crop(bbox, settings.QWEN_TITLE_BLOCK_UPSCALE, settings.QWEN_TITLE_BLOCK_MAX_SIDE,
+                                padding=0.0)
+        else:
+            strip = drawing_vision.crop(
+                layout.image, bbox, upscale=settings.QWEN_TITLE_BLOCK_UPSCALE,
+                padding=0.0, max_side=settings.QWEN_TITLE_BLOCK_MAX_SIDE,
+            )
+        piece = drawing_vision.upright(strip)
         parsed = self.qwen.read_side_column(piece)
         payload["side_column"] = {"bbox": bbox, "read": parsed is not None}
         return parsed
@@ -2061,6 +2093,30 @@ class DrawingProcessor:
                         time.monotonic() - started)
 
     # ------------------------------------------------------------ хранилище
+    def _native_sheet(
+        self, image_ref: str, page: int, image, layout: drawing_vision.SheetLayout,
+    ) -> Optional[native_tiles.NativeSheet]:
+        """
+        Лист в родном разрешении (DRAWING_NATIVE_TILES), без флага — None.
+        PDF отрисовывается заново (лениво, при первой вырезке или плитке) и
+        выправляется теми же наклоном и поворотом, что и рабочий растр
+        (`drawing_vision.reproduce`); растр — как есть. dpi растра — из его
+        сведений, без них — рабочее DRAWING_RENDER_DPI.
+        """
+        if not settings.DRAWING_NATIVE_TILES or image is None or layout.image is None:
+            return None
+        rendered = (getattr(image, "info", None) or {}).get("render_dpi")
+        if not rendered:
+            dpi = native_tiles.raster_dpi(image) or float(settings.DRAWING_RENDER_DPI)
+            return native_tiles.NativeSheet(layout.image, dpi)
+
+        def render(dpi: float):
+            data = self._read(image_ref)
+            raw = _render_pdf_page(data, page, dpi=dpi) if data[:5] == b"%PDF-" else None
+            return None if raw is None else drawing_vision.reproduce(raw, layout.angle, layout.turn)
+
+        return native_tiles.NativeSheet(layout.image, float(rendered), render)
+
     def _open(self, image_ref: str, page: int = 1):
         data = self._read(image_ref)
         if not data:
@@ -2236,8 +2292,12 @@ def _stamp_marks(text: str) -> int:
     return len({match.group(0).casefold().replace(" ", "") for match in _STAMP_WORDS.finditer(text)})
 
 
-def _render_pdf_page(data: bytes, page: int):
-    """Страница PDF как растр в рабочем разрешении чертежей."""
+def _render_pdf_page(data: bytes, page: int, dpi: Optional[float] = None):
+    """
+    Страница PDF как растр в рабочем разрешении чертежей (или в `dpi`). Своё
+    разрешение рендер помнит в `info["render_dpi"]`: по нему лист в родном
+    разрешении (DRAWING_NATIVE_TILES) знает, что его можно отрисовать заново.
+    """
     try:
         import fitz
         from PIL import Image
@@ -2252,8 +2312,11 @@ def _render_pdf_page(data: bytes, page: int):
         try:
             if not 1 <= page <= document.page_count:
                 return None
-            pixmap = document[page - 1].get_pixmap(dpi=settings.DRAWING_RENDER_DPI)
-            return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+            resolution = int(round(dpi)) if dpi else settings.DRAWING_RENDER_DPI
+            pixmap = document[page - 1].get_pixmap(dpi=resolution)
+            image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+            image.info["render_dpi"] = resolution
+            return image
         finally:
             document.close()
 
