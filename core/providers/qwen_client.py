@@ -390,6 +390,28 @@ _CONTENT_PROMPT = """Прочитай чертёж и перечисли все 
 - Не выдумывай надписей, которых нет.
 """
 
+# Плитка листа в родном разрешении (DRAWING_NATIVE_TILES): тот же короткий
+# ответ, что у содержания листа, но про часть листа. Место надписи — сама
+# плитка, поэтому рамок не просим.
+_TILE_PROMPT = """На картинке — часть листа чертежа в полном разрешении. Перечисли все
+надписи, которые на ней видны. Верни JSON:
+
+{{"sheet_type": "detail|assembly|scheme|unknown",
+  "annotations": [["<код>", "надпись как на листе"]]}}
+
+Коды: {codes}.
+
+Правила:
+- Порядок — как читают: сверху вниз, слева направо.
+- Одинаковые надписи в разных местах перечисляй столько раз, сколько они стоят.
+- Знак диаметра пиши как ⌀, допуск как ±, шероховатость как Ra/Rz.
+- Размер, посадку и допуск пиши одной надписью, как на листе: «⌀44H7», «20±0,1».
+- Пункт технических требований — одной надписью целиком, с номером.
+- Надпись, которую режет край картинки, пиши так, как она видна, не достраивай.
+- Служебные графы бланка («Инв. № подл.», «Взам. инв. №», «Подп. и дата») пропускай.
+- Не выдумывай надписей, которых нет.
+"""
+
 _SHEET_PROMPT_COMPACT = """Прочитай чертёж и верни JSON:
 
 {{"sheet_type": "detail|assembly|scheme|unknown",
@@ -646,6 +668,9 @@ class SheetReading:
     # Почему ответ по листу отбракован (DRAWING_SHEET_GUARDED): REJECT_CUT,
     # REJECT_LOOP или REJECT_EMPTY; пусто — ответ принят.
     rejected: str = ""
+    # Учёт плиток в родном разрешении (DRAWING_NATIVE_TILES): причина,
+    # сетка, dpi, прочитано плиток, надписей плиток и добавлено без пары.
+    native_tiles: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def complete(self) -> bool:
@@ -728,6 +753,7 @@ class QwenVisionClient:
 
     def read_sheet(
         self, image, hint: str = "", until: Optional[float] = None, with_content: bool = True,
+        native: Optional[Any] = None,
     ) -> Optional[SheetReading]:
         """
         Лист целиком (см. `_read_sheet_located`). С DRAWING_SHEET_CONTENT_PASS
@@ -735,12 +761,23 @@ class QwenVisionClient:
         ответ «[код, надпись]» в родном разрешении; место каждой надписи —
         от прежнего прохода с рамками (`merge_content`).
 
+        `native` — лист в родном разрешении (`native_tiles.NativeSheet`,
+        DRAWING_NATIVE_TILES): мелкий для ужатия или плотный лист читается
+        плитками, и они заменяют содержание листа (`with_tiles`). Плитки не
+        прочитаны — дальше как без них.
+
         Содержание читается раз на лист: `with_content=False` — повторное
         чтение того же листа (DRAWING_CONSENSUS_READS). Вызов не начинается,
         если до `until` (часы `gpu_gate.budget_now()`) или до срока задачи
         меньше VLM_TIMEOUT: бюджет листа общий с частями прохода с рамками.
         """
         located = self._read_sheet_located(image, hint, until)
+        if native is not None and with_content:
+            from core.providers import native_tiles
+
+            tiles = native_tiles.read(self, native, located, until)
+            if tiles is not None:
+                return with_tiles(tiles, located)
         if not settings.DRAWING_SHEET_CONTENT_PASS or not with_content:
             return located
         if not _time_for_call(until):
@@ -772,6 +809,35 @@ class QwenVisionClient:
         if sheet_type not in ("detail", "assembly", "scheme", "unknown"):
             sheet_type = "unknown"
         return SheetReading(sheet_type=sheet_type, annotations=items, raw=data, cut=answer[1] == "length")
+
+    def read_sheet_tile(self, image, max_side: int) -> Optional[SheetReading]:
+        """
+        Плитка листа в родном разрешении (DRAWING_NATIVE_TILES): надписи
+        «[код, надпись]» без рамок под той же схемой, что у содержания листа.
+        Оборванный ответ отдаёт дописанные надписи (`cut`), зацикленный — None.
+        """
+        answer = self._ask_text(
+            image, _TILE_PROMPT.format(codes=_COMPACT_LEGEND), max_side,
+            max_tokens=settings.DRAWING_NATIVE_TILES_MAX_TOKENS, response_format=content_schema(),
+        )
+        if answer is None:
+            return None
+        content, finish = answer
+        cut = finish == "length"
+        data = extract_json(content)
+        if not isinstance(data, dict) or not isinstance(data.get("annotations"), list):
+            salvaged = salvage_list(content, "annotations")
+            if not salvaged:
+                logger.warning("Плитка листа: ответ не JSON (finish=%s)", finish)
+                return None
+            data, cut = {"annotations": salvaged}, True
+        if sheet_verdict(None, data["annotations"]) == REJECT_LOOP:
+            logger.warning("Плитка листа: ответ зациклен, не берётся")
+            return None
+        sheet_type = str(data.get("sheet_type") or "unknown")
+        if sheet_type not in ("detail", "assembly", "scheme", "unknown"):
+            sheet_type = "unknown"
+        return SheetReading(sheet_type=sheet_type, annotations=content_items(data["annotations"]), cut=cut)
 
     def _read_sheet_located(
         self, image, hint: str = "", until: Optional[float] = None,
@@ -2072,6 +2138,30 @@ def merge_content(content: "SheetReading", located: Optional["SheetReading"]) ->
     sheet_type = content.sheet_type if content.sheet_type != "unknown" else base.sheet_type
     return SheetReading(sheet_type=sheet_type, annotations=merged, raw=base.raw, cut=base.cut,
                         tiles=base.tiles, failed=base.failed, lost=base.lost, rejected=base.rejected)
+
+
+def with_tiles(tiles: Any, located: Optional["SheetReading"]) -> "SheetReading":
+    """
+    Плитки листа (`native_tiles.TileReading`) и проход с рамками в одно
+    чтение. Надписи прохода с рамками остаются как есть: запись, категория и
+    место прочитаны на месте и побеждают. Надписи плиток без пары
+    (`native_tiles.unpaired`) добавляются после них без рамки, как надписи
+    содержания листа (`merge_content`): место плитки — половина листа и
+    больше, рамкой надписи оно было бы враньём; разбор ставит рамку по
+    умолчанию.
+    """
+    from core.providers import native_tiles
+
+    base = located if located is not None else SheetReading()
+    sheet_type = base.sheet_type if base.sheet_type != "unknown" else tiles.sheet_type
+    added = [
+        {"category": item.get("category") or "note", "value": item.get("value")}
+        for item in native_tiles.unpaired(tiles.items, base.annotations)
+    ]
+    stats = {**tiles.stats, "added": len(added)}
+    return SheetReading(sheet_type=sheet_type, annotations=list(base.annotations) + added, raw=base.raw,
+                        cut=base.cut, tiles=base.tiles, failed=base.failed, lost=base.lost,
+                        rejected=base.rejected, native_tiles=stats)
 
 
 def as_annotations(
