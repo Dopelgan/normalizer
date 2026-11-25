@@ -70,6 +70,14 @@ def image():
     return Image.new("RGB", (400, 300), (255, 255, 255))
 
 
+def varied_image():
+    """Лист, у которого каждая часть своя: одинаковые части делят ключ кэша."""
+    img = Image.new("RGB", (400, 300))
+    img.putdata([(x * 255 // 400, y * 255 // 300, (x + y) % 256)
+                 for y in range(300) for x in range(400)])
+    return img
+
+
 def cached_files(path: Path):
     return sorted(path.rglob("*.json"))
 
@@ -147,7 +155,9 @@ class TestGuarded:
 
     def test_looping_answer_is_rejected_not_cached_and_read_by_tiles(self, guarded, tmp_path):
         model = Model(sheet(LOOP), sheet(GOOD))
-        reading = client(model).read_sheet(image())
+        # Части идут параллельно: на одинаковых белых частях ответ одной
+        # успевал лечь в кэш раньше, чем вторая сходила в модель (4 вызова из 5).
+        reading = client(model).read_sheet(varied_image())
         assert reading.rejected == REJECT_LOOP
         # Лист и четыре части; лист прочитан частями, хотя DRAWING_SHEET_TILES выключен.
         assert len(model.bodies) == 5 and reading.tiles == 4
@@ -155,7 +165,7 @@ class TestGuarded:
         assert values.count("⌀8") <= 5          # хвост цикла не дошёл до полей
         assert "⌀280±0,3" in values
         # В кэше только ответы частей, ответа по листу нет.
-        assert len(cached_files(tmp_path)) == 1  # четыре части прислали одно и то же
+        assert len(cached_files(tmp_path)) == 4  # листа нет, по файлу на каждую из четырёх частей
 
     def test_cut_answer_is_rejected_and_read_by_tiles(self, guarded, tmp_path):
         model = Model(sheet(GOOD, finish="length"), sheet(GOOD))
