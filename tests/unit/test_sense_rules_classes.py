@@ -109,7 +109,8 @@ def test_class_rules_off_changes_nothing(flags_off):
 
 SPEC = (["Поз.", "Обозначение", "Наименование", "Кол."],
         [["1", "АБВ.001", "Корпус", "1"], ["2", "АБВ.002", "Крышка", "1"],
-         ["5", "", "Болт М6", "4"], ["", "", "Стандартные изделия", ""]])
+         ["3", "АБВ.003", "Втулка", "2"], ["5", "", "Болт М6", "4"],
+         ["", "", "Стандартные изделия", ""]])
 
 
 def assembly(fields, **payload):
@@ -117,9 +118,9 @@ def assembly(fields, **payload):
 
 
 def test_spec_positions_from_table_fragment_and_sheet_table():
-    assert sense_rules.spec_positions([table(*SPEC)]) == {1, 2, 5}
+    assert sense_rules.spec_positions([table(*SPEC)]) == {1, 2, 3, 5}
     sheet = drawing([], tables=[{"kind": "table", "headers": [], "rows": [list(SPEC[0])] + SPEC[1]}])
-    assert sense_rules.spec_positions([sheet]) == {1, 2, 5}
+    assert sense_rules.spec_positions([sheet]) == {1, 2, 3, 5}
     # Одна строка — не спецификация; таблица без «Поз.» — тоже.
     assert sense_rules.spec_positions([table(SPEC[0], SPEC[1][:1])]) is None
     assert sense_rules.spec_positions([table(["Обозначение", "Кол."], [["А", "1"], ["Б", "2"]])]) is None
@@ -158,6 +159,18 @@ def test_spec_positions_without_spec_do_nothing(monkeypatch):
     assert sheet == before
 
 
+def test_spec_positions_incomplete_spec_does_nothing(monkeypatch):
+    # Из номеров 1…5 прочитаны три (60 % < 80 %): строки спецификации
+    # потеряны, «нет в спецификации» ничего не значит.
+    flag_on(monkeypatch, "DRAWING_SENSE_SPEC_POSITIONS")
+    sheet = spec_sheet()
+    before = copy.deepcopy(sheet)
+    rows = [row for row in SPEC[1] if row[0] != "3"]
+    stats = sense_rules.apply([sheet, table(SPEC[0], rows)])
+    assert sheet == before
+    assert not stats.get("spec_position_dropped") and not stats.get("spec_position_added")
+
+
 def test_spec_positions_only_on_assembly(monkeypatch):
     flag_on(monkeypatch, "DRAWING_SENSE_SPEC_POSITIONS")
     sheet = drawing([field("7", [0.4, 0.2, 0.41, 0.22], category="position")], sheet_type="detail")
@@ -175,26 +188,41 @@ def test_spec_positions_off(flags_off):
 # --- S1 ---------------------------------------------------------------------
 
 @pytest.mark.parametrize("raw, fixed", [
-    ("Ra 16", "Ra 1,6"), ("Ra 32", "Ra 3,2"), ("Ra 63", "Ra 6,3"), ("Ra 125", "Ra 12,5"),
-    ("Ra 08", "Ra 0,8"), ("√Ra 63 (√)", "√Ra 6,3 (√)"), ("Rz 08", "Rz 0,8"),
+    # Не из полного ряда — правится всегда.
+    ("Ra 08", "Ra 0,8"), ("Ra 04", "Ra 0,4"), ("Rz 08", "Rz 0,8"),
 ])
 def test_ra_series_fix(raw, fixed):
     assert sense_rules.ra_series_fix(raw) == fixed
+    assert sense_rules.ra_series_fix(raw, fine_sheet=True) == fixed
+
+
+@pytest.mark.parametrize("raw, fixed", [
+    ("Ra 16", "Ra 1,6"), ("Ra 32", "Ra 3,2"), ("Ra 63", "Ra 6,3"), ("Ra 125", "Ra 12,5"),
+    ("√Ra 63 (√)", "√Ra 6,3 (√)"),
+])
+def test_ra_full_series_fixed_only_on_fine_sheet(raw, fixed):
+    # Значения полного ряда Ra верны сами по себе: правка — только при
+    # другой шероховатости листа не грубее 12,5.
+    assert sense_rules.ra_series_fix(raw) is None
+    assert sense_rules.ra_series_fix(raw, fine_sheet=True) == fixed
 
 
 @pytest.mark.parametrize("value", [
     "Ra 25", "Ra 50", "Ra 100", "Ra 1,6", "Ra 12",  # верные или неоднозначные
+    "Ra 160", "Ra 200", "Ra 320", "Ra 400",          # «1,60» и прочее — никогда
     "Rz 16", "Rz 20", "Rz 40", "Rz 320", "Rz 125",   # полный ряд Rz
     "R 16", "⌀16",
 ])
 def test_ra_series_keeps_valid(value):
     assert sense_rules.ra_series_fix(value) is None
+    assert sense_rules.ra_series_fix(value, fine_sheet=True) is None
 
 
-def ra_sheet():
+def ra_sheet(other="Ra 3,2"):
     return drawing([
         field("Ra 16", [0.2, 0.6, 0.24, 0.62], category="roughness", link=link()),
         field("Ra 25", [0.3, 0.6, 0.34, 0.62], category="roughness"),
+        field(other, [0.5, 0.6, 0.54, 0.62], category="roughness"),
         field("16", [0.4, 0.6, 0.42, 0.62], category="size"),
     ])
 
@@ -203,13 +231,22 @@ def test_ra_series_rule(monkeypatch):
     flag_on(monkeypatch, "DRAWING_SENSE_RA_SERIES")
     sheet = ra_sheet()
     stats = sense_rules.apply([sheet])
-    fixed, valid, size = sheet.content.structured_drawing_fields
+    fixed, valid, _, size = sheet.content.structured_drawing_fields
     assert fixed.value == "Ra 1,6" and fixed.needs_review and fixed.link is not None
     assert [r["value"] for r in fixed.readings] == ["Ra 16", "Ra 1,6"]
     assert fixed.readings[1]["source"] == sense_rules.SENSE
     assert valid.value == "Ra 25" and valid.readings is None
     assert size.value == "16"
     assert stats["ra_series"] == 1
+
+
+def test_ra_series_rule_keeps_full_series_on_coarse_sheet(monkeypatch):
+    # Тонкой шероховатости на листе нет: «Ra 16» — значение ряда, остаётся.
+    flag_on(monkeypatch, "DRAWING_SENSE_RA_SERIES")
+    sheet = ra_sheet(other="Ra 50")
+    stats = sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].value == "Ra 16"
+    assert not stats.get("ra_series")
 
 
 def test_ra_series_off(flags_off):

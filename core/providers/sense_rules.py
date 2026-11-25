@@ -888,6 +888,8 @@ def _class_rule(items: List[_Item], stats: Dict[str, int]) -> None:
 # --- C12: позиции по спецификации ------------------------------------------
 
 _SPEC_POSITION = re.compile(r"^\d{1,3}$")
+# Доля номеров 1…max, при которой спецификация считается прочитанной целиком.
+_SPEC_COMPLETE = 0.8
 
 
 def _position_column(headers: Sequence[Any]) -> Optional[int]:
@@ -957,7 +959,15 @@ def _spec_position_rule(items: List[_Item], positions: set, stats: Dict[str, int
     «Поз.» нет, — размер, если у неё есть связь с элементом, иначе выноска
     (с `needs_review`). Голое число на выноске с номером из спецификации —
     позиция. Метки швов «№N» не трогаются. Только лист сборки.
+
+    Спецификация, прочитанная не целиком (из номеров 1…max есть меньше
+    `_SPEC_COMPLETE` — пропуски строк, оборванная таблица), судить о
+    позициях не может: «нет в спецификации» значило бы «не дочитали».
+    Тогда правило не делает ничего.
     """
+    top = max(positions)
+    if len({number for number in positions if 1 <= number <= top}) < _SPEC_COMPLETE * top:
+        return
     for item in items:
         field = item.field
         if item.gone:
@@ -983,28 +993,47 @@ def _spec_position_rule(items: List[_Item], positions: set, stats: Dict[str, int
 # Предпочтительные значения Ra и Rz, мкм (ГОСТ 2789-73, выделенные в рядах).
 _RA_PREFERRED = (0.012, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.3, 12.5, 25, 50, 100)
 _RZ_PREFERRED = (0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.3, 12.5, 25, 50, 100, 200, 400, 800, 1600)
-# Полный ряд Rz: «Rz 16», «Rz 32», «Rz 320» в нём есть и не правятся. Для Ra
-# правка идёт против предпочтительного ряда: «Ra 16» на чертеже — почти
-# всегда потерянная запятая «Ra 1,6».
-_RZ_FULL = tuple(sorted({
-    round(base * scale, 4)
-    for base in (1.0, 1.25, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 8.0)
-    for scale in (0.01, 0.1, 1, 10, 100, 1000)
-    if 0.025 <= round(base * scale, 4) <= 1600
-}))
+
+
+def _full_series(low: float, high: float) -> Tuple[float, ...]:
+    """Полный ряд ГОСТ 2789: 1; 1,25; 1,6; 2; 2,5; 3,2; 4; 5; 6,3; 8 по декадам."""
+    return tuple(sorted({
+        round(base * scale, 4)
+        for base in (1.0, 1.25, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 8.0)
+        for scale in (0.001, 0.01, 0.1, 1, 10, 100, 1000)
+        if low <= round(base * scale, 4) <= high
+    }))
+
+
+# Полные ряды: Ra 0,008…400 (в нём и 10, 12,5, 16, 20, 25, 32, 40, 50, 63,
+# 80, 100, 125, 160, 200, 250, 320, 400), Rz 0,025…1600.
+_RA_FULL = _full_series(0.008, 400)
+_RZ_FULL = _full_series(0.025, 1600)
+# Шероховатость «тонкого» листа: Ra/Rz не грубее этого значения.
+_FINE_LIMIT = 12.5
 _RA_RECORD = re.compile(r"^(√?\s*)(R[az])(\s*)(\d{2,3})(\s*\*?\s*(?:\(\s*[√Vv✓]\s*\))?)$")
+_ROUGHNESS_NUMBER = re.compile(r"R[az]\s*(\d+(?:[.,]\d+)?)")
 
 
 def _in(series: Sequence[float], number: float) -> bool:
     return any(abs(number - v) < 1e-9 for v in series)
 
 
-def ra_series_fix(value: Any) -> Optional[str]:
+def ra_series_fix(value: Any, fine_sheet: bool = False) -> Optional[str]:
     """
-    «Ra 16» -> «Ra 1,6»: число без запятой, которого нет в ряду, становится
-    значением ряда, если вставить запятую ровно в одном месте. Записи,
-    верные как есть («Ra 25», «Ra 100», «Rz 40»), и записи с запятой не
-    меняются. Иначе None.
+    Потерянная запятая шероховатости: «Ra 08» -> «Ra 0,8». Иначе None.
+
+    Правило (ГОСТ 2789):
+    1. Запись с запятой не трогается; правится только целое число из двух-трёх
+       цифр.
+    2. Исправление — вставка запятой ровно в одном месте, после которой
+       получается предпочтительное значение ряда; дробная часть не кончается
+       нулём («160» никогда не становится «1,60»: так значения ряда не пишут).
+    3. Если само прочтение — значение полного ряда («Ra 16», «Ra 63»,
+       «Ra 125», «Rz 40»), оно может быть верным: правится, только если на
+       том же листе есть другая шероховатость не грубее 12,5 (`fine_sheet`) —
+       для Ra. Полный ряд Rz без такой оговорки не правится вовсе.
+    4. Число не из полного ряда («Ra 08», «Ra 04») правится всегда.
     """
     text = str(value or "").strip()
     match = _RA_RECORD.match(text)
@@ -1013,13 +1042,14 @@ def ra_series_fix(value: Any) -> Optional[str]:
     head, letters, gap, number, tail = match.groups()
     kind = "R" + letters[1].lower()
     preferred = _RA_PREFERRED if kind == "Ra" else _RZ_PREFERRED
-    valid = _RA_PREFERRED if kind == "Ra" else _RZ_FULL
-    if not number.startswith("0") and _in(valid, float(number)):
+    full = _RA_FULL if kind == "Ra" else _RZ_FULL
+    in_full = not number.startswith("0") and _in(full, float(number))
+    if in_full and not (kind == "Ra" and fine_sheet):
         return None
     found = []
     for cut in range(1, len(number)):
         whole, part = number[:cut], number[cut:]
-        if len(whole) > 1 and whole.startswith("0"):
+        if (len(whole) > 1 and whole.startswith("0")) or part.endswith("0"):
             continue
         if _in(preferred, float(whole + "." + part)):
             found.append(whole + "," + part)
@@ -1028,14 +1058,29 @@ def ra_series_fix(value: Any) -> Optional[str]:
     return head + letters + gap + found[0] + tail
 
 
+def _fine_elsewhere(items: List[_Item], item: _Item) -> bool:
+    """Есть ли на листе другая шероховатость не грубее 12,5."""
+    for other in items:
+        if other is item or other.gone or other.field.category != "roughness":
+            continue
+        match = _ROUGHNESS_NUMBER.search(str(other.field.value or ""))
+        if match and float(match.group(1).replace(",", ".")) <= _FINE_LIMIT:
+            return True
+    return False
+
+
 def _ra_series_rule(items: List[_Item], stats: Dict[str, int]) -> None:
     """Потерянная запятая шероховатости (DRAWING_SENSE_RA_SERIES); сырое прочтение — в `readings`."""
+    fixes = []
     for item in items:
         if item.gone or item.field.category != "roughness":
             continue
-        fixed = ra_series_fix(item.field.value)
-        if fixed is None:
-            continue
+        fixed = ra_series_fix(item.field.value, fine_sheet=_fine_elsewhere(items, item))
+        if fixed is not None:
+            fixes.append((item, fixed))
+    # Сначала решение по всем, потом правка: исправленная запись не должна
+    # сама становиться «другой тонкой шероховатостью» для соседней.
+    for item, fixed in fixes:
         _note_value(item, fixed, review=True)
         _count(stats, "ra_series")
 
