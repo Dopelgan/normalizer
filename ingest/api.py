@@ -11,6 +11,9 @@ NORMALIZER_REQUIRE_TOKEN=true все ручки, кроме /health и /metrics,
 `Authorization: Bearer <NORMALIZER_API_TOKEN>` (core/api_auth.py). Наружу
 порты публиковать не следует.
 
+    DELETE /internal/v1/documents/{s3_fileid}    удаление документа отовсюду
+                                                 (NORMALIZER_DELETE_ENABLED)
+
 Сторона RAG. Фоновый разбор (события жизненного цикла, `event_id`) уходит в
 очередь `CELERY_ML_QUEUE`, синхронный (вложения чата, `dialog_id`) — в
 `CELERY_INTERACTIVE_QUEUE`, если она задана (`parse_queue`). По задаче на
@@ -303,6 +306,40 @@ async def parse_results(request_id: str):
         documents=_documents(state),
         error=_first_error(state) if state["status"] in ("error", "partial") else None,
     )
+
+
+@app.delete("/internal/v1/documents/{s3_fileid:path}", dependencies=PROTECTED)
+async def delete_document(s3_fileid: str):
+    """
+    Удаление документа отовсюду: строки БД, решения приёма, копии в Redis,
+    картинки MinerU, запись кэша лестницы (core/document_delete.py).
+
+    Идемпотентно: уже удалённое — 200 со статусом `absent`. Сбой части
+    хранилищ — 500 с отчётом (`partial`), повтор безопасен. Флаг
+    NORMALIZER_DELETE_ENABLED выключен — 501.
+    """
+    if not settings.NORMALIZER_DELETE_ENABLED:
+        raise HTTPException(
+            status_code=501,
+            detail="Удаление документов выключено (NORMALIZER_DELETE_ENABLED=false).",
+        )
+    fileid = s3_fileid.strip()
+    if not fileid:
+        raise HTTPException(status_code=422, detail="Пустой s3_fileid")
+
+    from core.db.session import SessionLocal
+    from core.document_delete import delete_document as drop
+    from core.providers.storage import StorageProviderFactory
+    from core.result_aggregator import get_client
+
+    report = await asyncio.to_thread(
+        drop, fileid,
+        session_factory=SessionLocal,
+        redis_client=get_client(),
+        storage=StorageProviderFactory.default(),
+    )
+    body = report.as_dict()
+    return JSONResponse(status_code=500 if report.errors else 200, content=body)
 
 
 def _first_error(state: Dict[str, Any]) -> ParserError:

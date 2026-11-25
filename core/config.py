@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # бакет явно (`<S3_ATTACHMENTS_BUCKET>/<uuid>`, core/providers/file_locator.py).
     NORMALIZER_REQUIRE_TOKEN: bool = False
     NORMALIZER_API_TOKEN: str = ""
+    # Ручка удаления документа DELETE /internal/v1/documents/{s3_fileid}
+    # (core/document_delete.py). Выключена — ручка отвечает 501.
+    NORMALIZER_DELETE_ENABLED: bool = False
 
     # ------------------------------------------------------------ База данных
     POSTGRES_USER: str = "knowledge_user"

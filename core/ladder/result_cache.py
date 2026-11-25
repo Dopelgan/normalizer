@@ -41,6 +41,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -313,8 +314,12 @@ def cacheable(result: ParseResult) -> bool:
 
 # ------------------------------------------------------------ запись/чтение
 def put(key: str, result: ParseResult, uri: str, file_type: str,
-        metadata: Dict[str, Any]) -> bool:
-    """Сохранить результат атомарно (временный файл и переименование)."""
+        metadata: Dict[str, Any], file_sha256: Optional[str] = None) -> bool:
+    """
+    Сохранить результат атомарно (временный файл и переименование).
+    `file` (sha256 байтов) в записи — для удаления документа: ключ из него
+    не восстановить, он зависит от настроек и кода (`drop_for`).
+    """
     if not cacheable(result):
         return False
     reserve = result.fallback_reserve
@@ -323,6 +328,7 @@ def put(key: str, result: ParseResult, uri: str, file_type: str,
         "key": key,
         "created": time.time(),
         "doc_id": metadata.get("doc_id") or "",
+        "file": file_sha256 or "",
         "uri": uri,
         "asset_prefix": metadata.get("asset_prefix") or "",
         "mineru_name": _mineru_name(uri, file_type),
@@ -516,6 +522,52 @@ def prune(now: Optional[float] = None) -> int:
     return removed
 
 
+# --------------------------------------------------------- удаление документа
+# Поля записи `doc_id` и `file` идут в начале JSON (до `result`), поэтому
+# хватает головы файла: читать мегабайты результата ради них незачем.
+_HEAD_BYTES = 16384
+_HEAD_FIELD = re.compile(r'"(doc_id|file)":\s*"([^"]*)"')
+
+
+def _head_fields(path: Path) -> Dict[str, str]:
+    try:
+        with open(path, "rb") as stream:
+            head = stream.read(_HEAD_BYTES).decode("utf-8", errors="ignore")
+    except OSError:
+        return {}
+    fields: Dict[str, str] = {}
+    for name, value in _HEAD_FIELD.findall(head):
+        fields.setdefault(name, value)
+    return fields
+
+
+def drop_for(doc_id: str, file_sha256: Optional[str]) -> int:
+    """
+    Удалить записи кэша документа: записанные им (`doc_id`) и записи тех же
+    байтов (`file`). Решение, можно ли трогать общие байты, — за вызывающим
+    (`core/document_delete.py`): он передаёт хеш, только если другого живого
+    документа с таким содержимым нет. Работает и при выключенном флаге кэша:
+    записи, сделанные раньше, остаются на диске.
+    """
+    root = cache_dir()
+    if not root.is_dir() or not (doc_id or file_sha256):
+        return 0
+    removed = 0
+    for path in _entries(root):
+        if path.suffix != ".json":
+            continue
+        fields = _head_fields(path)
+        if (doc_id and fields.get("doc_id") == doc_id) or (
+            file_sha256 and fields.get("file") == file_sha256
+        ):
+            try:
+                path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                continue
+    return removed
+
+
 def _entries(root: Path) -> Iterable[Path]:
     for shard in root.iterdir():
         if shard.is_dir():
@@ -571,7 +623,7 @@ def parse(parser, storage, uri: str, file_type: str, metadata: Dict[str, Any],
         key = None
     if key is not None:
         try:
-            if put(key, result, uri, file_type, metadata):
+            if put(key, result, uri, file_type, metadata, file_sha256):
                 _maybe_prune()
         except Exception as exc:  # noqa: BLE001
             _warn_once(f"Кэш лестницы: запись не удалась: {exc}")
