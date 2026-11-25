@@ -51,6 +51,17 @@ class DocumentRepository:
         doc.extra_data = current
         doc.updated_at = utcnow()
 
+    def replace_extra(self, doc_id: str, extra: Dict[str, Any]) -> None:
+        """
+        Заменяет extra_data целиком (NORMALIZER_FINGERPRINT_REPARSE): ключи
+        прежнего разбора не сливаются с новыми.
+        """
+        doc = self.get(doc_id, for_update=True)
+        if doc is None:
+            return
+        doc.extra_data = dict(extra)
+        doc.updated_at = utcnow()
+
     def update_metadata(self, doc_id: str, **kwargs) -> None:
         doc = self.get(doc_id, for_update=True)
         if doc is None:

@@ -200,6 +200,14 @@
 | `DRAWING_CATEGORY_PROSE_GUARD` | `false` | `core/providers/vector_drawing.py` |
 | `DRAWING_SMALL_PRINT_CARE` | `false` | `core/providers/qwen_client.py` |
 | `DRAWING_SHEET_COMPACT_JSON` | `false` | `core/providers/qwen_client.py` (`_sheet_prompt`, `as_annotations`, `compact_annotation`) |
+| `DRAWING_TEXT_SYMBOLS` | `false` | `core/providers/drawing_text.py::looks_like_text` → `_symbolic_inscription` |
+| `VLM_CACHE_VALIDATE` (+ `VLM_RESPONSE_CACHE_NAMESPACE`, `VLM_RESPONSE_CACHE_TTL_DAYS`) | `false` | `core/providers/qwen_client.py` (`cache_check` из `_ask_text`/`_answer`; `cache_key`, `cache_get` → `_expired`); строки слоя — `DrawingProcessor._sheet_context` |
+| `DRAWING_ROBUST_PASSES` (+ `DRAWING_ROBUST_MIN_CALL_TIMEOUT`) | `false` | `core/drawing_processor.py` (`_process` после чтения листа, `_sheet_context`, `_Passes.add`, `_read_sheets`, `_finished`); `core/providers/qwen_client.py` (`call_timeout`, `_post_attempts`) |
+| `DRAWING_ASK_SALVAGE` | `false` | `core/providers/qwen_client.py` (`_ask` → `_salvaged`, `outer_json`, `salvage_object`, `salvage_pairs`); пометки — `DrawingProcessor._read_table`, `_read_title_block`, `_read_title_block_fields` |
+| `DRAWING_STAMP_SINGLE_FORM` | `false` | `core/providers/qwen_client.py::_single_form` (из `read_title_block`, `read_title_block_fields`) |
+| `DRAWING_CONFIRMED_CALIBRATED` (+ `DRAWING_CONFIRMED_MIN_CONFIDENCE`, `DRAWING_REVIEW_MIN_COMPLETENESS`, `DRAWING_VLM_MAX_CONFIDENCE`) | `false` | `core/drawing_quality.py` (`apply_drawing_quality` → `_confirmed`, `_second_source`) |
+| `NORMALIZER_FINGERPRINT_REPARSE` (+ `RELEASE_SHA_FILE`) | `false` | `core/build_fingerprint.py`; `ingest/tasks.py` (`_same_build`, запись `extra_data` → `DocumentRepository.replace_extra`); `core/models/contract.py::DocumentResult.build_fingerprint` |
+| `NORMALIZER_IDEMPOTENT_BY_HASH` | `false` | `ingest/tasks.py` (`current_hash` до проверки идемпотентности, `_same_bytes`, запись `file_hash`) |
 | `DRAWING_VLM_STABLE` | `false` | `core/providers/qwen_client.py` (`_thinking_off`, `_non_empty`, `_log_rejected`, `_ask`, `_answer`) |
 | `DRAWING_SHEET_CONTENT_PASS` | `false` | `core/providers/qwen_client.py::read_sheet` → `read_sheet_content`, `content_schema`, `content_items`, `merge_content` |
 | `DRAWING_NATIVE_TILES` | `false` | `core/providers/native_tiles.py` (`wanted`, `NativeSheet`, `plan`, `read`, `merge`, `unpaired`); вызовы — `qwen_client.read_sheet` → `read_sheet_tile`, `with_tiles`; `DrawingProcessor._native_sheet`, `_read_title_block_fields`, `_read_side_column`; ключ кэша — `result_cache.WHEN_ON` |

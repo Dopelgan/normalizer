@@ -710,7 +710,7 @@ class TestFidelityOnTitleBlockPass:
 
         asked = []
 
-        def fake_ask(self, image, prompt, max_side):
+        def fake_ask(self, image, prompt, max_side, **kwargs):
             asked.append(prompt)
             return None
 

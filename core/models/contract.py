@@ -490,11 +490,21 @@ class DocumentResult(BaseModel):
     # `unknown_pages`: покрытие страниц у них полное, не прочитан текст.
     unread_text_pages: List[int] = Field(default_factory=list)
     error: Optional[ParserError] = None
+    # Отпечаток сборки разбора (NORMALIZER_FINGERPRINT_REPARSE):
+    # {"release_sha", "settings_sha256"}. Без флага ключа в ответе нет вовсе.
+    build_fingerprint: Optional[Dict[str, str]] = None
 
     @field_validator("error", mode="before")
     @classmethod
     def _error_object(cls, v: Any) -> Any:
         return ParserError.coerce(v)
+
+    @model_serializer(mode="wrap")
+    def _without_unset_fingerprint(self, handler):
+        data = handler(self)
+        if isinstance(data, dict) and data.get("build_fingerprint") is None:
+            data.pop("build_fingerprint", None)
+        return data
 
 
 # ===========================================================================
