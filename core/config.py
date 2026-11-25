@@ -1274,6 +1274,10 @@ class Settings(BaseSettings):
     DRAWING_ROUTE_SHEET_TEXT_MIN_SHARE: float = 0.35
     DRAWING_ROUTE_SHEET_TEXT_MAX_BLOCKS: int = 24
     DRAWING_ROUTE_SHEET_TEXT_DPI: int = 300
+    # Потолок рендера страницы для вырезок, мегапикселей: A0 в 300 dpi —
+    # 140 Мп и 420 МБ в памяти; выше потолка dpi снижается (как у
+    # DRAWING_NATIVE_TILES_RENDER_MAX_MP).
+    DRAWING_ROUTE_SHEET_TEXT_RENDER_MAX_MP: float = 48.0
     # Схлопнувшееся чтение листа (U2): надписей меньше, чем
     # DRAWING_COLLAPSE_RATIO от строк того же листа (проход «весь текст
     # листа» или слой распознавания страницы) при не меньше
