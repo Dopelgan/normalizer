@@ -105,6 +105,7 @@
 | Нормализация строки чертежа (⌀, ±, гомоглифы) | `core/providers/drawing_text.py` | `normalize` |
 | Сведение прочтений поля по странице (`DRAWING_READINGS_RECONCILED`) | `core/providers/reading_reconcile.py` | `apply`, `reconcile_page`, `choose`; свидетельство вырезки D4 — `witness` |
 | Связь размера с измеряемым элементом (`DRAWING_DIMENSION_LINKS`) | `core/providers/dimension_links.py` | `apply`; геометрия PDF — `geometry_from_page`, `vector_link`; модель — `vlm_prompt`, `marked_image`, `validate_vlm`; место вызова — `DrawingProcessor._dimension_links` сразу после `_value_links` |
+| Размерные линии на растре листа (`DRAWING_DIMENSION_GEOMETRY`, N-G1) | `core/providers/dimension_geometry.py` | `apply`, `measure` (линейный — `_linear`, `_extensions`, `_trace`; выноска — `_leader`, `_ray_arrow`), виды и роль — `_Views`, `_role`, масштаб — `_scale`; вызов — `DrawingProcessor._dimension_geometry` после `_dimension_links` |
 | Размещение полей на странице, повторы, классы (`DRAWING_FIELD_PLACEMENT_V2`) | `core/providers/field_placement.py` | `apply` (перевод вырезка→страница `place_fragment`/`box_to_page`, `reclassify`, `mark_quality`, `dedupe_page`); вызов — последним в `DrawingProcessor._enrich_fragments`; размер картинки — `layout.source_size` в `_process` |
 | Правила здравого смысла полей (`DRAWING_SENSE_RULES`) | `core/providers/sense_rules.py` | `apply`, `apply_page`, `thickness`, `misread_thickness`, `link_fits`, `check_links`; место вызова — `DrawingProcessor._enrich_fragments` после D3/D4, связи — `_dimension_links` |
 | Знак общей шероховатости в углу листа (`DRAWING_CORNER_ROUGHNESS`) | `core/drawing_processor.py::_corner_roughness` | угол и разбор ответа — `sense_rules.corner_box`, `corner_roughness`, `roughness_known`; вызов модели — `qwen_client.read_corner_roughness` |
@@ -181,6 +182,7 @@
 | `DRAWING_RECORD_COMPOSED` | `false` | `core/drawing_record.py`, `core/contract_finalize.py`, `core/document_parts.py` |
 | `DRAWING_VALUE_VIEW_LINKS` | `false` | `core/providers/drawing_views.py`, `core/drawing_processor.py` |
 | `DRAWING_DIMENSION_LINKS`, `DRAWING_DIMENSION_LINKS_MAX` | `false`, `60` | `core/providers/dimension_links.py` (`apply`, `vector_link`, `validate_vlm`), `core/drawing_processor.py` (`_dimension_links`, `_vector_geometry`), вызов модели — `core/providers/qwen_client.py::read_dimension_links` |
+| `DRAWING_DIMENSION_GEOMETRY` | `false` | `core/providers/dimension_geometry.py` (`apply`), `core/drawing_processor.py` (`_process` → `_dimension_geometry`; учёт — `build_fragment`) |
 | `DRAWING_FIELD_PLACEMENT_V2` | `false` | `core/drawing_processor.py` (`_process`, `_enrich_fragments`), `core/providers/field_placement.py` |
 | `DRAWING_DIAGNOSTICS_NOT_INDEXED` | `false` | `core/contract_finalize.py` |
 | `DRAWING_RECORD_WITHOUT_SHEET_TEXT` | `false` | `core/drawing_record.py` |

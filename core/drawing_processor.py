@@ -565,6 +565,11 @@ class DrawingProcessor:
             payload["dimension_links"] = self._dimension_links(
                 image_ref, page, layout, fields, value_links, budget_started,
             )
+        if settings.DRAWING_DIMENSION_GEOMETRY and fields and not text_only:
+            # Размерные линии на растре (N-G1): после связи моделью — она
+            # снимает прежние `link`, а геометрия векторную связь не трогает
+            # и подпись модели оставляет.
+            payload["dimension_geometry"] = self._dimension_geometry(image_ref, layout, fields)
         if (settings.DRAWING_WHAT_DRAWN and self._what_drawn_sheets is not None and whole_sheet
                 and not text_only and fields
                 and reading is not None and reading.sheet_type in ("detail", "assembly")):
@@ -772,6 +777,35 @@ class DrawingProcessor:
         )
         return stats
 
+    @staticmethod
+    def _dimension_geometry(image_ref, layout, fields) -> Dict[str, Any]:
+        """
+        Размерные линии на растре листа (`DRAWING_DIMENSION_GEOMETRY`): `link`
+        с `method: "raster"`; учёт — в `drawing_diagnostics.dimension_geometry`.
+        """
+        from core.providers import dimension_geometry, dimension_links
+
+        try:
+            stats = dimension_geometry.apply(
+                fields, layout.image, forbidden=dimension_links.forbidden_regions(layout),
+            )
+        except (SoftTimeLimitExceeded, deadline.Cancelled):
+            raise
+        except Exception as exc:  # noqa: BLE001 — геометрия не роняет лист
+            logger.error("Размерные линии листа не разобраны: %s", exc)
+            return {"error": type(exc).__name__}
+        stats = stats or {}
+        if settings.DRAWING_SENSE_RULES and stats.get("linked"):
+            # Та же проверка вида, что у связи моделью: подпись модели,
+            # оставленная у растровой связи, не должна спорить с записью.
+            stats["type_mismatch"] = sense_rules.check_links(fields)
+        logger.info(
+            "Размерные линии листа %s: величин %d, связано %d (линейных %d, выносок %d), роли %s за %.2f с",
+            image_ref, stats.get("dimensions", 0), stats.get("linked", 0), stats.get("linear", 0),
+            stats.get("leader", 0), stats.get("roles", {}), stats.get("seconds", 0.0),
+        )
+        return stats
+
     def _vector_geometry(self, image_ref, page, layout):
         """Отрезки и стрелки страницы PDF в координатах выправленного листа или None."""
         data = self._read(image_ref)
@@ -879,6 +913,12 @@ class DrawingProcessor:
             # поэтому он сразу лежит там, где тот флаг держит служебное.
             diagnostics = dict(mechanisms.get("drawing_diagnostics") or {})
             diagnostics["dimension_links"] = links_stats
+            mechanisms["drawing_diagnostics"] = diagnostics
+        geometry_stats = payload.pop("dimension_geometry", None)
+        if geometry_stats is not None:
+            # Учёт размерных линий на растре — служебный, как учёт связи выше.
+            diagnostics = dict(mechanisms.get("drawing_diagnostics") or {})
+            diagnostics["dimension_geometry"] = geometry_stats
             mechanisms["drawing_diagnostics"] = diagnostics
         fragment = Fragment(
             fragment_id=source.fragment_id,
