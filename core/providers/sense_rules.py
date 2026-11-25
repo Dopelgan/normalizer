@@ -391,12 +391,20 @@ def _merge_readings(keep: _Item, other: _Item) -> None:
         keep.field.needs_review = True
 
 
-def _thickness_rule(items: List[_Item], t: str, stats: Dict[str, int]) -> None:
+def _thickness_rule(items: List[_Item], t: str, stats: Dict[str, int], need_s: bool = False) -> None:
+    """
+    `need_s` — толщина взята не из графы материала, а из текста листа или
+    примечаний (DRAWING_THICKNESS_EVIDENCE): там «Лист 2 ГОСТ 19903-74» может
+    быть строкой спецификации, и настоящий размер «52*» стал бы «S2*». Тогда
+    «5<t>*» переписывается только при прочтении «S<t>» того же места.
+    """
     for item in items:
         field = item.field
         if item.gone or field.category not in _SIZE_LIKE or is_thickness(field.value, t):
             continue
         value = misread_thickness(field.value, t)
+        if value is not None and need_s and _s_alternative(field, t) is None:
+            value = None
         if value is None and _looks_like_thickness(field.value, t):
             # Прочтение «S<t>» правит только запись, похожую на толщину:
             # у постороннего размера случайное «S…» среди прочтений — шум.
@@ -488,9 +496,11 @@ def _material_texts(drawings: Sequence[Fragment]) -> List[str]:
 
 
 # Листовой прокат без толщины в графе материала или в примечании:
-# «Лист Б-ПН-НО ГОСТ 19903-74», «Лента ГОСТ 503-81». Слово с заглавной буквы
-# и ГОСТ/ТУ в той же строке: «листа» и «лист 2» без ГОСТ — не материал.
-_SHEET_METAL = re.compile(r"(?<![А-Яа-яЁёA-Za-z])(?:Лист|Лента|Полоса)(?![А-Яа-яЁё])[^\n]{0,60}?(?:ГОСТ|ТУ)")
+# «Лист Б-ПН-НО ГОСТ 19903-74», «Лента ГОСТ 503-81». Слово проката
+# и ГОСТ/ТУ в той же строке (регистр любой): «листа» и «лист 2» без ГОСТ —
+# не материал.
+_SHEET_METAL = re.compile(r"(?<![А-Яа-яЁёA-Za-z])(?:Лист|Лента|Полоса)(?![А-Яа-яЁё])[^\n]{0,60}?(?:ГОСТ|ТУ)",
+                          re.IGNORECASE)
 
 
 def _sheet_metal(entries: Iterable[Tuple[str, bool]], notes: Iterable[str]) -> bool:
@@ -654,23 +664,33 @@ def apply_page(drawings: List[Fragment], texts: Sequence[str] = ()) -> Dict[str,
     evidence = settings.DRAWING_THICKNESS_EVIDENCE
     material = _material_texts(drawings)
     t = thickness(material)
-    if t is None and evidence:
+    need_s = False
+    # На сборке «Лист 2 ГОСТ 19903-74» в тексте листа — строка спецификации,
+    # а не толщина листа.
+    assembly = any((f.content.structured_payload or {}).get("sheet_type") == "assembly" for f in drawings)
+    if t is None and evidence and not assembly:
         # Примечание «Материал заготовки: Лист 0,5 ГОСТ 19904-90» — та же
         # толщина; только строгий образец: «лист 2» в примечании — ссылка.
         t = thickness([(note, False) for note in _notes(drawings)])
-    if t is None and texts:
+        need_s = t is not None
+    if t is None and evidence and not assembly:
+        t = thickness([(text, False) for text in texts])
+        need_s = t is not None
+    elif t is None and texts and not evidence:
         t = thickness([(text, False) for text in texts])
     items = [
         _Item(fragment, field, reading_reconcile._is_whole_sheet(fragment))
         for fragment in drawings
         for field in list(fragment.content.structured_drawing_fields or [])
     ]
-    _roughness_rule(items, t, stats)
+    # Толщина из текста или примечаний шероховатость в размер не переводит:
+    # без прочтения «S» это могла быть строка спецификации.
+    _roughness_rule(items, None if need_s else t, stats)
     _thread_rule(items, stats)
     if settings.DRAWING_SENSE_POSITIONS:
         _position_rule(items, stats)
     if t is not None:
-        _thickness_rule(items, t, stats)
+        _thickness_rule(items, t, stats, need_s)
         _deduplicate_thickness(items, t, stats)
     else:
         _reference_thickness_rule(items, "\n".join(_notes(drawings)) + "\n" + "\n".join(texts), stats,
