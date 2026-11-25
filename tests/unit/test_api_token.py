@@ -83,6 +83,25 @@ class TestFlagOn:
             assert api_auth.require_api_token in calls, path
 
 
+class TestDocsAndQuality:
+    @pytest.mark.parametrize("path", ["/docs", "/openapi.json", "/redoc"])
+    def test_docs_need_token_when_flag_on(self, token_on, ingest_client, path):
+        assert ingest_client.get(path).status_code == 401
+        ok = ingest_client.get(path, headers={"Authorization": f"Bearer {FAKE_TOKEN}"})
+        assert ok.status_code == 200
+
+    def test_docs_open_when_flag_off(self, ingest_client):
+        assert ingest_client.get("/openapi.json").status_code == 200
+
+    def test_quality_forward_sends_bearer(self, token_on, mocker):
+        from core.models.intake import IntakeFile
+
+        post = mocker.patch.object(quality_api.requests, "post")
+        post.return_value.raise_for_status.return_value = None
+        quality_api._forward("req-1", [IntakeFile(s3_fileid="a.pdf")])
+        assert post.call_args.kwargs["headers"] == {"Authorization": f"Bearer {FAKE_TOKEN}"}
+
+
 class TestFailClosed:
     def test_flag_on_without_token_refuses_to_start(self, monkeypatch, fake_redis):
         monkeypatch.setattr(settings, "NORMALIZER_REQUIRE_TOKEN", True)
@@ -141,6 +160,9 @@ class TestAttachmentFallback:
         located = FileLocator(s3).locate(f"s3://chat-attachments/{UUID}")
         assert located.uri == f"s3://chat-attachments/{UUID}"
 
-    def test_presence_still_sees_bare_uuid(self, s3, token_on):
-        # Уборка сирот не должна счесть живое вложение пропавшим.
+    def test_presence_ignores_bare_uuid_when_flag_on(self, s3, token_on):
+        assert FileLocator(s3).is_present(UUID) is False
+        assert FileLocator(s3).is_present(f"chat-attachments/{UUID}") is True
+
+    def test_presence_sees_bare_uuid_when_flag_off(self, s3):
         assert FileLocator(s3).is_present(UUID) is True

@@ -55,6 +55,7 @@ app = FastAPI(
 )
 telemetry.install_metrics_endpoint(app)
 app.add_event_handler("startup", api_auth.ensure_configured)
+api_auth.protect_docs(app)
 # Все ручки, кроме проб /health и /metrics, — под общим токеном (core/api_auth.py).
 PROTECTED = [Depends(api_auth.require_api_token)]
 
@@ -196,7 +197,10 @@ def _forward(request_id: str, files: List[IntakeFile]):
         "files": [item.model_dump() for item in files],
     }
     try:
-        response = requests.post(url, json=payload, timeout=settings.INTAKE_TIMEOUT)
+        response = requests.post(
+            url, json=payload, timeout=settings.INTAKE_TIMEOUT,
+            headers=api_auth.outbound_headers(),
+        )
         response.raise_for_status()
         return True, None
     except requests.RequestException as exc:

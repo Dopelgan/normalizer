@@ -119,10 +119,13 @@ class FileLocator:
             return False
         uris = [self._build_uri(candidate) for candidate in self._candidates(fileid)]
         bucket = (settings.S3_ATTACHMENTS_BUCKET or "").strip()
-        # Вопрос «жив ли файл» содержимого не отдаёт: голый uuid проверяется
-        # во вложениях и при NORMALIZER_REQUIRE_TOKEN, иначе уборка сирот
-        # (tools/purge_orphans.py) сочла бы живое вложение пропавшим.
-        key = _attachment_key(fileid, bucket, allow_bare=True)
+        # То же правило, что у locate: при NORMALIZER_REQUIRE_TOKEN голый uuid
+        # во вложения не ведёт (по ответу «есть/нет» можно перебирать чужие
+        # вложения). Документы вложений под голым uuid tools/purge_orphans.py
+        # тогда считает сиротами: прочитать их по такому ключу уже нельзя.
+        key = _attachment_key(
+            fileid, bucket, allow_bare=not settings.NORMALIZER_REQUIRE_TOKEN,
+        )
         if bucket and self.is_s3 and key:
             uris.append(f"s3://{bucket}/{key}")
 

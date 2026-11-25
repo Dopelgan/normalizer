@@ -54,6 +54,28 @@ def require_api_token(authorization: Optional[str] = Header(default=None)) -> No
         raise _unauthorized()
 
 
+_DOC_PATHS = ("/docs", "/redoc", "/openapi.json")
+
+
+def protect_docs(app) -> None:
+    """
+    Схема и страницы документации FastAPI (`/docs`, `/redoc`, `/openapi.json`)
+    при включённом флаге — тоже по токену: они перечисляют все ручки.
+    """
+    from fastapi.responses import JSONResponse
+
+    @app.middleware("http")
+    async def _docs_guard(request, call_next):
+        path = request.url.path
+        if settings.NORMALIZER_REQUIRE_TOKEN and path.startswith(_DOC_PATHS):
+            try:
+                require_api_token(request.headers.get("authorization"))
+            except HTTPException as exc:
+                return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail},
+                                    headers=exc.headers)
+        return await call_next(request)
+
+
 def outbound_headers() -> dict:
     """Заголовок для своих же вызовов между сервисами (gateway → ingest)."""
     token = settings.NORMALIZER_API_TOKEN.strip()
