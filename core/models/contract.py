@@ -329,12 +329,16 @@ class DrawingField(BaseModel):
     # области на пол-листа, рамка снята ([0, 0, 1, 1]), рисовать её нельзя.
     # Без флага ключа нет в ответе вовсе.
     placeable: Optional[bool] = None
+    # Фамилия в графе подписанта не сверена со списком подписантов
+    # (DRAWING_LEXICON_FIX): ни на кого не похожа или похожа на двоих.
+    # Прочтение остаётся как было. Без флага ключа нет в ответе вовсе.
+    unverified_signer: Optional[bool] = None
 
     @model_serializer(mode="wrap")
     def _without_unset_readings(self, handler):
         data = handler(self)
         for key in ("readings", "agreement", "link", "bbox_exact", "alternatives",
-                    "needs_review", "low_quality", "placeable"):
+                    "needs_review", "low_quality", "placeable", "unverified_signer"):
             if isinstance(data, dict) and data.get(key) is None:
                 data.pop(key, None)
         return data

@@ -1179,6 +1179,15 @@ class DrawingProcessor:
             # После правки абзацев: исправленный абзац к этому моменту —
             # текст модели, и убирается как повтор, а не как расхождение.
             result = suppress_stale_sources(result)
+        if settings.DRAWING_LEXICON_FIX:
+            # Фамилии подписантов, стандарты, термины — по закрытым спискам
+            # (C15, F5). После всех прочтений и штампов всех страниц, до
+            # размещения полей: правится итог, рамки не трогаются.
+            from core.providers import lexicon_fix
+
+            fixed = lexicon_fix.apply(result)
+            if any(fixed.values()):
+                logger.info("Правка по словарям: %s", fixed)
         if settings.DRAWING_FIELD_PLACEMENT_V2:
             # Последним: сведение D3 и дочитывание D4 работают в координатах
             # вырезок и выправленного листа, а наружу поля уходят в долях страницы.
