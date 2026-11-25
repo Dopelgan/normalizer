@@ -709,7 +709,7 @@ def apply_page(drawings: List[Fragment], texts: Sequence[str] = (),
     if settings.DRAWING_SENSE_RA_SERIES:
         _ra_series_rule(items, stats)
     if settings.DRAWING_CORNER_ROUGHNESS_V2:
-        # После ряда: «Ra 63» в углу сначала становится «Ra 6,3».
+        # После ряда: исправленная запятая («Ra 08» -> «Ra 0,8») уже стоит.
         _corner_rule(drawings, items, stats)
     for fragment in drawings:
         stats["links_dropped"] += check_links(fragment.content.structured_drawing_fields or [])
