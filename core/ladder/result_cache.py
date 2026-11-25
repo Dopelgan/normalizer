@@ -146,6 +146,7 @@ NOT_IN_KEY: Tuple[str, ...] = (
     # N-02: что пишется в кэш ответов и с каким ключом — не результат
     # (свежий ответ разбору отдаётся тот же)
     "VLM_CACHE_VALIDATE", "VLM_RESPONSE_CACHE_NAMESPACE", "VLM_RESPONSE_CACHE_TTL_DAYS",
+    "VLM_CACHE_SHEET_MIN_LINES", "VLM_CACHE_SHEET_MIN_SHARE",
     "DRAWING_VLM_REJECTED_LOG",  # только журнал отказов
     # U2: причина и сырой ответ отказа — журнал и payload ветки чертежей, не результат лестницы
     "DRAWING_VLM_REJECT_DETAILS", "DRAWING_VLM_REJECT_RAW_MAX",

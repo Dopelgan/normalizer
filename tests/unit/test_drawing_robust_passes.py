@@ -459,3 +459,46 @@ def test_flag_off_keeps_ladder_key_and_on_changes_it(monkeypatch, flag):
     assert flag not in off
     monkeypatch.setattr(settings, flag, True)
     assert result_cache.settings_snapshot()[flag] is True
+
+
+# ------------------------------------------------------- правки по ревью
+def test_namespace_skips_v1_fallback(cache, monkeypatch):
+    monkeypatch.setattr(settings, "VLM_CACHE_V1_FALLBACK", True)
+    monkeypatch.setattr(settings, "DRAWING_VLM_STABLE", False)
+    old_key = "cd" + "1" * 62
+    monkeypatch.setattr(qwen_client, "cache_key_v1", lambda *args: old_key)
+    qwen_client.cache_put(old_key, ('{"fields": {"Обозначение": "СТАРОЕ.1"}, "rows": []}', "stop"))
+    fresh = '{"fields": {"Обозначение": "НОВОЕ.1"}, "rows": []}'
+
+    monkeypatch.setattr(settings, "VLM_RESPONSE_CACHE_NAMESPACE", "")
+    model = Model(reply(fresh))
+    assert client(model).read_title_block(picture())["fields"]["Обозначение"] == "СТАРОЕ.1"
+    assert model.bodies == []
+
+    monkeypatch.setattr(settings, "VLM_RESPONSE_CACHE_NAMESPACE", "reprocess-2")
+    model = Model(reply(fresh))
+    assert client(model).read_title_block(picture())["fields"]["Обозначение"] == "НОВОЕ.1"
+    assert len(model.bodies) == 1
+
+
+def test_sparse_sheet_thresholds_are_settings_and_counted(cache, monkeypatch):
+    monkeypatch.setattr(settings, "VLM_CACHE_VALIDATE", True)
+    counted = []
+    monkeypatch.setattr(qwen_client.telemetry, "add",
+                        lambda name, value: counted.append(name))
+
+    def stored(share):
+        monkeypatch.setattr(settings, "VLM_CACHE_SHEET_MIN_SHARE", share)
+        for path in cached_files(cache):
+            path.unlink()
+        token = qwen_client.set_expected_text_lines(40)
+        try:
+            client(Model(sheet_answer(3)))._read_sheet_piece(picture(), "лист", whole_sheet=True)
+        finally:
+            qwen_client.reset_expected_text_lines(token)
+        return len(cached_files(cache))
+
+    assert stored(0.25) == 0
+    assert counted.count("parse.vlm_cache_rejected_sparse") == 1
+    assert stored(0.05) == 1
+    assert counted.count("parse.vlm_cache_rejected_sparse") == 1
