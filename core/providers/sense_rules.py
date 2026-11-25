@@ -845,6 +845,12 @@ def _recategorise(field: DrawingField, category: str) -> None:
 # Это пояснение к размеру (примечание), а не выноска с номером.
 _COUNT_NOTE = re.compile(
     r"^\d{1,3}\s*(?:мест[аo]?|отв(?:ерсти[яей]|ерстие)?)\.?$", re.IGNORECASE)
+# Пункт технических требований: номер, затем текст с заглавной буквы и
+# хотя бы три слова. Графа «Материал» номером пункта не начинается.
+# Сортамент («2 Лист Б-ПН…», «Круг…») пунктом не считается.
+_NUMBERED_NOTE = re.compile(
+    r"^\d{1,2}\s*[.)]?\s+(?!(?:Лист|Круг|Труба|Шестигранник|Полоса|Пруток|Проволока|Квадрат|Уголок"
+    r"|Швеллер|Лента|Сталь)\b)[А-ЯЁ][а-яё]+(?:\s+\S+){3,}")
 # Величина с номиналом и симметричным отклонением: «30°±2°», «12±0,1»,
 # «⌀20±0,05», «45°30′±1°». Номинал обязателен: «±0,1» без него — допуск.
 _ANGLE_OR_NUMBER = r"\d+(?:[.,]\d+)?\s*(?:°(?:\s*\d+\s*['′])?|['′])?"
@@ -856,6 +862,7 @@ def _class_rule(items: List[_Item], stats: Dict[str, int]) -> None:
     """
     Однозначные смешения категорий (DRAWING_SENSE_CLASS_RULES):
     «2 места», «4 отв.» в выноске или позиции — примечание `note`;
+    пункт технических требований «3 Допускается…» в материале — `note`;
     «30°±2°» в допуске — размер с допуском `size` (допуск остаётся в
     `tolerance`), повтор того же места размером снимается; метка шва «№1»,
     «2№3» в позиции — выноска на листе любого вида. Значение не меняется.
@@ -868,6 +875,11 @@ def _class_rule(items: List[_Item], stats: Dict[str, int]) -> None:
         if field.category in ("callout", "position") and _COUNT_NOTE.match(value):
             _recategorise(field, "note")
             _count(stats, "class_count_note")
+        elif field.category == "material" and _NUMBERED_NOTE.match(value):
+            # «3 Допускается применять любой другой металлопрокат…» —
+            # пункт технических требований, а не графа «Материал».
+            _recategorise(field, "note")
+            _count(stats, "class_numbered_note")
         elif field.category == "position" and _WELD_MARK.match(value):
             _recategorise(field, "callout")
             _count(stats, "class_weld_mark")
@@ -1106,6 +1118,14 @@ def general_roughness(value: Any) -> Optional[str]:
     return "R%s %s (√)" % (match.group(1)[1].lower(), match.group(2).replace(".", ","))
 
 
+def _unplaced(box: Optional[Sequence[float]]) -> bool:
+    """Рамки нет или она — почти весь лист: место надписи не прочитано."""
+    if not box or len(box) != 4:
+        return True
+    x1, y1, x2, y2 = (float(v) for v in box)
+    return (x2 - x1) * (y2 - y1) >= 0.8
+
+
 def _inside(box: Optional[Sequence[float]], zone: Sequence[float]) -> bool:
     centre = reading_reconcile._centre(box or [])
     if centre is None:
@@ -1124,6 +1144,7 @@ def _corner_rule(drawings: Sequence[Fragment], items: List[_Item], stats: Dict[s
     """
     Общий знак шероховатости (DRAWING_CORNER_ROUGHNESS_V2), без вызовов модели:
     1) поле с записью «Ra x (√)» / «√ (√)» — шероховатость с этой записью;
+       без места (рамка всего листа) — в правом верхнем углу рамки;
     2) иначе единственная шероховатость «Ra x» листа целиком в правом
        верхнем углу рамки (`CORNER`), вне вырезок видов, на листе не сборки
        и не схемы, получает «(√)»;
@@ -1145,6 +1166,14 @@ def _corner_rule(drawings: Sequence[Fragment], items: List[_Item], stats: Dict[s
         if canonical != field.value:
             _note_value(item, canonical, review=False)
             _count(stats, "corner_canonical")
+        if item.whole and _unplaced(field.bbox):
+            # Знак «Ra x (√)» без места (содержание листа без рамок): по
+            # ГОСТ 2.309 общий знак стоит в правом верхнем углу рамки, и
+            # рамка всего листа была бы враньём о месте.
+            frame = ((item.fragment.content.structured_payload or {}).get("layout") or {}).get("frame")
+            field.bbox = corner_sign_box(corner_box(frame))
+            item.box = _page_box(item.fragment, field, item.whole)
+            _count(stats, "corner_placed")
     if general:
         return
     sheets = [f for f in drawings if reading_reconcile._is_whole_sheet(f)]

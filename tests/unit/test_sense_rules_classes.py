@@ -85,6 +85,20 @@ def test_class_rules(monkeypatch):
     assert stats["class_count_note"] == 2 and stats["class_pm_size"] == 1 and stats["class_weld_mark"] == 1
 
 
+@pytest.mark.parametrize("value, category", [
+    ("3 Допускается применять любой другой металлопрокат из стали 12Х18Н10Т по ГОСТ 5632-2014.", "note"),
+    ("4. Материал заменять только по согласованию с разработчиком", "note"),
+    ("3 ГОСТ 19904-90 12Х18Н10Т ГОСТ 5582-75", "material"),
+    ("2 Лист Б-ПН-2 ГОСТ 19903-74 12Х18Н10Т ГОСТ 5582-75", "material"),
+    ("Круг 12Х18Н10Т ГОСТ 5949-75", "material"),
+])
+def test_numbered_requirement_in_material_is_note(monkeypatch, value, category):
+    flag_on(monkeypatch, "DRAWING_SENSE_CLASS_RULES")
+    sheet = drawing([field(value, [0.5, 0.7, 0.9, 0.72], category="material")], sheet_type="detail")
+    sense_rules.apply([sheet])
+    assert categories(sheet) == [(value, category)]
+
+
 def test_pm_twin_keeps_one_size(monkeypatch):
     flag_on(monkeypatch, "DRAWING_SENSE_CLASS_RULES")
     sheet = drawing([
@@ -283,6 +297,26 @@ def test_corner_roughness_gets_check_mark(monkeypatch):
     assert corner.value == "Ra 6,3 (√)" and not corner.needs_review
     assert inner.value == "Ra 3,2"
     assert stats["corner_marked"] == 1
+
+
+def test_unplaced_general_roughness_goes_to_corner(monkeypatch):
+    flag_on(monkeypatch, "DRAWING_CORNER_ROUGHNESS_V2")
+    frame = [0.02, 0.02, 0.98, 0.98]
+    sheet = drawing([
+        field("Ra 6,3 (√)", [0.0, 0.0, 1.0, 1.0], category="roughness"),
+        field("Ra 1,6 (√)", [0.3, 0.3, 0.34, 0.32], category="roughness"),
+    ], sheet_type="detail", layout={"frame": frame})
+    stats = sense_rules.apply([sheet])
+    unplaced, placed = sheet.content.structured_drawing_fields
+    assert unplaced.bbox == sense_rules.corner_sign_box(sense_rules.corner_box(frame))
+    assert placed.bbox == [0.3, 0.3, 0.34, 0.32]
+    assert stats["corner_placed"] == 1
+
+
+def test_unplaced_general_roughness_stays_with_flag_off(flags_off):
+    sheet = drawing([field("Ra 6,3 (√)", [0.0, 0.0, 1.0, 1.0], category="roughness")], sheet_type="detail")
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].bbox == [0.0, 0.0, 1.0, 1.0]
 
 
 def test_roughness_inside_view_is_not_general(monkeypatch):
