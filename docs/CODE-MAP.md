@@ -38,6 +38,8 @@
 | Стадия | Файл | Вход |
 |---|---|---|
 | Синхронный разбор | `ingest/api.py` | `parse_sync` (186, `POST /internal/v1/parse`) |
+| Проверка токена на всех ручках | `core/api_auth.py` | `require_api_token`, `ensure_configured` |
+| Удаление документа отовсюду | `ingest/api.py` → `core/document_delete.py` | `delete_document` (`DELETE /internal/v1/documents/{s3_fileid}`) |
 | Фоновый разбор | `ingest/api.py` | `parse_background` (239, `POST /internal/v1/parse/background`) |
 | Выдача результата | `ingest/api.py` | `parse_results` (275, `GET /internal/v1/parse/results/{request_id}`) |
 | Выбор очереди (ml_gpu / интерактивная) | `ingest/api.py` | `parse_queue` (72), `_dispatch` (86) |
@@ -252,6 +254,8 @@
 | `DRAWING_VLM_REJECT_DETAILS` (+ `DRAWING_VLM_REJECT_RAW_MAX`) | `false` | `core/providers/qwen_client.py` (`reject_reason`, `_log_rejected`, `_answer` → `_note_rejected`); в payload — `core/sheet_text_route.attach_rejected` из `_enrich_fragments` |
 | `DRAWING_WHAT_DRAWN` | `false` | `core/drawing_processor.py::_process` (запись листа) → `_enrich_fragments` → `_what_drawn_pass` → `core/providers/what_drawn.py`; `qwen_client.read_what_drawn` |
 | `DRAWING_BLOCK_CLEANUP` | `false` | `core/providers/mineru_parser.py` → `text_layer.reconcile_with_text_layer(drop_gibberish_tables)`; `field_placement.apply`; `DrawingProcessor._process` → `core/providers/block_cleanup.py` |
+| `NORMALIZER_REQUIRE_TOKEN` (+ `NORMALIZER_API_TOKEN`) | `false` | `core/api_auth.py` (`require_api_token` — зависимость `PROTECTED` на ручках `ingest/api.py`, `gateway/api.py`, `quality/api.py`; `ensure_configured` — отказ старта без токена; `outbound_headers` — `core/intake/pipeline.py::forward`); голый uuid вложения — `core/providers/file_locator.py::_attachment_key` |
+| `NORMALIZER_DELETE_ENABLED` | `false` | `ingest/api.py::delete_document` (`DELETE /internal/v1/documents/{s3_fileid}`) → `core/document_delete.py::delete_document`; хранилища — `storage.delete_prefix`, `result_cache.drop_for`; уборка сирот — `tools/purge_orphans.py` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
 

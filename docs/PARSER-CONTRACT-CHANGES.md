@@ -1450,3 +1450,36 @@ deskewed_page`), та же система, что у `bbox` поля, поэто
   (`kind`, `before`, `after`, `where`); в `structured_payload` его нет —
   оттуда снятая выдуманная фамилия попала бы в индекс.
 Код: `core/providers/lexicon_fix.py`. Откат — флаг выключен.
+
+## 9. Удаление документа и токен (25.11.2026)
+
+### `DELETE /internal/v1/documents/{s3_fileid}`
+
+Выбрана отдельная ручка, а не `operation: "delete"` в `Operation`: фоновая
+ручка ставит задачу разбора и отдаёт результат опросом, а удалению нечего
+разбирать и нечего опрашивать — ответ синхронный. `Operation` остаётся
+`create | update`, форма фонового контракта не меняется.
+
+- `s3_fileid` — тот же идентификатор, что в разборе, со слешами как есть
+  (`/internal/v1/documents/cluster-a/document.pdf`).
+- Удаляет строки `documents` и `chunks`, решения приёма `intake_decisions`,
+  копии результата в Redis, картинки MinerU `assets/<doc_id>/`, запись кэша
+  лестницы (только если тех же байтов нет у другого живого документа).
+- Ответ `200`: `{"s3_fileid", "doc_id", "status": "deleted" | "absent", ...счётчики}`.
+  Повтор — `200` со `status: "absent"`.
+- `500` со `status: "partial"` и `errors` — часть хранилищ не очищена;
+  повтор безопасен.
+- `501` — выключено флагом `NORMALIZER_DELETE_ENABLED` (по умолчанию).
+- `401` — при `NORMALIZER_REQUIRE_TOKEN=true` без верного токена.
+
+RAG вызывает её при отзыве документа под флагом `parser.delete_on_withdraw`;
+`asset.deleted`/`asset.withdrawn` из раздела «Связь с пачкой» при выключенном
+флаге по-прежнему обрабатываются без вызова Parser.
+
+### Токен на всех ручках
+
+При `NORMALIZER_REQUIRE_TOKEN=true` каждая ручка, кроме `/health` и
+`/metrics`, требует `Authorization: Bearer <NORMALIZER_API_TOKEN>`. RAG шлёт
+`PARSER_API_TOKEN`, Backend → data_gateway — `VALIDATION_API_TOKEN`. Под тем же
+флагом вложение чата ищется только по явной форме `<S3_ATTACHMENTS_BUCKET>/<uuid>`
+(можно с `s3://`); голый uuid — только в основном бакете.
