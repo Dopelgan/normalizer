@@ -84,6 +84,7 @@ from core.drawing_quality import apply_drawing_quality
 from core.drawing_stale_sources import suppress_stale_sources
 from core.drawing_transcript import apply_transcripts
 from core.scan_text_rescan import poor_pages
+from core import sheet_text_route
 
 logger = logging.getLogger(__name__)
 
@@ -436,6 +437,14 @@ class DrawingProcessor:
                 if guard:
                     payload["sheet_guard"] = guard
                     self._sheet_record(reading, payload)
+            if reading is not None and settings.DRAWING_COLLAPSE_REREAD:
+                layer = self._layer_lines.get(int(page), 0) if log_page is None else 0
+                collapsed = self._guard_collapsed_sheet(
+                    layout, reading, max(len(lines or []), layer), budget_started, payload,
+                )
+                if collapsed is not reading:
+                    reading = collapsed
+                    self._sheet_record(reading, payload)
             if reading is None and not lines:
                 logger.error("Модель не прочитала лист %s", image_ref)
                 self._log_sheet(image_ref, sheet, MODE_NONE, 0, 0, 0, 0, started)
@@ -630,6 +639,42 @@ class DrawingProcessor:
         budget = settings.DRAWING_TIME_BUDGET
         until = budget_started + budget - settings.DRAWING_SHEET_TILE_RESERVE if budget else None
         return self.qwen.reread_sheet_by_tiles(layout.image, reading, hint=layout.hint(), until=until)
+
+    def _guard_collapsed_sheet(self, layout, reading, text_lines: int, budget_started: float,
+                               payload: Dict[str, Any]):
+        """
+        Схлопнувшееся чтение листа (DRAWING_COLLAPSE_REREAD): надписей много
+        меньше, чем строк у того же листа. Ответ модели на один и тот же лист
+        гулял от прогона к прогону (124 позиции против 17), а пустым «{}» он
+        при этом не был, и прежняя защита его не ловила. Лист перечитывается
+        частями один раз; надписи целого ответа остаются (`merge_annotations`),
+        поэтому перечитывание ничего не теряет. Ответ из кэша при повторе
+        вернулся бы тем же, поэтому частями, а не тем же вызовом.
+        """
+        if reading.tiles or text_lines < settings.DRAWING_COLLAPSE_MIN_LINES:
+            return reading
+        if len(reading.annotations) >= settings.DRAWING_COLLAPSE_RATIO * text_lines:
+            return reading
+        budget = settings.DRAWING_TIME_BUDGET
+        until = budget_started + budget - settings.DRAWING_SHEET_TILE_RESERVE if budget else None
+        if until is not None and gpu_gate.budget_now() + settings.VLM_TIMEOUT > until:
+            # Перечитывание не уложится в бюджет листа: лучше схлопнувшийся
+            # ответ с пометкой, чем лист, оборванный сроком.
+            payload["collapse_reread"] = {"items": len(reading.annotations), "text_lines": text_lines,
+                                          "skipped": "time_budget"}
+            return reading
+        logger.warning("Надписей листа %d при %d строках текста: лист перечитывается частями",
+                       len(reading.annotations), text_lines)
+        before = len(reading.annotations)
+        reread = self.qwen.reread_sheet_by_tiles(layout.image, reading, hint=layout.hint(), until=until)
+        if reread is None or len(reread.annotations) <= before:
+            payload["collapse_reread"] = {"items": before, "text_lines": text_lines,
+                                          "items_after": len(reread.annotations) if reread else 0,
+                                          "kept": "first"}
+            return reading
+        payload["collapse_reread"] = {"items": before, "text_lines": text_lines,
+                                      "items_after": len(reread.annotations), "kept": "tiles"}
+        return reread
 
     @staticmethod
     def _sheet_produced(reading) -> str:
@@ -1065,6 +1110,12 @@ class DrawingProcessor:
                 raise
             except Exception as exc:  # noqa: BLE001 — штамп страниц не роняет документ
                 logger.error("Штамп страниц без полей штампа не прочитан: %s", exc)
+        if settings.DRAWING_ROUTE_SHEET_TEXT_VLM:
+            # C8: штамп и ТТ страницы-чертежа — модели, а не OCR. После
+            # штампа всех страниц: страница, штамп которой уже прочитан, не
+            # читается второй раз.
+            result = sheet_text_route.apply(self, result, metadata)
+        sheet_text_route.attach_rejected(self.qwen, result)
         # Модель не ответила документу ни разу и отказывала как сервис:
         # непрочитанные листы — свойство минуты, а не документа. С
         # PARSE_REQUEUE_ON_OUTAGE документ ставится в очередь (ServiceOutage).
