@@ -263,10 +263,8 @@ def _expired(path: Path) -> bool:
 _expected_text_lines: contextvars.ContextVar[int] = contextvars.ContextVar(
     "qwen_expected_text_lines", default=0
 )
-# Не меньше стольких строк слоя, чтобы бедный ответ листа считался сбоем.
-_SHEET_COVERAGE_MIN_LINES = 12
-# Надписей в ответе листа должно быть не меньше этой доли строк слоя.
-_SHEET_COVERAGE_SHARE = 0.25
+# Пороги бедного ответа листа — VLM_CACHE_SHEET_MIN_LINES и
+# VLM_CACHE_SHEET_MIN_SHARE (core/config.py).
 
 # Момент по `time.monotonic()`, после которого вызов модели этого листа
 # уже не нужен (DRAWING_ROBUST_PASSES): срок HTTP-вызова не больше остатка.
@@ -350,7 +348,11 @@ def cache_check(required: Sequence[str] = (), sheet: bool = False) -> Callable[[
             if not isinstance(items, list) or sheet_verdict(finish, items) is not None:
                 return False
             lines = _expected_text_lines.get()
-            if lines >= _SHEET_COVERAGE_MIN_LINES and len(items) < _SHEET_COVERAGE_SHARE * lines:
+            if (lines >= int(settings.VLM_CACHE_SHEET_MIN_LINES)
+                    and len(items) < float(settings.VLM_CACHE_SHEET_MIN_SHARE) * lines):
+                # Счётчик — чтобы замер видел, как часто срабатывает правило:
+                # разреженный лист над плотным слоем не кэшируется никогда.
+                telemetry.add("parse.vlm_cache_rejected_sparse", 1)
                 return False
         return True
 
@@ -1777,8 +1779,10 @@ class QwenVisionClient:
         # проход листа) старый ответ без схемы не берётся.
         # С DRAWING_VLM_STABLE рассуждение выключено, а записи прежней версии
         # сделаны с ним: под ключом нового запроса им не место.
+        # С пространством имён (VLM_RESPONSE_CACHE_NAMESPACE) старые записи
+        # не видны вовсе — и по ключу прежней версии тоже.
         if (cached is None and settings.VLM_CACHE_V1_FALLBACK and response_format is None
-                and not settings.DRAWING_VLM_STABLE):
+                and not settings.DRAWING_VLM_STABLE and not settings.VLM_RESPONSE_CACHE_NAMESPACE):
             # Временно (VLM_CACHE_V1_FALLBACK): промах по новому ключу
             # проверяется по ключу прежней версии. Тело запроса у неё было
             # из тех же полей, и все её записи сделаны одним сервером прода,

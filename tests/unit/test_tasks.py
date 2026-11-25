@@ -681,6 +681,24 @@ class TestBuildFingerprint:
         process_document("fp-3", "file-fp", operation="update")
         assert "drawing_route" not in self._extra(task_db, first["doc_id"])
 
+    def test_reparse_keeps_keys_not_written_by_parse(self, pipeline, monkeypatch, task_db):
+        monkeypatch.setattr(tasks.settings, "NORMALIZER_FINGERPRINT_REPARSE", True)
+        init_request_state("fp-1", ["file-fp"])
+        first = process_document("fp-1", "file-fp")
+        # Всё, что пишет разбор, — в списке ключей разбора.
+        assert set(self._extra(task_db, first["doc_id"])) <= tasks.PARSE_EXTRA_KEYS
+        session = task_db()
+        with session.begin():
+            DocumentRepository(session).update_extra(first["doc_id"], {
+                "drawing_route": "прежний", "admin_decision": "оставить",
+            })
+        session.close()
+        init_request_state("fp-2", ["file-fp"])
+        process_document("fp-2", "file-fp", operation="update")
+        extra = self._extra(task_db, first["doc_id"])
+        assert "drawing_route" not in extra
+        assert extra["admin_decision"] == "оставить"
+
     def test_release_sha_from_file(self, monkeypatch, tmp_path):
         from core import build_fingerprint
 

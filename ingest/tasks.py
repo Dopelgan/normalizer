@@ -337,6 +337,22 @@ def mark_unread_sheets(fragments, pages: List[int]) -> int:
     return marked
 
 
+# Ключи extra_data, которые пишет разбор (шаг 4 `process_document`), включая
+# необязательные. С NORMALIZER_FINGERPRINT_REPARSE переразбор заменяет
+# только их; прочие ключи (решения админки, приёма, карантина, пометки
+# проверки — их пишет не разбор) сохраняются. Новый ключ разбора нужно
+# внести сюда — тест сверяет список с записью.
+PARSE_EXTRA_KEYS = frozenset({
+    "build_fingerprint", "mime_type", "document_status", "pages_reported", "processed_pages",
+    "failed_pages", "unknown_pages", "unread_text_pages", "unread_sheet_pages",
+    "page_coverage_version", "warnings", "processing_profile_version", "review_required",
+    "text_incomplete", "quality_reprocess", "normalized_content_hash", "parsed_pages_count",
+    "total_fragments", "parser", "source_kind", "is_fallback", "needs_review", "raw_parse_uri",
+    "last_operation", "chosen_level", "chosen_strategy", "ladder_attempts", "fallback_won",
+    "drawing_route", "degraded", "text_layer_stats", "timings_ms",
+})
+
+
 def _same_build(doc_id: str, extra: Dict[str, Any]) -> bool:
     """
     Сохранённый разбор сделан этой же сборкой (NORMALIZER_FINGERPRINT_REPARSE):
@@ -793,7 +809,10 @@ def process_document(
             # необязательные) не переживают переразбор, и рядом лежит
             # отпечаток сборки. Без флага — слияние, как прежде.
             fingerprint = build_fingerprint.current() if settings.NORMALIZER_FINGERPRINT_REPARSE else None
-            write_extra = doc_repo.replace_extra if fingerprint is not None else doc_repo.update_extra
+            write_extra = (
+                (lambda doc, extra: doc_repo.replace_extra(doc, extra, owned=PARSE_EXTRA_KEYS))
+                if fingerprint is not None else doc_repo.update_extra
+            )
             write_extra(doc_id, {
                 **({"build_fingerprint": fingerprint} if fingerprint is not None else {}),
                 # Поля контракта, которые нужно отдать и при повторной

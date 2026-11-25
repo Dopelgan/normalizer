@@ -1,6 +1,6 @@
 """Репозиторий документов."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from sqlalchemy.orm import Session
 
@@ -51,15 +51,24 @@ class DocumentRepository:
         doc.extra_data = current
         doc.updated_at = utcnow()
 
-    def replace_extra(self, doc_id: str, extra: Dict[str, Any]) -> None:
+    def replace_extra(self, doc_id: str, extra: Dict[str, Any],
+                      owned: Iterable[str] = ()) -> None:
         """
-        Заменяет extra_data целиком (NORMALIZER_FINGERPRINT_REPARSE): ключи
-        прежнего разбора не сливаются с новыми.
+        Заменяет ключи разбора в extra_data (NORMALIZER_FINGERPRINT_REPARSE):
+        ключи `owned`, которые пишет разбор, прежнего разбора не переживают —
+        в том числе необязательные, которых в новом разборе нет
+        (`drawing_route`). Все прочие ключи сохраняются: их пишет не разбор
+        (решения админки, приёма, карантина, пометки проверки — в этом
+        репозитории таких писателей сейчас нет, но поле общее, и ключ, не
+        принадлежащий разбору, разбор не стирает).
         """
         doc = self.get(doc_id, for_update=True)
         if doc is None:
             return
-        doc.extra_data = dict(extra)
+        dropped = set(owned) | set(extra)
+        current = {key: value for key, value in (doc.extra_data or {}).items() if key not in dropped}
+        current.update(extra)
+        doc.extra_data = current
         doc.updated_at = utcnow()
 
     def update_metadata(self, doc_id: str, **kwargs) -> None:
