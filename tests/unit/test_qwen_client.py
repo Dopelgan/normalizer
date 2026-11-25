@@ -629,11 +629,30 @@ class TestContentPass:
         merged = qwen_client.merge_content(content, located)
         values = [(a["value"], a.get("bbox")) for a in merged.annotations]
         if flag:
-            assert values == [("ТАДУ 421451.003 СБ", [0.7, 0.9, 0.9, 0.92]),
+            # Пара выходит надписью прохода с рамками (запись прочитана на месте).
+            assert values == [("ТАДУ 421451003 СБ", [0.7, 0.9, 0.9, 0.92]),
                               ("Острые кромки притупить", None), ("12Х18Н10Т", None)]
         else:
             assert len(values) == 8 and ("Копировал", None) in values
             assert values[-1] == ("ТАДУ 421451003 СБ", [0.7, 0.9, 0.9, 0.92])
+
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_unplaced_cleanup_pair_keeps_located_value_and_category(self, mocker, flag):
+        # Пара по записи без знаков не подменяет прочитанное на месте:
+        # «Ra 6,3» листа не становится «Ra 6,3 (√)», допуск — выноской.
+        mocker.patch.object(qwen_client.settings, "DRAWING_UNPLACED_CLEANUP", flag)
+        content = qwen_client.SheetReading(sheet_type="detail", annotations=[
+            {"category": "roughness", "value": "Ra 6,3 (√)"},
+            {"category": "callout", "value": "30°±2°"}])
+        located = qwen_client.SheetReading(sheet_type="unknown", annotations=[
+            {"category": "roughness", "value": "Ra 6,3", "bbox": [0.8, 0.05, 0.9, 0.08]},
+            {"category": "tolerance", "value": "30°±2°", "bbox": [0.4, 0.4, 0.45, 0.42]}])
+        merged = qwen_client.merge_content(content, located).annotations
+        pairs = [(a["category"], a["value"]) for a in merged]
+        if flag:
+            assert pairs == [("roughness", "Ra 6,3"), ("tolerance", "30°±2°")]
+        else:
+            assert ("callout", "30°±2°") in pairs and ("roughness", "Ra 6,3 (√)") in pairs
 
     def test_schema_requires_both_keys(self):
         schema = qwen_client.content_schema()["json_schema"]["schema"]

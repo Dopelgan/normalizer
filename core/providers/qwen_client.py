@@ -2022,7 +2022,8 @@ def merge_content(content: "SheetReading", located: Optional["SheetReading"]) ->
     рамку по умолчанию). Надписи прохода с рамками, которых в содержании
     нет, добавляются: содержание полнее, но не всегда. С
     DRAWING_UNPLACED_CLEANUP пара ищется и по записи без знаков и похожих
-    букв, а надпись без пары, которая не надпись листа (голая подпись графы,
+    букв, пара выходит надписью прохода с рамками (запись и категория
+    прочитаны на месте), а надпись без пары, которая не надпись листа (голая подпись графы,
     смешение алфавитов), отбрасывается — см. `unplaced_cleanup`.
     """
     from core.providers import unplaced_cleanup
@@ -2053,7 +2054,12 @@ def merge_content(content: "SheetReading", located: Optional["SheetReading"]) ->
             key = unplaced_cleanup.loose(item["value"])
             twin = take(by_loose.get(key, ())) if key else None
         if twin is not None:
-            merged.append({**item, "bbox": twin.get("bbox")})
+            # С DRAWING_UNPLACED_CLEANUP пара — это надпись прохода с рамками
+            # как есть: её запись и категория прочитаны на месте. Иначе
+            # «Ra 6,3 (√)» содержания заменяла «Ra 6,3» листа, а код «c» —
+            # категорию допуска «30°±2°». Содержание добавляет только то,
+            # чего у прохода с рамками нет.
+            merged.append(dict(twin) if cleanup else {**item, "bbox": twin.get("bbox")})
             continue
         reason = unplaced_cleanup.noise(item["value"]) if cleanup else None
         if reason:
