@@ -51,9 +51,9 @@ INTAKE_FORWARD_TO_PARSER; по умолчанию цепочка останав�
 import logging
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 
-from core import logging_setup, telemetry
+from core import api_auth, logging_setup, telemetry
 from core.db.session import SessionLocal
 from core.intake import state
 from core.intake.pipeline import IntakePipeline
@@ -81,6 +81,9 @@ app = FastAPI(
     version="2.0.0",
 )
 telemetry.install_metrics_endpoint(app)
+app.add_event_handler("startup", api_auth.ensure_configured)
+# Все ручки, кроме проб /health и /metrics, — под общим токеном (core/api_auth.py).
+PROTECTED = [Depends(api_auth.require_api_token)]
 
 STAGE = "data_gateway"
 RESULTS_PATH = "/internal/v1/intake/results"
@@ -94,6 +97,7 @@ RESULTS_PATH = "/internal/v1/intake/results"
     "/internal/v1/intake",
     response_model=IntakeAcceptedResponse,
     status_code=202,
+    dependencies=PROTECTED,
 )
 def intake(request: IntakeRequest) -> IntakeAcceptedResponse:
     """
@@ -135,7 +139,7 @@ def intake(request: IntakeRequest) -> IntakeAcceptedResponse:
     )
 
 
-@app.get(RESULTS_PATH + "/{request_id}", response_model=IntakeResultsResponse)
+@app.get(RESULTS_PATH + "/{request_id}", response_model=IntakeResultsResponse, dependencies=PROTECTED)
 def intake_results(request_id: str) -> IntakeResultsResponse:
     """Готовность приёма и вердикты по каждому файлу."""
     snapshot = state.get_state(request_id)
@@ -150,7 +154,7 @@ def intake_results(request_id: str) -> IntakeResultsResponse:
     return IntakeResultsResponse(**snapshot)
 
 
-@app.post("/internal/v1/intake/sync", response_model=IntakeResponse)
+@app.post("/internal/v1/intake/sync", response_model=IntakeResponse, dependencies=PROTECTED)
 def intake_sync(request: IntakeRequest) -> IntakeResponse:
     """
     Приём без очереди: ответ отдаётся, когда готовы вердикты по всем файлам.
@@ -198,7 +202,7 @@ def _bucket(response: IntakeResponse, outcome: str, s3_fileid: str) -> None:
 # Карантин и отчёты
 # ===========================================================================
 
-@app.get("/internal/v1/intake/quarantine", response_model=List[QuarantineItem])
+@app.get("/internal/v1/intake/quarantine", response_model=List[QuarantineItem], dependencies=PROTECTED)
 def quarantine(limit: int = 100) -> List[QuarantineItem]:
     """Очередь администратору: что не пропущено и почему."""
     session = SessionLocal()
@@ -216,7 +220,7 @@ def quarantine(limit: int = 100) -> List[QuarantineItem]:
         session.close()
 
 
-@app.post("/internal/v1/intake/quarantine/{record_id}/resolve")
+@app.post("/internal/v1/intake/quarantine/{record_id}/resolve", dependencies=PROTECTED)
 def resolve(record_id: str, request: ResolveRequest) -> dict:
     """Решение человека по карантину. На этих решениях система и учится."""
     session = SessionLocal()
@@ -237,7 +241,7 @@ def resolve(record_id: str, request: ResolveRequest) -> dict:
         session.close()
 
 
-@app.get("/internal/v1/intake/report")
+@app.get("/internal/v1/intake/report", dependencies=PROTECTED)
 def report(stage: Optional[str] = None) -> dict:
     """Отчёт по итогам приёма: сколько принято, в карантине, отклонено."""
     session = SessionLocal()
@@ -247,7 +251,7 @@ def report(stage: Optional[str] = None) -> dict:
         session.close()
 
 
-@app.get("/internal/v1/intake/suggestions")
+@app.get("/internal/v1/intake/suggestions", dependencies=PROTECTED)
 def suggestions() -> dict:
     """
     Что стоит поправить в правилах отсева. Система предлагает — меняет

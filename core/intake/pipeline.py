@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from core import telemetry
+from core import api_auth, telemetry
 from core.config import settings
 from core.db.session import SessionLocal
 from core.gateway.profile import load_profile
@@ -246,7 +246,8 @@ class IntakePipeline:
         try:
             with telemetry.measure("intake.forward", request_id=request_id):
                 response = requests.post(
-                    url, json=payload, timeout=settings.INTAKE_TIMEOUT
+                    url, json=payload, timeout=settings.INTAKE_TIMEOUT,
+                    headers=api_auth.outbound_headers(),
                 )
                 response.raise_for_status()
             return True, None

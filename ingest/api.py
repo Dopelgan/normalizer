@@ -6,8 +6,10 @@ HTTP-интерфейс Parser по контракту RAG <-> Parser.
     GET  /internal/v1/parse/results/{request_id} готовность и результат
     GET  /health, GET /metrics
 
-Ручки рассчитаны на внутреннюю сеть контейнеров: авторизации в MVP-контракте
-нет. Наружу порты публиковать не следует.
+Ручки рассчитаны на внутреннюю сеть контейнеров. При
+NORMALIZER_REQUIRE_TOKEN=true все ручки, кроме /health и /metrics, требуют
+`Authorization: Bearer <NORMALIZER_API_TOKEN>` (core/api_auth.py). Наружу
+порты публиковать не следует.
 
 Сторона RAG. Фоновый разбор (события жизненного цикла, `event_id`) уходит в
 очередь `CELERY_ML_QUEUE`, синхронный (вложения чата, `dialog_id`) — в
@@ -28,12 +30,12 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from core import logging_setup, telemetry
+from core import api_auth, logging_setup, telemetry
 from core.config import settings
 from core.models.api import BackgroundParseRequest, HealthResponse, ParseRequest
 from core.models.intake import IntakeFile
@@ -60,6 +62,9 @@ app = FastAPI(
     version="1.0.0",
 )
 telemetry.install_metrics_endpoint(app)
+app.add_event_handler("startup", api_auth.ensure_configured)
+# Все ручки, кроме проб /health и /metrics, — под общим токеном (core/api_auth.py).
+PROTECTED = [Depends(api_auth.require_api_token)]
 
 SYNC_POLL_INTERVAL = 0.5
 ACTIVE_STATUSES = ("queued", "processing")
@@ -182,7 +187,7 @@ def _documents(state: Dict[str, Any]) -> List[DocumentResult]:
 # Ручки контракта
 # ===========================================================================
 
-@app.post("/internal/v1/parse", response_model=ParseResponse)
+@app.post("/internal/v1/parse", response_model=ParseResponse, dependencies=PROTECTED)
 async def parse_sync(request: ParseRequest):
     """
     Синхронная обработка: ответ отдаётся, когда готовы все файлы пакета.
@@ -235,7 +240,12 @@ async def parse_sync(request: ParseRequest):
         await asyncio.sleep(SYNC_POLL_INTERVAL)
 
 
-@app.post("/internal/v1/parse/background", response_model=BackgroundAcceptedResponse, status_code=202)
+@app.post(
+    "/internal/v1/parse/background",
+    response_model=BackgroundAcceptedResponse,
+    status_code=202,
+    dependencies=PROTECTED,
+)
 async def parse_background(request: BackgroundParseRequest):
     """Фоновая обработка: сразу 202, результат забирается поллингом."""
     items = request.items
@@ -271,7 +281,11 @@ async def parse_background(request: BackgroundParseRequest):
     )
 
 
-@app.get("/internal/v1/parse/results/{request_id}", response_model=ResultsResponse)
+@app.get(
+    "/internal/v1/parse/results/{request_id}",
+    response_model=ResultsResponse,
+    dependencies=PROTECTED,
+)
 async def parse_results(request_id: str):
     """Статус и результат фоновой задачи."""
     state = await asyncio.to_thread(get_request_state, request_id)

@@ -137,6 +137,7 @@ NOT_IN_KEY: Tuple[str, ...] = (
     "S3_ACCESS_KEY", "S3_ATTACHMENTS_BUCKET", "S3_BUCKET", "S3_ENDPOINT", "S3_READONLY",
     "S3_SECRET_KEY", "SOURCE_PREFIX", "SOURCE_PROBE_EXTENSIONS",
     "STORAGE_LOCAL_MOUNT", "STORAGE_TYPE", "TEMP_DIR", "TESSERACT_PAGE_WORKERS",
+    "NORMALIZER_REQUIRE_TOKEN",  # только какой бакет смотреть по голому uuid (file_locator)
     "VLM_CACHE_V1_FALLBACK", "VLM_RESPONSE_CACHE", "VLM_RESPONSE_CACHE_DIR",
     "DRAWING_VLM_REJECTED_LOG",  # только журнал отказов
     # U2: причина и сырой ответ отказа — журнал и payload ветки чертежей, не результат лестницы
