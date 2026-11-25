@@ -261,7 +261,7 @@
 | `DRAWING_WHAT_DRAWN` | `false` | `core/drawing_processor.py::_process` (запись листа) → `_enrich_fragments` → `_what_drawn_pass` → `core/providers/what_drawn.py`; `qwen_client.read_what_drawn` |
 | `DRAWING_BLOCK_CLEANUP` | `false` | `core/providers/mineru_parser.py` → `text_layer.reconcile_with_text_layer(drop_gibberish_tables)`; `field_placement.apply`; `DrawingProcessor._process` → `core/providers/block_cleanup.py` |
 | `DRAWING_FIELDS_FROM_TEXT_WIDE` | `false` | `core/drawing_processor.py::_process` → `_fields_from_text` → `_strict_text_field` (`_element_row_field`, `_wide_text_field`); текст вырезки — `_read_crop` → `_crop_lines` |
-| `DRAWING_SHEETS_PER_PAGE` | `false` | `core/ladder/context.py::_classify_pdf` → `_raster_sheet_pages` (признак `raster_sheet_pages`); `core/drawing_processor.py::_sheet_drawings` → `_per_page_sheets` |
+| `DRAWING_SHEETS_PER_PAGE` | `false` | `core/ladder/context.py::_classify_pdf` → `_raster_sheet_pages` (признак `raster_sheet_pages`); `core/drawing_processor.py::_sheet_drawings`, `_pages_read_whole` → `_per_page_sheets`, `_sheet_full_read`, `_sheet_page_list` |
 | `DRAWING_KEEP_TITLE_BLOCK_REGION` | `false` | `core/providers/drawing_vision.py::analyse` (до среза `DRAWING_MAX_REGIONS`) |
 | `DRAWING_STAMP_FALLBACK_GOST` | `false` | `core/providers/drawing_vision.py::fallback_title_block` → `gost_fallback_box`; dpi — `core/drawing_processor.py::_image_dpi` |
 | `DRAWING_PASSES_BY_GEOMETRY` | `false` | `core/drawing_processor.py::_process` → `_sheet_by_geometry` (шероховатость в углу, поле подшивки, «что изображено») |
@@ -318,6 +318,7 @@
 | `SOURCE_PREFIX`, `SOURCE_PROBE_EXTENSIONS`, `S3_ATTACHMENTS_BUCKET` | `documents/` | `core/providers/file_locator.py` | где ищется файл |
 | `DRAWING_STAMP_MAX_SIDE` | `0` (= `QWEN_REGION_MAX_SIDE`) | `core/drawing_processor.py::_read_title_block` → `qwen_client.read_title_block(max_side)` | сторона вырезки штампа (N-15) |
 | `DRAWING_CROP_MIN_AREA`, `DRAWING_CROP_MAX_PER_DOC` | `0.02` / `12` | `core/drawing_processor.py::_crop_gate` (при `DRAWING_CROP_GATE`) | какие вырезки MinerU уходят в модель (N-06) |
+| `DRAWING_SHEETS_PER_PAGE_MAX` | `40` | `core/drawing_processor.py::_sheet_page_list` (из `_sheet_drawings`, `_pages_read_whole`) | потолок листов при чтении по страницам |
 | `DRAWING_CROPS_PARALLEL` | `1` | `core/drawing_processor.py::_enrich_fragments` → `_read_crops_parallel` | вырезок разных страниц разом (N-20) |
 | `MAX_IMAGE_PIXELS`, `CONFIDENCE_THRESHOLD`, `HF_TOKEN` | — | **никто** (объявлены в `core/config.py`, чтений в коде нет) | — |
 
