@@ -79,6 +79,10 @@ KEY_SETTINGS: Tuple[str, ...] = (
     # D4: плитки крупного листа и дочитывание вырезками (через qwen_client)
     "DRAWING_NATIVE_MIN_SCALE", "DRAWING_REREAD_MAX_CROPS", "DRAWING_REREAD_MAX_SIDE",
     "DRAWING_SHEET_NATIVE_TILES",
+    # Крупный лист плитками в родном разрешении (25.11)
+    "DRAWING_NATIVE_TILES", "DRAWING_NATIVE_TILES_MIN_CAP_PX", "DRAWING_NATIVE_TILES_DPI",
+    "DRAWING_NATIVE_TILES_MIN_DPI", "DRAWING_NATIVE_TILES_MAX_SIDE", "DRAWING_NATIVE_TILES_OVERLAP",
+    "DRAWING_NATIVE_TILES_MAX", "DRAWING_NATIVE_TILES_MAX_TOKENS", "DRAWING_NATIVE_TILES_RENDER_MAX_MP",
     "DRAWING_SHEET_GUARDED", "DRAWING_SHEET_HIGH_TOKENS", "DRAWING_SHEET_MAX_ITEMS",
     "DRAWING_SHEET_MAX_TOKENS", "DRAWING_SHEET_SCHEMA", "DRAWING_SHEET_TILES",
     "DRAWING_SHEET_TILE_GRID", "DRAWING_SHEET_TILE_NEAR", "DRAWING_SHEET_TILE_OVERLAP",
@@ -122,7 +126,7 @@ KEY_SETTINGS: Tuple[str, ...] = (
 NOT_IN_KEY: Tuple[str, ...] = (
     "ARTIFACTS_MOUNT", "CELERY_BROKER_URL",
     "VLM_SAME_REQUEST_ONCE",  # только повторное использование ответа модели, вывод тот же
-    "DRAWING_PASSES_PARALLEL", "DRAWING_TRANSCRIBE_TILE_PARALLEL",
+    "DRAWING_PASSES_PARALLEL", "DRAWING_TRANSCRIBE_TILE_PARALLEL", "DRAWING_NATIVE_TILES_PARALLEL",
     "GPU_GATE_BUSY_HOURS_UTC", "GPU_GATE_ENABLED", "GPU_GATE_MINERU_SLOTS_DAY",
     "GPU_GATE_MINERU_SLOTS_NIGHT", "GPU_GATE_VLM_SLOTS_DAY", "GPU_GATE_VLM_SLOTS_NIGHT",
     "GPU_GATE_YIELD_ON_WAITING",
@@ -201,8 +205,23 @@ def code_digest() -> str:
         return _code_digest
 
 
+# Настройки, которые в ключе только при включённом флаге: с выключенным
+# флагом они ничего не меняют, и ключ остаётся прежним — кэш, собранный до
+# флага, не теряется.
+WHEN_ON: Dict[str, Tuple[str, ...]] = {
+    "DRAWING_NATIVE_TILES": (
+        "DRAWING_NATIVE_TILES", "DRAWING_NATIVE_TILES_MIN_CAP_PX", "DRAWING_NATIVE_TILES_DPI",
+        "DRAWING_NATIVE_TILES_MIN_DPI", "DRAWING_NATIVE_TILES_MAX_SIDE", "DRAWING_NATIVE_TILES_OVERLAP",
+        "DRAWING_NATIVE_TILES_MAX", "DRAWING_NATIVE_TILES_MAX_TOKENS", "DRAWING_NATIVE_TILES_RENDER_MAX_MP",
+    ),
+}
+
+
 def settings_snapshot() -> Dict[str, Any]:
-    return {name: getattr(settings, name, None) for name in KEY_SETTINGS}
+    hidden = {
+        name for flag, names in WHEN_ON.items() if not getattr(settings, flag, False) for name in names
+    }
+    return {name: getattr(settings, name, None) for name in KEY_SETTINGS if name not in hidden}
 
 
 def cache_key(file_sha256: str, file_type: str, metadata: Optional[Dict[str, Any]]) -> str:
