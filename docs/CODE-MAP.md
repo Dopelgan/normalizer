@@ -227,6 +227,10 @@
 | `DRAWING_SENSE_RULES` | `false` | `core/drawing_processor.py::_enrich_fragments` и `_dimension_links` → `core/providers/sense_rules.py` (`apply`, `check_links`) |
 | `DRAWING_SENSE_POSITIONS` | `false` | `core/providers/sense_rules.py::_position_rule` (из `apply_page`) |
 | `DRAWING_THICKNESS_EVIDENCE` | `false` | `core/providers/sense_rules.py` (`apply` → `_page_texts`; `apply_page` → толщина из примечаний, `_sheet_metal` для `_reference_thickness_rule`) |
+| `DRAWING_SENSE_CLASS_RULES` | `false` | `core/providers/sense_rules.py::_class_rule` (из `apply_page`) |
+| `DRAWING_SENSE_SPEC_POSITIONS` | `false` | `core/providers/sense_rules.py` (`apply` → `spec_positions`; `apply_page` → `_spec_position_rule`) |
+| `DRAWING_SENSE_RA_SERIES` | `false` | `core/providers/sense_rules.py` (`apply_page` → `_ra_series_rule`, `ra_series_fix`) |
+| `DRAWING_CORNER_ROUGHNESS_V2` | `false` | `core/providers/sense_rules.py` (`apply_page` → `_corner_rule`, `general_roughness`) |
 | `DRAWING_MARGIN_DATE_FIX` | `false` | `core/providers/title_block.py::fix_month_year` (из `parse`), `core/providers/margin_columns.py::parse` |
 | `DRAWING_FIELDS_FROM_TEXT` | `false` | `core/drawing_processor.py::process` → `_fields_from_text` (`_text_cells`, `_text_category`); фильтр в `_what_drawn_pass` |
 | `DRAWING_KEEP_REPEATS` | `false` | `core/drawing_processor.py::_deduplicate` → `_deduplicate_by_place` (`_same_place`) |
