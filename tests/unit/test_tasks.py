@@ -614,3 +614,109 @@ class TestHelpers:
         tasks.finalize("req-2", "f1", document)
 
         published.assert_called_once()
+
+
+@pytest.mark.usefixtures("pipeline")
+class TestBuildFingerprint:
+    """N-12 (NORMALIZER_FINGERPRINT_REPARSE): отпечаток сборки и переразбор."""
+
+    @staticmethod
+    def _extra(task_db, doc_id):
+        session = task_db()
+        try:
+            return dict(DocumentRepository(session).get(doc_id).extra_data or {})
+        finally:
+            session.close()
+
+    def test_flag_off_ignores_build_and_has_no_key(self, pipeline, monkeypatch, task_db):
+        monkeypatch.setattr(tasks.settings, "NORMALIZER_FINGERPRINT_REPARSE", False)
+        init_request_state("fp-1", ["file-fp"])
+        first = process_document("fp-1", "file-fp")
+        monkeypatch.setenv("RELEASE_SHA", "другая-сборка")
+        init_request_state("fp-2", ["file-fp"])
+        assert process_document("fp-2", "file-fp")["status"] == "already_processed"
+        assert len(pipeline.calls) == 1
+        assert "build_fingerprint" not in self._extra(task_db, first["doc_id"])
+        assert "build_fingerprint" not in get_request_state("fp-2")["documents"][0]
+
+    def test_other_build_is_reparsed_same_build_is_not(self, pipeline, monkeypatch, task_db):
+        monkeypatch.setattr(tasks.settings, "NORMALIZER_FINGERPRINT_REPARSE", True)
+        monkeypatch.setenv("RELEASE_SHA", "сборка-1")
+        init_request_state("fp-1", ["file-fp"])
+        first = process_document("fp-1", "file-fp")
+        stored = self._extra(task_db, first["doc_id"])["build_fingerprint"]
+        assert stored["release_sha"] == "сборка-1"
+        assert get_request_state("fp-1")["documents"][0]["build_fingerprint"] == stored
+
+        init_request_state("fp-2", ["file-fp"])
+        assert process_document("fp-2", "file-fp")["status"] == "already_processed"
+        assert get_request_state("fp-2")["documents"][0]["build_fingerprint"] == stored
+
+        monkeypatch.setenv("RELEASE_SHA", "сборка-2")
+        init_request_state("fp-3", ["file-fp"])
+        assert process_document("fp-3", "file-fp")["status"] == "success"
+        assert len(pipeline.calls) == 2
+
+    def test_parse_affecting_flag_changes_fingerprint(self, pipeline, monkeypatch):
+        monkeypatch.setattr(tasks.settings, "NORMALIZER_FINGERPRINT_REPARSE", True)
+        init_request_state("fp-1", ["file-fp"])
+        process_document("fp-1", "file-fp")
+        monkeypatch.setattr(tasks.settings, "DRAWING_ROBUST_PASSES", True)
+        init_request_state("fp-2", ["file-fp"])
+        assert process_document("fp-2", "file-fp")["status"] == "success"
+
+    def test_reparse_replaces_stale_extra_keys(self, pipeline, monkeypatch, task_db):
+        init_request_state("fp-1", ["file-fp"])
+        first = process_document("fp-1", "file-fp")
+        session = task_db()
+        with session.begin():
+            DocumentRepository(session).update_extra(first["doc_id"], {"drawing_route": "прежний"})
+        session.close()
+        monkeypatch.setattr(tasks.settings, "NORMALIZER_FINGERPRINT_REPARSE", False)
+        init_request_state("fp-2", ["file-fp"])
+        process_document("fp-2", "file-fp", operation="update")
+        assert self._extra(task_db, first["doc_id"])["drawing_route"] == "прежний"
+        monkeypatch.setattr(tasks.settings, "NORMALIZER_FINGERPRINT_REPARSE", True)
+        init_request_state("fp-3", ["file-fp"])
+        process_document("fp-3", "file-fp", operation="update")
+        assert "drawing_route" not in self._extra(task_db, first["doc_id"])
+
+    def test_release_sha_from_file(self, monkeypatch, tmp_path):
+        from core import build_fingerprint
+
+        monkeypatch.delenv("RELEASE_SHA", raising=False)
+        path = tmp_path / "RELEASE_SHA"
+        path.write_text("abc123\n", encoding="utf-8")
+        monkeypatch.setattr(tasks.settings, "RELEASE_SHA_FILE", str(path))
+        assert build_fingerprint.release_sha() == "abc123"
+        monkeypatch.setattr(tasks.settings, "RELEASE_SHA_FILE", str(tmp_path / "нет"))
+        assert build_fingerprint.release_sha() == "unknown"
+
+
+@pytest.mark.usefixtures("pipeline")
+class TestIdempotentByHash:
+    """BUG-01 (NORMALIZER_IDEMPOTENT_BY_HASH): другой файл по тому же пути."""
+
+    def test_other_bytes_at_same_path(self, pipeline, monkeypatch, temp_storage):
+        uri = "documents/file-h.pdf"
+
+        def run(flag):
+            monkeypatch.setattr(tasks.settings, "NORMALIZER_IDEMPOTENT_BY_HASH", flag)
+            temp_storage.write_file(uri, b"%PDF-1.4 old")
+            init_request_state(f"h-{flag}-1", ["file-h"])
+            process_document(f"h-{flag}-1", "file-h", operation="update")
+            temp_storage.write_file(uri, b"%PDF-1.4 new and different")
+            init_request_state(f"h-{flag}-2", ["file-h"])
+            return process_document(f"h-{flag}-2", "file-h")["status"]
+
+        assert run(False) == "already_processed"       # прежний разбор чужого файла
+        assert run(True) == "success"
+
+    def test_same_bytes_still_reused(self, pipeline, monkeypatch, temp_storage):
+        monkeypatch.setattr(tasks.settings, "NORMALIZER_IDEMPOTENT_BY_HASH", True)
+        temp_storage.write_file("documents/file-s.pdf", b"%PDF-1.4 same")
+        init_request_state("s-1", ["file-s"])
+        process_document("s-1", "file-s")
+        init_request_state("s-2", ["file-s"])
+        assert process_document("s-2", "file-s")["status"] == "already_processed"
+        assert len(pipeline.calls) == 1
