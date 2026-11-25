@@ -386,6 +386,9 @@ def _carry_link(field: DrawingField, primary: Fragment, crop: Fragment, crop_fie
     moved.target_bbox = [round(v, 4) for v in _to_page(link.target_bbox, frame)]
     moved.leader = [[round(fx1 + float(p[0]) * w, 4), round(fy1 + float(p[1]) * h, 4)]
                     for p in link.leader if len(p) == 2]
+    if link.edges:
+        moved.edges = [[round(fx1 + float(p[0]) * w, 4), round(fy1 + float(p[1]) * h, 4)]
+                       for p in link.edges if len(p) == 2]
     field.link = moved
 
 

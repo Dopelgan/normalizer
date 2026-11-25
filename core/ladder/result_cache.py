@@ -71,6 +71,8 @@ KEY_SETTINGS: Tuple[str, ...] = (
     "DRAWING_INNER_FRAME_EXTENT", "DRAWING_MARGIN_DATE_FIX",
     # N-S1: свидетельства толщины листа меняют поля чертежа
     "DRAWING_THICKNESS_EVIDENCE",
+    # N-G1: размерные линии на растре меняют связи полей чертежа
+    "DRAWING_DIMENSION_GEOMETRY",
     # Карточки B, D, E: меняют запрос к модели, а значит и разбор.
     "DRAWING_VLM_STABLE", "DRAWING_SHEET_CONTENT_PASS", "DRAWING_SHEET_CONTENT_MAX_SIDE",
     "DRAWING_FIELDS_FROM_TEXT", "DRAWING_KEEP_REPEATS",

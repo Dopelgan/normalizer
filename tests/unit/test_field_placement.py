@@ -87,6 +87,17 @@ def test_link_coordinates_follow_the_field():
     assert _close(moved.leader[1], [0.6, 0.6])
 
 
+def test_raster_link_edges_follow_the_field():
+    # Точки на кромках (DRAWING_DIMENSION_GEOMETRY) переносятся как концы линии.
+    link = DimensionLink(target_label="размер по горизонтали", target_bbox=[0.5, 0.5, 0.6, 0.6],
+                         leader=[[0.5, 0.5], [1.0, 0.5]], method="raster", confidence=0.8,
+                         axis="horizontal", span_px=200, edges=[[0.5, 1.0], [1.0, 1.0]])
+    crop = _drawing([_field("size", "40", [0.1, 0.1, 0.2, 0.2], link=link)], [0.2, 0.2, 0.6, 0.6])
+    fp.apply([crop])
+    moved = crop.content.structured_drawing_fields[0].link
+    assert _close(moved.edges[1], [0.6, 0.6]) and moved.span_px == 200
+
+
 def test_default_bbox_is_only_the_crop_region():
     crop = _drawing([_field("note", "Линия сгиба", [0, 0, 1, 1])], [0.5, 0.1, 0.9, 0.5])
     fp.apply([crop])

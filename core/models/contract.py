@@ -264,8 +264,26 @@ class DimensionLink(BaseModel):
     target_label: str
     target_bbox: List[float]
     leader: List[List[float]] = Field(default_factory=list)
-    method: Literal["vector", "vlm"]
+    method: Literal["vector", "vlm", "raster"]
     confidence: float = Field(0.0, ge=0, le=1)
+    # Геометрия размерной линии на растре (DRAWING_DIMENSION_GEOMETRY,
+    # `method: "raster"`): вид величины, ось и длина размерной линии в
+    # пикселях листа, роль по виду, точки на кромках элемента (дальние концы
+    # выносных) и согласие масштаба внутри вида. Без флага ключей нет вовсе.
+    dimension_kind: Optional[Literal["linear", "diameter", "radius"]] = None
+    axis: Optional[Literal["horizontal", "vertical"]] = None
+    span_px: Optional[int] = None
+    extent_role: Optional[Literal["overall", "edge", "inner"]] = None
+    edges: Optional[List[List[float]]] = None
+    scale_ok: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _without_unset_geometry(self, handler):
+        data = handler(self)
+        for key in ("dimension_kind", "axis", "span_px", "extent_role", "edges", "scale_ok"):
+            if isinstance(data, dict) and data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class DrawingField(BaseModel):

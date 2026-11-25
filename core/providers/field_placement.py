@@ -180,6 +180,11 @@ def place_fragment(fragment: Fragment) -> None:
             field.link.leader = [list(map(lambda c: round(c, 4),
                                           point_to_page(p[0], p[1], frame, angle, turn, size)))
                                  for p in field.link.leader if len(p) == 2]
+            if field.link.edges:
+                # Точки на кромках элемента (DRAWING_DIMENSION_GEOMETRY) — тем же переносом.
+                field.link.edges = [list(map(lambda c: round(c, 4),
+                                             point_to_page(p[0], p[1], frame, angle, turn, size)))
+                                    for p in field.link.edges if len(p) == 2]
     payload["coordinate_reference"] = PAGE
     fragment.content.structured_payload = payload
 
