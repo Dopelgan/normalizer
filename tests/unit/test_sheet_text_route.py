@@ -240,6 +240,21 @@ class TestCollapseReread:
         out = DrawingProcessor(storage, qwen=qwen)._guard_empty_sheet(self._layout(), reading, 60, 0.0)
         assert out is not reading and out.native_tiles == {"grid": [2, 2], "read": 0}
 
+    def test_reread_respects_tile_reserve(self, storage, monkeypatch):
+        # Осталось 170 с бюджета листа, но 60 из них — запас плиток: на вызов
+        # модели (120 с) не хватает, перечитывания нет.
+        from core.providers import gpu_gate
+
+        monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 420)
+        monkeypatch.setattr(settings, "DRAWING_SHEET_TILE_RESERVE", 60)
+        monkeypatch.setattr(settings, "VLM_TIMEOUT", 120)
+        monkeypatch.setattr(gpu_gate, "budget_now", lambda: 250.0)
+        qwen = self.Qwen(tiles_items=100)
+        payload = {}
+        DrawingProcessor(storage, qwen=qwen)._guard_collapsed_sheet(
+            self._layout(), self._reading(2), 60, 0.0, payload)
+        assert qwen.calls == 0 and payload["collapse_reread"]["skipped"] == "time_budget"
+
 
 class TestRejectDetails:
     @pytest.mark.parametrize("content, finish, reason", [
