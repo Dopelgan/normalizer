@@ -122,6 +122,7 @@
 | Разметка частей обычного документа | `core/document_parts.py` | — |
 | Учёт разбора в сторону от индекса (`DRAWING_DIAGNOSTICS_NOT_INDEXED`) | `core/contract_finalize.py` | `_diagnostics_aside` |
 | Снятие устаревших источников | `core/drawing_stale_sources.py` | — |
+| Текст страницы-чертежа (штамп, ТТ) — модели (`DRAWING_ROUTE_SHEET_TEXT_VLM`) | `core/sheet_text_route.py` | `apply`; вызов — `DrawingProcessor._enrich_fragments` после `_stamp_pages` |
 | **Решение «чертёж против OCR»** | `core/ladder/drawing_route.py` | `settle` (173) — вызывается из `ingest/tasks.py:601`; `deferred` (84), `volume` (143), `lost` (320), `thinner_kept` (325) |
 
 **Сборщика и переупорядочивания строк листа нет.** Текст записи чертежа — строки
@@ -245,6 +246,9 @@
 | `DRAWING_INNER_FRAME_EXTENT` | `false` | `core/providers/drawing_vision.py::_inner_frame` → `_frame_rows` |
 | `DRAWING_STAMP_FALLBACK` | `false` | `core/drawing_processor.py::_process` → `core/providers/drawing_vision.py::fallback_title_block` |
 | `DRAWING_STAMP_ALL_PAGES` | `false` | `core/drawing_processor.py::enrich_fragments` → `_stamp_pages` → `_stamp_page` → `_read_title_block` |
+| `DRAWING_ROUTE_SHEET_TEXT_VLM` (+ `_MIN_SHARE`, `_MAX_BLOCKS`, `_DPI`) | `false` | `core/sheet_text_route.py` (`apply`, `_route_page`, `_is_drawing_page`, `_reread_block`); вызов — `core/drawing_processor.py::_enrich_fragments` после `_stamp_pages`; штамп — `_stamp_page`, текст — `qwen_client.transcribe` |
+| `DRAWING_COLLAPSE_REREAD` (+ `DRAWING_COLLAPSE_RATIO`, `DRAWING_COLLAPSE_MIN_LINES`) | `false` | `core/drawing_processor.py::_guard_collapsed_sheet` (из `_process` после `_guard_empty_sheet`) → `qwen_client.reread_sheet_by_tiles` |
+| `DRAWING_VLM_REJECT_DETAILS` (+ `DRAWING_VLM_REJECT_RAW_MAX`) | `false` | `core/providers/qwen_client.py` (`reject_reason`, `_log_rejected`, `_answer` → `_note_rejected`); в payload — `core/sheet_text_route.attach_rejected` из `_enrich_fragments` |
 | `DRAWING_WHAT_DRAWN` | `false` | `core/drawing_processor.py::_process` (запись листа) → `_enrich_fragments` → `_what_drawn_pass` → `core/providers/what_drawn.py`; `qwen_client.read_what_drawn` |
 | `DRAWING_BLOCK_CLEANUP` | `false` | `core/providers/mineru_parser.py` → `text_layer.reconcile_with_text_layer(drop_gibberish_tables)`; `field_placement.apply`; `DrawingProcessor._process` → `core/providers/block_cleanup.py` |
 

@@ -62,6 +62,8 @@ _shared: Optional[requests.Session] = None
 # Код отказа 4xx последнего вызова потока: по нему ограждённый проход листа
 # отличает «модель не приняла схему» от «модель не ответила».
 _rejection = threading.local()
+# Список отказов клиента (DRAWING_VLM_REJECT_DETAILS) пополняется из потоков проходов.
+_rejected_lock = threading.Lock()
 
 
 def shared_session() -> requests.Session:
@@ -177,20 +179,49 @@ def _non_empty(content: str, finish: Optional[str]) -> bool:
     return not (isinstance(data, dict) and not data)
 
 
+def reject_reason(content: str, finish: Optional[str]) -> str:
+    """
+    Почему ответ не принят — одним словом (DRAWING_VLM_REJECT_DETAILS): без
+    причины в логе не отличить оборванный ответ от пустого «{}», а разброс
+    от прогона к прогону разбирается именно по ней.
+    """
+    if finish == "length":
+        return "cut"
+    data = extract_json(content)
+    if data is None:
+        return "not_json"
+    if isinstance(data, dict) and not data:
+        return "empty_object"
+    return "check_failed"
+
+
 def _log_rejected(key: str, answer: Tuple[str, Optional[str]]) -> None:
     """
     Непринятый ответ модели — в лог и, с DRAWING_VLM_REJECTED_LOG, строкой
     JSON в файл: сырые отказы иначе нигде не хранятся (карточка E).
+    С DRAWING_VLM_REJECT_DETAILS — ещё причина и ответ целиком (до
+    DRAWING_VLM_REJECT_RAW_MAX символов): по началу ответа не видно, где он
+    сломался.
     """
     content, finish = answer
-    logger.warning("Ответ модели отбракован (%s, finish=%s): %.300s", key[:12], finish, content)
+    details = settings.DRAWING_VLM_REJECT_DETAILS
+    reason = reject_reason(content, finish) if details else None
+    if details:
+        logger.warning("Ответ модели отбракован (%s, finish=%s, причина %s): %.300s",
+                       key[:12], finish, reason, content)
+    else:
+        logger.warning("Ответ модели отбракован (%s, finish=%s): %.300s", key[:12], finish, content)
     path = settings.DRAWING_VLM_REJECTED_LOG
     if not path:
         return
+    record: Dict[str, Any] = {"key": key, "finish": finish, "head": content[:300],
+                              "length": len(content)}
+    if details:
+        record["reason"] = reason
+        record["raw"] = content[: max(0, int(settings.DRAWING_VLM_REJECT_RAW_MAX))]
     try:
         with open(path, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"key": key, "finish": finish, "head": content[:300],
-                                     "length": len(content)}, ensure_ascii=False) + "\n")
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError as exc:
         logger.warning("Лог отбракованных ответов не записан: %s", exc)
 
@@ -1568,10 +1599,31 @@ class QwenVisionClient:
             return answer
         if keep_rejected is not None and keep_rejected(*answer):
             rejected_put(key, answer)
-        if settings.DRAWING_VLM_STABLE or settings.DRAWING_VLM_REJECTED_LOG:
+        if (settings.DRAWING_VLM_STABLE or settings.DRAWING_VLM_REJECTED_LOG
+                or settings.DRAWING_VLM_REJECT_DETAILS):
             # Без флагов вызов прежний: отказ в лог не пишется.
             _log_rejected(key, answer)
+        if settings.DRAWING_VLM_REJECT_DETAILS:
+            self._note_rejected(key, answer)
         return answer
+
+    # Не больше стольких отказов на клиента в payload: запись документа не раздувается.
+    _REJECTED_KEEP = 20
+
+    def _note_rejected(self, key: str, answer: Tuple[str, Optional[str]]) -> None:
+        """
+        Отказ — в список клиента (DRAWING_VLM_REJECT_DETAILS): клиент живёт
+        один документ, и ветка чертежей кладёт список в payload
+        (`core/sheet_text_route.attach_rejected`). Проходы листа идут в
+        потоках — список под замком.
+        """
+        content, finish = answer
+        with _rejected_lock:
+            kept = self.__dict__.setdefault("rejected_answers", [])
+            if len(kept) >= self._REJECTED_KEEP:
+                return
+            kept.append({"key": key[:12], "reason": reject_reason(content, finish),
+                         "finish": finish, "length": len(content), "head": content[:500]})
 
     def _post(self, body: Dict[str, Any], **limits: Any) -> Optional[Dict[str, Any]]:
         """
