@@ -1450,3 +1450,24 @@ deskewed_page`), та же система, что у `bbox` поля, поэто
   (`kind`, `before`, `after`, `where`); в `structured_payload` его нет —
   оттуда снятая выдуманная фамилия попала бы в индекс.
 Код: `core/providers/lexicon_fix.py`. Откат — флаг выключен.
+
+## Отпечаток сборки и проверки разбора (25.11.2026)
+Без флагов ничего не меняется. С флагами:
+- `NORMALIZER_FINGERPRINT_REPARSE` — документ результата получает
+  необязательный ключ `build_fingerprint: {"release_sha": "<sha>",
+  "settings_sha256": "<hex>"}` (свежий разбор и повторная выдача из БД).
+  Без флага ключа нет вовсе. Потребитель может по нему отличить разборы
+  разных сборок; `create` файла, разобранного другой сборкой, — новый разбор;
+- `NORMALIZER_IDEMPOTENT_BY_HASH` — `create` по пути, где лежит уже другой
+  файл, даёт новый разбор, а не прежний; `content_hash` у файлов S3 больше
+  не пустой;
+- `DRAWING_CONFIRMED_CALIBRATED` — `DrawingField.confirmed` бывает `true`
+  у полей модели: уверенность на её максимуме и второй источник (согласие
+  прочтений, текстовый слой, переписанный текст листа);
+- `DRAWING_ROBUST_PASSES` — новое значение `missing_regions[].kind: "sheet"`
+  (`reason: "sheet_not_read"`): проход «лист целиком» не удался, штамп и
+  таблицы прочитаны;
+- `DRAWING_ASK_SALVAGE` — у таблицы в `structured_payload.tables[]`
+  необязательный `cut: true`, у фрагмента — `structured_payload.title_block_cut: true`.
+Код: `core/build_fingerprint.py`, `ingest/tasks.py`, `core/drawing_quality.py`,
+`core/drawing_processor.py`, `core/providers/qwen_client.py`. Откат — флаги выключены.
