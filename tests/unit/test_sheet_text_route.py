@@ -221,6 +221,25 @@ class TestCollapseReread:
         assert qwen.calls == 0 and out.annotations == self._reading(2).annotations
         assert payload["collapse_reread"]["skipped"] == "time_budget"
 
+    def test_sheet_read_by_native_tiles_is_not_reread(self, storage, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 0)
+        qwen = self.Qwen(tiles_items=100)
+        reading = self._reading(5)
+        reading.native_tiles = {"grid": [2, 2], "read": 4}
+        out = DrawingProcessor(storage, qwen=qwen)._guard_collapsed_sheet(
+            self._layout(), reading, 124, 0.0, {})
+        assert out is reading and qwen.calls == 0
+
+    def test_reread_keeps_native_tiles(self, storage, monkeypatch):
+        # Пустой ответ при плитках в родном разрешении перечитывается частями,
+        # но учёт плиток остаётся у нового прочтения.
+        monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 0)
+        qwen = self.Qwen(tiles_items=3)
+        reading = self._reading(0)
+        reading.native_tiles = {"grid": [2, 2], "read": 0}
+        out = DrawingProcessor(storage, qwen=qwen)._guard_empty_sheet(self._layout(), reading, 60, 0.0)
+        assert out is not reading and out.native_tiles == {"grid": [2, 2], "read": 0}
+
 
 class TestRejectDetails:
     @pytest.mark.parametrize("content, finish, reason", [

@@ -652,7 +652,8 @@ class DrawingProcessor:
         reading.rejected = REJECT_EMPTY
         budget = settings.DRAWING_TIME_BUDGET
         until = budget_started + budget - settings.DRAWING_SHEET_TILE_RESERVE if budget else None
-        return self.qwen.reread_sheet_by_tiles(layout.image, reading, hint=layout.hint(), until=until)
+        return _keep_native_tiles(
+            reading, self.qwen.reread_sheet_by_tiles(layout.image, reading, hint=layout.hint(), until=until))
 
     def _guard_collapsed_sheet(self, layout, reading, text_lines: int, budget_started: float,
                                payload: Dict[str, Any]):
@@ -665,7 +666,9 @@ class DrawingProcessor:
         поэтому перечитывание ничего не теряет. Ответ из кэша при повторе
         вернулся бы тем же, поэтому частями, а не тем же вызовом.
         """
-        if reading.tiles or text_lines < settings.DRAWING_COLLAPSE_MIN_LINES:
+        # Лист, уже прочитанный плитками (обычными или в родном разрешении), —
+        # не схлопнувшийся ответ: перечитывать его частями ещё раз незачем.
+        if reading.tiles or reading.native_tiles or text_lines < settings.DRAWING_COLLAPSE_MIN_LINES:
             return reading
         if len(reading.annotations) >= settings.DRAWING_COLLAPSE_RATIO * text_lines:
             return reading
@@ -688,7 +691,7 @@ class DrawingProcessor:
             return reading
         payload["collapse_reread"] = {"items": before, "text_lines": text_lines,
                                       "items_after": len(reread.annotations), "kept": "tiles"}
-        return reread
+        return _keep_native_tiles(reading, reread)
 
     @staticmethod
     def _sheet_produced(reading) -> str:
@@ -2253,6 +2256,13 @@ def _layer_lines_by_page(fragments: List[Fragment]) -> Dict[int, int]:
             1 for line in fragment.content.text.splitlines() if line.strip()
         )
     return lines
+
+
+def _keep_native_tiles(before, after):
+    """Учёт плиток в родном разрешении не теряется при перечитывании листа."""
+    if after is not None and after is not before and before.native_tiles and not after.native_tiles:
+        after.native_tiles = dict(before.native_tiles)
+    return after
 
 
 def _guard_note(reading) -> Optional[Dict[str, Any]]:
