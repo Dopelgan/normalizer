@@ -142,6 +142,8 @@ _CROP_TABLE_RULES = 3
 _PDF_RENDER_LOCK = threading.Lock()
 # Кэш байтов документа (DRAWING_SOURCE_CACHE): листы читаются из потоков.
 _SOURCE_CACHE_LOCK = threading.Lock()
+# Пометка закрытого кэша документа: в нём больше ничего не ищется и не хранится.
+_CACHE_CLOSED = "\0closed"
 
 
 class _Either:
@@ -227,6 +229,7 @@ class DrawingProcessor:
     # документа — None, и каждый вызов читает хранилище сам.
     _source_cache: Optional[Dict[str, bytes]] = None
     _pdf_cache: Optional[Dict[str, Any]] = None
+    _source_uri: str = ""
 
     def __init__(
         self,
@@ -1108,7 +1111,9 @@ class DrawingProcessor:
         # документа), как их находит фрагмент листа.
         self._what_drawn_sheets = {}
         if settings.DRAWING_SOURCE_CACHE:
-            # Байты файлов и открытые PDF — на время документа (N-18).
+            # Байты исходника и открытый PDF — на время документа (N-18).
+            # Вырезки MinerU малы и читаются по разу: их байты не держатся.
+            self._source_uri = str(metadata.get("source_path") or "")
             self._source_cache = {}
             self._pdf_cache = {}
         try:
@@ -1137,6 +1142,9 @@ class DrawingProcessor:
         crops_sent = 0
         parallel_crops = max(1, int(settings.DRAWING_CROPS_PARALLEL or 1))
         crop_jobs: List[Tuple[int, Fragment]] = []
+        # Мягкий лимит задачи на вырезке (DRAWING_ROBUST_PASSES): прочитанные
+        # вырезки остаются, следующие в модель не уходят.
+        soft_limit = False
         for fragment in fragments:
             # Векторный чертёж уже разобран парсером по текстовому слою —
             # там точные значения и углы, читать нечего.
@@ -1183,14 +1191,22 @@ class DrawingProcessor:
                 result.append(fragment)
                 continue
             left = deadline.remaining()
-            if left is not None and left < settings.VLM_TIMEOUT:
+            if soft_limit or (left is not None and left < settings.VLM_TIMEOUT):
                 # До срока задачи не уложится даже один вызов модели: лучше
                 # сохранить документ с пометкой, чем потерять его целиком.
-                fragment.review_required = True
-                fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_SKIPPED_NO_TIME"]))
+                _mark_no_time(fragment)
                 result.append(fragment)
                 continue
-            result.append(self._read_crop(fragment, fragments, metadata, page_fields))
+            try:
+                result.append(self._read_crop(fragment, fragments, metadata, page_fields))
+            except SoftTimeLimitExceeded:
+                if not settings.DRAWING_ROBUST_PASSES:
+                    raise
+                logger.warning("Мягкий лимит задачи на вырезке %s: прочитанные вырезки остаются",
+                               fragment.content.image_ref)
+                soft_limit = True
+                _mark_no_time(fragment)
+                result.append(fragment)
         if crop_jobs:
             self._read_crops_parallel(crop_jobs, result, fragments, metadata, page_fields,
                                       parallel_crops)
@@ -1341,15 +1357,24 @@ class DrawingProcessor:
             by_page.setdefault(page, []).append((index, fragment))
         lists = {page: page_fields.setdefault(page, []) for page in by_page}
         abort = threading.Event()
+        # Законченные вырезки по месту в `result`: при мягком лимите задачи
+        # (DRAWING_ROBUST_PASSES) они остаются, даже если их страница не
+        # дочитана. После сбора (`closed`) поздние потоки сюда не пишут.
+        finished: Dict[int, Fragment] = {}
+        lock = threading.Lock()
+        closed = [False]
+
+        def keep(index: int, fragment: Fragment) -> None:
+            with lock:
+                if not closed[0]:
+                    finished[index] = fragment
 
         def run(page: int) -> List[Tuple[int, Fragment]]:
             done: List[Tuple[int, Fragment]] = []
             for index, fragment in by_page[page]:
                 left = deadline.remaining()
                 if abort.is_set() or (left is not None and left < settings.VLM_TIMEOUT):
-                    fragment.review_required = True
-                    fragment.warnings = list(dict.fromkeys(
-                        fragment.warnings + ["DRAWING_SKIPPED_NO_TIME"]))
+                    _mark_no_time(fragment)
                     done.append((index, fragment))
                     continue
                 try:
@@ -1359,6 +1384,7 @@ class DrawingProcessor:
                             in_pool=True)))
                 except deadline.Cancelled:
                     done.append((index, fragment))
+                keep(*done[-1])
             return done
 
         pool = ThreadPoolExecutor(max_workers=min(workers, len(by_page)),
@@ -1369,6 +1395,22 @@ class DrawingProcessor:
             for future in futures:
                 for index, fragment in future.result():
                     result[index] = fragment
+        except SoftTimeLimitExceeded:
+            abort.set()
+            if not settings.DRAWING_ROBUST_PASSES:
+                raise
+            # Мягкий лимит, пока вырезки читались разом: законченные остаются,
+            # недочитанные — картинками с пометкой нехватки времени.
+            with lock:
+                closed[0] = True
+                done = dict(finished)
+            for index, fragment in jobs:
+                if index in done:
+                    result[index] = done[index]
+                else:
+                    _mark_no_time(fragment)
+            logger.warning("Мягкий лимит задачи при чтении вырезок: прочитано %d из %d",
+                           len(done), len(jobs))
         except BaseException:
             # Обрыв задачи: вырезки из очереди не начинаются, начатые бросают
             # работу перед следующим вызовом модели (как у листов).
@@ -1594,46 +1636,40 @@ class DrawingProcessor:
         лестницы), а не только файл как одна картинка: PDF как растр не
         открывается, и ветка молча вернула бы пустой результат.
         """
-        full_read = self._full_read_image(metadata) or self._full_read_pdf(metadata)
-        # Листы по каждой странице (DRAWING_SHEETS_PER_PAGE, N-08): решает
-        # детектор страницы, а не доля чертежей в документе.
+        # Листы по каждой странице (DRAWING_SHEETS_PER_PAGE, N-08) заменяют
+        # только решение «документ — растровый чертёж» (половина первых 8
+        # страниц): ворота полного чтения и уже нарезанных вырезок прежние.
         per_page = self._per_page_sheets(metadata)
-        if per_page is not None:
-            full_read = full_read or self._per_page_full_read(metadata)
+        full_read = self._sheet_full_read(metadata, per_page)
+        raster_sheets = per_page is not None or self._source_is_raster_drawing(metadata)
         drawings = [fragment for fragment in fragments if fragment.type == "drawing"]
         drawn_pages = {int(f.position.page) for f in drawings if f.position is not None}
         # Нарезанные MinerU картинки листа — это виды, а не лист: штамп,
         # номер листа и примечания остаются за ними. При полном чтении
         # картинки лист читается целиком и в этом случае.
         only_undrawn = False
-        if per_page is None and not full_read and drawings:
+        if not full_read and drawings:
             # Листы без единого фрагмента drawing (повёрнутый лист, который
             # MinerU принял за таблицу) иначе не читались моделью вовсе.
             # Фрагмент без страницы не даёт сказать, какой лист уже прочитан.
             if (not settings.DRAWING_SHEET_MISSING_PAGES
                     or len(drawn_pages) == 0 or any(f.position is None for f in drawings)
-                    or not self._source_is_raster_drawing(metadata)):
+                    or not raster_sheets):
                 return []
             only_undrawn = True
-        if per_page is None and not full_read and not self._source_is_raster_drawing(metadata):
+        if not full_read and not raster_sheets:
             return []
 
         source_uri = str(metadata.get("source_path") or "")
         if not source_uri:
             return []
 
-        signals = (metadata.get("classification") or {}).get("signals") or {}
-        pages = list(signals.get("raster_drawing_pages") or signals.get("drawing_pages") or [1])
-        if per_page is not None:
-            pages = per_page
+        pages, limit = self._sheet_page_list(metadata, per_page)
         if only_undrawn:
             pages = [page for page in pages if int(page) not in drawn_pages]
             if not pages:
                 return []
         sheets: List[Fragment] = []
-        # Без потолка числа листов при чтении по страницам: ограничивает срок
-        # задачи (`_NO_TIME`), недочитанное — DRAWING_SHEETS_SKIPPED.
-        limit = len(pages) if per_page is not None else settings.DRAWING_MAX_SHEETS
         skipped = pages[limit:]
         chosen = pages[:limit]
         # Списки прочтений берутся здесь, в порядке страниц: потоки листов
@@ -1808,6 +1844,30 @@ class DrawingProcessor:
         found = sorted({int(page) for page in pages if int(page) >= 1})
         return found or None
 
+    def _sheet_full_read(self, metadata: Dict[str, Any], per_page: Optional[List[int]]) -> bool:
+        """
+        Читается ли лист со всем текстом: прежнее решение, а при чтении по
+        страницам — ещё флаг полного чтения своего типа файла (жанр
+        документа там не решает).
+        """
+        full_read = self._full_read_image(metadata) or self._full_read_pdf(metadata)
+        return full_read or (per_page is not None and self._per_page_full_read(metadata))
+
+    @staticmethod
+    def _sheet_page_list(metadata: Dict[str, Any],
+                         per_page: Optional[List[int]]) -> Tuple[List[Any], int]:
+        """
+        (страницы листов, потолок числа листов): чертёжные страницы из
+        классификации и DRAWING_MAX_SHEETS, а при чтении по страницам —
+        `raster_sheet_pages` и DRAWING_SHEETS_PER_PAGE_MAX. Остальное
+        уходит в DRAWING_SHEETS_SKIPPED.
+        """
+        if per_page is not None:
+            return list(per_page), max(0, int(settings.DRAWING_SHEETS_PER_PAGE_MAX))
+        signals = (metadata.get("classification") or {}).get("signals") or {}
+        pages = list(signals.get("raster_drawing_pages") or signals.get("drawing_pages") or [1])
+        return pages, settings.DRAWING_MAX_SHEETS
+
     @staticmethod
     def _per_page_full_read(metadata: Dict[str, Any]) -> bool:
         """Лист по странице читается со всем текстом — по флагу полного чтения своего типа."""
@@ -1828,13 +1888,13 @@ class DrawingProcessor:
         """
         if not settings.DRAWING_SKIP_SMALL_CROPS:
             return frozenset()
-        if not (self._full_read_image(metadata) or self._full_read_pdf(metadata)):
+        per_page = self._per_page_sheets(metadata)
+        if not self._sheet_full_read(metadata, per_page):
             return frozenset()
         if not str(metadata.get("source_path") or ""):
             return frozenset()      # без источника лист целиком не открыть
-        signals = (metadata.get("classification") or {}).get("signals") or {}
-        pages = list(signals.get("raster_drawing_pages") or signals.get("drawing_pages") or [1])
-        return frozenset(int(page) for page in pages[: settings.DRAWING_MAX_SHEETS])
+        pages, limit = self._sheet_page_list(metadata, per_page)
+        return frozenset(int(page) for page in pages[:limit])
 
     @staticmethod
     def _crop_covered_by_whole_page(fragment: Fragment, whole_pages: frozenset) -> bool:
@@ -2481,6 +2541,8 @@ class DrawingProcessor:
 
     def _read(self, uri: str) -> bytes:
         cache = self._source_cache
+        if cache is not None and (not uri or uri != self._source_uri):
+            cache = None
         if cache is not None:
             with _SOURCE_CACHE_LOCK:
                 cached = cache.get(uri)
@@ -2493,20 +2555,32 @@ class DrawingProcessor:
             return b""
         if cache is not None and data:
             with _SOURCE_CACHE_LOCK:
-                cache.setdefault(uri, data)
+                if not cache.get(_CACHE_CLOSED):
+                    cache.setdefault(uri, data)
         return data
 
     def _drop_source_cache(self) -> None:
         """Конец документа: байты отпускаются, открытые PDF закрываются (N-18)."""
-        documents = self._pdf_cache or {}
+        sources, documents = self._source_cache, self._pdf_cache
         self._source_cache = None
         self._pdf_cache = None
-        with _PDF_RENDER_LOCK:
-            for document in documents.values():
-                try:
-                    document.close()
-                except Exception:  # noqa: BLE001
-                    pass
+        self._source_uri = ""
+        if sources is not None:
+            with _SOURCE_CACHE_LOCK:
+                # Поток листа или вырезки, доживший до конца документа,
+                # держит ссылку на словарь: пометка не даёт ему снова его
+                # наполнить.
+                sources.clear()
+                sources[_CACHE_CLOSED] = True
+        if documents is not None:
+            with _PDF_RENDER_LOCK:
+                for name, document in list(documents.items()):
+                    try:
+                        document.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                documents.clear()
+                documents[_CACHE_CLOSED] = True
 
 
 # ===========================================================================
@@ -2618,6 +2692,12 @@ def _value_view_links() -> bool:
     настроек: pydantic отказывается заводить неизвестное поле даже на запись.
     """
     return bool(getattr(settings, "DRAWING_VALUE_VIEW_LINKS", False))
+
+
+def _mark_no_time(fragment: Fragment) -> None:
+    """Вырезка не прочитана: до срока задачи вызов модели не уложится."""
+    fragment.review_required = True
+    fragment.warnings = list(dict.fromkeys(fragment.warnings + ["DRAWING_SKIPPED_NO_TIME"]))
 
 
 def _image_dpi(image) -> Optional[float]:
@@ -2746,6 +2826,10 @@ def _render_pdf_page(data: bytes, page: int, dpi: Optional[float] = None,
     except ImportError:  # pragma: no cover
         return None
     with _PDF_RENDER_LOCK:
+        if documents is not None and documents.get(_CACHE_CLOSED):
+            # Кэш документа уже закрыт (поток пережил документ): PDF
+            # открывается и закрывается здесь же, как без кэша.
+            documents = None
         document = documents.get(key) if documents is not None else None
         keep = document is not None
         if document is None:

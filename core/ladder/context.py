@@ -349,7 +349,9 @@ def _classify_pdf(context: DocumentContext) -> Classification:
             if settings.DRAWING_SHEETS_PER_PAGE:
                 # Листы для чтения целиком — по каждой странице, на всех
                 # страницах; жанр ниже решается, как раньше, по первым.
-                signals["raster_sheet_pages"] = _raster_sheet_pages(context.data)
+                sheet_pages, sheet_checked = _raster_sheet_pages(context.data)
+                signals["raster_sheet_pages"] = sheet_pages
+                signals["raster_sheet_pages_checked"] = sheet_checked
             if checked and len(raster_pages) / checked >= _DRAWING_GENRE_SHARE:
                 drawing_pages = raster_pages
                 signals["drawing_share"] = round(len(raster_pages) / checked, 3)
@@ -477,29 +479,41 @@ def _is_sheet(verdict) -> bool:
     return verdict.is_drawing or bool(signals.get("frame") or signals.get("thin_line_frame"))
 
 
-def _raster_sheet_pages(data: bytes) -> list:
+def _raster_sheet_pages(data: bytes):
     """
     DRAWING_SHEETS_PER_PAGE: номера страниц скана, где детектор видит
     чертёж или рамку формата, — на всех страницах, а не на первых
     `_RASTER_DRAWING_PAGES`. Жанровый гейт по тексту страницы — как в
     `_raster_drawing_pages`: лист текста в рамке (ПОК, ТУ) листом чертежа
     не становится, если текст это показывает.
+
+    Возвращает (страницы, проверено страниц). Между страницами смотрится
+    срок задачи: при остатке меньше LADDER_MIN_REMAINING рендер
+    останавливается, непроверенные страницы листами не считаются.
     """
     try:
         import fitz
     except ImportError:  # pragma: no cover
-        return []
+        return [], 0
+    from core import deadline
     from core.providers import drawing_genre
 
     try:
         document = fitz.open(stream=data, filetype="pdf")
     except Exception as exc:  # noqa: BLE001
         logger.debug("Скан не открылся для поиска листов: %s", exc)
-        return []
+        return [], 0
     pages = []
+    checked = 0
     gate_on = drawing_genre.enabled()
     try:
         for index in range(document.page_count):
+            left = deadline.remaining()
+            if left is not None and left < settings.LADDER_MIN_REMAINING:
+                logger.warning("Поиск листов скана остановлен на стр. %d из %d: до срока задачи %.0f с",
+                               index + 1, document.page_count, left)
+                break
+            checked += 1
             png = document[index].get_pixmap(dpi=100).tobytes("png")
             if not _is_sheet(raster_drawing.analyse(png)):
                 continue
@@ -513,7 +527,7 @@ def _raster_sheet_pages(data: bytes) -> list:
             pages.append(index + 1)
     finally:
         document.close()
-    return pages
+    return pages, checked
 
 
 def _frame_sheet_pages(data: bytes, signals: Dict[str, Any]) -> None:
