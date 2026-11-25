@@ -26,6 +26,7 @@ from core import filetypes, telemetry
 from core.celery_app import app
 from core import deadline, outage
 from core import document_parts
+from core import build_fingerprint
 from core.config import settings
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import document_quality
@@ -336,6 +337,36 @@ def mark_unread_sheets(fragments, pages: List[int]) -> int:
     return marked
 
 
+def _same_build(doc_id: str, extra: Dict[str, Any]) -> bool:
+    """
+    Сохранённый разбор сделан этой же сборкой (NORMALIZER_FINGERPRINT_REPARSE):
+    тот же SHA выпуска и те же настройки разбора. Без флага — всегда да.
+    """
+    if not settings.NORMALIZER_FINGERPRINT_REPARSE:
+        return True
+    if build_fingerprint.matches(extra.get("build_fingerprint")):
+        return True
+    logger.info("Документ %s разобран другой сборкой (%s): разбирается заново",
+                doc_id, extra.get("build_fingerprint") or "без отпечатка")
+    return False
+
+
+def _same_bytes(doc_id: str, document, current_hash: Optional[str]) -> bool:
+    """
+    Сохранённый разбор сделан по этим же байтам (NORMALIZER_IDEMPOTENT_BY_HASH,
+    BUG-01). Хеш файла неизвестен или не записан у документа — не доказано,
+    разбирается заново. Без флага — всегда да.
+    """
+    if not settings.NORMALIZER_IDEMPOTENT_BY_HASH:
+        return True
+    if current_hash and document.file_hash == current_hash:
+        return True
+    logger.info("Документ %s: по тому же пути другой файл или хеш неизвестен "
+                "(было %s, стало %s) — разбирается заново",
+                doc_id, (document.file_hash or "нет")[:12], (current_hash or "нет")[:12])
+    return False
+
+
 def build_document_result(
     s3_fileid: str,
     document,
@@ -371,6 +402,8 @@ def build_document_result(
         # Повторная выдача обязана называть полноту так же, как свежий разбор.
         text_incomplete=extra.get("text_incomplete"),
         unread_text_pages=list(extra.get("unread_text_pages") or []),
+        build_fingerprint=(extra.get("build_fingerprint")
+                           if settings.NORMALIZER_FINGERPRINT_REPARSE else None),
     ).model_dump(mode="json")
 
 
@@ -507,13 +540,23 @@ def process_document(
         )
 
         # ------------------------------- 2. Идемпотентность и запись документа
+        # Хеш байтов файла до проверки идемпотентности (NORMALIZER_IDEMPOTENT_BY_HASH):
+        # doc_id — хеш пути, и другой файл по тому же пути иначе получал
+        # прежний разбор. Считается до транзакции, чтобы не держать строку
+        # документа под замком на время чтения файла. Без флага не считается.
+        current_hash: Optional[str] = None
+        if settings.NORMALIZER_IDEMPOTENT_BY_HASH and operation != "update":
+            with telemetry.measure("parse.file_hash"):
+                current_hash = result_cache.content_sha256(storage, located.uri)
         with session.begin():
             doc_repo = DocumentRepository(session)
             document = doc_repo.get(doc_id, for_update=True)
 
             if (document is not None and document.status == "indexed" and operation != "update"
                     and (document.extra_data or {}).get("processing_profile_version") == PROCESSING_PROFILE_VERSION
-                    and (document.extra_data or {}).get("page_coverage_version") == PAGE_COVERAGE_VERSION):
+                    and (document.extra_data or {}).get("page_coverage_version") == PAGE_COVERAGE_VERSION
+                    and _same_build(doc_id, document.extra_data or {})
+                    and _same_bytes(doc_id, document, current_hash)):
                 logger.info("Документ %s уже проиндексирован, отдаём из БД", doc_id)
                 fragments = [row_to_fragment(r) for r in ChunkRepository(session).get_by_doc_id(doc_id)]
                 cached = build_document_result(
@@ -647,6 +690,10 @@ def process_document(
             # Тот же sha256, что дал бы compute_file_hash; для S3 поле, как
             # и прежде, пустое.
             file_hash = cache_hash
+        elif current_hash:
+            # Уже посчитан для проверки идемпотентности, в том числе у S3:
+            # без записанного хеша следующая проверка не докажет тот же файл.
+            file_hash = current_hash
         else:
             with telemetry.measure("parse.file_hash"):
                 file_hash = compute_file_hash(storage, located.uri)
@@ -741,7 +788,14 @@ def process_document(
                 language=metadata["language"],
             )
             ladder = parse_result.ladder or {}
-            doc_repo.update_extra(doc_id, {
+            # С NORMALIZER_FINGERPRINT_REPARSE новый разбор заменяет extra_data
+            # целиком: ключи прежнего разбора (`drawing_route` и прочие
+            # необязательные) не переживают переразбор, и рядом лежит
+            # отпечаток сборки. Без флага — слияние, как прежде.
+            fingerprint = build_fingerprint.current() if settings.NORMALIZER_FINGERPRINT_REPARSE else None
+            write_extra = doc_repo.replace_extra if fingerprint is not None else doc_repo.update_extra
+            write_extra(doc_id, {
+                **({"build_fingerprint": fingerprint} if fingerprint is not None else {}),
                 # Поля контракта, которые нужно отдать и при повторной
                 # выдаче из БД, без нового разбора.
                 "mime_type": mime_type,
@@ -823,6 +877,7 @@ def process_document(
             review_required=review_required,
             text_incomplete=text_incomplete,
             unread_text_pages=parse_result.unread_text_pages,
+            build_fingerprint=fingerprint,
         ).model_dump(mode="json")
         finalize(request_id, s3_fileid, result, dialog_id, event_id)
 

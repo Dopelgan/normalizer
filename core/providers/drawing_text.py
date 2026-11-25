@@ -108,5 +108,36 @@ def looks_like_text(text: str) -> Tuple[bool, str]:
     if letters < 1:
         return False, "нет ни одной буквы или цифры"
     if letters / len(text) < 0.4:
+        if _symbols_enabled() and _symbolic_inscription(text, letters):
+            return True, ""
         return False, "больше половины символов — не буквы и не цифры"
     return True, ""
+
+
+# Чертёжные знаки, которые на листе — содержание, а не графика (N-01):
+# диаметр, допуск, градус, шероховатость, квадрат, угол, перпендикулярность,
+# параллельность, соосность, дуга, «×», справочная звёздочка, скобки
+# справочного размера, знаки отклонений, разделители чисел и дроби.
+_DRAWING_SIGNS = frozenset("⌀Ø∅±°√□∠⊥∥◎⌒×*()+−-–,./")
+
+
+def _symbols_enabled() -> bool:
+    from core.config import settings
+
+    return bool(getattr(settings, "DRAWING_TEXT_SYMBOLS", False))
+
+
+def _symbolic_inscription(text: str, letters: int) -> bool:
+    """
+    Надпись из чертёжных знаков и пары цифр («⌀ 5», «(+0,2)», «±2°»): знаки
+    считаются содержанием, пробелы — нет. Строка из одного повторённого
+    знака с цифрой («......1», «-----2») — по-прежнему обрывок графики.
+    """
+    signs = [character for character in text if character in _DRAWING_SIGNS]
+    if (letters + len(signs)) / len(text) < 0.4:
+        return False
+    if signs:
+        commonest = max(signs.count(sign) for sign in set(signs))
+        if commonest * 2 > len(text):
+            return False
+    return True
