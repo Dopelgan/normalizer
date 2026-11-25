@@ -134,6 +134,11 @@ NOT_IN_KEY: Tuple[str, ...] = (
     "VLM_CACHE_V1_FALLBACK", "VLM_RESPONSE_CACHE", "VLM_RESPONSE_CACHE_DIR",
     "DRAWING_VLM_REJECTED_LOG",  # только журнал отказов
     "VLM_SHEET_CONCURRENCY",
+    # Правка по словарям (C15): в ключ идёт не значение настроек, а отпечаток
+    # содержимого списков и только при включённом флаге (`cache_key`), чтобы
+    # с выключенным флагом ключ не менялся вовсе.
+    "DRAWING_LEXICON_FIX", "DRAWING_LEXICON_SIGNERS_PATH", "DRAWING_LEXICON_TERMS_PATH",
+    "DRAWING_LEXICON_GOST_PATH",
 )
 
 _ROOT_MODULE = "core.ladder.router"
@@ -205,6 +210,13 @@ def settings_snapshot() -> Dict[str, Any]:
     return {name: getattr(settings, name, None) for name in KEY_SETTINGS}
 
 
+def _lexicon_digest() -> Optional[str]:
+    """Отпечаток списков DRAWING_LEXICON_FIX; `None` — флаг выключен."""
+    from core.providers import lexicon_fix
+
+    return lexicon_fix.settings_digest()
+
+
 def cache_key(file_sha256: str, file_type: str, metadata: Optional[Dict[str, Any]]) -> str:
     material = {
         "format": _FORMAT,
@@ -215,6 +227,9 @@ def cache_key(file_sha256: str, file_type: str, metadata: Optional[Dict[str, Any
         "settings": settings_snapshot(),
         "code": code_digest(),
     }
+    lexicon = _lexicon_digest()
+    if lexicon is not None:
+        material["lexicon"] = lexicon
     blob = json.dumps(material, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
