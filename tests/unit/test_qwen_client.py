@@ -580,6 +580,30 @@ class TestContentPass:
         assert boxes[:4] == [[0.1, 0.1, 0.2, 0.2], [0.5, 0.5, 0.6, 0.6], None, None]
         assert merged.annotations[-1]["value"] == "R2"
 
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_unplaced_cleanup_drops_captions_and_pairs_loosely(self, mocker, flag):
+        # DRAWING_UNPLACED_CLEANUP: голые подписи граф и смешение алфавитов
+        # без пары не выходят; запись, отличная точкой, получает рамку пары.
+        mocker.patch.object(qwen_client.settings, "DRAWING_UNPLACED_CLEANUP", flag)
+        content = qwen_client.SheetReading(sheet_type="detail", annotations=[
+            {"category": "title_block", "value": "Копировал"},
+            {"category": "title_block", "value": "Справ. №"},
+            {"category": "title_block", "value": "Т.контр.:"},
+            {"category": "note", "value": "Гervasov"},
+            {"category": "title_block", "value": "ТАДУ 421451.003 СБ"},
+            {"category": "note", "value": "Острые кромки притупить"},
+            {"category": "material", "value": "12Х18Н10Т"}])
+        located = qwen_client.SheetReading(sheet_type="unknown", annotations=[
+            {"category": "title_block", "value": "ТАДУ 421451003 СБ", "bbox": [0.7, 0.9, 0.9, 0.92]}])
+        merged = qwen_client.merge_content(content, located)
+        values = [(a["value"], a.get("bbox")) for a in merged.annotations]
+        if flag:
+            assert values == [("ТАДУ 421451.003 СБ", [0.7, 0.9, 0.9, 0.92]),
+                              ("Острые кромки притупить", None), ("12Х18Н10Т", None)]
+        else:
+            assert len(values) == 8 and ("Копировал", None) in values
+            assert values[-1] == ("ТАДУ 421451003 СБ", [0.7, 0.9, 0.9, 0.92])
+
     def test_schema_requires_both_keys(self):
         schema = qwen_client.content_schema()["json_schema"]["schema"]
         assert schema["required"] == ["sheet_type", "annotations"]

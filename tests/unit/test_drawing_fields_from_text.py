@@ -145,3 +145,20 @@ def test_one_place_still_merges(monkeypatch):
     out = _deduplicate([{**SIZE_A, "confidence": 0.75}, near, region, sheet, whole])
     # Тот же размер рядом, без места, и графа штампа внутри области — одно поле.
     assert [(f["value"], f["confidence"]) for f in out] == [("15±0,1", 0.9), ("Масштаб: 1:1", 0.9)]
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_unplaced_cleanup_skips_bare_captions_and_mixed_script(monkeypatch, flag):
+    # Строки текста листа «Копировал», «Изм. Лист № докум.» — подписи граф
+    # без значения; «Гervasov» — сбой чтения. С DRAWING_UNPLACED_CLEANUP
+    # полями без места они не становятся, марка стали с двойниками остаётся.
+    from core.drawing_processor import _fields_from_text
+
+    monkeypatch.setattr(settings, "DRAWING_UNPLACED_CLEANUP", flag)
+    lines = ["Копировал", "Изм. Лист № докум.", "Справ. №", "Гervasov", "Лампа СКЛ 14", "12Х18Н10Т"]
+    # Нормализация пишет марку стали латиницей — сравнение по числу полей.
+    values = [f["value"] for f in _fields_from_text([], lines, [])]
+    if flag:
+        assert values[0] == "Лампа СКЛ 14" and len(values) == 2
+    else:
+        assert values[:5] == lines[:5] and len(values) == 6

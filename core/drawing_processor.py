@@ -73,7 +73,7 @@ from core.config import settings
 from core.models.contract import Content, DrawingField, Fragment, Position, Provenance
 from core.providers import (
     block_cleanup, dimension_fidelity, disputed_reread, drawing_text, drawing_vision, field_placement, gpu_gate,
-    raster_drawing, reading_reconcile, sense_rules, title_block, vector_drawing,
+    raster_drawing, reading_reconcile, sense_rules, title_block, unplaced_cleanup, vector_drawing,
 )
 from core.providers.qwen_client import (
     CATEGORIES, GUARD_MIN_TEXT_LINES, REJECT_EMPTY, QwenVisionClient,
@@ -2518,6 +2518,10 @@ def _fields_from_text(
             if found is None:
                 continue
             category, value = found
+            if settings.DRAWING_UNPLACED_CLEANUP and unplaced_cleanup.noise(value):
+                # Голая подпись графы («Копировал», «Справ. №») или смешение
+                # алфавитов в слове: без места такое поле проверить нечем.
+                continue
             key = _loose(value)
             bare = _loose(_LABEL.match(value).group(1)) if _LABEL.match(value) else key
             if not key or key in seen or key in exact or bare in exact:

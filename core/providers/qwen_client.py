@@ -1999,21 +1999,48 @@ def merge_content(content: "SheetReading", located: Optional["SheetReading"]) ->
     Надпись содержания получает рамку надписи прохода с той же записью (по
     порядку: повторы — по очереди); без пары — без рамки (разбор поставит
     рамку по умолчанию). Надписи прохода с рамками, которых в содержании
-    нет, добавляются: содержание полнее, но не всегда.
+    нет, добавляются: содержание полнее, но не всегда. С
+    DRAWING_UNPLACED_CLEANUP пара ищется и по записи без знаков и похожих
+    букв, а надпись без пары, которая не надпись листа (голая подпись графы,
+    смешение алфавитов), отбрасывается — см. `unplaced_cleanup`.
     """
-    pool: Dict[str, List[Dict[str, Any]]] = {}
-    for item in (located.annotations if located is not None else []):
-        pool.setdefault(_content_key(item.get("value")), []).append(item)
+    from core.providers import unplaced_cleanup
+
+    cleanup = settings.DRAWING_UNPLACED_CLEANUP
+    boxed = list(located.annotations if located is not None else [])
+    used = [False] * len(boxed)
+    pool: Dict[str, List[int]] = {}
+    by_loose: Dict[str, List[int]] = {}
+    for n, item in enumerate(boxed):
+        pool.setdefault(_content_key(item.get("value")), []).append(n)
+        if cleanup:
+            by_loose.setdefault(unplaced_cleanup.loose(item.get("value")), []).append(n)
+
+    def take(indexes: Sequence[int]) -> Optional[Dict[str, Any]]:
+        for n in indexes:
+            if not used[n]:
+                used[n] = True
+                return boxed[n]
+        return None
+
     merged: List[Dict[str, Any]] = []
     for item in content.annotations:
-        twins = pool.get(_content_key(item["value"]))
-        if twins:
-            twin = twins.pop(0)
+        twin = take(pool.get(_content_key(item["value"]), ()))
+        if twin is None and cleanup:
+            # DRAWING_UNPLACED_CLEANUP: пара и при разнице в точке, пробеле
+            # или похожей букве («ТАДУ 421451.003» и «ТАДУ 421451003»).
+            key = unplaced_cleanup.loose(item["value"])
+            twin = take(by_loose.get(key, ())) if key else None
+        if twin is not None:
             merged.append({**item, "bbox": twin.get("bbox")})
-        else:
-            merged.append(dict(item))
-    for rest in pool.values():
-        merged.extend(rest)
+            continue
+        reason = unplaced_cleanup.noise(item["value"]) if cleanup else None
+        if reason:
+            logger.debug("Надпись содержания без места отброшена (%s): %r", reason, item["value"])
+            continue
+        merged.append(dict(item))
+    for indexes in pool.values():
+        merged.extend(boxed[n] for n in indexes if not used[n])
     base = located if located is not None else SheetReading()
     sheet_type = content.sheet_type if content.sheet_type != "unknown" else base.sheet_type
     return SheetReading(sheet_type=sheet_type, annotations=merged, raw=base.raw, cut=base.cut,
