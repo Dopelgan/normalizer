@@ -226,6 +226,13 @@ class LadderRouter:
             for strategy in self.strategies
         )
         classification = context.classification
+        if drawing_route.skip_ocr_levels(context, [s.level for s in applicable]):
+            # Растровый чертёж прочитает целиком чертёжная ветка
+            # (LADDER_SKIP_OCR_ON_RASTER_DRAWING): Tesseract и второй проход
+            # MinerU по нему — только время до первого вызова модели.
+            logger.info("Уровни 4 и 6 пропущены для %s: растровый чертёж читается моделью целиком",
+                        context.uri)
+            applicable = [s for s in applicable if s.level not in drawing_route.OCR_LEVELS]
         # Полный текстовый слой: уровень 4 не запускается, его роль (мерка
         # сохранности и запас для чертёжной ветки) отдаётся уровню 2 — явно,
         # без пометки `is_fallback` на самом результате. Пропуск решается,
