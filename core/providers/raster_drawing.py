@@ -163,6 +163,22 @@ def analyse_image(image) -> RasterVerdict:
         "text_bands": text_bands,
     })
 
+    if (colourfulness > _COLOUR_PHOTO or whiteness < _WHITE_DOCUMENT) and _tinted_check_enabled():
+        # Тонированная бумага, синька, серый скан: цвет и тёмный фон ещё не
+        # фото. Линейная графика узнаётся по маске местного порога.
+        tinted = _tinted_line_sheet(work, numpy)
+        if tinted is not None:
+            tinted_frame, tinted_rules, tinted_ink = tinted
+            signals.update({"tinted_frame": tinted_frame, "tinted_rules": tinted_rules,
+                            "tinted_ink": round(tinted_ink, 4)})
+            if tinted_frame and tinted_rules >= 3 and _INK_BLANK <= tinted_ink <= _INK_DRAWING:
+                return RasterVerdict(
+                    KIND_DRAWING, 0.7,
+                    f"рамка формата и {tinted_rules} длинных линий на тонированном "
+                    f"листе после местного порога",
+                    signals,
+                )
+
     if colourfulness > _COLOUR_PHOTO:
         return RasterVerdict(
             KIND_PHOTO, 0.75, "цветовой разброс как у съёмки, а не у листа",
@@ -249,19 +265,113 @@ def analyse_image(image) -> RasterVerdict:
 # Помощники
 # ===========================================================================
 
-def open_image(data: bytes):
-    """Целая картинка из байтов. `None` — не открылась (обрезок, не растр)."""
+def open_image(data: bytes, frame: int = 0):
+    """
+    Целая картинка из байтов. `None` — не открылась (обрезок, не растр).
+
+    С RASTER_ALL_FRAMES `frame` — номер кадра многокадрового TIFF (с нуля;
+    кадра нет — `None`), и ориентация из EXIF применяется к картинке. Без
+    флага — первый кадр как есть, как раньше.
+    """
     try:
         from PIL import Image
     except ImportError:  # pragma: no cover
         return None
     try:
         image = Image.open(io.BytesIO(data))
+        if _all_frames_enabled():
+            if frame:
+                if frame >= getattr(image, "n_frames", 1):
+                    return None
+                image.seek(frame)
+            image.load()
+            return upright_exif(image)
         image.load()
         return image
     except Exception as exc:  # noqa: BLE001 — битый или обрезанный файл
         logger.debug("Растр не открылся: %s", exc)
         return None
+
+
+def frame_count(data: bytes) -> int:
+    """Число кадров картинки (многокадровый TIFF); не открылась — 0."""
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as image:
+            return int(getattr(image, "n_frames", 1) or 1)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def upright_exif(image):
+    """Картинка с применённой ориентацией EXIF (снимок с телефона)."""
+    try:
+        from PIL import ImageOps
+
+        turned = ImageOps.exif_transpose(image)
+        return image if turned is None else turned
+    except Exception as exc:  # noqa: BLE001 — битый EXIF не мешает разбору
+        logger.debug("Ориентация EXIF не применена: %s", exc)
+        return image
+
+
+def _all_frames_enabled() -> bool:
+    try:
+        from core.config import settings
+    except Exception:  # noqa: BLE001 — детектор работает и без настроек
+        return False
+    return bool(settings.RASTER_ALL_FRAMES)
+
+
+def _tinted_check_enabled() -> bool:
+    try:
+        from core.config import settings
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(settings.RASTER_TINTED_LINE_CHECK)
+
+
+# Местный порог (N-23): окно усреднения в пикселях рабочего размера и
+# насколько пиксель темнее (или светлее у синьки) местного фона.
+_LOCAL_WINDOW = 15
+_LOCAL_OFFSET = 18.0
+
+
+def _tinted_line_sheet(work, numpy):
+    """
+    (рамка, длинных линий, плотность графики) по маске местного порога
+    серого листа; берётся та полярность (тёмные линии на светлом или
+    светлые на тёмном, как у синьки), где видны рамка и больше линий.
+    `None` — маска не построилась.
+
+    Цвет фона и общая яркость здесь не участвуют: пиксель — линия, если он
+    заметно темнее среднего по своему окну. Тонированная бумага, синька и
+    серый скан дают ту же маску, что белый лист.
+    """
+    try:
+        from PIL import ImageFilter
+
+        grey_image = work.convert("L")
+        grey = numpy.asarray(grey_image, dtype=numpy.float32)
+        local = numpy.asarray(
+            grey_image.filter(ImageFilter.BoxBlur(_LOCAL_WINDOW)), dtype=numpy.float32)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Местный порог не построился: %s", exc)
+        return None
+    best = None
+    for mask in (grey < local - _LOCAL_OFFSET, grey > local + _LOCAL_OFFSET):
+        ink = float(mask.mean())
+        skew = _mask_skew(mask, numpy)
+        if skew:
+            mask = _rotate_mask(mask, skew, numpy)
+        rules = (_rule_bands(mask.sum(axis=1), mask.shape[1])
+                 + _rule_bands(mask.sum(axis=0), mask.shape[0]))
+        found = (_has_frame(mask), rules, ink)
+        # Полярность с рамкой и большим числом линий; пустая маска не выигрывает.
+        if best is None or found[:2] > best[:2]:
+            best = found
+    return best
 
 
 def _downscale(image, side: int):

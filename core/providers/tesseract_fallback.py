@@ -339,6 +339,10 @@ class TesseractFallbackProvider:
         if self._treat_as_image(local_path, file_type):
             if first_page > 1:
                 return []
+            if settings.RASTER_ALL_FRAMES:
+                # Многокадровый TIFF — каждый кадр страницей; ориентация EXIF
+                # применяется (RASTER_ALL_FRAMES).
+                return self._image_frames(local_path)
             try:
                 image = Image.open(local_path)
                 image.load()
@@ -346,6 +350,23 @@ class TesseractFallbackProvider:
                 raise OcrUnavailable(f"Изображение не открылось: {exc}") from exc
             return [(1, image)]
         return self._pdf_pages(local_path, first_page=first_page)
+
+    @staticmethod
+    def _image_frames(local_path: str):
+        """Кадры картинки по одному: (номер с единицы, кадр с ориентацией EXIF)."""
+        from PIL import ImageSequence
+
+        from core.providers import raster_drawing
+
+        try:
+            image = Image.open(local_path)
+            frames = []
+            for number, frame in enumerate(ImageSequence.Iterator(image), start=1):
+                frame.load()
+                frames.append((number, raster_drawing.upright_exif(frame.copy())))
+        except Exception as exc:  # noqa: BLE001
+            raise OcrUnavailable(f"Изображение не открылось: {exc}") from exc
+        return frames
 
     def _pdf_pages(self, local_path: str, first_page: int = 1):
         """
