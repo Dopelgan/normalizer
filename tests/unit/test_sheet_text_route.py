@@ -221,6 +221,40 @@ class TestCollapseReread:
         assert qwen.calls == 0 and out.annotations == self._reading(2).annotations
         assert payload["collapse_reread"]["skipped"] == "time_budget"
 
+    def test_sheet_read_by_native_tiles_is_not_reread(self, storage, monkeypatch):
+        monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 0)
+        qwen = self.Qwen(tiles_items=100)
+        reading = self._reading(5)
+        reading.native_tiles = {"grid": [2, 2], "read": 4}
+        out = DrawingProcessor(storage, qwen=qwen)._guard_collapsed_sheet(
+            self._layout(), reading, 124, 0.0, {})
+        assert out is reading and qwen.calls == 0
+
+    def test_reread_keeps_native_tiles(self, storage, monkeypatch):
+        # Пустой ответ при плитках в родном разрешении перечитывается частями,
+        # но учёт плиток остаётся у нового прочтения.
+        monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 0)
+        qwen = self.Qwen(tiles_items=3)
+        reading = self._reading(0)
+        reading.native_tiles = {"grid": [2, 2], "read": 0}
+        out = DrawingProcessor(storage, qwen=qwen)._guard_empty_sheet(self._layout(), reading, 60, 0.0)
+        assert out is not reading and out.native_tiles == {"grid": [2, 2], "read": 0}
+
+    def test_reread_respects_tile_reserve(self, storage, monkeypatch):
+        # Осталось 170 с бюджета листа, но 60 из них — запас плиток: на вызов
+        # модели (120 с) не хватает, перечитывания нет.
+        from core.providers import gpu_gate
+
+        monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 420)
+        monkeypatch.setattr(settings, "DRAWING_SHEET_TILE_RESERVE", 60)
+        monkeypatch.setattr(settings, "VLM_TIMEOUT", 120)
+        monkeypatch.setattr(gpu_gate, "budget_now", lambda: 250.0)
+        qwen = self.Qwen(tiles_items=100)
+        payload = {}
+        DrawingProcessor(storage, qwen=qwen)._guard_collapsed_sheet(
+            self._layout(), self._reading(2), 60, 0.0, payload)
+        assert qwen.calls == 0 and payload["collapse_reread"]["skipped"] == "time_budget"
+
 
 class TestRejectDetails:
     @pytest.mark.parametrize("content, finish, reason", [
@@ -260,3 +294,71 @@ class TestRejectDetails:
         row = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
         assert set(row) == {"key", "finish", "head", "length"}
         assert not hasattr(model, "rejected_answers")
+
+
+class TestRouteLimits:
+    def test_block_error_keeps_stamp_and_ocr(self, storage, flags):
+        class Failing(FakeQwen):
+            def transcribe(self, image):
+                raise RuntimeError("обрыв соединения")
+
+        qwen = Failing(block=title_block.parse(STAMP))
+        fragments = [_picture([0.05, 0.05, 0.7, 0.75]), _text(OCR_TT, [0.72, 0.1, 0.95, 0.4])]
+        out = _route(storage, qwen, fragments)
+        assert out[0].content.structured_payload["stamp_only"] is True
+        tt = next(f for f in out if f.fragment_id == "doc-1-frag-002")
+        assert tt.content.text == OCR_TT
+        assert tt.content.structured_payload["sheet_text_route"] == {"source": "ocr_fallback",
+                                                                     "reason": "vlm_error"}
+
+    def test_spent_drawing_budget_stops_route(self, storage, flags, monkeypatch):
+        from core.providers import gpu_gate
+
+        clock = iter([0.0] + [1000.0] * 10)
+        monkeypatch.setattr(settings, "DRAWING_TIME_BUDGET", 100)
+        monkeypatch.setattr(gpu_gate, "budget_now", lambda: next(clock))
+        qwen = FakeQwen(lines=VLM_TT, block=title_block.parse(STAMP))
+        fragments = [_picture([0.05, 0.05, 0.7, 0.75]), _text(OCR_TT, [0.72, 0.1, 0.95, 0.4])]
+        out = _route(storage, qwen, fragments)
+        assert qwen.transcribed == [] and qwen.stamps == 0
+        assert len(out) == 2 and out[1].content.text == OCR_TT
+
+    def test_render_dpi_capped_by_megapixels(self, monkeypatch):
+        from core import sheet_text_route
+
+        monkeypatch.setattr(settings, "DRAWING_ROUTE_SHEET_TEXT_DPI", 300)
+        monkeypatch.setattr(settings, "DRAWING_ROUTE_SHEET_TEXT_RENDER_MAX_MP", 48.0)
+        assert sheet_text_route.render_dpi(595, 842) == 300  # A4
+        a0 = sheet_text_route.render_dpi(2384, 3370)
+        assert a0 < 300
+        assert (2384 / 72 * a0) * (3370 / 72 * a0) <= 48e6 * 1.001
+
+    def test_pdf_page_render_respects_cap(self, temp_storage, monkeypatch):
+        fitz = pytest.importorskip("fitz")
+        from core import sheet_text_route
+
+        document = fitz.open()
+        document.new_page(width=1190, height=842)  # A3
+        temp_storage.write_file("documents/sheet.pdf", document.tobytes())
+        monkeypatch.setattr(settings, "DRAWING_ROUTE_SHEET_TEXT_RENDER_MAX_MP", 2.0)
+        image = sheet_text_route._page_image(DrawingProcessor(temp_storage, qwen=FakeQwen()),
+                                             "documents/sheet.pdf", 1)
+        assert image.width * image.height <= 2e6 * 1.01
+        assert image.info["render_dpi"] < settings.DRAWING_ROUTE_SHEET_TEXT_DPI
+
+    def test_frame_check_runs_on_working_resolution(self, storage, monkeypatch):
+        from PIL import Image
+
+        from core import sheet_text_route
+        from core.providers import drawing_vision
+
+        monkeypatch.setattr(settings, "DRAWING_VISION_ENABLED", True)
+        monkeypatch.setattr(settings, "DRAWING_RENDER_DPI", 150)
+        seen = []
+        monkeypatch.setattr(drawing_vision, "analyse",
+                            lambda image: seen.append(image.size) or drawing_vision.SheetLayout(image=image))
+        page = Image.new("RGB", (3000, 2000), "white")
+        page.info["render_dpi"] = 300
+        processor = DrawingProcessor(storage, qwen=FakeQwen())
+        sheet_text_route._is_drawing_page([_picture([0.1, 0.1, 0.2, 0.2])], page, processor)
+        assert seen == [(1500, 1000)]

@@ -29,7 +29,10 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
+import math
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Sequence
 
 from celery.exceptions import SoftTimeLimitExceeded
@@ -68,19 +71,20 @@ def apply(processor, fragments: List[Fragment], metadata: Dict[str, Any]) -> Lis
     pages = _candidate_pages(fragments, whole_document)
     budget = [max(0, int(settings.DRAWING_ROUTE_SHEET_TEXT_MAX_BLOCKS))]
     stamps: List[Fragment] = []
-    for page in pages:
-        if not _time_left():
-            logger.warning("Текст страниц-чертежей не перечитан: до срока задачи мало времени")
-            break
-        try:
-            stamp = _route_page(processor, fragments, metadata, source_uri, page, whole_document, budget)
-        except (SoftTimeLimitExceeded, deadline.Cancelled):
-            raise
-        except Exception as exc:  # noqa: BLE001 — страница не роняет документ
-            logger.error("Текст страницы-чертежа %d не перечитан: %s", page, exc)
-            continue
-        if stamp is not None:
-            stamps.append(stamp)
+    with _budget():
+        for page in pages:
+            if not _time_left():
+                logger.warning("Текст страниц-чертежей не перечитан: исчерпан срок задачи или бюджет чертежей")
+                break
+            try:
+                stamp = _route_page(processor, fragments, metadata, source_uri, page, whole_document, budget)
+            except (SoftTimeLimitExceeded, deadline.Cancelled):
+                raise
+            except Exception as exc:  # noqa: BLE001 — страница не роняет документ
+                logger.error("Текст страницы-чертежа %d не перечитан: %s", page, exc)
+                continue
+            if stamp is not None:
+                stamps.append(stamp)
     for stamp in stamps:
         # Штамп встаёт перед фрагментами своей страницы: порядок страниц сохраняется.
         index = next((i for i, f in enumerate(fragments)
@@ -149,7 +153,15 @@ def _route_page(processor, fragments, metadata, source_uri: str, page: int,
             logger.warning("Текстовые блоки страницы %d не перечитаны: исчерпан предел вырезок или срок", page)
             break
         budget[0] -= 1
-        _reread_block(processor, fragment, image, box)
+        try:
+            _reread_block(processor, fragment, image, box)
+        except (SoftTimeLimitExceeded, deadline.Cancelled):
+            raise
+        except Exception as exc:  # noqa: BLE001 — сбой блока не теряет штамп страницы
+            # Штамп этой страницы уже прочитан: он возвращается, а блок
+            # остаётся с текстом OCR и причиной в учёте.
+            logger.error("Блок %s не перечитан: %s", fragment.fragment_id, exc)
+            _note(fragment, {"source": SOURCE_OCR, "reason": "vlm_error"})
     return stamp
 
 
@@ -165,7 +177,21 @@ def _is_drawing_page(pictures: Sequence[Fragment], image, processor) -> bool:
 
     if not processor.vision_enabled:
         return False
-    return bool(drawing_vision.analyse(image).frame)
+    return bool(drawing_vision.analyse(_analysis_image(image)).frame)
+
+
+def _analysis_image(image):
+    """
+    Рамку формата ищем на растре в рабочем разрешении чертежей
+    (DRAWING_RENDER_DPI), а не на рендере для вырезок: рамка видна и там, а
+    разбор листа в 300 dpi в разы дольше и тяжелее по памяти.
+    """
+    dpi = float((getattr(image, "info", None) or {}).get("render_dpi") or 0)
+    work = float(settings.DRAWING_RENDER_DPI or 0)
+    if dpi <= 0 or work <= 0 or work >= dpi:
+        return image
+    scale = work / dpi
+    return image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))))
 
 
 def _has_stamp(fragments: Sequence[Fragment], page: int) -> bool:
@@ -206,11 +232,30 @@ def _reread_block(processor, fragment: Fragment, image, box: List[float]) -> Non
         position.source_spans = []
         position.text_offsets_exact = False
         position.lines = None
+    _note(fragment, note)
+    logger.info("Блок %s: %s (OCR %d знаков, модель %d)", fragment.fragment_id,
+                note["source"], ocr_chars, vlm_chars)
+
+
+def _note(fragment: Fragment, note: Dict[str, Any]) -> None:
     payload = fragment.content.structured_payload or {}
     payload["sheet_text_route"] = note
     fragment.content.structured_payload = payload
-    logger.info("Блок %s: %s (OCR %d знаков, модель %d)", fragment.fragment_id,
-                note["source"], ocr_chars, vlm_chars)
+
+
+def render_dpi(width_pt: float, height_pt: float) -> float:
+    """
+    dpi рендера страницы для вырезок: DRAWING_ROUTE_SHEET_TEXT_DPI, но не
+    больше DRAWING_ROUTE_SHEET_TEXT_RENDER_MAX_MP мегапикселей на страницу
+    (A0 в 300 dpi — 140 Мп, 420 МБ в памяти) — как у плиток в родном
+    разрешении (`native_tiles.render_dpi`).
+    """
+    target = float(settings.DRAWING_ROUTE_SHEET_TEXT_DPI)
+    limit = float(settings.DRAWING_ROUTE_SHEET_TEXT_RENDER_MAX_MP) * 1e6
+    width_in, height_in = width_pt / 72.0, height_pt / 72.0
+    if width_in > 0 and height_in > 0 and limit > 0:
+        target = min(target, math.sqrt(limit / (width_in * height_in)))
+    return target
 
 
 def _page_image(processor, source_uri: str, page: int):
@@ -240,15 +285,51 @@ def _page_image(processor, source_uri: str, page: int):
         try:
             if not 1 <= page <= document.page_count:
                 return None
-            pixmap = document[page - 1].get_pixmap(dpi=settings.DRAWING_ROUTE_SHEET_TEXT_DPI)
-            return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+            rect = document[page - 1].rect
+            dpi = max(1, int(render_dpi(rect.width, rect.height)))
+            pixmap = document[page - 1].get_pixmap(dpi=dpi)
+            image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+            image.info["render_dpi"] = dpi
+            return image
         finally:
             document.close()
 
 
+# Начало бюджета прохода на часах `gpu_gate.budget_now` (без ожидания
+# места на видеокарте); None — вне `_budget`.
+_started: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "sheet_text_route_started", default=None)
+
+
+@contextmanager
+def _budget():
+    """
+    Проход по документу укладывается в DRAWING_TIME_BUDGET — тот же учёт,
+    что у листа в ветке чертежей: свои часы без ожидания видеокарты.
+    """
+    from core.providers import gpu_gate
+
+    with gpu_gate.budget_clock():
+        token = _started.set(gpu_gate.budget_now())
+        try:
+            yield
+        finally:
+            _started.reset(token)
+
+
 def _time_left() -> bool:
+    """Хватит ли на вызов модели и срока задачи, и бюджета чертежей."""
     left = deadline.remaining()
-    return left is None or left >= settings.VLM_TIMEOUT
+    if left is not None and left < settings.VLM_TIMEOUT:
+        return False
+    budget = settings.DRAWING_TIME_BUDGET
+    started = _started.get()
+    if budget and started is not None:
+        from core.providers import gpu_gate
+
+        if gpu_gate.budget_now() + settings.VLM_TIMEOUT > started + budget:
+            return False
+    return True
 
 
 def _bbox(fragment: Fragment) -> Optional[List[float]]:

@@ -344,3 +344,68 @@ def test_builder_tie_takes_nothing():
     names, _ = builder.cluster(collections.Counter({"Колбина": 6, "Колбино": 4}), 3, 0.5)
     # Второе написание частое — остаётся отдельной записью.
     assert names == ["Колбина", "Колбино"]
+
+
+# ------------------------------------------- текст листа и прочтения поля
+
+def test_dropped_scribble_leaves_text_and_readings(lexicon):
+    # Снятая «фамилия» по закорючке уходит и из текста листа, и из прочтений
+    # поля; сырое прочтение остаётся только в учёте.
+    sheet = drawing([field("Подп. и дата: Шварценбах Ш.Ш. 08.22 (рукописно)")],
+                    text="Изм. Лист\nПодп. и дата Шварценбах Ш.Ш. 08.22\nМасса 3,4")
+    only = sheet.content.structured_drawing_fields[0]
+    only.readings = [{"source": "sheet", "value": "Шварценбах Ш.Ш. 08.22"},
+                     {"source": "stamp", "value": "Шварценбах"}]
+    only.alternatives = ["Шварценбах Ш.Ш. 08.22", "08.22"]
+    lexicon_fix.apply([sheet], lexicon)
+    assert "Шварценбах" not in sheet.content.text
+    assert sheet.content.text == "Изм. Лист\nПодп. и дата 08.22\nМасса 3,4"
+    assert only.readings == [{"source": "sheet", "value": "08.22"}]
+    assert only.alternatives == ["08.22"]
+    assert "Шварценбах" not in json.dumps(sheet.content.model_dump(), ensure_ascii=False)
+    assert any(n["before"] == "Шварценбах Ш.Ш." for n in notes_of(sheet))
+
+
+def test_dropped_whole_field_leaves_text(lexicon):
+    sheet = drawing([field("Подп.: Хрюндиков")], text="Подп. Хрюндиков\nДата 08.22")
+    lexicon_fix.apply([sheet], lexicon)
+    assert values(sheet) == []
+    assert sheet.content.text == "Подп.\nДата 08.22"
+
+
+def test_snapped_name_replaces_misreading_in_readings(lexicon):
+    sheet = drawing([field("Пров.: Зорубякин")])
+    only = sheet.content.structured_drawing_fields[0]
+    only.readings = [{"source": "stamp", "value": "Зорубякин"}, {"source": "sheet", "value": "Пров. Зорубякин"}]
+    only.alternatives = ["Зорубякин"]
+    lexicon_fix.apply([sheet], lexicon)
+    assert [r["value"] for r in only.readings] == ["Зарубякин", "Пров. Зарубякин"]
+    assert only.alternatives == ["Зарубякин"]
+
+
+def test_text_changed_only_next_to_role_label(lexicon):
+    # Та же запись в другом месте листа — не графа подписанта: не трогается.
+    text = "Пров. Зорубякин\nСогласовано: Зорубякин\nТ. контр. Зорубякин"
+    sheet = drawing([field("Пров.: Зорубякин")], text=text)
+    lexicon_fix.apply([sheet], lexicon)
+    assert sheet.content.text == "Пров. Зарубякин\nСогласовано: Зорубякин\nТ. контр. Зорубякин"
+
+
+def test_text_label_synonym_and_block_key(lexicon):
+    sheet = drawing([], text="Проверил: Зорубякин\nЗорубякин", block={"checked": "Зорубякин"})
+    lexicon_fix.apply([sheet], lexicon)
+    assert sheet.content.text == "Проверил: Зарубякин\nЗорубякин"
+
+
+def test_text_unlocated_is_unchanged(lexicon):
+    sheet = drawing([field("Пров.: Зорубякин")], text="Зорубякин 12.03 Масса")
+    lexicon_fix.apply([sheet], lexicon)
+    assert values(sheet) == ["Пров.: Зарубякин"]
+    assert sheet.content.text == "Зорубякин 12.03 Масса"
+
+
+def test_term_in_text_only_on_field_line(lexicon):
+    sheet = drawing([field("Сдувка")], text="Сдувка\nСдувка 12 шт. по месту")
+    lexicon_fix.apply([sheet], lexicon)
+    assert values(sheet) == ["Сдвижка"]
+    assert sheet.content.text == "Сдвижка\nСдувка 12 шт. по месту"
