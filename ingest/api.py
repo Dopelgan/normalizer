@@ -6,8 +6,13 @@ HTTP-интерфейс Parser по контракту RAG <-> Parser.
     GET  /internal/v1/parse/results/{request_id} готовность и результат
     GET  /health, GET /metrics
 
-Ручки рассчитаны на внутреннюю сеть контейнеров: авторизации в MVP-контракте
-нет. Наружу порты публиковать не следует.
+Ручки рассчитаны на внутреннюю сеть контейнеров. При
+NORMALIZER_REQUIRE_TOKEN=true все ручки, кроме /health и /metrics, требуют
+`Authorization: Bearer <NORMALIZER_API_TOKEN>` (core/api_auth.py). Наружу
+порты публиковать не следует.
+
+    DELETE /internal/v1/documents/{s3_fileid}    удаление документа отовсюду
+                                                 (NORMALIZER_DELETE_ENABLED)
 
 Сторона RAG. Фоновый разбор (события жизненного цикла, `event_id`) уходит в
 очередь `CELERY_ML_QUEUE`, синхронный (вложения чата, `dialog_id`) — в
@@ -28,12 +33,12 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from core import logging_setup, telemetry
+from core import api_auth, logging_setup, telemetry
 from core.config import settings
 from core.models.api import BackgroundParseRequest, HealthResponse, ParseRequest
 from core.models.intake import IntakeFile
@@ -60,6 +65,9 @@ app = FastAPI(
     version="1.0.0",
 )
 telemetry.install_metrics_endpoint(app)
+app.add_event_handler("startup", api_auth.ensure_configured)
+# Все ручки, кроме проб /health и /metrics, — под общим токеном (core/api_auth.py).
+PROTECTED = [Depends(api_auth.require_api_token)]
 
 SYNC_POLL_INTERVAL = 0.5
 ACTIVE_STATUSES = ("queued", "processing")
@@ -182,7 +190,7 @@ def _documents(state: Dict[str, Any]) -> List[DocumentResult]:
 # Ручки контракта
 # ===========================================================================
 
-@app.post("/internal/v1/parse", response_model=ParseResponse)
+@app.post("/internal/v1/parse", response_model=ParseResponse, dependencies=PROTECTED)
 async def parse_sync(request: ParseRequest):
     """
     Синхронная обработка: ответ отдаётся, когда готовы все файлы пакета.
@@ -235,7 +243,12 @@ async def parse_sync(request: ParseRequest):
         await asyncio.sleep(SYNC_POLL_INTERVAL)
 
 
-@app.post("/internal/v1/parse/background", response_model=BackgroundAcceptedResponse, status_code=202)
+@app.post(
+    "/internal/v1/parse/background",
+    response_model=BackgroundAcceptedResponse,
+    status_code=202,
+    dependencies=PROTECTED,
+)
 async def parse_background(request: BackgroundParseRequest):
     """Фоновая обработка: сразу 202, результат забирается поллингом."""
     items = request.items
@@ -271,7 +284,11 @@ async def parse_background(request: BackgroundParseRequest):
     )
 
 
-@app.get("/internal/v1/parse/results/{request_id}", response_model=ResultsResponse)
+@app.get(
+    "/internal/v1/parse/results/{request_id}",
+    response_model=ResultsResponse,
+    dependencies=PROTECTED,
+)
 async def parse_results(request_id: str):
     """Статус и результат фоновой задачи."""
     state = await asyncio.to_thread(get_request_state, request_id)
@@ -289,6 +306,40 @@ async def parse_results(request_id: str):
         documents=_documents(state),
         error=_first_error(state) if state["status"] in ("error", "partial") else None,
     )
+
+
+@app.delete("/internal/v1/documents/{s3_fileid:path}", dependencies=PROTECTED)
+async def delete_document(s3_fileid: str):
+    """
+    Удаление документа отовсюду: строки БД, решения приёма, копии в Redis,
+    картинки MinerU, запись кэша лестницы (core/document_delete.py).
+
+    Идемпотентно: уже удалённое — 200 со статусом `absent`. Сбой части
+    хранилищ — 500 с отчётом (`partial`), повтор безопасен. Флаг
+    NORMALIZER_DELETE_ENABLED выключен — 501.
+    """
+    if not settings.NORMALIZER_DELETE_ENABLED:
+        raise HTTPException(
+            status_code=501,
+            detail="Удаление документов выключено (NORMALIZER_DELETE_ENABLED=false).",
+        )
+    fileid = s3_fileid.strip()
+    if not fileid:
+        raise HTTPException(status_code=422, detail="Пустой s3_fileid")
+
+    from core.db.session import SessionLocal
+    from core.document_delete import delete_document as drop
+    from core.providers.storage import StorageProviderFactory
+    from core.result_aggregator import get_client
+
+    report = await asyncio.to_thread(
+        drop, fileid,
+        session_factory=SessionLocal,
+        redis_client=get_client(),
+        storage=StorageProviderFactory.default(),
+    )
+    body = report.as_dict()
+    return JSONResponse(status_code=500 if report.errors else 200, content=body)
 
 
 def _first_error(state: Dict[str, Any]) -> ParserError:

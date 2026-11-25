@@ -4,6 +4,7 @@
 """
 
 import logging
+import shutil
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -53,6 +54,13 @@ class StorageProvider(ABC):
     @abstractmethod
     def get_accessible_uri(self, uri: str) -> str:
         """URI, пригодный для чтения из текущего контекста."""
+
+    def delete_prefix(self, prefix: str) -> int:
+        """
+        Удаляет всё под префиксом-«папкой» (`assets/<doc_id>/`). Возвращает
+        число удалённых объектов. Нужен удалению документа.
+        """
+        raise NotImplementedError
 
     def size(self, uri: str) -> Optional[int]:
         """
@@ -107,6 +115,16 @@ class LocalStorageProvider(StorageProvider):
         path = self._resolve_path(uri)
         if path.exists():
             path.unlink()
+
+    def delete_prefix(self, prefix: str) -> int:
+        path = self._resolve_path(prefix)
+        if path == self.base_path:
+            raise ValueError("Удаление всего хранилища запрещено")
+        if not path.is_dir():
+            return 0
+        count = sum(1 for item in path.rglob("*") if item.is_file())
+        shutil.rmtree(path)
+        return count
 
     def size(self, uri: str) -> Optional[int]:
         try:
@@ -192,6 +210,21 @@ class S3StorageProvider(StorageProvider):
         self._ensure_writable(uri)
         bucket, key = self._parse_s3_uri(uri)
         self.s3_client.delete_object(Bucket=bucket, Key=key)
+
+    def delete_prefix(self, prefix: str) -> int:
+        self._ensure_writable(prefix)
+        bucket, key = self._parse_s3_uri(prefix)
+        if not key.strip("/"):
+            raise ValueError("Удаление всего бакета запрещено")
+        key = key if key.endswith("/") else key + "/"
+        removed = 0
+        paginator = self.s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=key):
+            objects = [{"Key": item["Key"]} for item in page.get("Contents") or []]
+            if objects:
+                self.s3_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+                removed += len(objects)
+        return removed
 
     @staticmethod
     def _ensure_writable(uri: str) -> None:
@@ -289,6 +322,13 @@ class ReadThroughS3Provider(StorageProvider):
                 f"S3 доступен только на чтение, удаление {uri} запрещено."
             )
         self.local.delete_file(uri)
+
+    def delete_prefix(self, prefix: str) -> int:
+        if prefix.startswith("s3://"):
+            raise ReadOnlyStorageError(
+                f"S3 доступен только на чтение, удаление {prefix} запрещено."
+            )
+        return self.local.delete_prefix(prefix)
 
     def size(self, uri: str) -> Optional[int]:
         return self._for(uri).size(uri)

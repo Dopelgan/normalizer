@@ -34,6 +34,23 @@ _ATTACHMENT_ID = re.compile(
 _ATTACHMENT_FILENAME_META = "filename"
 
 
+def _attachment_key(fileid: str, bucket: str, *, allow_bare: bool) -> Optional[str]:
+    """
+    uuid вложения из s3_fileid или None. Явная форма `<бакет>/<uuid>`
+    (можно с `s3://`) принимается всегда, голый uuid — только при allow_bare.
+    """
+    if not bucket:
+        return None
+    raw = fileid[len("s3://"):] if fileid.startswith("s3://") else fileid
+    named = f"{bucket}/"
+    if raw.startswith(named):
+        key = raw[len(named):]
+        return key if _ATTACHMENT_ID.fullmatch(key) else None
+    if allow_bare and _ATTACHMENT_ID.fullmatch(fileid):
+        return fileid
+    return None
+
+
 class SourceFileNotFound(FileNotFoundError):
     """Файл по s3_fileid не найден ни с одним из проверенных расширений."""
 
@@ -102,8 +119,12 @@ class FileLocator:
             return False
         uris = [self._build_uri(candidate) for candidate in self._candidates(fileid)]
         bucket = (settings.S3_ATTACHMENTS_BUCKET or "").strip()
-        if bucket and self.is_s3 and _ATTACHMENT_ID.fullmatch(fileid):
-            uris.append(f"s3://{bucket}/{fileid}")
+        # Вопрос «жив ли файл» содержимого не отдаёт: голый uuid проверяется
+        # во вложениях и при NORMALIZER_REQUIRE_TOKEN, иначе уборка сирот
+        # (tools/purge_orphans.py) сочла бы живое вложение пропавшим.
+        key = _attachment_key(fileid, bucket, allow_bare=True)
+        if bucket and self.is_s3 and key:
+            uris.append(f"s3://{bucket}/{key}")
 
         unknown = False
         for uri in uris:
@@ -127,15 +148,22 @@ class FileLocator:
     def _locate_attachment(self, s3_fileid: str, fileid: str) -> Optional[LocatedFile]:
         """
         Вложение чата: Backend хранит его в отдельном бакете под голым uuid,
-        и RAG передаёт этот uuid как s3_fileid. Проверяется ровно один ключ —
-        без перебора расширений и без префикса, только для точного uuid.
+        и RAG передаёт этот uuid как s3_fileid (или явно `<бакет>/<uuid>`).
+        Проверяется ровно один ключ — без перебора расширений и без
+        префикса, только для точного uuid.
         """
         bucket = (settings.S3_ATTACHMENTS_BUCKET or "").strip()
         if not bucket or not self.is_s3:
             return None
-        if not _ATTACHMENT_ID.fullmatch(fileid):
+        # При NORMALIZER_REQUIRE_TOKEN голый uuid во вложения не ведёт: иначе
+        # любой, кто знает uuid чужого вложения, получает его текст. Тогда
+        # вызывающий называет бакет явно: `<бакет>/<uuid>`.
+        key = _attachment_key(
+            fileid, bucket, allow_bare=not settings.NORMALIZER_REQUIRE_TOKEN,
+        )
+        if not key:
             return None
-        uri = f"s3://{bucket}/{fileid}"
+        uri = f"s3://{bucket}/{key}"
         try:
             if not self.storage.exists(uri):
                 return None

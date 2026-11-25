@@ -27,10 +27,10 @@ import logging
 from typing import Dict, List, Tuple
 
 import requests
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from sqlalchemy import select
 
-from core import logging_setup, telemetry
+from core import api_auth, logging_setup, telemetry
 from core.config import settings
 from core.db.models import IntakeDecisionDB
 from core.db.session import SessionLocal
@@ -54,6 +54,9 @@ app = FastAPI(
     version="2.0.0",
 )
 telemetry.install_metrics_endpoint(app)
+app.add_event_handler("startup", api_auth.ensure_configured)
+# Все ручки, кроме проб /health и /metrics, — под общим токеном (core/api_auth.py).
+PROTECTED = [Depends(api_auth.require_api_token)]
 
 STAGE = "quality_gate"
 
@@ -75,7 +78,7 @@ def _known(session) -> Tuple[Dict[str, str], List[Tuple[str, int]]]:
     return hashes, IntakeRepository(session).fingerprints()
 
 
-@app.post("/internal/v1/quality", response_model=IntakeResponse)
+@app.post("/internal/v1/quality", response_model=IntakeResponse, dependencies=PROTECTED)
 def check(request: IntakeRequest) -> IntakeResponse:
     storage = StorageProviderFactory.default()
     locator = FileLocator(storage)

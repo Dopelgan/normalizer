@@ -21,6 +21,18 @@ class Settings(BaseSettings):
     # У сервисов FastAPI метрики отдаёт ручка /metrics.
     METRICS_WORKER_PORT: int = 9100
 
+    # ------------------------------------------------------------- Доступ
+    # Общий bearer-токен на ручках ingest/gateway/quality (кроме /health и
+    # /metrics): `Authorization: Bearer <NORMALIZER_API_TOKEN>`. Флаг включён,
+    # а токен пуст — сервис не стартует (core/api_auth.py). Под этим же
+    # флагом голый uuid не ищется в бакете вложений чата: вызывающий называет
+    # бакет явно (`<S3_ATTACHMENTS_BUCKET>/<uuid>`, core/providers/file_locator.py).
+    NORMALIZER_REQUIRE_TOKEN: bool = False
+    NORMALIZER_API_TOKEN: str = ""
+    # Ручка удаления документа DELETE /internal/v1/documents/{s3_fileid}
+    # (core/document_delete.py). Выключена — ручка отвечает 501.
+    NORMALIZER_DELETE_ENABLED: bool = False
+
     # ------------------------------------------------------------ База данных
     POSTGRES_USER: str = "knowledge_user"
     POSTGRES_PASSWORD: str = "secure_password"
