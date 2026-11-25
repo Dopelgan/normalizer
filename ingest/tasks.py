@@ -25,7 +25,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from core import filetypes, telemetry
 from core.celery_app import app
 from core import deadline, outage
-from core import document_parts
+from core import document_delete, document_parts
 from core.config import settings
 from core.processing_contract import PROCESSING_PROFILE_VERSION
 from core.drawing_quality import document_quality
@@ -53,6 +53,7 @@ from core.providers.storage import StorageProviderFactory
 from core.repositories import ChunkRepository, DocumentRepository
 from core.result_aggregator import (
     claim_publication,
+    get_client,
     get_request_state,
     mark_handed_off,
     mark_started,
@@ -77,6 +78,10 @@ _SNAPSHOT_FILENAME_META = "filename"
 # ===========================================================================
 # Вспомогательные функции
 # ===========================================================================
+
+class _Tombstoned(Exception):
+    """Документ удалён после начала разбора: сохранение отменяется."""
+
 
 def generate_doc_id(s3_fileid: str) -> str:
     """Стабильный идентификатор документа: один и тот же файл — один doc_id."""
@@ -464,6 +469,7 @@ def process_document(
     Qwen-VL (PARSE_REQUEUE_ON_OUTAGE); 0 — не заставал.
     """
     mark_started(request_id, s3_fileid)
+    task_started = time.time()
     doc_id = generate_doc_id(s3_fileid)
     storage = StorageProviderFactory.default()
     session = SessionLocal()
@@ -722,79 +728,95 @@ def process_document(
         mime_type = filetypes.mime_for(located.file_type)
         normalized_hash = normalized_content_hash(fragments)
 
-        with telemetry.measure("parse.save", doc_id=doc_id), session.begin():
-            chunk_repo = ChunkRepository(session)
-            doc_repo = DocumentRepository(session)
+        # Документ удалили, пока он разбирался или ждал в очереди: результат
+        # не сохраняется (надгробие — core/document_delete.py). Проверка — под
+        # блокировкой строки: удаление, начатое позже, дождётся сохранения и
+        # снимет его само.
+        started_at = document_delete.parse_started_at(get_client(), request_id, task_started)
+        try:
+            with telemetry.measure("parse.save", doc_id=doc_id), session.begin():
+                chunk_repo = ChunkRepository(session)
+                doc_repo = DocumentRepository(session)
+                doc_repo.get(doc_id, for_update=True)
+                if document_delete.tombstoned(get_client(), doc_id, started_at):
+                    raise _Tombstoned()
 
-            chunk_repo.delete_by_doc_id(doc_id)
-            rows = [
-                fragment_to_row(fragment, doc_id, flags_by_id.get(fragment.fragment_id, {}))
-                for fragment in fragments
-            ]
-            if rows:
-                chunk_repo.create_chunks_bulk(rows)
+                chunk_repo.delete_by_doc_id(doc_id)
+                rows = [
+                    fragment_to_row(fragment, doc_id, flags_by_id.get(fragment.fragment_id, {}))
+                    for fragment in fragments
+                ]
+                if rows:
+                    chunk_repo.create_chunks_bulk(rows)
 
-            doc_repo.update_metadata(
-                doc_id,
-                status="indexed",
-                file_hash=file_hash,
-                language=metadata["language"],
-            )
-            ladder = parse_result.ladder or {}
-            doc_repo.update_extra(doc_id, {
-                # Поля контракта, которые нужно отдать и при повторной
-                # выдаче из БД, без нового разбора.
-                "mime_type": mime_type,
-                "document_status": document_status,
-                "pages_reported": report["pages"],
-                "processed_pages": report["processed_pages"],
-                "failed_pages": report["failed_pages"],
-                "unknown_pages": report["unknown_pages"],
-                # Страницы с блоками, но без прочитанного текста. Отдельно
-                # от unknown_pages: покрытие страниц у них полное.
-                "unread_text_pages": parse_result.unread_text_pages,
-                # Страницы-чертежи, которые модель не читала (предел
-                # DRAWING_MAX_SHEETS или остаток срока задачи).
-                "unread_sheet_pages": unread_sheets,
-                "page_coverage_version": PAGE_COVERAGE_VERSION,
-                "warnings": warnings,
-                "processing_profile_version": PROCESSING_PROFILE_VERSION,
-                "review_required": review_required,
-                # Текст документа неполон — независимо от того, зовут ли
-                # человека. По этому полю считают качество разбора, а не
-                # загрузку людей, и оно же отбирает документы на повторное
-                # чтение (`quality_reprocess` называет причины).
-                "text_incomplete": text_incomplete,
-                "quality_reprocess": reprocess,
-                "normalized_content_hash": normalized_hash,
-                "parsed_pages_count": parse_result.page_count or len(parse_result.pages()),
-                "total_fragments": len(fragments),
-                "parser": parse_result.parser_name,
-                "source_kind": parse_result.source_kind,
-                "is_fallback": parse_result.is_fallback,
-                "needs_review": sum(1 for f in fragments if f.review_required),
-                "raw_parse_uri": raw_uri,
-                "last_operation": operation,
-                # Как выбирался уровень — рядом с документом, а не только в
-                # логе воркера и в сыром JSON. Без этого на вопрос «почему в
-                # ответе OCR, а не разбор» нельзя ответить, не имея доступа
-                # к хранилищу.
-                "chosen_level": ladder.get("chosen_level"),
-                "chosen_strategy": ladder.get("chosen_strategy"),
-                "ladder_attempts": ladder.get("attempts") or [],
-                "fallback_won": bool(ladder.get("fallback_won")),
-                # Итог сверки чертёжного разбора с распознаванием — только
-                # у листов, где она была (LADDER_DRAWING_OVER_OCR).
-                **({"drawing_route": ladder["drawing_route"]}
-                   if ladder.get("drawing_route") else {}),
-                "degraded": list(parse_result.degraded),
-                "text_layer_stats": parse_result.text_layer_stats or {},
-                # Время каждой операции рядом с документом: по нему видно,
-                # где именно он провёл время, без похода в логи воркера.
-                "timings_ms": dict(timings),
-            })
-            document = doc_repo.get(doc_id)
-            doc_metadata = document_to_metadata(document)
+                doc_repo.update_metadata(
+                    doc_id,
+                    status="indexed",
+                    file_hash=file_hash,
+                    language=metadata["language"],
+                )
+                ladder = parse_result.ladder or {}
+                doc_repo.update_extra(doc_id, {
+                    # Поля контракта, которые нужно отдать и при повторной
+                    # выдаче из БД, без нового разбора.
+                    "mime_type": mime_type,
+                    "document_status": document_status,
+                    "pages_reported": report["pages"],
+                    "processed_pages": report["processed_pages"],
+                    "failed_pages": report["failed_pages"],
+                    "unknown_pages": report["unknown_pages"],
+                    # Страницы с блоками, но без прочитанного текста. Отдельно
+                    # от unknown_pages: покрытие страниц у них полное.
+                    "unread_text_pages": parse_result.unread_text_pages,
+                    # Страницы-чертежи, которые модель не читала (предел
+                    # DRAWING_MAX_SHEETS или остаток срока задачи).
+                    "unread_sheet_pages": unread_sheets,
+                    "page_coverage_version": PAGE_COVERAGE_VERSION,
+                    "warnings": warnings,
+                    "processing_profile_version": PROCESSING_PROFILE_VERSION,
+                    "review_required": review_required,
+                    # Текст документа неполон — независимо от того, зовут ли
+                    # человека. По этому полю считают качество разбора, а не
+                    # загрузку людей, и оно же отбирает документы на повторное
+                    # чтение (`quality_reprocess` называет причины).
+                    "text_incomplete": text_incomplete,
+                    "quality_reprocess": reprocess,
+                    "normalized_content_hash": normalized_hash,
+                    "parsed_pages_count": parse_result.page_count or len(parse_result.pages()),
+                    "total_fragments": len(fragments),
+                    "parser": parse_result.parser_name,
+                    "source_kind": parse_result.source_kind,
+                    "is_fallback": parse_result.is_fallback,
+                    "needs_review": sum(1 for f in fragments if f.review_required),
+                    "raw_parse_uri": raw_uri,
+                    "last_operation": operation,
+                    # Как выбирался уровень — рядом с документом, а не только в
+                    # логе воркера и в сыром JSON. Без этого на вопрос «почему в
+                    # ответе OCR, а не разбор» нельзя ответить, не имея доступа
+                    # к хранилищу.
+                    "chosen_level": ladder.get("chosen_level"),
+                    "chosen_strategy": ladder.get("chosen_strategy"),
+                    "ladder_attempts": ladder.get("attempts") or [],
+                    "fallback_won": bool(ladder.get("fallback_won")),
+                    # Итог сверки чертёжного разбора с распознаванием — только
+                    # у листов, где она была (LADDER_DRAWING_OVER_OCR).
+                    **({"drawing_route": ladder["drawing_route"]}
+                       if ladder.get("drawing_route") else {}),
+                    "degraded": list(parse_result.degraded),
+                    "text_layer_stats": parse_result.text_layer_stats or {},
+                    # Время каждой операции рядом с документом: по нему видно,
+                    # где именно он провёл время, без похода в логи воркера.
+                    "timings_ms": dict(timings),
+                })
+                document = doc_repo.get(doc_id)
+                doc_metadata = document_to_metadata(document)
+        except _Tombstoned:
+            logger.warning("Документ %s удалён во время разбора — результат отброшен", doc_id)
+            document_delete.discard_tombstoned(
+                s3_fileid, doc_id, storage=storage, session_factory=SessionLocal)
+            finalize(request_id, s3_fileid,
+                     document_delete.deleted_document(s3_fileid, doc_id), dialog_id, event_id)
+            return {"status": "discarded_deleted", "doc_id": doc_id}
 
         # ------------------------------------------ 5. Сырой результат парсера
         try:
@@ -825,6 +847,11 @@ def process_document(
             unread_text_pages=parse_result.unread_text_pages,
         ).model_dump(mode="json")
         finalize(request_id, s3_fileid, result, dialog_id, event_id)
+        # Удаление прошло между сохранением и публикацией: его чистка Redis
+        # могла опередить эту запись — результат заменяется пустым.
+        if document_delete.tombstoned(get_client(), doc_id, started_at):
+            put_document_result(
+                request_id, s3_fileid, document_delete.deleted_document(s3_fileid, doc_id))
 
         if parse_result.degraded:
             logger.error(

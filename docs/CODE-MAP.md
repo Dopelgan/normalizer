@@ -255,7 +255,7 @@
 | `DRAWING_WHAT_DRAWN` | `false` | `core/drawing_processor.py::_process` (запись листа) → `_enrich_fragments` → `_what_drawn_pass` → `core/providers/what_drawn.py`; `qwen_client.read_what_drawn` |
 | `DRAWING_BLOCK_CLEANUP` | `false` | `core/providers/mineru_parser.py` → `text_layer.reconcile_with_text_layer(drop_gibberish_tables)`; `field_placement.apply`; `DrawingProcessor._process` → `core/providers/block_cleanup.py` |
 | `NORMALIZER_REQUIRE_TOKEN` (+ `NORMALIZER_API_TOKEN`) | `false` | `core/api_auth.py` (`require_api_token` — зависимость `PROTECTED` на ручках `ingest/api.py`, `gateway/api.py`, `quality/api.py`; `ensure_configured` — отказ старта без токена; `outbound_headers` — `core/intake/pipeline.py::forward`); голый uuid вложения — `core/providers/file_locator.py::_attachment_key` |
-| `NORMALIZER_DELETE_ENABLED` | `false` | `ingest/api.py::delete_document` (`DELETE /internal/v1/documents/{s3_fileid}`) → `core/document_delete.py::delete_document`; хранилища — `storage.delete_prefix`, `result_cache.drop_for`; уборка сирот — `tools/purge_orphans.py` |
+| `NORMALIZER_DELETE_ENABLED` (+ `NORMALIZER_DELETE_TOMBSTONE_SECONDS`) | `false` | `ingest/api.py::delete_document` (`DELETE /internal/v1/documents/{s3_fileid}`) → `core/document_delete.py::delete_document`; надгробие — `write_tombstone`, проверка при сохранении — `ingest/tasks.py::process_document` (`tombstoned`, `discard_tombstoned`); хранилища — `storage.delete_prefix`, `result_cache.drop_for`; уборка сирот — `tools/purge_orphans.py` |
 
 ### 2.2. Пороги и лимиты — файл-читатель
 

@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # Ручка удаления документа DELETE /internal/v1/documents/{s3_fileid}
     # (core/document_delete.py). Выключена — ручка отвечает 501.
     NORMALIZER_DELETE_ENABLED: bool = False
+    # Сколько живёт надгробие удалённого документа `deleted:<doc_id>` в Redis:
+    # разбор, начатый до удаления и закончившийся в этот срок, не сохраняется.
+    # Срок должен быть больше самого долгого разбора с ожиданием в очереди.
+    NORMALIZER_DELETE_TOMBSTONE_SECONDS: int = 21600
 
     # ------------------------------------------------------------ База данных
     POSTGRES_USER: str = "knowledge_user"

@@ -133,7 +133,11 @@ def test_delete_removes_every_store(enabled, client, session_factory, storage, f
     assert _counts(session_factory) == (0, 0, 0)
     assert not storage.exists(f"assets/{doc_id}/page1.jpg")
     assert not entry.exists()
-    assert fake_redis.keys("req:req-1:*") == []
+    # Поле файла заменено пустым документом; мета и счётчики запроса на месте.
+    assert fake_redis.exists("req:req-1:meta")
+    stored = json.loads(fake_redis.hget("req:req-1:docs", FILEID))
+    assert stored["fragments"] == [] and "секрет" not in json.dumps(stored, ensure_ascii=False)
+    assert fake_redis.exists(f"deleted:{doc_id}")
     assert (body["documents"], body["chunks"], body["intake_decisions"]) == (1, 1, 1)
     assert (body["assets"], body["cache_entries"], body["redis_results"]) == (1, 1, 1)
 
@@ -157,8 +161,9 @@ def test_cache_entry_kept_when_content_shared(enabled, client, session_factory, 
 
     body = response.json()
     assert body["cache_kept_shared"] is True
-    assert body["cache_entries"] == 0
-    assert entry.exists() and other_entry.exists()
+    # Своя запись удаляемого документа уходит, общая запись тех же байтов остаётся.
+    assert body["cache_entries"] == 1
+    assert not entry.exists() and other_entry.exists()
     assert _counts(session_factory) == (1, 1, 1)  # остался только второй документ
 
 
@@ -172,8 +177,65 @@ def test_other_request_documents_survive_in_redis(enabled, session_factory, stor
     delete_document(FILEID, session_factory=session_factory,
                     redis_client=fake_redis, storage=storage)
 
-    assert fake_redis.hkeys("req:req-2:docs") == [OTHER]
+    assert sorted(fake_redis.hkeys("req:req-2:docs")) == sorted([FILEID, OTHER])
+    assert json.loads(fake_redis.hget("req:req-2:docs", FILEID))["status"] == "error"
+    assert json.loads(fake_redis.hget("req:req-2:docs", OTHER)) == {"s3_fileid": OTHER}
     assert fake_redis.exists("req:req-2:meta")
+
+
+def test_assets_of_other_rows_with_same_fileid_removed(enabled, session_factory, storage,
+                                                       fake_redis, cache_root):
+    _seed(session_factory, storage, fake_redis, cache_root)
+    session = session_factory()
+    session.add(DocumentDB(id="doc-legacy", s3_fileid=FILEID, source_path="x",
+                           status="indexed", extra_data={}))
+    session.commit()
+    session.close()
+    storage.write_file("assets/doc-legacy/img.jpg", b"jpeg")
+
+    report = delete_document(FILEID, session_factory=session_factory,
+                             redis_client=fake_redis, storage=storage)
+
+    assert report.documents == 2
+    assert not storage.exists("assets/doc-legacy/img.jpg")
+
+
+class _FakeS3:
+    def __init__(self, errors):
+        self.errors = errors
+
+    def get_paginator(self, name):
+        class _P:
+            def paginate(self, **kwargs):
+                return [{"Contents": [{"Key": "assets/doc-x/a.jpg"}, {"Key": "assets/doc-x/b.jpg"}]}]
+        return _P()
+
+    def delete_objects(self, **kwargs):
+        return {"Errors": [{"Key": key, "Code": "AccessDenied"} for key in self.errors]}
+
+
+def test_s3_per_key_errors_make_delete_partial(enabled, client, session_factory, fake_redis,
+                                               cache_root, monkeypatch):
+    from core.providers.storage import PartialDeleteError, S3StorageProvider
+
+    monkeypatch.setattr(settings, "S3_READONLY", False)
+    s3 = object.__new__(S3StorageProvider)
+    s3.bucket, s3.s3_client = "kb", _FakeS3(["assets/doc-x/b.jpg"])
+    with pytest.raises(PartialDeleteError) as caught:
+        s3.delete_prefix("assets/doc-x/")
+    assert caught.value.failed_keys == ["assets/doc-x/b.jpg"]
+
+    s3.s3_client = _FakeS3([])
+    assert s3.delete_prefix("assets/doc-x/") == 2
+
+    s3.s3_client = _FakeS3(["assets/doc-x/b.jpg"])
+    monkeypatch.setattr(
+        "core.providers.storage.StorageProviderFactory.default", lambda: s3,
+    )
+    response = client.delete(f"/internal/v1/documents/{FILEID}")
+    assert response.status_code == 500
+    assert response.json()["status"] == "partial"
+    assert "assets/doc-x/b.jpg" in response.json()["failed_keys"]
 
 
 def test_token_required_when_flag_on(enabled, client, session_factory, storage, fake_redis,
