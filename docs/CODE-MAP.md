@@ -112,6 +112,7 @@
 | «Что изображено» на листе (`DRAWING_WHAT_DRAWN`) | `core/providers/what_drawn.py` | `build_prompt`, `parse`, `contradicts`, `parts_fit`; лист запоминается в `DrawingProcessor._process`, вызов — `_what_drawn_pass` после `sense_rules.apply`, модель — `qwen_client.read_what_drawn` |
 | Уборка мусора листа (`DRAWING_BLOCK_CLEANUP`) | `core/providers/block_cleanup.py` | `drop_gibberish_tables` (в `text_layer.reconcile_with_text_layer`), `unplace_oversized` (конец `field_placement.apply`), `drop_caption_fields` (`DrawingProcessor._process` после `_deduplicate`) |
 | Надписи без места: подписи граф, смешение алфавитов, пара без знаков (`DRAWING_UNPLACED_CLEANUP`); поле без места не поглощает клетки (`DRAWING_UNPLACED_NO_ABSORB`) | `core/providers/unplaced_cleanup.py`, `core/providers/field_placement.py` | `noise`, `loose`; вызовы — `qwen_client.merge_content`, `drawing_processor._fields_from_text`; `field_placement.dedupe_page` → `_unplaced` |
+| Крупный лист плитками в родном разрешении и штамп из родного рендера (`DRAWING_NATIVE_TILES`) | `core/providers/native_tiles.py` | `wanted`, `plan`, `read`, `merge`, `unpaired`; вызов — `qwen_client.read_sheet` → `read_sheet_tile`, `with_tiles`; лист — `DrawingProcessor._native_sheet` |
 | Дочитывание спорных чисел вырезками (`DRAWING_DISPUTED_REREAD`) | `core/providers/disputed_reread.py` | `apply`, `targets`; без D3 — `DrawingProcessor._reread_disputed` в проходе листа, с D3 — `_reread_reconciled` после `reading_reconcile.apply` |
 | **Сборка `content.text` фрагмента чертежа** | `core/drawing_processor.py` | `build_fragment` (432), строка 460: `text="\n".join(transcript) or None`; `transcript` берётся из `payload.pop("transcript_lines")` (443) |
 | Качество фрагмента чертежа | `core/drawing_quality.py` | `apply_drawing_quality` (7), `document_quality` (71) |
@@ -197,6 +198,7 @@
 | `DRAWING_SHEET_COMPACT_JSON` | `false` | `core/providers/qwen_client.py` (`_sheet_prompt`, `as_annotations`, `compact_annotation`) |
 | `DRAWING_VLM_STABLE` | `false` | `core/providers/qwen_client.py` (`_thinking_off`, `_non_empty`, `_log_rejected`, `_ask`, `_answer`) |
 | `DRAWING_SHEET_CONTENT_PASS` | `false` | `core/providers/qwen_client.py::read_sheet` → `read_sheet_content`, `content_schema`, `content_items`, `merge_content` |
+| `DRAWING_NATIVE_TILES` | `false` | `core/providers/native_tiles.py` (`wanted`, `NativeSheet`, `plan`, `read`, `merge`, `unpaired`); вызовы — `qwen_client.read_sheet` → `read_sheet_tile`, `with_tiles`; `DrawingProcessor._native_sheet`, `_read_title_block_fields`, `_read_side_column`; ключ кэша — `result_cache.WHEN_ON` |
 | `DRAWING_AUTO_ROTATE` | `true` | `core/providers/drawing_vision.py` |
 | `RASTER_FRAME_THIN_LINES` | `false` | `core/providers/raster_drawing.py` |
 | `FRAME_TABLE_GUARD_ENABLED` | `false` | `core/providers/mineru_parser.py` |
