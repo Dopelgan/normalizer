@@ -198,6 +198,10 @@ def analyse(image, deskew_limit: Optional[float] = None) -> SheetLayout:
             # первый раз с найденной рамкой, область штампа растянется дважды.
             regions = _mark_title_block(regions, frame)
 
+    if settings.DRAWING_KEEP_TITLE_BLOCK_REGION:
+        # Штамп меньше видов, которые геометрия приняла за таблицы, и при
+        # сортировке по площади уходил за потолок DRAWING_MAX_REGIONS.
+        regions = sorted(regions, key=lambda r: r.kind != KIND_TITLE_BLOCK)
     layout = SheetLayout(
         image=straight,
         angle=angle,
@@ -414,7 +418,33 @@ _FALLBACK_PORTRAIT = [0.05, 0.74, 1.0, 1.0]
 _FALLBACK_LANDSCAPE = [0.5, 0.74, 1.0, 1.0]
 
 
-def fallback_title_block(layout: "SheetLayout") -> Optional[Region]:
+# Запас вокруг штампа ГОСТ 2.104 в запасной области (DRAWING_STAMP_FALLBACK_GOST):
+# поле листа 5 мм и столько же на неточность скана и обрез.
+_FALLBACK_MARGIN_MM = 15.0
+# Меньше этого лист — не лист ЕСКД (или разрешение неверно): область прежняя.
+_FALLBACK_MIN_SHEET_MM = 140.0
+
+
+def gost_fallback_box(size: Tuple[int, int], dpi: Optional[float]) -> Optional[List[float]]:
+    """
+    Область штампа 185×55 мм с запасом в правом нижнем углу листа размером
+    `size` пикселей при разрешении `dpi`, в долях листа, — не больше
+    прежней запасной области. `None` — разрешение неизвестно или лист
+    меньше листа ЕСКД.
+    """
+    if not dpi or dpi <= 0:
+        return None
+    width_mm = size[0] / float(dpi) * 25.4
+    height_mm = size[1] / float(dpi) * 25.4
+    if min(width_mm, height_mm) < _FALLBACK_MIN_SHEET_MM:
+        return None
+    wide = _FALLBACK_PORTRAIT if size[1] >= size[0] else _FALLBACK_LANDSCAPE
+    left = 1.0 - (_STAMP_MM[0] + _FALLBACK_MARGIN_MM) / width_mm
+    top = 1.0 - (_STAMP_MM[1] + _FALLBACK_MARGIN_MM) / height_mm
+    return [round(max(wide[0], left), 4), round(max(wide[1], top), 4), 1.0, 1.0]
+
+
+def fallback_title_block(layout: "SheetLayout", dpi: Optional[float] = None) -> Optional[Region]:
     """
     Область штампа по ГОСТ 2.104 без рамки и сетки (DRAWING_STAMP_FALLBACK).
 
@@ -428,6 +458,10 @@ def fallback_title_block(layout: "SheetLayout") -> Optional[Region]:
         return None
     width, height = layout.image.size
     box = _FALLBACK_PORTRAIT if height >= width else _FALLBACK_LANDSCAPE
+    if settings.DRAWING_STAMP_FALLBACK_GOST:
+        # Половина альбомного A1 ради штампа 185×55 мм — вырезка, которую
+        # потолок стороны ужимает вдвое; по разрешению листа — штамп с запасом.
+        box = gost_fallback_box((width, height), dpi) or box
     return Region(kind=KIND_TITLE_BLOCK, bbox=list(box))
 
 
