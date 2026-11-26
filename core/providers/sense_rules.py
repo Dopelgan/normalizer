@@ -872,6 +872,8 @@ def _recategorise(field: DrawingField, category: str) -> None:
 # Это пояснение к размеру (примечание), а не выноска с номером.
 _COUNT_NOTE = re.compile(
     r"^\d{1,3}\s*(?:мест[аo]?|отв(?:ерсти[яей]|ерстие)?)\.?$", re.IGNORECASE)
+# Фаска: катет на угол («0,5x45°», «3х45°», «1,6×30°»).
+_CHAMFER = re.compile(r"^\d+(?:[.,]\d+)?\s*[xх×*]\s*\d{1,2}°$")
 # Пункт технических требований: номер, затем слово, которым начинаются
 # пункты требований, и хотя бы три слова. Сортамент с номером («2 Лист
 # Б-ПН…», «10 Поковка…») сюда не подходит: его слов в списке нет.
@@ -903,6 +905,10 @@ def _class_rule(items: List[_Item], stats: Dict[str, int]) -> None:
         if field.category in ("callout", "position") and _COUNT_NOTE.match(value):
             _recategorise(field, "note")
             _count(stats, "class_count_note")
+        elif field.category == "callout" and _CHAMFER.match(value):
+            # «0,5x45°», «3х45°» — фаска: размер, а не выноска.
+            _recategorise(field, "size")
+            _count(stats, "class_chamfer_size")
         elif field.category == "material" and _NUMBERED_NOTE.match(value):
             # «3 Допускается применять любой другой металлопрокат…» —
             # пункт технических требований, а не графа «Материал».
