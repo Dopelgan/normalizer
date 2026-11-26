@@ -1232,9 +1232,11 @@ class QwenVisionClient:
         if settings.DRAWING_VLM_STABLE and answer is not None and _empty_answer(*answer):
             # Без рассуждения модель на плотном листе отвечает «{}» и при
             # повторе — тем же: лист терял все надписи с местами. Переспрос —
-            # с рассуждением, как читал прежний разбор.
+            # с рассуждением и прежним правилом повторов (DRAWING_KEEP_REPEATS
+            # на таком листе тоже давал «{}»), как читал прежний разбор.
             logger.warning("Ответ по листу пуст: лист читается ещё раз с рассуждением модели")
-            again = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE, limit,
+            plain = prompt.replace(_KEEP_REPEATS_RULE, _NO_REPEATS_RULE)
+            again = self._ask_text(image, plain, settings.QWEN_SHEET_MAX_SIDE, limit,
                                    think=True, **guarded)
             if again is not None and not _empty_answer(*again):
                 return again

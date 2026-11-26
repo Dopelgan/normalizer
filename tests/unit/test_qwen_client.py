@@ -589,6 +589,18 @@ class TestStableCalls:
         assert "chat_template_kwargs" not in session.requests[1]["json"]
         assert [a["value"] for a in reading.annotations] == ["1. Текст"]
 
+    def test_empty_sheet_retry_drops_keep_repeats_rule(self, mocker):
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", True)
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_GUARDED", True)
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_SCHEMA", False)
+        mocker.patch.object(qwen_client.settings, "DRAWING_KEEP_REPEATS", True)
+        session = FakeSession(FakeResponse(answer("{}")), FakeResponse(answer("{}")))
+        client(session).read_sheet(picture())
+        first = session.requests[0]["json"]["messages"][1]["content"][1]["text"]
+        second = session.requests[1]["json"]["messages"][1]["content"][1]["text"]
+        assert qwen_client._KEEP_REPEATS_RULE in first
+        assert qwen_client._NO_REPEATS_RULE in second and qwen_client._KEEP_REPEATS_RULE not in second
+
     def test_empty_object_without_flag_is_taken_as_is(self, mocker):
         mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", False)
         session = FakeSession(FakeResponse(answer("{}")))
