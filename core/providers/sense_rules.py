@@ -845,12 +845,13 @@ def _recategorise(field: DrawingField, category: str) -> None:
 # Это пояснение к размеру (примечание), а не выноска с номером.
 _COUNT_NOTE = re.compile(
     r"^\d{1,3}\s*(?:мест[аo]?|отв(?:ерсти[яей]|ерстие)?)\.?$", re.IGNORECASE)
-# Пункт технических требований: номер, затем текст с заглавной буквы и
-# хотя бы три слова. Графа «Материал» номером пункта не начинается.
-# Сортамент («2 Лист Б-ПН…», «Круг…») пунктом не считается.
+# Пункт технических требований: номер, затем слово, которым начинаются
+# пункты требований, и хотя бы три слова. Сортамент с номером («2 Лист
+# Б-ПН…», «10 Поковка…») сюда не подходит: его слов в списке нет.
 _NUMBERED_NOTE = re.compile(
-    r"^\d{1,2}\s*[.)]?\s+(?!(?:Лист|Круг|Труба|Шестигранник|Полоса|Пруток|Проволока|Квадрат|Уголок"
-    r"|Швеллер|Лента|Сталь)\b)[А-ЯЁ][а-яё]+(?:\s+\S+){3,}")
+    r"^\d{1,2}\s*[.)]?\s+(?:Допуска|Допуск\b|Разреша|Размер|Неуказанн|Покрыти|Маркир|Остр|Сварк|Сварн"
+    r"|Обеспеч|Термообраб|Притуп|Шероховат|Поверхност|Предельн|Контрол|Испытан|Технические|Замен"
+    r"|Применять|Действительн)[а-яё]*(?:\s+\S+){3,}")
 # Величина с номиналом и симметричным отклонением: «30°±2°», «12±0,1»,
 # «⌀20±0,05», «45°30′±1°». Номинал обязателен: «±0,1» без него — допуск.
 _ANGLE_OR_NUMBER = r"\d+(?:[.,]\d+)?\s*(?:°(?:\s*\d+\s*['′])?|['′])?"
@@ -1120,7 +1121,7 @@ def general_roughness(value: Any) -> Optional[str]:
 
 def _unplaced(box: Optional[Sequence[float]]) -> bool:
     """Рамки нет или она — почти весь лист: место надписи не прочитано."""
-    if not box or len(box) != 4:
+    if not box or len(box) != 4 or not all(isinstance(v, (int, float)) for v in box):
         return True
     x1, y1, x2, y2 = (float(v) for v in box)
     return (x2 - x1) * (y2 - y1) >= 0.8
@@ -1170,7 +1171,8 @@ def _corner_rule(drawings: Sequence[Fragment], items: List[_Item], stats: Dict[s
             # Знак «Ra x (√)» без места (содержание листа без рамок): по
             # ГОСТ 2.309 общий знак стоит в правом верхнем углу рамки, и
             # рамка всего листа была бы враньём о месте.
-            frame = ((item.fragment.content.structured_payload or {}).get("layout") or {}).get("frame")
+            layout = (item.fragment.content.structured_payload or {}).get("layout")
+            frame = layout.get("frame") if isinstance(layout, dict) else None
             field.bbox = corner_sign_box(corner_box(frame))
             item.box = _page_box(item.fragment, field, item.whole)
             _count(stats, "corner_placed")

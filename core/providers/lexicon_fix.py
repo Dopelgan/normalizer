@@ -425,8 +425,14 @@ def fix_gost(text: str, known: frozenset = frozenset()) -> Tuple[str, List[Dict[
 # «±1Т14/2»). Правится только в записи, где есть «откл», и только сами
 # квалитеты: буквы отверстия и вала и «IT» перед номером 1–18.
 _DEVIATION_CONTEXT = re.compile(r"откл", re.IGNORECASE)
-_GRADE_LETTER = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])([НнHh])(1[0-8]|[1-9])(?![0-9])")
-_GRADE_IT = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])(?:[IІ1lЛ]?[TТ]|IT)(1[0-8]|[1-9])(?=\s*/\s*2|[^0-9]|$)")
+# Буквы отверстия и вала — только парой через запятую («Н14, н14»): одиночное
+# «Н10» может быть обозначением. «IT» — только в «±IT14/2» (знак или «/2»):
+# «Т8» — марка стали, «Т15» — обозначение.
+_GRADE_PAIR = re.compile(
+    r"(?<![0-9A-Za-zА-Яа-яЁё])([НнHh])(1[0-8]|[1-9])(\s*[,;]\s*)([НнHh])(1[0-8]|[1-9])(?![0-9]|[.,]\d)")
+_GRADE_IT = re.compile(
+    r"(?:(?<=±)|(?<=±\s))(?:[IІ1lЛ]?[TТ]|IT)(1[0-8]|[1-9])(?=\s*/\s*2)"
+    r"|(?<![0-9A-Za-zА-Яа-яЁё])(?:[IІ1lЛ][TТ]|IT)(1[0-8]|[1-9])(?=\s*/\s*2)")
 
 
 def fix_grades(text: str) -> Tuple[str, List[Dict[str, str]]]:
@@ -434,8 +440,12 @@ def fix_grades(text: str) -> Tuple[str, List[Dict[str, str]]]:
     value = str(text or "")
     if not _DEVIATION_CONTEXT.search(value):
         return value, []
-    fixed = _GRADE_LETTER.sub(lambda m: ("H" if m.group(1) in "НH" else "h") + m.group(2), value)
-    fixed = _GRADE_IT.sub(lambda m: "IT" + m.group(1), fixed)
+    def letter(char: str) -> str:
+        return "H" if char in "НH" else "h"
+
+    fixed = _GRADE_PAIR.sub(
+        lambda m: letter(m.group(1)) + m.group(2) + m.group(3) + letter(m.group(4)) + m.group(5), value)
+    fixed = _GRADE_IT.sub(lambda m: "IT" + (m.group(1) or m.group(2)), fixed)
     if fixed == value:
         return value, []
     return fixed, [{"kind": GRADE, "before": value, "after": fixed}]
