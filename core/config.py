@@ -1467,6 +1467,13 @@ class Settings(BaseSettings):
     # одна подпись графы («Лит.», «Масса»), отдельным полем не выходит.
     # Вызовов модели нет. По умолчанию выключено.
     DRAWING_BLOCK_CLEANUP: bool = False
+    # Вместе с DRAWING_FIELD_PLACEMENT_V2: поле чертежа без места (рамка
+    # листа или области) получает рамку единственной строки распознавания
+    # страницы (`position.lines`, RECOGNITION_LINES) с той же записью;
+    # запись внутри строки — часть рамки по доле знаков. Две строки с такой
+    # записью — поле не трогается. Вызовов модели нет
+    # (core/providers/line_placement.py). По умолчанию выключено.
+    DRAWING_PLACE_FROM_LINES: bool = False
     # Места на видеокарте для фоновых вызовов разбора
     # (core/providers/gpu_gate.py). Один счётчик на все воркеры в Redis
     # Celery: днём (GPU_GATE_BUSY_HOURS_UTC, «4-13» — с 4:00 до 12:59 UTC,

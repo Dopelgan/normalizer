@@ -100,6 +100,14 @@ def test_numbered_requirement_in_material_is_note(monkeypatch, value, category):
     assert categories(sheet) == [(value, category)]
 
 
+@pytest.mark.parametrize("value, category", [("0,5x45°", "size"), ("3х45°", "size"), ("А", "callout")])
+def test_chamfer_callout_is_size(monkeypatch, value, category):
+    flag_on(monkeypatch, "DRAWING_SENSE_CLASS_RULES")
+    sheet = drawing([field(value, [0.5, 0.1, 0.55, 0.12], category="callout")], sheet_type="detail")
+    sense_rules.apply([sheet])
+    assert categories(sheet) == [(value, category)]
+
+
 def test_pm_twin_keeps_one_size(monkeypatch):
     flag_on(monkeypatch, "DRAWING_SENSE_CLASS_RULES")
     sheet = drawing([

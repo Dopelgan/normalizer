@@ -36,6 +36,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from difflib import SequenceMatcher
@@ -43,6 +44,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core.models.contract import DrawingField, Fragment
 from core.providers.reading_reconcile import NUMERIC, digits, notation
+
+logger = logging.getLogger(__name__)
 
 PAGE = "page"
 WHOLE = [0.0, 0.0, 1.0, 1.0]
@@ -461,4 +464,12 @@ def apply(fragments: List[Fragment]) -> List[Fragment]:
         for drawings in pages.values():
             for fragment in drawings:
                 block_cleanup.unplace_oversized(fragment.content.structured_drawing_fields or [])
+    if settings.DRAWING_PLACE_FROM_LINES:
+        # Последним: поле без места после сведения повторов и уборки
+        # получает рамку строки распознавания с той же записью.
+        from core.providers import line_placement
+
+        placed = line_placement.apply(fragments)
+        if placed["placed"]:
+            logger.info("Место по строкам распознавания: %s", placed)
     return fragments
