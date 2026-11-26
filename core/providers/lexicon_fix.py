@@ -62,6 +62,7 @@ UNVERIFIED = "unverified"    # фамилия оставлена, но со сп
 DROPPED = "dropped"          # прочтение подписи снято: фамилии нет в списке
 TERM = "term"                # слово поставлено к термину из списка
 GOST = "gost"                # номер стандарта
+GRADE = "grade"              # квалитет в записи неуказанных отклонений
 
 # ===========================================================================
 # Сравнение написаний
@@ -419,6 +420,27 @@ def fix_gost(text: str, known: frozenset = frozenset()) -> Tuple[str, List[Dict[
     return _GOST.sub(repair, str(text or "")), notes
 
 
+# Неуказанные предельные отклонения (ГОСТ 30893.1): «H14, h14, ±IT14/2».
+# Модель пишет квалитеты кириллицей («Н14, н14») и теряет «I» («±Т14/2»,
+# «±1Т14/2»). Правится только в записи, где есть «откл», и только сами
+# квалитеты: буквы отверстия и вала и «IT» перед номером 1–18.
+_DEVIATION_CONTEXT = re.compile(r"откл", re.IGNORECASE)
+_GRADE_LETTER = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])([НнHh])(1[0-8]|[1-9])(?![0-9])")
+_GRADE_IT = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])(?:[IІ1lЛ]?[TТ]|IT)(1[0-8]|[1-9])(?=\s*/\s*2|[^0-9]|$)")
+
+
+def fix_grades(text: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Квалитеты в записи неуказанных отклонений латиницей: «Н14» -> «H14», «Т14/2» -> «IT14/2»."""
+    value = str(text or "")
+    if not _DEVIATION_CONTEXT.search(value):
+        return value, []
+    fixed = _GRADE_LETTER.sub(lambda m: ("H" if m.group(1) in "НH" else "h") + m.group(2), value)
+    fixed = _GRADE_IT.sub(lambda m: "IT" + m.group(1), fixed)
+    if fixed == value:
+        return value, []
+    return fixed, [{"kind": GRADE, "before": value, "after": fixed}]
+
+
 # ===========================================================================
 # Списки из файлов и ключ кэша
 # ===========================================================================
@@ -487,6 +509,8 @@ def _fix_value(value: str, kind: str, handwritten: bool, category: str,
             value, lexicon.signers, signature=kind == "signature" or handwritten)
         notes += found
     value, found = fix_gost(value, lexicon.gost)
+    notes += found
+    value, found = fix_grades(value)
     notes += found
     if kind == "other" and category in ("title_block", "material"):
         value, found = fix_terms(value, lexicon.terms)
