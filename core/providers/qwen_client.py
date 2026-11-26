@@ -184,6 +184,13 @@ def _non_empty(content: str, finish: Optional[str]) -> bool:
     return not (isinstance(data, dict) and not data)
 
 
+def _empty_answer(content: str, finish: Optional[str]) -> bool:
+    """Ответ листа без единой надписи и не оборванный: «{}», «[]», пустой список."""
+    if finish == "length":
+        return False
+    return not _sheet_items(content)
+
+
 def reject_reason(content: str, finish: Optional[str]) -> str:
     """
     Почему ответ не принят — одним словом (DRAWING_VLM_REJECT_DETAILS): без
@@ -1212,13 +1219,26 @@ class QwenVisionClient:
         guarded = {"accept": sheet_answer_accepted, "keep_rejected": sheet_answer_repeats,
                    "timeout": timeout, "read_timeout_retries": 1,
                    "required": required, "sheet": sheet}
+        answer: Optional[Tuple[str, Optional[str]]] = None
+        asked = False
         if schema is not None:
             answer = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE, limit,
                                     response_format=schema, **guarded)
-            if answer is not None or not self._rejected_now():
-                return answer
-            logger.warning("Модель не приняла схему ответа листа: лист читается без схемы")
-        return self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE, limit, **guarded)
+            asked = answer is not None or not self._rejected_now()
+            if not asked:
+                logger.warning("Модель не приняла схему ответа листа: лист читается без схемы")
+        if not asked:
+            answer = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE, limit, **guarded)
+        if settings.DRAWING_VLM_STABLE and answer is not None and _empty_answer(*answer):
+            # Без рассуждения модель на плотном листе отвечает «{}» и при
+            # повторе — тем же: лист терял все надписи с местами. Переспрос —
+            # с рассуждением, как читал прежний разбор.
+            logger.warning("Ответ по листу пуст: лист читается ещё раз с рассуждением модели")
+            again = self._ask_text(image, prompt, settings.QWEN_SHEET_MAX_SIDE, limit,
+                                   think=True, **guarded)
+            if again is not None and not _empty_answer(*again):
+                return again
+        return answer
 
     def _rejected_now(self) -> bool:
         """Последний вызов этого потока отклонён моделью как неверный запрос (4xx)."""
@@ -1673,9 +1693,11 @@ class QwenVisionClient:
         if answer is not None and accept is not None and not accept(*answer):
             # Пустой объект «{}» — один токен, и на нём модель иногда
             # останавливается (карточка E): спросить ещё раз, один раз.
+            # Тот же запрос при температуре 0 даёт тот же «{}»: переспрос —
+            # с рассуждением, как читал прежний разбор.
             logger.warning("Модель ответила пустым объектом: вопрос задаётся ещё раз")
             answer = self._ask_text(image, prompt, max_side, max_tokens, accept=accept,
-                                    required=required)
+                                    required=required, think=True)
         if answer is None:
             return None
         content = answer[0]
@@ -1721,10 +1743,13 @@ class QwenVisionClient:
         timeout: Optional[int] = None,
         read_timeout_retries: Optional[int] = None,
         keep_rejected: Optional[Callable[[str, Optional[str]], bool]] = None,
-        required: Sequence[str] = (), sheet: bool = False,
+        required: Sequence[str] = (), sheet: bool = False, think: bool = False,
     ) -> Optional[Tuple[str, Optional[str]]]:
         """
         Текст ответа и finish_reason («length» — упёрся в потолок токенов).
+
+        `think` — рассуждение модели не выключается и при DRAWING_VLM_STABLE:
+        переспрос после пустого ответа (`_empty_answer`).
 
         С VLM_CACHE_VALIDATE в кэш пишется и из кэша берётся только ответ,
         прошедший `cache_check(required, sheet)`; отдаётся разбору ответ
@@ -1758,7 +1783,7 @@ class QwenVisionClient:
             "temperature": settings.QWEN_TEMPERATURE,
             "max_tokens": limit,
             "response_format": response_format or {"type": "json_object"},
-            **_thinking_off(),
+            **({} if think else _thinking_off()),
             "messages": [
                 {"role": "system", "content": _SYSTEM},
                 {"role": "user", "content": [

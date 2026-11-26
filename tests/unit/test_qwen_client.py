@@ -570,6 +570,25 @@ class TestStableCalls:
         rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
         assert rows and rows[0]["head"] == "{}"
 
+    def test_second_ask_after_empty_object_thinks(self, mocker):
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", True)
+        session = FakeSession(FakeResponse(answer("{}")), FakeResponse(answer({"fields": {"Масса": "3,74"}})))
+        client(session).read_title_block_fields(picture())
+        assert session.requests[0]["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+        assert "chat_template_kwargs" not in session.requests[1]["json"]
+
+    def test_empty_sheet_answer_is_read_again_with_thinking(self, mocker):
+        mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", True)
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_GUARDED", True)
+        mocker.patch.object(qwen_client.settings, "DRAWING_SHEET_SCHEMA", False)
+        sheet = {"sheet_type": "assembly", "annotations": [
+            {"category": "note", "value": "1. Текст", "bbox": [100, 100, 300, 120]}]}
+        session = FakeSession(FakeResponse(answer("{}")), FakeResponse(answer(sheet)))
+        reading = client(session).read_sheet(picture())
+        assert len(session.requests) == 2
+        assert "chat_template_kwargs" not in session.requests[1]["json"]
+        assert [a["value"] for a in reading.annotations] == ["1. Текст"]
+
     def test_empty_object_without_flag_is_taken_as_is(self, mocker):
         mocker.patch.object(qwen_client.settings, "DRAWING_VLM_STABLE", False)
         session = FakeSession(FakeResponse(answer("{}")))
