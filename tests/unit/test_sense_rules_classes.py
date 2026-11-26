@@ -276,7 +276,7 @@ VIEW_IN_CORNER = (0.80, 0.0, 1.0, 0.3)       # вырезка вида, накр
 
 
 @pytest.mark.parametrize("raw, value", [
-    ("Ra 6,3(V)", "Ra 6,3 (√)"), ("√ (√)", "√ (√)"), ("Ra 6,3 (√)", "Ra 6,3 (√)"),
+    ("Ra 6,3(V)", "Ra 6,3 (√)"), ("Ra 6,3 (/)", "Ra 6,3 (√)"), ("√ (√)", "√ (√)"), ("Ra 6,3 (√)", "Ra 6,3 (√)"),
 ])
 def test_general_roughness_record(monkeypatch, raw, value):
     flag_on(monkeypatch, "DRAWING_CORNER_ROUGHNESS_V2")

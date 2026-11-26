@@ -1102,7 +1102,7 @@ def _ra_series_rule(items: List[_Item], stats: Dict[str, int]) -> None:
 # Знак общей шероховатости записью: «Ra 6,3 (√)», «√Rz 20 (√)», «√ (√)»
 # (без параметров). Галочку в скобках распознавание отдаёт и буквой V.
 _GENERAL_ROUGHNESS = re.compile(
-    r"^√?\s*(?:(R[az])\s*(\d+(?:[.,]\d+)?))?\s*\(\s*[√Vv✓]\s*\)$", re.IGNORECASE)
+    r"^√?\s*(?:(R[az])\s*(\d+(?:[.,]\d+)?))?\s*\(\s*[√Vv✓/]\s*\)$", re.IGNORECASE)
 _PLAIN_ROUGHNESS = re.compile(r"^√?\s*(R[az])\s*(\d+(?:[.,]\d+)?)$", re.IGNORECASE)
 
 
