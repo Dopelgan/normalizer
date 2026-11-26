@@ -540,3 +540,34 @@ def test_sheet_metal_lowercase(evidence_on):
     ])
     sense_rules.apply([sheet])
     assert sheet.content.structured_drawing_fields[1].value == "S0,5*"
+
+
+# ---------------------------------------------------------------------------
+# Обозначение шва ГОСТ 14771, прочитанное резьбой (DRAWING_SENSE_WELD_CODES)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["Н1-ИНп", "У4-ИНп", "Т1-ИНп", "T1-ИН", "С17-Р", "H1-ИНп", "Т3 - ЗН"])
+def test_weld_code_read_as_thread_becomes_callout_with_flag(value, monkeypatch):
+    """Пробка ЭК150 СБ: на вопрос о резьбах ответ называл «Н1-ИНп» и «У4-ИНп»."""
+    monkeypatch.setattr(settings, "DRAWING_SENSE_WELD_CODES", True)
+    sheet = drawing([field(value, [0.7, 0.2, 0.75, 0.23], category="thread")])
+    stats = sense_rules.apply([sheet])
+    (mark,) = sheet.content.structured_drawing_fields
+    assert mark.category == "callout" and mark.value == value and mark.needs_review
+    assert stats["thread_weld_code"] == 1
+
+
+def test_weld_code_stays_thread_without_flag():
+    assert settings.DRAWING_SENSE_WELD_CODES is False
+    sheet = drawing([field("Н1-ИНп", [0.7, 0.2, 0.75, 0.23], category="thread")])
+    stats = sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].category == "thread"
+    assert "thread_weld_code" not in stats
+
+
+@pytest.mark.parametrize("value", ["M12-6g", "M6-6H", "M20x1,5", "G1/2", "Tr20x4", "M1", "Rc1/4", "K1/8"])
+def test_real_threads_stay_with_weld_code_flag(value, monkeypatch):
+    monkeypatch.setattr(settings, "DRAWING_SENSE_WELD_CODES", True)
+    sheet = drawing([field(value, [0.3, 0.3, 0.32, 0.32], category="thread")])
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].category == "thread"
