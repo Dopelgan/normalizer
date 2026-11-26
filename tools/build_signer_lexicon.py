@@ -270,7 +270,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.output:
         with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
-        print(f"{args.output}: {len(names)} {"фамилий" if args.kind == "signers" else "терминов"} из {documents} документов", file=sys.stderr)
+        print(f"{args.output}: {len(names)} {'фамилий' if args.kind == 'signers' else 'терминов'} из {documents} документов", file=sys.stderr)
     else:
         sys.stdout.write(text)
     return 0
