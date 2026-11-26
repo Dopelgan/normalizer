@@ -63,6 +63,7 @@ DROPPED = "dropped"          # прочтение подписи снято: ф�
 TERM = "term"                # слово поставлено к термину из списка
 GOST = "gost"                # номер стандарта
 GRADE = "grade"              # квалитет в записи неуказанных отклонений
+DESIGNATION = "designation"  # точка обозначения ЕСКД, код схемы
 
 # ===========================================================================
 # Сравнение написаний
@@ -424,7 +425,9 @@ def fix_gost(text: str, known: frozenset = frozenset()) -> Tuple[str, List[Dict[
 # Модель пишет квалитеты кириллицей («Н14, н14») и теряет «I» («±Т14/2»,
 # «±1Т14/2»). Правится только в записи, где есть «откл», и только сами
 # квалитеты: буквы отверстия и вала и «IT» перед номером 1–18.
-_DEVIATION_CONTEXT = re.compile(r"откл", re.IGNORECASE)
+# Запись узнаётся по слову «откл» или по самому «±IT14/2» (значение графы
+# после подписи «…откл.:» приходит без слова).
+_DEVIATION_CONTEXT = re.compile(r"откл|±\s*[IІ1lЛ]?[TТ](?:1[0-8]|[1-9])\s*/\s*2", re.IGNORECASE)
 # Буквы отверстия и вала — только парой через запятую («Н14, н14»): одиночное
 # «Н10» может быть обозначением. «IT» — только в «±IT14/2» (знак или «/2»):
 # «Т8» — марка стали, «Т15» — обозначение.
@@ -433,6 +436,60 @@ _GRADE_PAIR = re.compile(
 _GRADE_IT = re.compile(
     r"(?:(?<=±)|(?<=±\s))(?:[IІ1lЛ]?[TТ]|IT)(1[0-8]|[1-9])(?=\s*/\s*2)"
     r"|(?<![0-9A-Za-zА-Яа-яЁё])(?:[IІ1lЛ][TТ]|IT)(1[0-8]|[1-9])(?=\s*/\s*2)")
+
+
+# Обозначение ЕСКД (ГОСТ 2.201): код организации, классификационная
+# характеристика из 6 цифр, точка, порядковый номер из 3 цифр, дальше —
+# части через точку или исполнение через дефис: «ТАДУ 421451.003.30.006».
+# Модель теряет точку («421451003») или ставит её не туда («4.21451003»).
+# Правится только первая часть, и только когда её 9 цифр ровно кончаются
+# на границе прочитанной группы — иначе где кончается номер, неизвестно.
+_DESIGNATION = re.compile(
+    r"(?<![0-9A-Za-zА-Яа-яЁё])(?P<org>[А-ЯЁ]{3,5})(?P<sep>[  ]?)"
+    r"(?P<run>\d[\d.]*\d)(?![\d])")
+# Код документа после обозначения: схемы — буква и цифра («Э4», «Э3»).
+# «34» и «З4» кодом быть не могут: так читается «Э4».
+_SCHEME_CODE = re.compile(r"^(?P<exec>-\d{2})?(?P<gap>[  ])[3З](?P<digit>[1-7])(?=\s*$|\s*л\.|\s*\()")
+# Префиксы стандартов — не коды организаций.
+_NOT_ORG = frozenset({"ГОСТ", "ОСТ", "СТО", "ПНАЭ", "РД", "ТУ", "НП", "ОТТ", "СНИП"})
+
+
+def fix_designations(text: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Точка обозначения ЕСКД на месте 6.3 и код схемы «Э4» вместо «34»."""
+    value = str(text or "")
+    notes: List[Dict[str, str]] = []
+    out: List[str] = []
+    last = 0
+    for match in _DESIGNATION.finditer(value):
+        if match.group("org") in _NOT_ORG:
+            continue
+        groups = match.group("run").split(".")
+        if any(not g for g in groups):
+            continue
+        digits, used = "", 0
+        while used < len(groups) and len(digits) < 9:
+            digits += groups[used]
+            used += 1
+        head = ".".join(groups[:used])
+        if len(digits) != 9 or head == f"{digits[:6]}.{digits[6:]}":
+            fixed_run = match.group("run")
+        else:
+            fixed_run = ".".join([f"{digits[:6]}.{digits[6:]}"] + groups[used:])
+        tail_start = match.end()
+        code = _SCHEME_CODE.match(value[tail_start:]) if len(digits) >= 9 else None
+        replacement = match.group("org") + match.group("sep") + fixed_run
+        end = match.end()
+        if code:
+            replacement += (code.group("exec") or "") + code.group("gap") + "Э" + code.group("digit")
+            end = tail_start + code.end()
+        if replacement != value[match.start():end]:
+            notes.append({"kind": DESIGNATION, "before": value[match.start():end], "after": replacement})
+            out.append(value[last:match.start()] + replacement)
+            last = end
+    if not notes:
+        return value, []
+    out.append(value[last:])
+    return "".join(out), notes
 
 
 def fix_grades(text: str) -> Tuple[str, List[Dict[str, str]]]:
@@ -521,6 +578,8 @@ def _fix_value(value: str, kind: str, handwritten: bool, category: str,
     value, found = fix_gost(value, lexicon.gost)
     notes += found
     value, found = fix_grades(value)
+    notes += found
+    value, found = fix_designations(value)
     notes += found
     if kind == "other" and category in ("title_block", "material"):
         value, found = fix_terms(value, lexicon.terms)
