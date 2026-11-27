@@ -103,9 +103,37 @@ def test_numbered_requirement_in_material_is_note(monkeypatch, value, category):
 @pytest.mark.parametrize("value, category", [("0,5x45°", "size"), ("3х45°", "size"), ("А", "callout")])
 def test_chamfer_callout_is_size(monkeypatch, value, category):
     flag_on(monkeypatch, "DRAWING_SENSE_CLASS_RULES")
+    monkeypatch.setattr(settings, "DRAWING_SENSE_SIZE_FORMS", True)
     sheet = drawing([field(value, [0.5, 0.1, 0.55, 0.12], category="callout")], sheet_type="detail")
     sense_rules.apply([sheet])
     assert categories(sheet) == [(value, category)]
+
+
+def test_chamfer_stays_callout_without_size_forms(monkeypatch):
+    flag_on(monkeypatch, "DRAWING_SENSE_CLASS_RULES")
+    monkeypatch.setattr(settings, "DRAWING_SENSE_SIZE_FORMS", False)
+    sheet = drawing([field("0,5x45°", [0.5, 0.1, 0.55, 0.12], category="callout")], sheet_type="detail")
+    sense_rules.apply([sheet])
+    assert categories(sheet) == [("0,5x45°", "callout")]
+
+
+@pytest.mark.parametrize("value, category", [
+    ("⌀22x3", "size"), ("⌀14х2", "size"), ("Ø57x3", "size"), ("M22x1,5", "thread"), ("G1/2", "thread"),
+])
+def test_tube_read_as_thread_is_size(monkeypatch, value, category):
+    flag_on(monkeypatch, "DRAWING_SENSE_CLASS_RULES")
+    monkeypatch.setattr(settings, "DRAWING_SENSE_SIZE_FORMS", True)
+    sheet = drawing([field(value, [0.5, 0.1, 0.55, 0.12], category="thread")], sheet_type="assembly")
+    sense_rules.apply([sheet])
+    assert categories(sheet) == [(value, category)]
+
+
+def test_tube_stays_thread_without_size_forms(monkeypatch):
+    flag_on(monkeypatch, "DRAWING_SENSE_CLASS_RULES")
+    monkeypatch.setattr(settings, "DRAWING_SENSE_SIZE_FORMS", False)
+    sheet = drawing([field("⌀22x3", [0.5, 0.1, 0.55, 0.12], category="thread")], sheet_type="assembly")
+    sense_rules.apply([sheet])
+    assert categories(sheet) == [("⌀22x3", "thread")]
 
 
 def test_pm_twin_keeps_one_size(monkeypatch):

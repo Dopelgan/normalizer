@@ -590,6 +590,12 @@ def _thread_rule(items: List[_Item], stats: Dict[str, int]) -> None:
             continue
         value = " ".join(str(field.value or "").split())
         payload = item.fragment.content.structured_payload or {}
+        if settings.DRAWING_SENSE_SIZE_FORMS and _TUBE_SIZE.match(value):
+            # «⌀22x3» — труба (диаметр на стенку), а не резьба: резьба
+            # пишется буквой профиля («M22x1,5», «G1/2»), знак ⌀ у неё не стоит.
+            field.category = "size"
+            _count(stats, "thread_tube_size")
+            continue
         if _WELD_AS_THREAD.match(value):
             field.category = "callout"
             field.needs_review = True
@@ -872,6 +878,8 @@ def _recategorise(field: DrawingField, category: str) -> None:
 # Это пояснение к размеру (примечание), а не выноска с номером.
 _COUNT_NOTE = re.compile(
     r"^\d{1,3}\s*(?:мест[аo]?|отв(?:ерсти[яей]|ерстие)?)\.?$", re.IGNORECASE)
+# Труба или пруток: диаметр со знаком ⌀ на стенку или длину («⌀22x3», «⌀14х2»).
+_TUBE_SIZE = re.compile(r"^[⌀Ø∅ø]\s*\d+(?:[.,]\d+)?\s*[xх×]\s*\d+(?:[.,]\d+)?$")
 # Фаска: катет на угол («0,5x45°», «3х45°», «1,6×30°»).
 _CHAMFER = re.compile(r"^\d+(?:[.,]\d+)?\s*[xх×*]\s*\d{1,2}°$")
 # Пункт технических требований: номер, затем слово, которым начинаются
@@ -893,10 +901,13 @@ def _class_rule(items: List[_Item], stats: Dict[str, int]) -> None:
     Однозначные смешения категорий (DRAWING_SENSE_CLASS_RULES):
     «2 места», «4 отв.» в выноске или позиции — примечание `note`;
     пункт технических требований «3 Допускается…» в материале — `note`;
+    с DRAWING_SENSE_SIZE_FORMS фаска «0,5x45°» в выноске — `size`;
     «30°±2°» в допуске — размер с допуском `size` (допуск остаётся в
     `tolerance`), повтор того же места размером снимается; метка шва «№1»,
     «2№3» в позиции — выноска на листе любого вида. Значение не меняется.
     """
+    from core.config import settings
+
     for item in items:
         field = item.field
         if item.gone:
@@ -905,7 +916,7 @@ def _class_rule(items: List[_Item], stats: Dict[str, int]) -> None:
         if field.category in ("callout", "position") and _COUNT_NOTE.match(value):
             _recategorise(field, "note")
             _count(stats, "class_count_note")
-        elif field.category == "callout" and _CHAMFER.match(value):
+        elif settings.DRAWING_SENSE_SIZE_FORMS and field.category == "callout" and _CHAMFER.match(value):
             # «0,5x45°», «3х45°» — фаска: размер, а не выноска.
             _recategorise(field, "size")
             _count(stats, "class_chamfer_size")
