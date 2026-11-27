@@ -527,6 +527,8 @@ _SCHEME_DESIGNATOR = re.compile(r"^[MМ]\d{1,3}(?:\(\d+\)|-\d{1,3})?$")
 # пишется: она начинается с M, G, Tr, Rc, K и т. п., а у метрической резьбы
 # после дефиса стоит поле допуска цифрой («M12-6g»). DRAWING_SENSE_WELD_CODES.
 _WELD_CODE = re.compile(r"^[СУТНCYTH]\d{1,3}\s?[-–]\s?[А-ЯЁ]{1,4}[а-яё]{0,2}$")
+# Роды поля, из которых обозначение шва тоже уходит в выноску (кроме резьбы — у неё своя ветка).
+_WELD_CODE_FROM = ("roughness", "tolerance")
 
 
 # Метка шва ГОСТ 2.312: «№1», «2№3», «4N°1» (знак номера — и «N°», «Nº»).
@@ -567,13 +569,24 @@ def _thread_rule(items: List[_Item], stats: Dict[str, int]) -> None:
     обозначения элементов «M1», «M11» на электрических схемах Э4 приходили
     резьбой и попадали в индекс как «резьбы листа». Значение не меняется,
     меняется только род: метка шва — выноска, обозначение — позиция.
-    С DRAWING_SENSE_WELD_CODES так же — обозначение шва «Н1-ИНп».
+    С DRAWING_SENSE_WELD_CODES так же — обозначение шва «Н1-ИНп», и не только
+    из резьбы: на штанге АЕГН оно пришло шероховатостью («Н1-ИНп — шероховатость
+    поверхности» в описании листа), бывает и допуском.
     """
     from core.config import settings
 
     for item in items:
         field = item.field
-        if item.gone or field.category != "thread":
+        if item.gone:
+            continue
+        if (settings.DRAWING_SENSE_WELD_CODES and field.category in _WELD_CODE_FROM
+                and _WELD_CODE.match(" ".join(str(field.value or "").split()))):
+            field.category = "callout"
+            field.needs_review = True
+            field.link = None
+            _count(stats, "weld_code_other")
+            continue
+        if field.category != "thread":
             continue
         value = " ".join(str(field.value or "").split())
         payload = item.fragment.content.structured_payload or {}

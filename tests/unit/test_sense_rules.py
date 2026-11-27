@@ -571,3 +571,29 @@ def test_real_threads_stay_with_weld_code_flag(value, monkeypatch):
     sheet = drawing([field(value, [0.3, 0.3, 0.32, 0.32], category="thread")])
     sense_rules.apply([sheet])
     assert sheet.content.structured_drawing_fields[0].category == "thread"
+
+
+@pytest.mark.parametrize("category", ["roughness", "tolerance"])
+def test_weld_code_read_as_roughness_or_tolerance_becomes_callout(category, monkeypatch):
+    """Штанга АЕГН СБ: «Н1-ИНп» в описании листа значилось шероховатостью."""
+    monkeypatch.setattr(settings, "DRAWING_SENSE_WELD_CODES", True)
+    sheet = drawing([field("Н1-ИНп", [0.7, 0.2, 0.75, 0.23], category=category)])
+    stats = sense_rules.apply([sheet])
+    (mark,) = sheet.content.structured_drawing_fields
+    assert mark.category == "callout" and mark.value == "Н1-ИНп" and mark.needs_review
+    assert stats["weld_code_other"] == 1
+
+
+@pytest.mark.parametrize("value, category", [("Ra 3,2", "roughness"), ("Rz 20", "roughness"),
+                                             ("H7", "tolerance"), ("±0,2", "tolerance"), ("h14", "tolerance")])
+def test_real_roughness_and_tolerances_stay_with_weld_code_flag(value, category, monkeypatch):
+    monkeypatch.setattr(settings, "DRAWING_SENSE_WELD_CODES", True)
+    sheet = drawing([field(value, [0.3, 0.3, 0.32, 0.32], category=category)])
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].category == category
+
+
+def test_weld_code_in_roughness_stays_without_flag():
+    sheet = drawing([field("Н1-ИНп", [0.7, 0.2, 0.75, 0.23], category="roughness")])
+    sense_rules.apply([sheet])
+    assert sheet.content.structured_drawing_fields[0].category == "roughness"

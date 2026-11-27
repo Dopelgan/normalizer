@@ -246,7 +246,7 @@
 | `DRAWING_SENSE_CLASS_RULES` | `false` | `core/providers/sense_rules.py::_class_rule` (из `apply_page`) |
 | `DRAWING_SENSE_SPEC_POSITIONS` | `false` | `core/providers/sense_rules.py` (`apply` → `spec_positions`; `apply_page` → `_spec_position_rule`) |
 | `DRAWING_SENSE_RA_SERIES` | `false` | `core/providers/sense_rules.py` (`apply_page` → `_ra_series_rule`, `ra_series_fix`) |
-| `DRAWING_SENSE_WELD_CODES` | `false` | `core/providers/sense_rules.py` (`_thread_rule`, `_WELD_CODE`) |
+| `DRAWING_SENSE_WELD_CODES` | `false` | `core/providers/sense_rules.py` (`_thread_rule`, `_WELD_CODE`, `_WELD_CODE_FROM`) |
 | `DRAWING_CORNER_ROUGHNESS_V2` | `false` | `core/providers/sense_rules.py` (`apply_page` → `_corner_rule`, `general_roughness`) |
 | `DRAWING_MARGIN_DATE_FIX` | `false` | `core/providers/title_block.py::fix_month_year` (из `parse`), `core/providers/margin_columns.py::parse` |
 | `DRAWING_FIELDS_FROM_TEXT` | `false` | `core/drawing_processor.py::process` → `_fields_from_text` (`_text_cells`, `_text_category`); фильтр в `_what_drawn_pass` |
