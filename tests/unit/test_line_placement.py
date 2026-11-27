@@ -66,3 +66,32 @@ def test_flag_off_leaves_fields(monkeypatch):
     sheet.content.structured_payload = {"coordinate_reference": "page"}
     field_placement.apply([sheet])
     assert sheet.content.structured_drawing_fields[0].bbox == [0.0, 0.0, 1.0, 1.0]
+
+
+WHOLE = ("2. Сварка аргонодуговая ГОСТ 14771-76. Присадочная проволока Св-04Х19Н11М3 ГОСТ 2246-70. "
+         "Масса наплавленного металла 20 г.")
+
+
+def test_whole_note_takes_its_pieces_box_and_pieces_go():
+    sheet = drawing([
+        field("1. Размеры для справок.", [0.09, 0.65, 0.3, 0.67], exact=True, category="note"),
+        field(WHOLE, [0.0, 0.0, 1.0, 1.0], exact=False, category="note"),
+        field("2. Сварка аргонодуговая ГОСТ 14771-76.", [0.09, 0.67, 0.45, 0.69], exact=True, category="note"),
+        field("Присадочная проволока Св-04Х19Н11М3 ГОСТ 2246-70. Масса наплавленного металла 20 г.",
+              [0.09, 0.69, 0.9, 0.71], exact=True, category="note"),
+    ], [])
+    stats = line_placement.merge_note_pieces([sheet])
+    got = [(f.value, f.bbox, f.bbox_exact) for f in sheet.content.structured_drawing_fields]
+    assert got == [("1. Размеры для справок.", [0.09, 0.65, 0.3, 0.67], True),
+                   (WHOLE, [0.09, 0.67, 0.9, 0.71], True)]
+    assert stats == {"merged": 1, "pieces": 2}
+
+
+def test_pieces_that_do_not_cover_the_whole_note_stay():
+    sheet = drawing([
+        field("2. Сварка аргонодуговая ГОСТ 14771-76. Присадочная проволока Св-04.", [0.0, 0.0, 1.0, 1.0],
+              exact=False, category="note"),
+        field("2. Сварка аргонодуговая ГОСТ 14771-76.", [0.09, 0.67, 0.45, 0.69], exact=True, category="note"),
+    ], [])
+    assert line_placement.merge_note_pieces([sheet]) == {"merged": 0, "pieces": 0}
+    assert len(sheet.content.structured_drawing_fields) == 2

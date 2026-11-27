@@ -537,7 +537,7 @@ KEYS_6E03189 = {
 
 # Новые флаги 25.11, все по умолчанию выключены.
 NEW_FLAGS_OFF = ("DRAWING_DIMENSION_GEOMETRY", "DRAWING_NATIVE_TILES", "DRAWING_LEXICON_FIX",
-                 "DRAWING_PLACE_FROM_LINES")
+                 "DRAWING_PLACE_FROM_LINES", "DRAWING_NOTE_PIECES_MERGE")
 
 
 class TestKeySetWithNewFlagsOff:

@@ -464,6 +464,13 @@ def apply(fragments: List[Fragment]) -> List[Fragment]:
         for drawings in pages.values():
             for fragment in drawings:
                 block_cleanup.unplace_oversized(fragment.content.structured_drawing_fields or [])
+    if settings.DRAWING_NOTE_PIECES_MERGE:
+        # Пункт требований целиком без места и его строки с местами — одно поле.
+        from core.providers import line_placement
+
+        merged = line_placement.merge_note_pieces(fragments)
+        if merged["merged"]:
+            logger.info("Пункты требований из строк: %s", merged)
     if settings.DRAWING_PLACE_FROM_LINES:
         # Последним: поле без места после сведения повторов и уборки
         # получает рамку строки распознавания с той же записью.

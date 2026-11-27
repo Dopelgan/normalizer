@@ -1485,6 +1485,12 @@ class Settings(BaseSettings):
     # записью — поле не трогается. Вызовов модели нет
     # (core/providers/line_placement.py). По умолчанию выключено.
     DRAWING_PLACE_FROM_LINES: bool = False
+    # Вместе с DRAWING_FIELD_PLACEMENT_V2: пункт технических требований,
+    # пришедший целиком без места и строками с местами, — одно поле с
+    # рамкой-объединением его строк; строки снимаются. Только если строки
+    # подряд и без остатка составляют пункт (core/providers/line_placement.py).
+    # По умолчанию выключено.
+    DRAWING_NOTE_PIECES_MERGE: bool = False
     # Места на видеокарте для фоновых вызовов разбора
     # (core/providers/gpu_gate.py). Один счётчик на все воркеры в Redis
     # Celery: днём (GPU_GATE_BUSY_HOURS_UTC, «4-13» — с 4:00 до 12:59 UTC,

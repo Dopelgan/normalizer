@@ -130,3 +130,78 @@ def apply(fragments: List[Fragment]) -> Dict[str, int]:
             field.bbox_exact = True
             stats["placed"] += 1
     return stats
+
+
+# ===========================================================================
+# Пункт требований целиком и его строки (DRAWING_NOTE_PIECES_MERGE)
+# ===========================================================================
+
+# Короче — не строка пункта, а надпись: склеивать нечего.
+_PIECE_MIN = 8
+_NOTE_KINDS = ("note", "callout")
+
+
+def _union(boxes: Sequence[Sequence[float]]) -> List[float]:
+    return [round(min(b[0] for b in boxes), 4), round(min(b[1] for b in boxes), 4),
+            round(max(b[2] for b in boxes), 4), round(max(b[3] for b in boxes), 4)]
+
+
+def _cover(whole: str, pieces: Sequence[Tuple[str, int]]) -> Optional[List[int]]:
+    """
+    Номера строк, которые подряд и без остатка составляют `whole`; None — не
+    составляют или строка одна. Строки идут по порядку чтения: каждая
+    следующая начинается там, где кончилась предыдущая.
+    """
+    at, used = 0, []
+    for piece, number in pieces:
+        if not whole.startswith(piece, at):
+            continue
+        at += len(piece)
+        used.append(number)
+        if at == len(whole):
+            return used if len(used) > 1 else None
+    return None
+
+
+def merge_note_pieces(fragments: List[Fragment]) -> Dict[str, int]:
+    """
+    Пункт технических требований пришёл дважды: целиком без места (содержание
+    листа без рамок) и строками с местами (проход с рамками режет пункт по
+    строкам листа). На листе штанги АЕГН строка «Присадочная проволока…»
+    выходила в требованиях два раза. Пункт целиком остаётся одним полем с
+    рамкой — объединением рамок его строк; строки снимаются. Не сложилось
+    без остатка — ничего не меняется.
+    """
+    stats = {"merged": 0, "pieces": 0}
+    for fragment in fragments:
+        if fragment.type != "drawing":
+            continue
+        payload = fragment.content.structured_payload or {}
+        if payload.get("coordinate_reference") != "page":
+            continue
+        fields = list(fragment.content.structured_drawing_fields or [])
+        placed = sorted(
+            (n for n, f in enumerate(fields) if f.category in _NOTE_KINDS and not unplaced(f)),
+            key=lambda n: (round(float(fields[n].bbox[1]), 3), float(fields[n].bbox[0])))
+        gone: set = set()
+        for whole in fields:
+            if whole.category not in _NOTE_KINDS or not unplaced(whole):
+                continue
+            wanted = key(whole.value)
+            if len(wanted) < 2 * _PIECE_MIN:
+                continue
+            pieces = [(key(fields[m].value), m) for m in placed
+                      if m not in gone and len(key(fields[m].value)) >= _PIECE_MIN
+                      and key(fields[m].value) in wanted]
+            used = _cover(wanted, pieces)
+            if used is None:
+                continue
+            whole.bbox = _union([fields[m].bbox for m in used])
+            whole.bbox_exact = True
+            gone.update(used)
+            stats["merged"] += 1
+            stats["pieces"] += len(used)
+        if gone:
+            fragment.content.structured_drawing_fields = [
+                f for m, f in enumerate(fields) if m not in gone]
+    return stats
